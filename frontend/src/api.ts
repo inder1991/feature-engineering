@@ -16,18 +16,29 @@ export class ApiError extends Error {
   // SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION on a 422). null whenever the server sent none —
   // framework validation errors deliberately have no code, so a caller must never read the
   // absence as "some other code".
+  //
+  // ALSO the `code` of a STRUCTURED refusal — the `{code, detail, ...facts}` body the build-set,
+  // code-generation and run-spine routes answer 409s with. It is the same idea in the other shape,
+  // and reading it from both is what stops a caller having to know which shape a route chose.
   errorCode: string | null
+  // The whole structured refusal body, when the server sent one. A refusal that carries FACTS —
+  // which members are blocked, how many provider calls the ceiling must cover — is unusable if the
+  // transport keeps only its sentence, and a screen that re-derived those numbers would be
+  // quoting itself rather than the enforcement.
+  payload: Record<string, unknown> | null
   constructor(
     status: number,
     detail: string,
     ingestionRunId: string | null = null,
     errorCode: string | null = null,
+    payload: Record<string, unknown> | null = null,
   ) {
     super(detail)
     this.status = status
     this.detail = detail
     this.ingestionRunId = ingestionRunId
     this.errorCode = errorCode
+    this.payload = payload
   }
 }
 
@@ -54,10 +65,19 @@ async function requestWithResponse<T>(
     // statusText is empty under HTTP/2, so never let the message end up blank.
     let detail = res.statusText || `HTTP ${res.status}`
     let errorCode: string | null = null
+    let payload: Record<string, unknown> | null = null
     try {
       const body = await res.json()
       if (typeof body.detail === 'string') {
         detail = body.detail
+      } else if (body.detail !== null && typeof body.detail === 'object'
+        && !Array.isArray(body.detail)) {
+        // The STRUCTURED refusal: `{code, detail, ...facts}`. Without this branch the sentence the
+        // server wrote is dropped and every such 409 reads as 'Conflict' — the status word, in
+        // place of the one thing the route said to help.
+        payload = body.detail as Record<string, unknown>
+        if (typeof payload.detail === 'string') detail = payload.detail
+        if (typeof payload.code === 'string') errorCode = payload.code
       } else if (Array.isArray(body.detail) && body.detail.length > 0) {
         // FastAPI 422 validation shape: detail is [{loc, msg, type}, ...]
         detail = body.detail
@@ -73,7 +93,8 @@ async function requestWithResponse<T>(
     }
     // A failed ingest still opened a run: keep its id (header) on the error, or it is lost —
     // the JSON body of a 4xx/5xx never carries it.
-    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'), errorCode)
+    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'), errorCode,
+      payload)
   }
   return { body: (await res.json()) as T, response: res }
 }
@@ -4565,6 +4586,21 @@ export interface RunRailStage {
   // Why a stage is UNAVAILABLE — a socket whose machinery does not exist yet. NOT_STARTED (a
   // stage that could actually run) carries none.
   reason_code: string | null
+  // The stage's own count, when it has one to state ("2 of 5 bound — accumulating"). It rides ONE
+  // entry today (BIND_SELECTIONS), which is why it is optional rather than a null every other
+  // stage would have to carry: a field no stage fills is a field every client tests for.
+  detail?: string | null
+}
+
+// One code-generation journey bridged to this run through its considered revision. The status is
+// the job store's own word, rendered verbatim. `actions` is a LIST because one job performs
+// several acts and migration 1111 refused to collapse them: "a single `requested_action` with a
+// single authorization could not truthfully cover AUTHOR_FORMULA and GENERATE_PREVIEW".
+export interface RunJobRow {
+  job_id: string
+  status: string
+  requested_at: string
+  actions: { action: string; state: string }[]
 }
 
 export interface RunAuthoringRow {
@@ -4608,14 +4644,33 @@ export interface FeatureRunDetail {
       considered_revision_id: string
       chosen_at: string
     }[]
-    // Nothing can write a binding in the foundation, so this is always empty today.
-    bind_selections: unknown[]
+    // One row per selection→formula pin (migration 1101), written by the code-generation
+    // coordinator when a job binds its members. NOT a count: the rail's BIND_SELECTIONS entry
+    // states how many of this run's choices are bound, and a second number rendered from these
+    // rows would be a different one — a selection can be pinned to two drafts, and a pin can cover
+    // a candidate no gate-1 choice named. These rows answer WHICH, and only which.
+    bind_selections: {
+      binding_id: string
+      selection_revision_id: string
+      formula_draft_id: string
+      considered_revision_id: string
+      option_id: string
+      recorded_at: string
+    }[]
   }
   // TWO READINGS of the same drafts, never one list: since migration 1107 a governed retry writes
   // a second draft against the same formula identity, so a candidate can hold BOTH a failure and
   // the answer that replaced it. `current` is where each candidate stands now (one row per
   // candidate); `history` is every attempt, in the order they were requested.
   authoring: { current: RunAuthoringCurrent[]; history: RunAuthoringRow[] }
+  // The code-generation jobs this run's candidates are being built through, newest first. Empty
+  // both when no job exists and when migration 1111 has not landed on the database being served —
+  // the run page never tells those apart, because the server deliberately does not.
+  jobs: RunJobRow[]
+  // Whether the run page's ONE gesture can run, DERIVED beside the rail from the same facts its
+  // entrance refuses on — so a control offered here can never be one the POST would refuse. When
+  // `available` is false the code and the sentence are the server's, rendered verbatim.
+  prepare_code: { available: boolean; reason_code: string | null; detail: string | null }
   rail: RunRailStage[]
 }
 
@@ -4632,4 +4687,41 @@ export function getFeatureRunDetail(runId: string): Promise<FeatureRunDetail> {
   // 404 covers both absence and denial on this route, deliberately — a 403 would confirm the id
   // exists. The client must not try to tell them apart.
   return request(`/feature-runs/${encodeURIComponent(runId)}`)
+}
+
+// The run page's ONE write (spec §R4.4.2): prepare formulas and code for candidates of this run.
+//
+// The body carries the CANDIDATES and, when the LLM authors any of them, the ceiling the person
+// confirmed — and nothing else. The considered revision, the target reading and each candidate's
+// selection are the run's own frozen facts, resolved server-side: a client that named them could
+// aim one run's gesture at another run's revision.
+//
+// `spend_approval` is omitted on the first call by design. The server answers 409
+// COST_AUTHORIZATION_MISSING carrying the number of provider calls its own enforcement will
+// budget, and the confirmation is sent on the second call with THAT number — never one this
+// browser computed.
+export function prepareRunCode(
+  runId: string,
+  body: { option_ids: string[]; spend_approval?: RunSpendApproval },
+): Promise<{
+  job_id: string
+  created: boolean
+  // Which job's declaration this build continues. The five declarations a build freezes are a
+  // person's, never the server's, so the reuse is named rather than silent.
+  declaration_source_job_id: string
+  run: FeatureRunDetail
+  detail: string
+}> {
+  return post(`/feature-runs/${encodeURIComponent(runId)}/prepare-code`, body)
+}
+
+// The SIX keys the code-generation screen's confirmation carries, unchanged: it is the same act of
+// agreeing to a cost, recorded as the same durable ceiling (§11.2).
+export interface RunSpendApproval {
+  max_calls: number
+  max_tokens: number
+  max_cost: string
+  currency: string
+  pricing_version: string
+  expires_at: string
 }

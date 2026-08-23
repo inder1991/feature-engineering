@@ -647,3 +647,105 @@ def test_invisible_run_returns_none(db):
 def test_absent_run_returns_none(db):
     """Absence and denial are indistinguishable to the caller — both None, both 404 at the route."""
     assert run_detail(db, _ADMIN, "no-such-run") is None
+
+
+# ══ the code-generation jobs bridge (spec §R4.4.2) ══════════════════════════════════════════════
+def _seed_job(db, chain, job_id, *, at, status="REQUESTED", actions=("AUTHOR_FORMULA",)):
+    """One `code_generation_job` on this run's considered revision — 1111's own columns.
+
+    The bridge is the REVISION: a job names the frozen set it builds from and that set names the
+    run, so nothing about this row mentions the run and the join is what has to find it."""
+    db.execute(
+        "INSERT INTO code_generation_job (job_id, content_identity_hash, considered_revision_id, "
+        "target_reading_revision_id, environment_id, logical_group_name, declaration_json, "
+        "execution_parameters_json, status, requested_by, requested_at) "
+        "VALUES (%s, %s, %s, 'trr-x', 'env-x', 'grp-x', '{}'::jsonb, '{}'::jsonb, %s, 'u1', %s)",
+        (job_id, f"cih-{job_id}", chain["considered_revision_id"], status, at))
+    for action in actions:
+        db.execute(
+            "INSERT INTO code_generation_job_action (job_id, action, state) VALUES (%s, %s, %s)",
+            (job_id, action, "PENDING"))
+
+
+def test_the_run_lists_the_jobs_bridged_to_it_newest_first(db):
+    """The jobs a person watches are DERIVED like everything else here — no stored back-reference.
+
+    Newest first, because the run page's question is "what is happening now"; the status is the
+    store's own word, rendered verbatim; and the ACTIONS are a list because 1111 refused a single
+    `requested_action` in writing ("could not truthfully cover AUTHOR_FORMULA and
+    GENERATE_PREVIEW").
+    """
+    c = seed_run_chain(db, run_id="rd-j")
+    other = seed_run_chain(db, run_id="rd-j-other")
+    _seed_job(db, c, "cgj-old", at="2026-08-20T00:00:00Z", status="BLOCKED")
+    _seed_job(db, c, "cgj-new", at="2026-08-22T00:00:00Z",
+              actions=("AUTHOR_FORMULA", "GENERATE_PREVIEW"))
+    _seed_job(db, other, "cgj-elsewhere", at="2026-08-23T00:00:00Z")
+
+    jobs = run_detail(db, _ADMIN, "rd-j")["jobs"]
+
+    assert [j["job_id"] for j in jobs] == ["cgj-new", "cgj-old"], \
+        "newest first, and ANOTHER run's job is not this run's — the bridge is the revision"
+    assert jobs[1]["status"] == "BLOCKED"        # verbatim: the projection folds nothing
+    assert [a["action"] for a in jobs[0]["actions"]] == ["AUTHOR_FORMULA", "GENERATE_PREVIEW"]
+    assert jobs[1]["actions"] == [{"action": "AUTHOR_FORMULA", "state": "PENDING"}]
+    assert isinstance(jobs[0]["requested_at"], str) and jobs[0]["requested_at"].startswith("2026")
+
+
+def test_the_jobs_bridge_is_silent_on_a_database_where_1111_never_landed(db):
+    """▲ THE LIVE-DATABASE GUARD, and it is not hypothetical: 1111 is committed but UNAPPLIED on
+    the live database (its ledger stands at 1099). Without the probe this join raises
+    `UndefinedTable` out of a read-only projection and EVERY run detail becomes a 500 the moment it
+    deploys — the `pin_exists` lesson, on the second file-only store this projection reads.
+
+    Postgres DDL is transactional and the `db` fixture rolls back, so the table is gone only for
+    the remainder of this test. Nothing outside 1111's own three tables references it.
+    """
+    c = seed_run_chain(db, run_id="rd-j0")
+    _seed_job(db, c, "cgj-gone", at="2026-08-22T00:00:00Z")
+    db.execute("DROP TABLE code_generation_job CASCADE")
+
+    out = run_detail(db, _ADMIN, "rd-j0")
+    assert out["jobs"] == []
+    # The whole projection still answers — the point of the probe is that a missing migration
+    # cannot take a read-only surface down.
+    assert out["generation_run_id"] == "rd-j0"
+
+
+def _prepare(db, run_id):
+    return run_detail(db, _ADMIN, run_id)["prepare_code"]
+
+
+def test_the_prepare_gesture_is_available_only_when_its_entrance_is(db, monkeypatch):
+    """▲ ONE ANSWER, TWO SURFACES (spec §7 [R3.1] applied to a gesture). §7 forbids a stage reading
+    NOT_STARTED over an entrance that refuses; a BUTTON offered over an entrance that refuses is
+    the same defect with a click in it. So the run page's control and `POST .../prepare-code` are
+    decided here, once — and this pins the PRECEDENCE, because each step sends a different person
+    to a different remedy.
+
+    The switch is answered FIRST even for a pre-spine run: a deployment that does not run V2
+    generation has no journey at all, and telling someone their run predates the spine there would
+    send them to start a new run and watch the same nothing happen.
+    """
+    from featuregen.runs.run_identity import record_run_identity
+
+    c = seed_run_chain(db, run_id="rd-pc")
+    monkeypatch.delenv("FEATUREGEN_GENERATION_V2_ENABLED", raising=False)
+    assert _prepare(db, "rd-pc")["reason_code"] == "GENERATION_DISABLED"
+
+    monkeypatch.setenv("FEATUREGEN_GENERATION_V2_ENABLED", "1")
+    # ...and only under the switch does a fact about the RUN decide it.
+    pre = _prepare(db, "rd-pc")
+    assert pre["available"] is False and pre["reason_code"] == "PRE_SPINE_NOT_ACTIONABLE"
+    assert "honest gap" in pre["detail"]
+
+    record_run_identity(db, "rd-pc", IdentityEnvelope(
+        subject="u1", actor_kind="human", authenticated=True, auth_method="test", role_claims=()))
+    # A spine run still cannot start a build nobody declared: the five declarations are a person's
+    # to make, and this platform will not make them on their behalf.
+    undeclared = _prepare(db, "rd-pc")
+    assert undeclared["reason_code"] == "RUN_BUILD_DECLARATION_ABSENT"
+    assert "will not choose them on your behalf" in undeclared["detail"]
+
+    _seed_job(db, c, "cgj-decl", at="2026-08-22T00:00:00Z")
+    assert _prepare(db, "rd-pc") == {"available": True, "reason_code": None, "detail": None}

@@ -113,6 +113,22 @@ _STATIC_SOCKETS = {
     "TRAIN_MODEL": "SUBSYSTEM_NOT_BUILT",
 }
 
+#: The deployment switch's own reason code, named ONCE. The rail reports it for `GENERATE_PREVIEW`
+#: and the run→job trigger refuses with it, because they are the same fact seen from two sides: a
+#: deployment with V2 generation off has no generation surface, so neither the stage nor the gesture
+#: can honestly claim otherwise. Shared the way `runs.pin` shares the pre-pin code — a string copied
+#: into a second file is a string that drifts.
+GENERATION_DISABLED_REASON_CODE = "GENERATION_DISABLED"
+
+#: The two ways the run→job gesture (spec §R4.4.2) can be unavailable for a reason of the RUN
+#: rather than of the deployment. PROJECTION-LOCAL vocabulary, like `GENERATION_DISABLED` and
+#: unlike a governed decision code: no registry row defines them, they name a gap in this surface's
+#: record, and `prepare_code_availability` is the only thing that emits them (Task 1's review
+#: settled that such literals need no registry entry). Constants rather than inline strings because
+#: the route quotes them into its 409 and the tests assert them.
+PRE_SPINE_NOT_ACTIONABLE = "PRE_SPINE_NOT_ACTIONABLE"
+RUN_BUILD_DECLARATION_ABSENT = "RUN_BUILD_DECLARATION_ABSENT"
+
 
 def _static_socket(stage: str) -> dict:
     """One literal socket. The lookup RAISES on a stage that is not one — a rail entry silently
@@ -146,7 +162,7 @@ def _generate_preview_stage(conn) -> dict:
         # This deployment does not run V2 generation, so `GENERATION_DISABLED` names the remedy
         # honestly: a deployment decision to reverse, not a schema to migrate.
         return {"stage": "GENERATE_PREVIEW", "state": "UNAVAILABLE",
-                "reason_code": "GENERATION_DISABLED"}
+                "reason_code": GENERATION_DISABLED_REASON_CODE}
     if not pin_exists(conn):
         return {"stage": "GENERATE_PREVIEW", "state": "UNAVAILABLE",
                 "reason_code": PRE_PIN_REASON_CODE}
@@ -309,6 +325,113 @@ def _bind_selections_milestone(conn, run_id: str,
              "detail": detail}, bindings)
 
 
+def jobs_store_exists(conn) -> bool:
+    """Whether migration 1111's `code_generation_job` has landed in THIS database.
+
+    The `pin_exists` rule, applied to the second file-only store this projection now reads. It is
+    not paranoia: 1111 is committed but unapplied on the live database (the ledger stands at 1099),
+    so a join written without this probe would turn EVERY run detail into an `UndefinedTable` 500
+    the moment it deployed — a read-only projection taken down by a table nobody had applied yet.
+
+    Self-retiring, like the pin: the day 1111 applies, `to_regclass` returns the relation and this
+    answers True for ever after with no code change.
+    """
+    return conn.execute("SELECT to_regclass('code_generation_job')").fetchone()[0] is not None
+
+
+def run_jobs(conn, run_id: str) -> list[dict]:
+    """The code-generation jobs bridged to this run, newest first — a READ-ONLY join (spec §R4.4.2).
+
+    THE BRIDGE IS THE CONSIDERED REVISION. A job names the frozen considered set it builds from
+    (1111's FK), and that revision names the run (1021's), so "this run's jobs" is a join and never
+    a stored back-reference — the same derivation discipline every other field here follows.
+
+    ▲ **NOT a single `requested_action`.** 1111 rejected that shape in writing: "a single
+    `requested_action` with a single authorization could not truthfully cover AUTHOR_FORMULA and
+    GENERATE_PREVIEW". One job performs SEVERAL acts and records one row per act, so the acts are
+    surfaced as the list they are, each with the state the store holds for it. Collapsing them to
+    one string here would re-invent exactly what the migration refused.
+
+    STATUS IS THE STORE'S WORD, verbatim — this projection folds nothing and translates nothing.
+    The empty list is not two answers dressed as one: on a pre-1111 database no job HAS ever been
+    requested for this run, because there is nowhere one could have been recorded, so "none" is
+    true either way. What the reader loses is only the MIGRATION's name, and the rail beside it
+    carries that already: 1111 cannot be present where 1101 is absent (the runner applies pending
+    migrations in order), so `GENERATE_PREVIEW` and `BIND_SELECTIONS` are both reading
+    `BUILD_SET_DECLARATION_WITHHELD_PRE_PIN` on exactly those databases.
+    """
+    if not jobs_store_exists(conn):
+        return []
+    # ORDER BY `requested_at` then `job_id`: jobs written in one transaction share `now()`, so the
+    # timestamp alone is not an order and the id is what makes it total. The column is a real
+    # `timestamptz` here (1111), unlike 1090's TEXT — so this is a chronological sort, not a
+    # lexical one that happens to agree.
+    rows = conn.execute(
+        """SELECT j.job_id, j.status, j.requested_at
+           FROM code_generation_job j
+           JOIN contract_considered_revision ccr USING (considered_revision_id)
+           WHERE ccr.generation_run_id = %s
+           ORDER BY j.requested_at DESC, j.job_id DESC""", (run_id,)).fetchall()
+    if not rows:
+        return []
+    # ONE query for every job's acts rather than one per job: the list is unbounded (a run
+    # accumulates jobs), and a per-row query here would be an N+1 inside a page render.
+    actions: dict[str, list[dict]] = {job_id: [] for job_id, _, _ in rows}
+    for job_id, action, state in conn.execute(
+            "SELECT job_id, action, state FROM code_generation_job_action "
+            "WHERE job_id = ANY(%s) ORDER BY job_id, action",
+            ([job_id for job_id, _, _ in rows],)).fetchall():
+        actions[job_id].append({"action": action, "state": state})
+    return [{"job_id": job_id, "status": status, "requested_at": at.isoformat(),
+             "actions": actions[job_id]} for job_id, status, at in rows]
+
+
+def prepare_code_availability(*, pre_spine: bool, has_job: bool) -> dict:
+    """Whether this run's `prepare-code` gesture can run, and — when it cannot — the ONE sentence
+    both the affordance and the entrance say (spec §7 [R3.1], applied to a gesture).
+
+    ▲ **THE SAME RULE THE RAIL FOLLOWS, FOR THE SAME REASON.** §7 forbids a stage reading
+    NOT_STARTED over an entrance that refuses; a BUTTON offered over an entrance that refuses is
+    that defect with a click in it. So availability is derived ONCE, here, from facts the projection
+    already holds — the run page disables the control off this answer and the route raises its 409
+    off this answer, which is why the two can never drift into "the page offered it and the server
+    said no" (or the worse direction: a control greyed out over a gesture that would have worked).
+
+    PRECEDENCE is the rail's own, and each step is a different person's remedy:
+
+      * the deployment switch first — a deployment with V2 generation off has no journey AT ALL, and
+        naming a fact about the run there would send someone to fix something that changes nothing;
+      * then PRE_SPINE — no identity row means no frozen considered set, and nothing a person does
+        to this run can produce one;
+      * then the declaration — see `api.routes.feature_runs.prepare_run_code`: the five declarations
+        a build freezes are a person's to make, and this platform will not make them for them.
+
+    Takes no connection: every input is a fact the caller already read. Accepting one would tell
+    each reader a query happens that does not.
+    """
+    if not generation_enabled():
+        return {"available": False, "reason_code": GENERATION_DISABLED_REASON_CODE,
+                "detail": "this deployment does not run V2 generation, so there is no "
+                          "code-generation journey to start — a deployment decision to reverse, "
+                          "not a fault of this run"}
+    if pre_spine:
+        return {"available": False, "reason_code": PRE_SPINE_NOT_ACTIONABLE,
+                "detail": "this run predates the identity spine, so no frozen considered set was "
+                          "recorded for it and there is nothing a build could be a build OF. An "
+                          "honest gap in the record, never a failure of the run: start a new run "
+                          "to prepare code for these candidates"}
+    if not has_job:
+        return {"available": False, "reason_code": RUN_BUILD_DECLARATION_ABSENT,
+                "detail": "no code-generation job has ever been requested for this run, so the "
+                          "five declarations a build freezes — the population, the cadence, the "
+                          "availability promise, the operand facts and the policy realizations — "
+                          "have never been made for it. Each decides a published number and the "
+                          "platform will not choose them on your behalf: declare them once "
+                          "through POST /code-generation-jobs, and this gesture then continues "
+                          "that build"}
+    return {"available": True, "reason_code": None, "detail": None}
+
+
 def _current_by_candidate(history: list[dict]) -> list[dict]:
     """The CURRENT answer per candidate, folded from the attempt history (spec §R4.4.1).
 
@@ -366,6 +489,8 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     `authoring` is TWO READINGS of the same rows (spec §R4.4.1) — `{"current": [...],
     "history": [...]}` — because since migration 1107 a candidate can hold both a failure and the
     answer that replaced it. See `_current_by_candidate` for which row is which and why.
+
+    `jobs` is the code-generation journeys bridged to this run (spec §R4.4.2) — see `run_jobs`.
 
     `visibility_where`'s params bind AT THE SPLICE POINT, which here is SECOND — after the run id.
     The fragment is parenthesized on splice (its own invariant): today's single comparison binds
@@ -439,6 +564,9 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     # candidate and the set is duplicate-free by construction.
     bind_stage, bindings = _bind_selections_milestone(
         conn, run_id, {(ccr_of, opt) for opt, ccr_of, _ in choices})
+    # Read ONCE and used twice: the list a person watches and the fact that decides whether the
+    # gesture beside it can run. Two reads could disagree inside one response.
+    jobs = run_jobs(conn, run_id)
     rail = [
         {"stage": "CHOOSE_CANDIDATES",
          "state": "SUCCEEDED" if choices else "NOT_STARTED", "reason_code": None},
@@ -479,5 +607,15 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
         # attempt that got it there. A single list cannot be both — since 1107 a candidate can have
         # a failure AND an answer, and which one a reader wants depends on the question they asked.
         "authoring": {"current": current, "history": history},
+        # The code-generation jobs this run's candidates are being built through (spec §R4.4.2).
+        # Derived by the considered-revision bridge like everything else here — the spine stores no
+        # link of its own, and the job store's status is the authority the trigger route just adds
+        # rows to.
+        "jobs": jobs,
+        # Whether the gesture that adds to that list can run, and the sentence if it cannot — the
+        # SAME answer its entrance refuses with. A button offered over an entrance that refuses is
+        # §7 [R3.1]'s false rail with a click in it.
+        "prepare_code": prepare_code_availability(
+            pre_spine=not has_identity, has_job=bool(jobs)),
         "rail": rail,
     }

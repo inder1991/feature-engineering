@@ -6,7 +6,7 @@ import {
   getFeatureRunDetail, getIntegration,
   getSemanticsPending, getSync, importSync, type Integration, type LineageGraph, lineageGraph,
   listContracts, listFeatureRuns, listIntegrations, listSyncs, patchIntegration, patchSync,
-  postFieldDecision,
+  postFieldDecision, prepareRunCode,
   getTableSuggestionsV4,
   previewSync, recommendFeatures, recommendFeatureSets, refineCandidate, searchCatalog,
   SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION, type Sync,
@@ -1024,5 +1024,42 @@ describe('feature run spine client (read-only list + detail)', () => {
     // as ONE path segment, or the request 404s against a route that never saw it.
     await getFeatureRunDetail('grun x/y')
     expect(fetchMock.mock.calls[1][0]).toBe('/feature-runs/grun%20x%2Fy')
+  })
+
+  it('prepareRunCode posts the candidates alone, and the ceiling only when confirmed', async () => {
+    fetchMock.mockImplementation(ok({ job_id: 'cgj_1', created: true }))
+    await prepareRunCode('grun x/y', { option_ids: ['o2', 'o1'] })
+    expect(fetchMock.mock.calls[0][0]).toBe('/feature-runs/grun%20x%2Fy/prepare-code')
+    // ORDERED, and nothing else on the wire: the considered revision and each candidate's
+    // selection are the run's own frozen facts, resolved server-side. A body that named them could
+    // aim one run's gesture at another run's revision.
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ option_ids: ['o2', 'o1'] })
+
+    await prepareRunCode('grun_x', {
+      option_ids: ['o2'],
+      spend_approval: { max_calls: 45, max_tokens: 1, max_cost: '1.00', currency: 'USD',
+        pricing_version: 'development', expires_at: '2026-08-24T00:00:00.000Z' },
+    })
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).spend_approval.max_calls).toBe(45)
+  })
+
+  it('keeps a STRUCTURED refusal whole: its sentence, its code and its facts', async () => {
+    // `{code, detail, ...facts}` is what the build-set, code-generation and run-spine routes answer
+    // 409s with. Before this branch existed the transport dropped all three and the error read
+    // 'Conflict' — the status word, in place of the one thing the server said to help.
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({
+      detail: { code: 'COST_AUTHORIZATION_MISSING', llm_members: 1,
+        estimated_provider_calls: 45, detail: 'confirm the ceiling by including spend_approval' },
+    }), { status: 409 }))
+
+    const err = await prepareRunCode('grun_x', { option_ids: ['o2'] }).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(ApiError)
+    expect(err).toMatchObject({ status: 409, errorCode: 'COST_AUTHORIZATION_MISSING' })
+    expect((err as ApiError).detail).toBe('confirm the ceiling by including spend_approval')
+    // The FACTS survive too: a refusal that carries the enforcement's own budget is unusable if
+    // the transport keeps only the sentence, and a screen that re-derived 45 would be quoting
+    // itself rather than the platform.
+    expect((err as ApiError).payload?.estimated_provider_calls).toBe(45)
   })
 })

@@ -6,7 +6,12 @@ from psycopg.types.json import Jsonb
 
 
 def seed_run_chain(conn, *, run_id, intent_id=None, considered_revision_id=None,
-                   snapshot_id=None, scope_id=None, recognition_id=None, subject="u1"):
+                   snapshot_id=None, scope_id=None, recognition_id=None, subject="u1",
+                   considered_json=None):
+    """`considered_json` defaults to `{}` — the shape every milestone/rail test needs, since none of
+    them resolves an OPTION out of the revision. A test that does (the run→job trigger has to, to
+    reach a real authoring strategy) passes the canonical v3 payload instead; the content hash stays
+    `'cch'` either way because 1025's lineage trigger and `_seed_choice` both key on that literal."""
     intent_id = intent_id or f"{run_id}-intent"
     considered_revision_id = considered_revision_id or f"{run_id}-ccr"
     snapshot_id = snapshot_id or f"{run_id}-snap"
@@ -47,8 +52,9 @@ def seed_run_chain(conn, *, run_id, intent_id=None, considered_revision_id=None,
         "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
         "generation_run_id, metadata_snapshot_id, metadata_snapshot_content_hash, "
         "considered_json, considered_content_hash, canonicalization_version) "
-        "VALUES (%s, %s, %s, %s, 'ch', '{}'::jsonb, 'cch', 'v1') ON CONFLICT DO NOTHING",
-        (considered_revision_id, intent_id, run_id, snapshot_id))
+        "VALUES (%s, %s, %s, %s, 'ch', %s, 'cch', 'v1') ON CONFLICT DO NOTHING",
+        (considered_revision_id, intent_id, run_id, snapshot_id,
+         Jsonb(considered_json if considered_json is not None else {})))
     return {"run_id": run_id, "intent_id": intent_id,
             "considered_revision_id": considered_revision_id, "snapshot_id": snapshot_id,
             "scope_id": scope_id, "recognition_id": recognition_id, "subject": subject}

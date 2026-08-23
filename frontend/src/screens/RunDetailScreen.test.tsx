@@ -10,9 +10,10 @@ import { RunDetailScreen } from './RunDetailScreen'
 // exercising the path it exists to pin. Every assertion of the brief's test is kept verbatim.
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, getFeatureRunDetail: vi.fn() }
+  return { ...actual, getFeatureRunDetail: vi.fn(), prepareRunCode: vi.fn() }
 })
 const getFeatureRunDetail = vi.mocked(api.getFeatureRunDetail)
+const prepareRunCode = vi.mocked(api.prepareRunCode)
 
 const RUN_ID = 'grun_01M02SAZQQQQ'
 
@@ -35,8 +36,14 @@ const DETAIL: api.FeatureRunDetail = {
     bind_selections: [],
   },
   authoring: { current: [{ ...DRAFT_1, resolved: true }], history: [DRAFT_1] },
+  jobs: [],
+  // The run in this fixture has one candidate and it already has an answer, so the gesture has
+  // nothing to prepare — the tests that exercise it widen `choose_candidates` themselves.
+  prepare_code: { available: true, reason_code: null, detail: null },
   rail: [
     { stage: 'CHOOSE_CANDIDATES', state: 'SUCCEEDED', reason_code: null },
+    { stage: 'BIND_SELECTIONS', state: 'IN_PROGRESS', reason_code: null,
+      detail: '2 of 5 bound — accumulating' },
     { stage: 'GENERATE_PREVIEW', state: 'UNAVAILABLE',
       reason_code: 'BUILD_SET_DECLARATION_WITHHELD_PRE_PIN' },
     { stage: 'TRAIN_MODEL', state: 'UNAVAILABLE', reason_code: 'SUBSYSTEM_NOT_BUILT' },
@@ -46,6 +53,7 @@ const DETAIL: api.FeatureRunDetail = {
 beforeEach(() => {
   getFeatureRunDetail.mockReset()
   getFeatureRunDetail.mockResolvedValue(DETAIL)
+  prepareRunCode.mockReset()
 })
 
 // jsdom implements no clipboard, so the copy test installs one onto the SHARED navigator. Put back
@@ -62,14 +70,17 @@ function rowOf(cellText: string): HTMLElement {
   return row
 }
 
-it('renders the rail honestly and both authoring axes, with no trigger buttons', async () => {
+it('renders the rail honestly and both authoring axes, and offers ONE write', async () => {
   render(<RunDetailScreen runId="grun_01M02SAZQQQQ" />)
   await waitFor(() => expect(screen.getByText('Retail churn')).toBeInTheDocument())
   expect(screen.getByText('BUILD_SET_DECLARATION_WITHHELD_PRE_PIN')).toBeInTheDocument()
   expect(screen.getByText(/SUCCEEDED/)).toBeInTheDocument()          // outcome axis
   expect(screen.getByText(/Withdrawn/)).toBeInTheDocument()          // eligibility axis
+  // The absent controls are still the design: preparing formulas is the ONE thing this screen can
+  // write, and nothing here re-runs, retries, executes or forks a run.
   expect(screen.queryAllByRole('button').filter(b =>
-    /run|re-run|retry|generate|execute|fork/i.test(b.textContent ?? ''))).toHaveLength(0)
+    /re-run|retry|execute|fork/i.test(b.textContent ?? ''))).toHaveLength(0)
+  expect(screen.getByRole('button', { name: /Prepare formulas/ })).toBeInTheDocument()
 })
 
 it('puts every reason code beside the stage it explains, and none beside the rest', async () => {
@@ -231,4 +242,197 @@ it('loads the run it was pointed at, and reloads when pointed at another', async
   getFeatureRunDetail.mockResolvedValue({ ...DETAIL, generation_run_id: 'grun_other' })
   rerender(<RunDetailScreen runId="grun_other" />)
   await waitFor(() => expect(getFeatureRunDetail).toHaveBeenCalledWith('grun_other'))
+})
+
+// ── the milestone's own count, which used to be computed and then dropped ────────────────────────
+it('renders a stage’s count beside the stage it belongs to', async () => {
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('BIND_SELECTIONS')).toBeInTheDocument())
+  // A number derived by the server and never shown is indistinguishable from one never derived —
+  // the run page carried this string in every response and rendered none of it.
+  expect(within(rowOf('BIND_SELECTIONS')).getByText('2 of 5 bound — accumulating'))
+    .toBeInTheDocument()
+})
+
+// ── the ONE gesture ─────────────────────────────────────────────────────────────────────────────
+// A run with two chosen candidates, one of which already has an answer: only the other is offered.
+const TWO_CHOSEN: api.FeatureRunDetail = {
+  ...DETAIL,
+  milestones: {
+    ...DETAIL.milestones,
+    choose_candidates: [
+      { option_id: 'o1', considered_revision_id: 'c', chosen_at: '2026-08-23T00:00:00+00:00' },
+      { option_id: 'o2', considered_revision_id: 'c', chosen_at: '2026-08-23T00:00:01+00:00' },
+      // The SAME candidate chosen twice is one thing to prepare, not two checkboxes.
+      { option_id: 'o2', considered_revision_id: 'c', chosen_at: '2026-08-23T00:00:02+00:00' },
+    ],
+  },
+}
+
+it('offers only the chosen candidates that have no answer yet, once each', async () => {
+  getFeatureRunDetail.mockResolvedValue(TWO_CHOSEN)
+  render(<RunDetailScreen runId={RUN_ID} />)
+
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+  // o1 already carries a current answer (DRAFT_1) — asking for it again would be a second purchase
+  // of something the run already has.
+  expect(screen.queryAllByRole('checkbox')).toHaveLength(1)
+})
+
+it('sends the candidates a person picked, and never fires from anything but the click', async () => {
+  getFeatureRunDetail.mockResolvedValue(TWO_CHOSEN)
+  prepareRunCode.mockResolvedValue({
+    job_id: 'cgj-new', created: true, declaration_source_job_id: 'cgj-old',
+    detail: 'the job was recorded; the worker drives it',
+    run: { ...TWO_CHOSEN, jobs: [{ job_id: 'cgj-new', status: 'REQUESTED',
+      requested_at: '2026-08-23T01:00:00+00:00',
+      actions: [{ action: 'AUTHOR_FORMULA', state: 'PENDING' }] }] },
+  })
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+
+  // Rendering alone must spend nothing: the whole screen has loaded and no request has gone out.
+  expect(prepareRunCode).not.toHaveBeenCalled()
+  const button = screen.getByRole('button', { name: /Prepare formulas/ })
+  expect(button).toBeDisabled()            // nothing picked yet — a no-op button would be a lie
+
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(button)
+
+  expect(prepareRunCode).toHaveBeenCalledWith(RUN_ID, { option_ids: ['o2'] })
+  // The run comes back READ from the store, so the job list below is the store's own answer.
+  await waitFor(() => expect(screen.getByText('cgj-new')).toBeInTheDocument())
+  expect(screen.getByTestId('prepare-status')).toHaveTextContent('cgj-old')
+})
+
+it('collects the ceiling from the SERVER’s numbers when the LLM authors', async () => {
+  getFeatureRunDetail.mockResolvedValue(TWO_CHOSEN)
+  prepareRunCode.mockRejectedValueOnce(new api.ApiError(
+    409, 'this job authors with the LLM, and spend is an authorized act', null,
+    'COST_AUTHORIZATION_MISSING',
+    { code: 'COST_AUTHORIZATION_MISSING', llm_members: 1, estimated_provider_calls: 45 }))
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+
+  // The enforcement's own budget, quoted back — never a number this browser computed.
+  await waitFor(() => expect(screen.getByText(/up to 45 provider calls/)).toBeInTheDocument())
+  expect(screen.getByText(/authors with the LLM/)).toBeInTheDocument()
+  // ...and the act cannot proceed on an unconfirmed ceiling.
+  expect(screen.getByRole('button', { name: /cost ceiling/ })).toBeDisabled()
+
+  prepareRunCode.mockResolvedValue({
+    job_id: 'cgj-paid', created: true, declaration_source_job_id: 'cgj-old',
+    detail: 'the job was recorded', run: TWO_CHOSEN,
+  })
+  await userEvent.type(screen.getByLabelText(/Token ceiling/), '200000')
+  await userEvent.type(screen.getByLabelText(/Cost ceiling/), '12.50')
+  await userEvent.click(screen.getByRole('button', { name: /cost ceiling/ }))
+
+  await waitFor(() => expect(prepareRunCode).toHaveBeenCalledTimes(2))
+  expect(prepareRunCode.mock.calls[1][1]).toMatchObject({
+    option_ids: ['o2'],
+    spend_approval: { max_calls: 45, max_tokens: 200000, max_cost: '12.50', currency: 'USD' },
+  })
+})
+
+it('disables the gesture with the server’s own sentence when its entrance would refuse', async () => {
+  getFeatureRunDetail.mockResolvedValue({
+    ...TWO_CHOSEN,
+    prepare_code: {
+      available: false, reason_code: 'PRE_SPINE_NOT_ACTIONABLE',
+      detail: 'this run predates the identity spine, so no frozen considered set was recorded',
+    },
+  })
+  render(<RunDetailScreen runId={RUN_ID} />)
+
+  await waitFor(() => expect(screen.getByTestId('prepare-unavailable')).toBeInTheDocument())
+  // Verbatim, code and sentence: this screen holds no policy and owns no words for a refusal.
+  expect(screen.getByTestId('prepare-unavailable')).toHaveTextContent('PRE_SPINE_NOT_ACTIONABLE')
+  expect(screen.getByTestId('prepare-unavailable'))
+    .toHaveTextContent('no frozen considered set was recorded')
+  expect(screen.getByRole('button', { name: /Prepare formulas/ })).toBeDisabled()
+  // The checkbox goes with it: a control that could not be acted on would invite the click anyway.
+  expect(screen.getByRole('checkbox', { name: /o2/ })).toBeDisabled()
+  // ...and the pair holds. Trying anyway reaches no request at all — the guard is what stops the
+  // gesture, not the greying, and a screen that only LOOKED disabled would still send this.
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+  expect(prepareRunCode).not.toHaveBeenCalled()
+})
+
+it('shows a refusal in the server’s words and records nothing of its own', async () => {
+  getFeatureRunDetail.mockResolvedValue(TWO_CHOSEN)
+  prepareRunCode.mockRejectedValue(new api.ApiError(
+    409, 'no code-generation job has ever been requested for this run', null,
+    'RUN_BUILD_DECLARATION_ABSENT',
+    { code: 'RUN_BUILD_DECLARATION_ABSENT' }))
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+
+  expect(await screen.findByRole('alert'))
+    .toHaveTextContent('no code-generation job has ever been requested for this run')
+})
+
+// ── the jobs bridge ─────────────────────────────────────────────────────────────────────────────
+const WITH_JOB: api.FeatureRunDetail = {
+  ...DETAIL,
+  jobs: [{
+    job_id: 'cgj_1', status: 'AUTHORING', requested_at: '2026-08-23T00:00:00+00:00',
+    actions: [{ action: 'AUTHOR_FORMULA', state: 'PERFORMED' },
+      { action: 'GENERATE_PREVIEW', state: 'PENDING' }],
+  }],
+}
+
+it('renders each job’s status and every act it performs, verbatim', async () => {
+  getFeatureRunDetail.mockResolvedValue(WITH_JOB)
+  render(<RunDetailScreen runId={RUN_ID} />)
+
+  await waitFor(() => expect(screen.getByText('cgj_1')).toBeInTheDocument())
+  const row = rowOf('cgj_1')
+  expect(within(row).getByText('AUTHORING')).toBeInTheDocument()
+  // SEVERAL acts, because one job performs several — 1111 refused to collapse them into one word.
+  expect(within(row).getByText(/AUTHOR_FORMULA performed · GENERATE_PREVIEW pending/))
+    .toBeInTheDocument()
+  // Flag off (the default in tests): the workspace is not routed, so there is no link to it.
+  expect(within(row).queryByRole('link')).toBeNull()
+})
+
+it('links a job to the generation workspace only where that workspace is routed', async () => {
+  vi.stubEnv('VITE_CODE_GENERATION', '1')
+  getFeatureRunDetail.mockResolvedValue(WITH_JOB)
+  render(<RunDetailScreen runId={RUN_ID} />)
+
+  await waitFor(() => expect(screen.getByRole('link', { name: 'cgj_1' })).toBeInTheDocument())
+  expect(screen.getByRole('link', { name: 'cgj_1' }))
+    .toHaveAttribute('href', '#/code-generation?job_id=cgj_1')
+  vi.unstubAllEnvs()
+})
+
+it('states WHICH choices carry a formula, and leaves HOW MANY to the rail', async () => {
+  getFeatureRunDetail.mockResolvedValue({
+    ...DETAIL,
+    milestones: {
+      ...DETAIL.milestones,
+      bind_selections: [
+        { binding_id: 'b1', selection_revision_id: 's1', formula_draft_id: 'd1',
+          considered_revision_id: 'c', option_id: 'o1', recorded_at: '2026-08-23T00:00:00+00:00' },
+        // The SAME selection re-pinned after a re-author: two rows, ONE choice. A count rendered
+        // from these rows would say 2 beside a rail that says "2 of 5" for a different reason.
+        { binding_id: 'b2', selection_revision_id: 's1', formula_draft_id: 'd2',
+          considered_revision_id: 'c', option_id: 'o1', recorded_at: '2026-08-23T00:01:00+00:00' },
+      ],
+    },
+  })
+  render(<RunDetailScreen runId={RUN_ID} />)
+
+  await waitFor(() => expect(screen.getByText(/Formulas are pinned to/)).toBeInTheDocument())
+  // No second number under the same heading: the rail already answered "how many", and these rows
+  // answer a different question.
+  expect(screen.queryByText(/2 selection binding/)).toBeNull()
+  expect(within(rowOf('BIND_SELECTIONS')).getByText('2 of 5 bound — accumulating'))
+    .toBeInTheDocument()
 })

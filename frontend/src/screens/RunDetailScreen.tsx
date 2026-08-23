@@ -1,10 +1,18 @@
 // One feature run opened to its record (GET /feature-runs/{id}) — identity, milestones, the
-// authoring rows and the stage rail.
+// authoring rows, the stage rail, and ONE gesture.
 //
-// **READ-ONLY BY CONSTRUCTION, AND THE ABSENCE OF BUTTONS IS THE DESIGN.** There is no run, re-run,
-// retry, generate, execute or fork control here, and none is missing: the spine DERIVES every field
-// below from stores that already hold the evidence, and no write endpoint exists behind this route
-// to offer. A button that could not do what its word says would be worse than no button.
+// **EXACTLY ONE CONTROL WRITES, AND EVERY ABSENT CONTROL IS STILL THE DESIGN.** There is no run,
+// re-run, retry, execute or fork button here, and none is missing: the spine DERIVES every field
+// below from stores that already hold the evidence, and no write endpoint exists behind those words
+// to offer. The one that does exist is `Prepare formulas` (spec §R4.4.2) — it hands the candidates a
+// person picked to the code-generation coordinator, and it fires from an onClick and nowhere else.
+// A button that could not do what its word says would be worse than no button, which is why it is
+// DISABLED whenever the server says its entrance would refuse.
+//
+// **THE SERVER DECIDES WHETHER THAT BUTTON CAN RUN.** `prepare_code.available` is derived beside
+// the rail, from the same facts the POST refuses on, and `prepare_code.detail` is the sentence —
+// rendered verbatim, never re-worded here. A screen that decided enablement for itself would be a
+// second policy, and the day the two disagreed a person would click into a refusal.
 //
 // **THIS SCREEN HOLDS NO POLICY** (the FeatureExecutionScreen rule). A stage is UNAVAILABLE because
 // its machinery does not exist, and WHICH machinery is the server's sentence: `reason_code` renders
@@ -32,9 +40,12 @@ import {
   type FeatureRunDetail,
   type RunAuthoringCurrent,
   type RunAuthoringRow,
+  type RunJobRow,
   type RunRailStage,
   getFeatureRunDetail,
+  prepareRunCode,
 } from '../api'
+import { codeGenerationEnabled } from '../nav'
 
 // How much of an opaque run id is shown before the ellipsis — the RunsScreen row's rule, so a run
 // reads the same in the list and in its own header.
@@ -80,10 +91,41 @@ function stateChipClass(state: string): string {
   return 'badge'
 }
 
+// The server's `COST_AUTHORIZATION_MISSING` refusal, as this screen needs it: how many members
+// author with the LLM and how many provider calls the enforcement will budget for them. Both
+// numbers are the SERVER's — a browser that computed a ceiling would be confirming a different
+// spend from the one the platform holds itself to.
+interface CostQuote {
+  llm_members: number
+  estimated_provider_calls: number
+  detail: string
+}
+
+function costQuote(err: unknown): CostQuote | null {
+  if (!(err instanceof ApiError) || err.errorCode !== 'COST_AUTHORIZATION_MISSING') return null
+  const payload = err.payload ?? {}
+  const calls = payload.estimated_provider_calls
+  if (typeof calls !== 'number') return null
+  return {
+    llm_members: typeof payload.llm_members === 'number' ? payload.llm_members : 0,
+    estimated_provider_calls: calls,
+    detail: err.detail,
+  }
+}
+
 export function RunDetailScreen({ runId }: { runId: string }) {
   const [run, setRun] = useState<FeatureRunDetail | null>(null)
   const [error, setError] = useState('')
   const [copyStatus, setCopyStatus] = useState('')
+  // The prepare gesture's own state. `picked` is keyed by option_id because that is what the body
+  // carries; `quote` is present only while the server is waiting for a confirmed ceiling.
+  const [picked, setPicked] = useState<string[]>([])
+  const [busy, setBusy] = useState(false)
+  const [quote, setQuote] = useState<CostQuote | null>(null)
+  const [maxTokens, setMaxTokens] = useState('')
+  const [maxCost, setMaxCost] = useState('')
+  const [prepareError, setPrepareError] = useState('')
+  const [prepareNotice, setPrepareNotice] = useState('')
 
   useEffect(() => {
     let live = true
@@ -92,6 +134,10 @@ export function RunDetailScreen({ runId }: { runId: string }) {
     setRun(null)
     setError('')
     setCopyStatus('')
+    setPicked([])
+    setQuote(null)
+    setPrepareError('')
+    setPrepareNotice('')
     getFeatureRunDetail(runId).then(
       detail => {
         if (live) setRun(detail)
@@ -122,6 +168,50 @@ export function RunDetailScreen({ runId }: { runId: string }) {
     }
   }
 
+  // THE ONE WRITE, and it fires from an onClick alone — never an effect, an interval or a retry.
+  // The first call deliberately carries no ceiling: the server answers with the number its own
+  // enforcement will budget, and the confirmation below sends THAT number back.
+  function prepare(approved: boolean) {
+    if (run === null) return
+    setBusy(true)
+    setPrepareError('')
+    setPrepareNotice('')
+    prepareRunCode(runId, {
+      option_ids: picked,
+      ...(approved && quote
+        ? {
+          spend_approval: {
+            max_calls: quote.estimated_provider_calls,
+            max_tokens: Number(maxTokens),
+            // The user's own number: this screen quotes WORK, never prices — a default price here
+            // would be the browser deciding a spend.
+            max_cost: maxCost,
+            currency: 'USD',
+            pricing_version: 'development',
+            // The approval covers this working session, not an open-ended future.
+            expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+          },
+        }
+        : {}),
+    }).then(
+      response => {
+        // The run comes back READ from the store, so the jobs list below is the store's and not a
+        // patch of this screen's own making.
+        setRun(response.run)
+        setPicked([])
+        setQuote(null)
+        setPrepareNotice(`${response.detail} (job ${response.job_id}; declaration from `
+          + `${response.declaration_source_job_id})`)
+      },
+      err => {
+        const asked = costQuote(err)
+        if (asked) setQuote(asked)
+        // The server's sentence, verbatim — this screen owns no vocabulary for a refusal.
+        else setPrepareError(err instanceof ApiError ? err.detail : String(err))
+      },
+    ).finally(() => setBusy(false))
+  }
+
   if (error)
     return (
       <p role="alert" className="error">
@@ -141,6 +231,20 @@ export function RunDetailScreen({ runId }: { runId: string }) {
   // client that re-derived "current" from the states in the table would be a second opinion, and
   // two folds of one question is how the rail and the table start disagreeing.
   const currentAnswers = new Map(run.authoring.current.map(row => [row.formula_draft_id, row]))
+
+  // The candidates a person can still ask for: CHOSEN (the milestone's own rows) and carrying no
+  // current answer yet. The candidate is the PAIR — an option id is only meaningful inside the
+  // revision that froze it — so membership is tested on both halves; the checkbox and the request
+  // then carry the option id, which is what the run's one frozen set makes unambiguous.
+  //
+  // Deduplicated by candidate: the same option can be chosen twice (a re-choice writes a second
+  // row), and that is one thing to prepare, not two checkboxes for one feature.
+  const answered = new Set(
+    run.authoring.current.map(row => `${row.considered_revision_id}#${row.option_id}`))
+  const waiting = [...new Map(
+    run.milestones.choose_candidates
+      .filter(c => !answered.has(`${c.considered_revision_id}#${c.option_id}`))
+      .map(c => [c.option_id, c] as const)).values()]
 
   return (
     <section className="panel" aria-label="Feature run">
@@ -250,13 +354,22 @@ export function RunDetailScreen({ runId }: { runId: string }) {
           </tbody>
         </table>
       )}
-      {/* The client types a binding as `unknown` because nothing can write one yet, so its fields
-          have no settled shape to render — the count is everything that can honestly be said. */}
-      <p className="hint">
-        {run.milestones.bind_selections.length === 0
-          ? 'No selection bindings are recorded.'
-          : `${run.milestones.bind_selections.length} selection binding(s) recorded.`}
-      </p>
+      {/* ▲ ONE NUMBER, NOT TWO. This used to render its own count beside the rail's "2 of 5
+          bound", and the two disagreed BY DESIGN: the rail counts CHOICES that carry a formula,
+          these are PINS — a selection re-pinned after a re-author is two rows for one choice, and
+          a pin on a candidate nobody chose is a row that counts towards nothing. Two numbers under
+          one heading make a reader arbitrate between them. So the rail states how many, and this
+          states which. */}
+      {run.milestones.bind_selections.length === 0 ? (
+        <p className="hint">No selection bindings are recorded.</p>
+      ) : (
+        <p className="hint">
+          Formulas are pinned to:{' '}
+          {run.milestones.bind_selections.map(pin => (
+            <span key={pin.binding_id} className="mono">{pin.option_id} </span>
+          ))}
+        </p>
+      )}
 
       <h3 className="run-section">Authoring</h3>
       {run.authoring.history.length === 0 ? (
@@ -293,7 +406,129 @@ export function RunDetailScreen({ runId }: { runId: string }) {
           </table>
         </>
       )}
+
+      <h3 className="run-section">Prepare code</h3>
+      {/* WHY THE CONTROL IS OFF, in the server's words. Not translated, not summarised, and not
+          replaced with a cheerful "coming soon": the sentence names which person fixes what. */}
+      {!run.prepare_code.available && (
+        <p className="hint" data-testid="prepare-unavailable">
+          <span className="mono">{run.prepare_code.reason_code}</span> — {run.prepare_code.detail}
+        </p>
+      )}
+      {waiting.length === 0 ? (
+        <p className="hint">
+          Every candidate this run chose already has a formula attempt; there is nothing left to
+          prepare.
+        </p>
+      ) : (
+        <ul className="prepare-candidates">
+          {waiting.map(candidate => (
+            <li key={candidate.option_id}>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={picked.includes(candidate.option_id)}
+                  disabled={!run.prepare_code.available || busy}
+                  onChange={() => setPicked(current =>
+                    current.includes(candidate.option_id)
+                      ? current.filter(o => o !== candidate.option_id)
+                      : [...current, candidate.option_id])}
+                />
+                {' '}
+                <span className="mono">{candidate.option_id}</span>
+              </label>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {quote && (
+        <fieldset className="prepare-spend">
+          <legend>Confirm the AI cost ceiling</legend>
+          {/* The server's own sentence and the server's own numbers. Up to N provider calls is the
+              enforcement's budget, not an estimate this browser produced. */}
+          <p>{quote.detail}</p>
+          <p>
+            {quote.llm_members} formula(s) author with the LLM — up to{' '}
+            {quote.estimated_provider_calls} provider calls. Your confirmation is recorded durably
+            and every call reserves against it.
+          </p>
+          <label>
+            Token ceiling
+            <input value={maxTokens} onChange={e => setMaxTokens(e.target.value)}
+                   inputMode="numeric" />
+          </label>
+          <label>
+            Cost ceiling (USD)
+            <input value={maxCost} onChange={e => setMaxCost(e.target.value)}
+                   inputMode="decimal" />
+          </label>
+        </fieldset>
+      )}
+
+      {/* ONE button, and its label states what it does. Disabled whenever the server says the
+          entrance would refuse, whenever nothing is picked, and while a request is in flight. */}
+      <button
+        type="button"
+        className="btn"
+        disabled={!run.prepare_code.available || picked.length === 0 || busy
+          || (quote !== null && (!maxTokens.trim() || !maxCost.trim()))}
+        onClick={() => prepare(quote !== null)}
+      >
+        {quote === null
+          ? 'Prepare formulas (records a code-generation job)'
+          : 'Prepare formulas (records the job and your cost ceiling)'}
+      </button>
+      {prepareNotice && (
+        <p className="hint" role="status" data-testid="prepare-status">{prepareNotice}</p>
+      )}
+      {prepareError && <p role="alert" className="error">{prepareError}</p>}
+
+      <h3 className="run-section">Code generation</h3>
+      {run.jobs.length === 0 ? (
+        <p className="hint">No code-generation job has been requested for this run.</p>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Job</th>
+              <th>Status</th>
+              <th>Acts</th>
+              <th>Requested</th>
+            </tr>
+          </thead>
+          <tbody>
+            {run.jobs.map(job => <JobRow key={job.job_id} job={job} />)}
+          </tbody>
+        </table>
+      )}
     </section>
+  )
+}
+
+// One code-generation journey. The status is the store's word, rendered as itself — this screen
+// has no vocabulary of its own for a job, and inventing one would be a second reading of a state
+// the generation workspace already renders.
+function JobRow({ job }: { job: RunJobRow }) {
+  return (
+    <tr>
+      <td className="mono">
+        {/* The workspace exists only where its flag is on — that flag mirrors the SERVER's own
+            switch, so a link rendered without it would go to a screen that is not routed. The id
+            still shows: a person can always quote it. */}
+        {codeGenerationEnabled() ? (
+          <a href={`#/code-generation?job_id=${encodeURIComponent(job.job_id)}`}>{job.job_id}</a>
+        ) : (
+          job.job_id
+        )}
+      </td>
+      <td className="mono">{job.status}</td>
+      {/* SEVERAL acts per job, because migration 1111 refused to collapse them into one. */}
+      <td className="mono stage-detail">
+        {job.actions.map(a => `${a.action} ${a.state.toLowerCase()}`).join(' · ') || '—'}
+      </td>
+      <td className="mono stage-detail">{fmtWhen(job.requested_at)}</td>
+    </tr>
   )
 }
 
@@ -307,8 +542,15 @@ function RailRow({ stage }: { stage: RunRailStage }) {
         </span>
       </td>
       {/* The server's code, verbatim. A stage that could actually run carries none, and that
-          absence renders as absence — not as a blank cell the reader has to interpret. */}
-      <td className="mono">{stage.reason_code ?? '—'}</td>
+          absence renders as absence — not as a blank cell the reader has to interpret.
+
+          The stage's own count rides beside it when it has one ("2 of 5 bound — accumulating").
+          It was computed and then dropped on the floor here, which is the worse half of the D3
+          rule: a number derived and never shown is indistinguishable from one never derived. */}
+      <td className="mono">
+        {stage.reason_code ?? (stage.detail ? '' : '—')}
+        {stage.detail && <span className="stage-detail">{stage.detail}</span>}
+      </td>
     </tr>
   )
 }
