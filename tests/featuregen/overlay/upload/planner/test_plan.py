@@ -344,3 +344,101 @@ def test_no_compile_ctx_leaves_every_plan_not_compiled(db):
     assert all(p.contract_resolution_status is ContractResolutionStatus.not_compiled
                and p.contract_id is None and p.contract_reason_codes == ()
                for p in result.candidate_plans)
+
+
+# ---------------------------------------------------------------------------------------------
+# Task S1A-4a — the PLAN FACTS a governed option builder consumes.
+#
+# The plan's OUTPUT grain cannot be rediscovered from the ingredient bindings: a
+# transaction -> account roll-up carries no account-key ingredient binding at all, and the landing
+# catalog is not the plan's `catalog_source`. It is therefore emitted, qualified, at the one place
+# that knows it — the assembler's completing mint. And `full_physical_plan_hash` exposes the
+# UNTRUNCATED digest of exactly the material `make_binding_plan` truncates into `physical_plan_id`,
+# from ONE shared material builder so the two can never drift apart.
+# ---------------------------------------------------------------------------------------------
+
+from featuregen.overlay.upload.planner.contracts import full_physical_plan_hash
+
+# Identity pins captured on the PRE-change checkout (task S1A-4a), by running the `_c8_fixture`
+# compile flow below before `output_grain_ref` / `anchor_catalog_source` existed. Both new fields
+# are non-identity-bearing: neither may move a physical plan id or a contract id.
+_PINNED_C8_CROSS_PHYSICAL_PLAN_ID = "bp_0adcb0a8c5748e1a"
+_PINNED_C8_CROSS_CONTRACT_ID = "cc_095c221534f53e67"
+
+
+def test_resolved_cross_catalog_plan_carries_a_qualified_output_grain(db):
+    _split(db)
+    _seed_bridge(db, "bfk_grain", "account",
+                 "ops", "public.transactions.account_id", "rev", "public.accounts.account_id")
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+    (cross,) = _cross(result)
+    # the roll-up LANDS in 'rev' on the account-grain table: the output grain is qualified by the
+    # LANDING catalog — not the plan's source catalog, and not derivable from the bindings.
+    assert cross.output_grain_ref == ("rev", "public.accounts.account_id")
+    assert cross.catalog_source == "ops"
+    assert all(b.bound_catalog_source == "ops" for b in cross.ingredient_bindings)
+    assert all(b.bound_object_ref != "public.accounts.account_id"
+               for b in cross.ingredient_bindings)
+    # the tier-1 candidates never reached the assembler, so they claim no output grain
+    assert all(p.output_grain_ref is None for p in result.candidate_plans
+               if p.path_resolution_status is PathResolutionStatus.ingredient_binding_only)
+
+
+def test_zero_bridge_rollup_output_grain_is_its_own_catalog(db):
+    _seed(db, "core", [
+        (CanonicalRow("core", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("core", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("core"), roles=(), now=_NOW)
+    (cross,) = _cross(result)
+    assert cross.bridge_count == 0
+    assert cross.output_grain_ref == ("core", "public.accounts.account_id")
+
+
+def test_rejected_plan_claims_no_output_grain(db):
+    _split(db)
+    _seed(db, "hidden", [
+        (CanonicalRow("hidden", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    # the only crossing to an account-grain table lands in a catalog OUTSIDE the frozen scope, so
+    # the roll-up fail-closes as a rejected candidate — which reaches no target grain to report.
+    _seed_bridge(db, "bfk_hidden_grain", "account",
+                 "ops", "public.transactions.account_id", "hidden", "public.accounts.account_id")
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+    rejects = [p for p in result.candidate_plans
+               if p.path_resolution_status is PathResolutionStatus.source_to_target_rejected]
+    assert rejects
+    assert all(p.output_grain_ref is None for p in rejects)
+
+
+def test_full_physical_plan_hash_is_the_untruncated_physical_plan_id(db):
+    scope = _c8_fixture(db)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
+                           roles=(), now=_NOW)
+    (cross,) = _cross(result)
+    full = full_physical_plan_hash(cross)
+    assert len(full) == 64 and full == full.lower()
+    assert full[:16] == cross.physical_plan_id[len("bp_"):]
+    # ONE material, two readers: it holds for every plan the run minted, tier-1 and cross alike
+    for p in result.candidate_plans:
+        assert full_physical_plan_hash(p)[:16] == p.physical_plan_id[len("bp_"):]
+
+
+def test_new_plan_facts_move_no_identity(db):
+    """The pinned literals were captured BEFORE either new field existed."""
+    scope = _c8_fixture(db)
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
+                           roles=(), now=_NOW, compile_ctx=ctx)
+    (cross,) = _cross(result)
+    assert cross.physical_plan_id == _PINNED_C8_CROSS_PHYSICAL_PLAN_ID
+    assert cross.contract_id == _PINNED_C8_CROSS_CONTRACT_ID
+    # ...and the un-hashed facts ARE populated on that very plan (a vacuous pin would prove nothing)
+    assert cross.output_grain_ref == ("rev", "public.accounts.account_id")
+    assert full_physical_plan_hash(cross)[:16] == _PINNED_C8_CROSS_PHYSICAL_PLAN_ID[len("bp_"):]

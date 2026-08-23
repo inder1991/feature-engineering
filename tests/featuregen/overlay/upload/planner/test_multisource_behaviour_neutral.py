@@ -176,10 +176,34 @@ _CONTRACTS_FILE = "src/featuregen/overlay/upload/planner/contracts.py"
 # origin-neutral request seam, asks for the new mode. The discriminator had to be an ARGUMENT
 # rather than a `Template` field because `recipe_grounding_context` enumerates Template's fields
 # dynamically, so a new field would move every legacy template's canonical hash.
+#
+# S1A-4a, THE PLAN FACTS A GOVERNED OPTION BUILDER CONSUMES (cross-catalog Stage 1). Two facts a
+# plan did not carry, both APPENDED as defaulted fields and neither hashed into any identity:
+#
+#   `assemble_paths`   — sets `output_grain_ref=(landing catalog, landing grain key)` at the ONE
+#                        point that knows it: the completing mint. The output grain is NOT
+#                        recoverable downstream — a transaction -> account roll-up binds no
+#                        account-key ingredient, and the landing catalog is not the plan's
+#                        `catalog_source`. Rejected/dead-end mints keep None.
+#   `_grain_key_ref`   — the new helper that resolves it, by the identical rule
+#                        `reposition_bridges` already uses (`is_grain` AND `key_entity` ==
+#                        position entity), through the planner's own governed helpers.
+#   `compile_temporal` — qualifies `anchor_binding` with the `bound_catalog_source` of the SAME
+#                        binding the ref was chosen from. The ambiguity decision is still taken
+#                        over the distinct REFS, so no declaration outcome moves.
+#
+# Not a shadow-engine perturbation and not a single-source perturbation either: `output_grain_ref`
+# is emitted only on a source_to_target_resolved path, which single-source `plan_bindings` never
+# produces, and the temporal change is a pure widening of what is RECORDED about a choice that is
+# made identically. Both are proved identity-neutral by the pre-change literal pins in
+# `test_plan.py::test_new_plan_facts_move_no_identity`, and proof 2 (RUNTIME) still passes.
 _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
+    "src/featuregen/overlay/upload/planner/assembly.py": frozenset({
+        "_grain_key_ref", "assemble_paths",
+    }),
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
         "_hop_evidence", "CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN", "CompilerContext",
-        "build_compiler_context",
+        "build_compiler_context", "compile_temporal",
     }),
     "src/featuregen/overlay/upload/planner/plan.py": frozenset({
         "METADATA_RESOLUTION_MODES", "plan_bindings",
@@ -364,9 +388,29 @@ def test_contracts_file_branch_diff_is_additive_only():
         '-APPLICABILITY_MAPPING_VERSION = "1.0.0"',
         '-CONCEPT_REGISTRY_VERSION = "concepts@1"',
     }
+    # S1A-4a, THE SHARED PHYSICAL-MATERIAL EXTRACTION (cross-catalog Stage 1). A governed option
+    # builder needs the UNTRUNCATED digest of a plan's physical identity, so contracts.py gained
+    # `full_physical_plan_hash`. The one thing that must never happen is giving it its OWN copy of
+    # the id material — two constructions of one identity drift apart — so the material moved into
+    # `_physical_plan_material`, read by BOTH it and `make_binding_plan`. These EXACT eight lines
+    # are everything that move removes, together with `make_binding_plan` gaining a defaulted,
+    # never-hashed `output_grain_ref` argument. The mint's OUTPUT is byte-for-byte unchanged, pinned
+    # by literals captured on the pre-change checkout
+    # (`test_plan.py::test_new_plan_facts_move_no_identity`). Listed line-for-line rather than by
+    # symbol so this exception cannot silently cover any other edit to the same function.
+    allowed_shared_material_extraction = set('''\
+-                      candidate_role: CandidateRole) -> BindingPlanV1:
+-    refs = tuple(sorted(b.bound_object_ref for b in ingredient_bindings))
+-    segments_material = ">".join(
+-        f"{s.segment_kind}:{s.catalog_source}:{_segment_physical_identity(s)}"
+-        for s in path_segments)
+-    material = (f"{recipe_id}|{catalog_source}|{'|'.join(refs)}|{tier}|{segments_material}"
+-                f"|{path_resolution_status}|{PLANNER_VERSION}|{PHYSICAL_PLAN_VERSION}")
+-        path_resolution_status=path_resolution_status, candidate_role=candidate_role)
+'''.splitlines())
     removed = [
         line for line in _removed_lines(diff)
-        if line not in allowed_version_source_move
+        if line not in allowed_version_source_move | allowed_shared_material_extraction
     ]
     assert not removed, (
         f"NEUTRALITY VIOLATION: {_CONTRACTS_FILE} removed or changed an existing line — this "

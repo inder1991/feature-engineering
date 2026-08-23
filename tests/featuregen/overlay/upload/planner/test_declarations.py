@@ -381,6 +381,51 @@ def test_temporal_window_min_param_is_a_minute_window():
     assert out.anchor_binding == "public.transactions.event_ts"
 
 
+def test_temporal_anchor_catalog_comes_from_the_binding_that_supplied_the_ref():
+    """S1A-4a: `anchor_binding` is a BARE column ref, and two catalogs can expose the identical
+    ref (`public.transactions.event_ts`) — so downstream it is ambiguous on its own. The catalog
+    is read off the SAME binding the ref was chosen from, never inferred later and never taken
+    from the plan's own `catalog_source` (which is a different catalog here, deliberately)."""
+    t = _template(
+        "c3_realtime_velocity_qualified",
+        needs=(Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window_min": (60,)})
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.transactions.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id",
+                     catalog="rev"),
+            _binding("event_ts", "public.transactions.event_ts", join_role=str(JoinRole.TIME),
+                     concept="event_timestamp", temporal=str(TemporalRole.EVENT_TIME),
+                     catalog="rev"),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    assert out.anchor_binding == "public.transactions.event_ts"
+    assert out.anchor_catalog_source == "rev"
+    assert plan.catalog_source == "core"        # NOT where the qualification came from
+
+
+def test_temporal_anchor_catalog_is_absent_when_no_anchor_is_bound():
+    """Honest absence: an anchor role that nothing supplies qualifies nothing."""
+    t = _template(
+        "c3_asof_rollup_unqualified",
+        needs=(Need("stock_col", "monetary_stock"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={})
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.accounts.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("stock_col", "public.accounts.balance", concept="monetary_stock"),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    assert out.anchor_binding is None and out.anchor_catalog_source == ""
+    assert out.reason_codes == (c.ReasonCode.temporal_anchor_missing,)
+
+
 def test_temporal_bitemporal_interval_is_valid_not_ambiguous():
     # valid_from + valid_to TOGETHER describe one validity interval (F17) — never flagged
     # ambiguous merely because two temporal roles are present. Neither is a primary PIT anchor.

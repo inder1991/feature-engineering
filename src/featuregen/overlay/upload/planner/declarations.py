@@ -301,7 +301,10 @@ def compile_temporal(ctx: CompilerContext, plan: BindingPlanV1,
     need role; ``valid_from``+``valid_to`` together are a VALID bitemporal interval (never a
     primary anchor, never ambiguity). ``temporal_anchor_ambiguous`` fires ONLY for genuinely
     incompatible anchors — the winning role's needs bound to ≥2 DISTINCT columns; a declared
-    anchor role that no ingredient supplies is ``temporal_anchor_missing``."""
+    anchor role that no ingredient supplies is ``temporal_anchor_missing``. The chosen anchor is
+    CATALOG-QUALIFIED (``anchor_catalog_source``) from the SAME ingredient binding its ref came
+    from — a bare column ref is ambiguous across catalogs, and the qualification cannot be
+    reconstructed downstream."""
     del ctx     # uniform check signature; conn-free like every check in this module
     metas = derive_need_metadata(template)
 
@@ -326,23 +329,34 @@ def compile_temporal(ctx: CompilerContext, plan: BindingPlanV1,
 
     pit_anchor: str | None = None
     anchor_binding: str | None = None
+    anchor_catalog_source = ""
     codes: list[ReasonCode] = []
     if anchor_metas:
-        bound_by_role = {b.need_role: b.bound_object_ref for b in plan.ingredient_bindings}
-        bound_refs = {bound_by_role[m.role] for m in anchor_metas if m.role in bound_by_role}
+        # S1A-4a: keep the BINDINGS, not just their refs. `anchor_binding` is a bare column ref, so
+        # two catalogs exposing the same `public.transactions.business_dt` are indistinguishable
+        # downstream; the qualifying catalog must come from the very binding the ref is taken from
+        # and can never be recovered afterwards. The ambiguity decision is unchanged — it is still
+        # taken over the distinct REFS, so a plan's declaration outcome does not move.
+        bound_by_role = {b.need_role: b for b in plan.ingredient_bindings}
+        anchor_bindings = tuple(bound_by_role[m.role]
+                                for m in anchor_metas if m.role in bound_by_role)
+        bound_refs = {b.bound_object_ref for b in anchor_bindings}
         if len(bound_refs) > 1:
             codes.append(ReasonCode.temporal_anchor_ambiguous)      # genuinely competing columns
         else:
             pit_anchor = str(anchor_metas[0].temporal_role)
-            if bound_refs:
-                anchor_binding = next(iter(bound_refs))
+            if anchor_bindings:
+                chosen = anchor_bindings[0]     # every element shares the one surviving ref
+                anchor_binding = chosen.bound_object_ref
+                anchor_catalog_source = chosen.bound_catalog_source
             else:
                 codes.append(ReasonCode.temporal_anchor_missing)    # declared but unsupplied
 
     return TemporalDeclarationV1(
         pit_anchor=pit_anchor, anchor_binding=anchor_binding, window=window,
         param_binding=param_binding, time_axis_aggregating=window is not None,
-        reason_codes=canonical_reason_codes(codes))
+        reason_codes=canonical_reason_codes(codes),
+        anchor_catalog_source=anchor_catalog_source)
 
 
 # ─── C4: per-ingredient aggregation + additivity + physical/bridge cardinality ────────────────

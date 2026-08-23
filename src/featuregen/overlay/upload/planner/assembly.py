@@ -155,6 +155,19 @@ def _table_columns(conn, catalog: str, table_ref: str) -> tuple[tuple[str, bool]
     return tuple((r[0], bool(r[1])) for r in rows)
 
 
+def _grain_key_ref(conn, pos: _Position) -> str | None:
+    """S1A-4a — the GRAIN-KEY column ref of the table held at ``pos``: the exact resolution
+    :func:`reposition_bridges` already uses to decide which column identifies that table's rows
+    (``is_grain`` AND ``key_entity`` == the position's entity), read through the planner's own
+    governed helpers rather than any ``graph_node.entity`` shortcut. Deterministic —
+    ``_table_columns`` orders by ``object_ref``. ``None`` when the table exposes no such column:
+    the output grain is then honestly unknown, never guessed from the table name."""
+    for col_ref, is_grain in _table_columns(conn, pos.catalog, pos.table_ref):
+        if is_grain and key_entity(conn, pos.catalog, col_ref) == pos.entity:
+            return col_ref
+    return None
+
+
 def _scoped_bridges(conn, entity_id: str, scope: CatalogScopeV1) -> tuple[ActiveBridgeV1, ...]:
     """The AVAILABLE bridges at ``entity_id`` whose BOTH endpoint catalogs are authorized — reviewed
     or not; ``active_bridges`` has already applied the lifecycle allow-list.
@@ -424,6 +437,9 @@ def attach_executable_bridge_realizations(
         preference_reasons=plan.preference_reasons,
         candidate_role=plan.candidate_role,
     )
+    # only the physical-identity fields are taken from the re-mint; everything else — including the
+    # S1A-4a `output_grain_ref` the assembler resolved at the landing position — is carried through
+    # unchanged by `replace`, because binding a directional realization moves no plan's output grain.
     return replace(
         plan,
         physical_plan_id=reminted.physical_plan_id,
@@ -490,14 +506,16 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
 
     def _mint(state: _State, *, resolution_status: PlanResolutionStatus,
               path_status: PathResolutionStatus, primary: ReasonCode | None,
-              role: CandidateRole) -> BindingPlanV1:
+              role: CandidateRole,
+              output_grain_ref: tuple[str, str] | None = None) -> BindingPlanV1:
         return make_binding_plan(
             recipe_id=template.id, target_entity=target_entity,
             catalog_source=source_position.catalog, ingredient_bindings=ingredient_bindings,
             path_segments=prefix + state.segments, resolution_status=resolution_status,
             path_resolution_status=path_status, primary_reason_code=primary,
             reason_codes=(primary,) if primary is not None else (), safety=safety,
-            preference_rank=-1, preference_reasons=(), candidate_role=role)
+            preference_rank=-1, preference_reasons=(), candidate_role=role,
+            output_grain_ref=output_grain_ref)
 
     start = _State(hop_index=0, position=source_position, segments=(), bridge_count=0,
                    participating=(source_position.catalog,), used_bridge_fact_keys=frozenset())
@@ -539,10 +557,17 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
                     paths_truncated = True      # a further complete path was DROPPED, not kept
                     stop = True
                     break
+                # S1A-4a: this is the ONE place that knows the plan's OUTPUT grain — the landing
+                # position, which is neither the source catalog nor recoverable from the ingredient
+                # bindings (a transaction->account roll-up binds no account key). Qualified by the
+                # LANDING catalog; None if that table exposes no governed grain key.
+                landing_key = _grain_key_ref(conn, state.position)
                 complete.append(_mint(
                     state, resolution_status=PlanResolutionStatus.resolved,
                     path_status=PathResolutionStatus.source_to_target_resolved, primary=None,
-                    role=CandidateRole.rejected))   # provisional; rank_and_classify assigns roles
+                    role=CandidateRole.rejected,    # provisional; rank_and_classify assigns roles
+                    output_grain_ref=((state.position.catalog, landing_key)
+                                      if landing_key is not None else None)))
                 continue                            # terminal success — never expanded further
 
             hop = hops[state.hop_index] if state.hop_index < len(hops) else None

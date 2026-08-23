@@ -481,6 +481,12 @@ class TemporalDeclarationV1:
     param_binding: ParamBindingV1
     time_axis_aggregating: bool
     reason_codes: tuple[ReasonCode, ...]
+    # S1A-4a — the CATALOG that qualifies `anchor_binding`. `anchor_binding` is a bare column ref,
+    # so two catalogs exposing the same `public.transactions.business_dt` are indistinguishable in
+    # it. Set by the compiler from the SAME ingredient binding the ref was chosen from, never
+    # inferred afterwards; "" is honest absence (no anchor bound), never a guess. Defaulted +
+    # appended: it is NOT contract_id material (make_contract_id hashes neither half of the anchor).
+    anchor_catalog_source: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,6 +542,14 @@ class BindingPlanV1:
     physical_read_set: PhysicalReadSetV1 | None = None
     audit_envelope: PlannerReplayEnvelopeV1 | None = None
     resolved_at_compilation: datetime | None = None
+    # S1A-4a — the plan's OUTPUT grain as a qualified `(catalog_source, grain_key_object_ref)`.
+    # It cannot be rediscovered from `ingredient_bindings`: a transaction -> account -> customer
+    # roll-up may bind NO customer-key ingredient at all, and the landing catalog is not
+    # `catalog_source` (that is where the path STARTS). Emitted only by the assembler, only for a
+    # path that actually completed to the target grain; None on every other plan — a rejected or
+    # ingredient-binding-only plan reached no output grain to report. Defaulted + appended, and
+    # deliberately NOT physical_plan_id material (see `_physical_plan_material`).
+    output_grain_ref: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,6 +649,40 @@ def _segment_physical_identity(segment: BindingPathSegmentV1) -> str:
     return segment.realization_ref or segment.bridge_fact_key or ""
 
 
+def _physical_plan_material(*, recipe_id: str, catalog_source: str,
+                            ingredient_bindings: tuple[IngredientBindingV1, ...],
+                            path_segments: tuple[BindingPathSegmentV1, ...],
+                            tier: PlanTier,
+                            path_resolution_status: PathResolutionStatus) -> str:
+    """THE physical-identity material — the single construction both `make_binding_plan` (which
+    truncates its digest into `physical_plan_id`) and `full_physical_plan_hash` (which does not)
+    read, so the two can never disagree about what a plan's physical identity is over.
+
+    Byte-identical to the pre-extraction expression, including the FROZEN PHYSICAL_PLAN_VERSION
+    tail. Everything NOT here is deliberately absent: `candidate_role` (reset post-construction by
+    the ranker), `target_entity`, the contract axes, and the S1A-4a plan facts (`output_grain_ref`)
+    — a fact ABOUT a physical path may never redefine which physical path it is."""
+    refs = tuple(sorted(b.bound_object_ref for b in ingredient_bindings))
+    segments_material = ">".join(
+        f"{s.segment_kind}:{s.catalog_source}:{_segment_physical_identity(s)}"
+        for s in path_segments)
+    return (f"{recipe_id}|{catalog_source}|{'|'.join(refs)}|{tier}|{segments_material}"
+            f"|{path_resolution_status}|{PLANNER_VERSION}|{PHYSICAL_PLAN_VERSION}")
+
+
+def full_physical_plan_hash(plan: BindingPlanV1) -> str:
+    """The UNTRUNCATED (64-hex) sha256 of the SAME material `make_binding_plan` hashes into
+    `physical_plan_id` — for consumers that need the full digest (a governed option's content
+    address) without re-deriving, and re-deriving differently, what a physical plan IS.
+
+    Invariant, held by construction rather than by convention:
+    ``full_physical_plan_hash(plan)[:16] == plan.physical_plan_id.removeprefix("bp_")``."""
+    return hashlib.sha256(_physical_plan_material(
+        recipe_id=plan.recipe_id, catalog_source=plan.catalog_source,
+        ingredient_bindings=plan.ingredient_bindings, path_segments=plan.path_segments,
+        tier=plan.tier, path_resolution_status=plan.path_resolution_status).encode()).hexdigest()
+
+
 def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_source: str,
                       ingredient_bindings: tuple[IngredientBindingV1, ...],
                       path_segments: tuple[BindingPathSegmentV1, ...],
@@ -645,7 +693,8 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
                       safety: BindingSafety,
                       preference_rank: int,
                       preference_reasons: tuple[str, ...],
-                      candidate_role: CandidateRole) -> BindingPlanV1:
+                      candidate_role: CandidateRole,
+                      output_grain_ref: tuple[str, str] | None = None) -> BindingPlanV1:
     """The ONE canonical constructor: derives participating_catalogs (ordered by first traversal, dedup,
     catalog_source first), bridge_count, tier, and a physical_plan_id over the canonical content + the
     FROZEN PHYSICAL_PLAN_VERSION (never PLAN_CONTRACT_VERSION — F1: schema bumps must not move ids);
@@ -666,18 +715,16 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
     if path_resolution_status is PathResolutionStatus.source_to_target_resolved \
             and resolution_status is PlanResolutionStatus.unresolved:
         raise ValueError("source_to_target_resolved plan cannot have resolution_status=unresolved")
-    refs = tuple(sorted(b.bound_object_ref for b in ingredient_bindings))
-    segments_material = ">".join(
-        f"{s.segment_kind}:{s.catalog_source}:{_segment_physical_identity(s)}"
-        for s in path_segments)
     # path_resolution_status is part of the hashed material: a tier-1 resolved plan and an
     # immediate-dead-end reject over the same refs/segments must NOT share a physical_plan_id
     # (3B.4 keys its store by physical id). It is stable at construction time — the ranker only
     # rewrites resolution_status/candidate_role — so it is safe to hash (candidate_role is NOT:
     # it is reset post-construction via dataclasses.replace). The tail is the FROZEN
     # PHYSICAL_PLAN_VERSION: byte-identical to the pre-split material, so every 3B.3b id is stable.
-    material = (f"{recipe_id}|{catalog_source}|{'|'.join(refs)}|{tier}|{segments_material}"
-                f"|{path_resolution_status}|{PLANNER_VERSION}|{PHYSICAL_PLAN_VERSION}")
+    material = _physical_plan_material(
+        recipe_id=recipe_id, catalog_source=catalog_source,
+        ingredient_bindings=ingredient_bindings, path_segments=path_segments, tier=tier,
+        path_resolution_status=path_resolution_status)
     physical_plan_id = "bp_" + hashlib.sha256(material.encode()).hexdigest()[:16]
     return BindingPlanV1(
         physical_plan_id=physical_plan_id, recipe_id=recipe_id, target_entity=target_entity, tier=tier,
@@ -685,7 +732,8 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
         resolution_status=resolution_status, primary_reason_code=primary_reason_code, reason_codes=reason_codes,
         safety=safety, preference_rank=preference_rank, preference_reasons=preference_reasons,
         participating_catalogs=tuple(participating), bridge_count=bridge_count,
-        path_resolution_status=path_resolution_status, candidate_role=candidate_role)
+        path_resolution_status=path_resolution_status, candidate_role=candidate_role,
+        output_grain_ref=output_grain_ref)
 
 
 # Observation-time reason codes (freshness + run budget): they describe WHEN/HOW the compile ran,
