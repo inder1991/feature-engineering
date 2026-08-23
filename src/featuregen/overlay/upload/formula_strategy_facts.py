@@ -29,15 +29,16 @@ __all__ = [
     "current_author_contract_hash",
 ]
 
-#: ▲ THE DETERMINISTIC LANE'S EXECUTION POSTURE — declared, not discovered. The worker's reviewed
-#: lane needs the candidate's GROUNDING CONTEXT to bind the blueprint, and that context is a
-#: serving-time product (`build_v2_recipe_grounding_context` consumes the live candidate's verdicts)
-#: which nothing yet persists to draft time. Until it is persisted, a reviewed-V2 candidate routes
-#: to the LLM **with the reason recorded** (`REVIEWED_LANE_UNAVAILABLE`) — the same honesty rule as
-#: `l0=None` execution posture: absence is a stated capability, never a skip, and NEVER dressed up
-#: as `REVIEWED_BLUEPRINT_NOT_EXECUTABLE`, which is reserved for a blueprint that genuinely failed
-#: to bind. Flipping this without the context plumbing routes drafts into a lane that refuses them.
-DETERMINISTIC_AUTHORING_AVAILABLE = False
+#: ▲ THE DETERMINISTIC LANE'S EXECUTION POSTURE — ON, since the correction that earned it. The
+#: premise that turned it off was wrong: grounding contexts ARE persisted, per candidate key, into
+#: `considered_json["recipe_grounding_context_by_candidate_key"]` at generation — so the worker
+#: binds against the SAME bytes the serving run bound with, and the loader is
+#: `formula_draft_worker._frozen_grounding_context`. Bindability remains PER CANDIDATE below: a
+#: legacy revision frozen before the engine pass, or an ambiguous candidate key, has no frozen
+#: context and routes to the LLM with `REVIEWED_LANE_UNAVAILABLE` recorded — a history gap, never
+#: dressed as `REVIEWED_BLUEPRINT_NOT_EXECUTABLE`, which the WORKER reserves for a blueprint that
+#: genuinely fails to bind.
+DETERMINISTIC_AUTHORING_AVAILABLE = True
 
 #: decision-row / legacy spellings -> the planning-contract vocabulary 1104's CHECK enforces.
 _ORIGIN_BY_SOURCE = {
@@ -105,6 +106,20 @@ def _origin_and_kind(conn, *, considered_revision_id: str, option_id: str, idea:
     return origin, "deterministic_formula", recipe_id, None, "bound"
 
 
+def _frozen_context_present(conn, *, considered_revision_id: str, option_id: str, idea) -> bool:
+    """Whether the SERVING run froze a grounding context for this option — the request-time half of
+    the same read the worker's loader performs, so the two can never disagree about availability."""
+    from featuregen.overlay.upload.contract.gate1 import _revision_recipe_candidate_key
+
+    row = conn.execute(
+        "SELECT considered_json FROM contract_considered_revision "
+        "WHERE considered_revision_id = %s", (considered_revision_id,)).fetchone()
+    considered = row[0] if row and isinstance(row[0], dict) else {}
+    key = _revision_recipe_candidate_key(considered, option_id=option_id, feature=idea)
+    return bool(key) and isinstance(
+        (considered.get("recipe_grounding_context_by_candidate_key") or {}).get(key), dict)
+
+
 def assemble_strategy_facts(
     conn, *, considered_revision_id: str, option_id: str, idea: Any,
     catalog_snapshot_hash: str, binding_plan_hash: str | None = None,
@@ -166,10 +181,15 @@ def assemble_strategy_facts(
         expectation_generation=generation,
         reviewed_expectation_current=reviewed_current,
         blueprint_derivable=derivable,
-        # ▲ The ENGINE's frozen verdict on this candidate's needs, gated by the lane posture: a
-        # blueprint the worker cannot yet bind at authoring time must not be routed as though it
-        # could. The distinction is recorded, not lost — the resolver names the posture warning.
-        blueprint_bindable=(binding_state == "bound" and DETERMINISTIC_AUTHORING_AVAILABLE),
+        # ▲ The ENGINE's frozen verdict AND a frozen context to re-bind with. Both are durable
+        # facts about THIS candidate; either absent means the worker could not execute the
+        # deterministic lane for it, and the resolver records why rather than discovering it later.
+        blueprint_bindable=(
+            binding_state == "bound"
+            and derivable
+            and _frozen_context_present(
+                conn, considered_revision_id=considered_revision_id, option_id=option_id,
+                idea=idea)),
         deterministic_lane_available=DETERMINISTIC_AUTHORING_AVAILABLE,
         reviewed_blueprint_revision=blueprint_revision,
         reviewed_blueprint_hash=blueprint_hash,

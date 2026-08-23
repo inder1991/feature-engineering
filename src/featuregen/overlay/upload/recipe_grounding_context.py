@@ -131,6 +131,45 @@ class RecipeGroundingContextV1:
         }
 
 
+def grounding_context_from_json(payload: dict[str, Any]) -> RecipeGroundingContextV1:
+    """The exact inverse of ``to_json`` — the frozen considered revision's context, rehydrated.
+
+    ▲ This is what makes the deterministic authoring lane possible at DRAFT time: the contexts are
+    frozen per candidate key into ``considered_json`` at generation (gate1's engine-context pass),
+    and the draft worker binds against the SAME bytes the serving run bound with — never a
+    re-grounding, whose answer could differ the moment the registry or the catalog moved.
+
+    Strict on shape (a KeyError names the missing field) because a context that half-rehydrates
+    would bind half a candidate and call it bound.
+    """
+    from featuregen.overlay.upload.templates import BindingResolution, GroundedNeedBinding
+
+    bindings = tuple(
+        GroundedNeedBinding(
+            role=str(b["role"]), catalog_source=str(b["catalog_source"]),
+            logical_ref=str(b["logical_ref"]), graph_object_ref=str(b["graph_object_ref"]),
+            expected_concept=str(b["expected_concept"]), optional=bool(b["optional"]),
+            join_role=b.get("join_role"), temporal_role=b.get("temporal_role"),
+            distinct_binding_group=b.get("distinct_binding_group"),
+            binding_resolution=BindingResolution(b["binding_resolution"]),
+            tied_candidate_logical_refs=tuple(b.get("tied_candidate_logical_refs") or ()),
+            tied_candidate_set_hash=str(b["tied_candidate_set_hash"]))
+        for b in payload["need_bindings"])
+    return RecipeGroundingContextV1(
+        recipe_candidate_key=str(payload["recipe_candidate_key"]),
+        recipe_id=str(payload["recipe_id"]),
+        source_entity_need_role=payload.get("source_entity_need_role"),
+        source_entity_role_resolution=SourceEntityRoleResolution(
+            payload["source_entity_role_resolution"]),
+        need_bindings=bindings,
+        semantic_parameters=tuple((str(k), v) for k, v in payload["semantic_parameters"]),
+        semantic_parameter_binding_hash=str(payload["semantic_parameter_binding_hash"]),
+        template_definition=dict(payload["template_definition"]),
+        template_content_hash=str(payload["template_content_hash"]),
+        canonicalization_version=str(
+            payload.get("canonicalization_version", CANONICALIZATION_VERSION)))
+
+
 def build_recipe_grounding_context(
     template: Template,
     feature: GroundedFeature,

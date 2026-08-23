@@ -443,16 +443,56 @@ def test_A_MOVED_BLUEPRINT_BLOCKS_BY_NAME_never_falls_back(db, monkeypatch):
     assert "moved" in raised.value.blocker["reason"]
 
 
-def test_THE_SHIPPED_POSTURE_HAS_NO_LOADER_and_a_reviewed_plan_blocks_loudly(db):
-    """▲ The resolver's posture routes reviewed candidates to the LLM while the context plumbing is
-    unpersisted, so a REVIEWED plan reaching this worker is a posture/plan DISAGREEMENT — blocked
-    loudly, never quietly LLM'd, because quiet is how a disagreement becomes a norm."""
+def test_A_REVIEWED_PLAN_WITHOUT_A_FROZEN_CONTEXT_BLOCKS_LOUDLY(db, monkeypatch):
+    """▲ The resolver's bindability fact reads the SAME frozen source as the worker's loader, so a
+    REVIEWED plan should always find a context here. None despite the plan is a plan/revision
+    DISAGREEMENT — blocked loudly, never quietly LLM'd, because quiet is how a disagreement becomes
+    a norm."""
     import featuregen.overlay.upload.formula_draft_worker as worker_mod
 
     draft_id, _ = _reviewed_plan(db, draft_id="fd-rev-noloader")
+    monkeypatch.setattr(worker_mod, "_BOUND_CONTEXT_LOADER", lambda conn, d: None)
 
-    assert worker_mod._BOUND_CONTEXT_LOADER is None
     with pytest.raises(worker_mod._DraftBlocked) as raised:
         worker_mod._reviewed_blueprint_for(db, draft_id)
     assert raised.value.blocker["code"] == "REVIEWED_BLUEPRINT_NOT_EXECUTABLE"
-    assert "posture" in raised.value.blocker["reason"]
+    assert "disagreement" in raised.value.blocker["reason"]
+
+
+def test_THE_DEFAULT_LOADER_READS_THE_FROZEN_REVISION(db):
+    """▲ The shipped loader IS the frozen-revision reader: the contexts are persisted per candidate
+    key into considered_json at generation, so the worker binds against the SAME bytes the serving
+    run bound with. A draft on a legacy revision with no context map reads back honest None."""
+    import json as _json
+
+    import featuregen.overlay.upload.formula_draft_worker as worker_mod
+
+    from tests.featuregen.overlay.upload.test_formula_draft_worker import _fixture_context
+
+    context = _fixture_context()
+    considered = {
+        "version": "contract-considered-v3",
+        "public": {"anchor": None, "rejections": []},
+        "options_by_id": {
+            "opt-ctx": {"source": "anchor", "lens": "anchor",
+                        "recipe_candidate_key": context.recipe_candidate_key},
+        },
+        "recipe_grounding_context_by_candidate_key": {
+            context.recipe_candidate_key: context.to_json()},
+    }
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
+               "VALUES ('int-ctx','h','hypothesis') ON CONFLICT DO NOTHING")
+    db.execute(
+        "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
+        "generation_run_id, considered_json, considered_content_hash, canonicalization_version) "
+        "VALUES ('crev-ctx','int-ctx','run-ctx',%s::jsonb,'sha256:c','contract-considered-v3')",
+        (_json.dumps(considered),))
+    db.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, definition_revision, "
+        "formula_identity_hash, state, requested_by, requested_at) VALUES "
+        "('fd-ctx','crev-ctx','opt-ctx','h1','h2','cfg','r','ident-ctx','REQUESTED','user:s','t')")
+
+    loaded = worker_mod._frozen_grounding_context(db, "fd-ctx")
+
+    assert loaded == context, "the exact frozen bytes, rehydrated"

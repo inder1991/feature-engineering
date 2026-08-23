@@ -64,13 +64,18 @@ def test_A_CURRENT_REVIEWED_V2_ENTRY_THAT_BINDS_IS_DETERMINISTIC():
     assert decision.blockers == () and decision.warnings == ()
 
 
-def test_A_REVIEWED_ENTRY_THAT_FAILS_TO_BIND_IS_BLOCKED_not_fallen_back():
-    """▲ NO SILENT LLM FALLBACK. It would hide a broken reviewed blueprint, change the cost, and
-    change which certificate production needs."""
+def test_A_REVIEWED_ENTRY_WITHOUT_A_FROZEN_CONTEXT_ROUTES_LLM_with_the_reason(db=None):
+    """▲ A GAP is not a DEFECT. `blueprint_bindable` is false when THIS candidate has no frozen
+    grounding context (a legacy revision, an ambiguous key, an engine binding that never bound) —
+    the deterministic lane cannot EXECUTE for it, so it authors by LLM with the reason RECORDED.
+    A blueprint that genuinely FAILS to bind surfaces at the WORKER as
+    REVIEWED_BLUEPRINT_NOT_EXECUTABLE, where binding actually runs — pinned by the worker's own
+    test_A_MOVED_BLUEPRINT_BLOCKS_BY_NAME_never_falls_back."""
     decision = resolve_formula_strategy(_reviewed(blueprint_bindable=False))
 
-    assert decision.strategy is FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT
-    assert "REVIEWED_BLUEPRINT_NOT_EXECUTABLE" in decision.blockers
+    assert decision.strategy is FormulaStrategy.LLM_AUTHORED
+    assert "REVIEWED_LANE_UNAVAILABLE" in decision.warnings
+    assert decision.blockers == ()
 
 
 def test_A_FORMULA_V1_REVIEWED_ENTRY_ROUTES_TO_THE_LLM():

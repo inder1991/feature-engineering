@@ -142,19 +142,15 @@ def _decide(facts: FormulaStrategyFactsV1) -> tuple[FormulaStrategy, tuple[str, 
         return FormulaStrategy.LLM_AUTHORED, (), ("METHOD_OVERRIDDEN_TO_LLM",)
 
     if facts.reviewed_expectation_current and facts.expectation_generation == "v2":
-        if not facts.deterministic_lane_available:
-            # ▲ A PLATFORM capability gap is not a CANDIDATE defect, and the two must not share a
-            # code. The deterministic lane cannot execute in this deployment (its grounding-context
-            # plumbing is not yet persisted to draft time), so the candidate authors by LLM — WITH
-            # THE REASON RECORDED, which is what makes this routing honest rather than silent.
-            # `REVIEWED_BLUEPRINT_NOT_EXECUTABLE` below stays reserved for a blueprint that
-            # genuinely failed against this candidate.
+        if not (facts.deterministic_lane_available and facts.blueprint_bindable):
+            # ▲ A GAP is not a DEFECT, and the two must not share a code. Whether the lane is off
+            # in this deployment or THIS candidate has no frozen grounding context (a legacy
+            # revision, an ambiguous candidate key, an engine binding that never bound), the
+            # deterministic lane cannot EXECUTE for it — so it authors by LLM, WITH THE REASON
+            # RECORDED, which is what makes this routing honest rather than silent. A blueprint
+            # that genuinely FAILS to bind surfaces at the worker as
+            # `REVIEWED_BLUEPRINT_NOT_EXECUTABLE`, where binding actually runs.
             return FormulaStrategy.LLM_AUTHORED, (), ("REVIEWED_LANE_UNAVAILABLE",)
-        if not facts.blueprint_bindable:
-            # Named, and it does NOT fall back. A silent fallback would hide a broken reviewed
-            # blueprint, change the cost and change which certificate production needs.
-            return (FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT,
-                    ("REVIEWED_BLUEPRINT_NOT_EXECUTABLE",), ())
         return FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT, (), ()
 
     if facts.reviewed_expectation_current and facts.expectation_generation == "v1":

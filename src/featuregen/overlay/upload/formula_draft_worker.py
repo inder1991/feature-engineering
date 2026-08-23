@@ -496,14 +496,54 @@ def _author(
     )
 
 
-#: ▲ THE BOUND-CONTEXT SEAM for the reviewed lane. `None` — the shipped default — means this
-#: deployment cannot rebuild a candidate's grounding context at draft time (it is a serving-time
-#: product nothing yet persists), which is exactly why `formula_strategy_facts` declares the lane
-#: posture OFF and the resolver routes reviewed candidates to the LLM with `REVIEWED_LANE_UNAVAILABLE`
-#: recorded. The seam exists NOW, with its dispatch wired and tested, so that landing the context
-#: plumbing is a loader plus a posture flip — never a re-derivation of this routing under deploy
-#: pressure. Tests inject a binder to drive the whole reviewed path, zero provider calls included.
-_BOUND_CONTEXT_LOADER = None
+def _frozen_grounding_context(conn, draft_id: str):
+    """The grounding context the SERVING run froze for this draft's candidate, rehydrated.
+
+    ▲ The premise this replaces was wrong, and the correction is what turned the lane on: the
+    contexts ARE persisted — `considered_json["recipe_grounding_context_by_candidate_key"]` holds
+    every served recipe candidate's context, written by gate1's engine pass at generation. The
+    worker therefore binds against the SAME bytes the serving run bound with — never a
+    re-grounding, whose answer could differ the moment the registry or catalog moved.
+
+    ``None`` — honest absence — for a legacy revision frozen before the engine pass, an option
+    whose candidate key is ambiguous, or a context that never bound. The resolver's bindability
+    fact reads the same source at request time, so a REVIEWED plan should always find one here;
+    ``None`` despite a REVIEWED plan is a plan/revision disagreement, blocked loudly by the caller.
+    """
+    from featuregen.overlay.upload.contract.gate1 import (
+        _chosen_option_from_revision,
+        _revision_recipe_candidate_key,
+    )
+    from featuregen.overlay.upload.recipe_grounding_context import (
+        grounding_context_from_json,
+    )
+
+    row = conn.execute(
+        "SELECT d.option_id, r.considered_json "
+        "  FROM formula_draft d "
+        "  JOIN contract_considered_revision r "
+        "    ON r.considered_revision_id = d.considered_revision_id "
+        " WHERE d.formula_draft_id = %s", (draft_id,)).fetchone()
+    if row is None:
+        return None
+    option_id, considered = row
+    considered = considered if isinstance(considered, dict) else {}
+    try:
+        idea, _source, _identity = _chosen_option_from_revision(considered, option_id)
+    except Exception:  # noqa: BLE001 — a legacy revision that cannot resolve options has no context
+        idea = None
+    key = _revision_recipe_candidate_key(considered, option_id=option_id, feature=idea)
+    payload = (considered.get("recipe_grounding_context_by_candidate_key") or {}).get(key)         if key else None
+    if not isinstance(payload, dict):
+        return None
+    return grounding_context_from_json(payload)
+
+
+#: ▲ THE BOUND-CONTEXT SEAM for the reviewed lane — defaulting to the REAL loader above. Kept as a
+#: seam (module attribute, not a hard call) because the reviewed path's tests drive it with
+#: hand-built contexts, and because a deployment that must disable the lane does it by posture in
+#: `formula_strategy_facts`, never by surgery here.
+_BOUND_CONTEXT_LOADER = _frozen_grounding_context
 
 
 def _reviewed_blueprint_for(conn, draft_id: str):
@@ -555,13 +595,14 @@ def _reviewed_blueprint_for(conn, draft_id: str):
                       f"pinned it ({pinned_hash} -> {expectation_content_hash_v2(derived)}); a "
                       f"NEW draft request resolves against the current one"})
 
-    if _BOUND_CONTEXT_LOADER is None:
+    context = _BOUND_CONTEXT_LOADER(conn, draft_id) if _BOUND_CONTEXT_LOADER else None
+    if context is None:
         raise _DraftBlocked({
             "code": "REVIEWED_BLUEPRINT_NOT_EXECUTABLE",
-            "reason": "this deployment has no bound-context loader for the deterministic lane; "
-                      "the resolver's posture should have routed this draft to the LLM, so a "
-                      "REVIEWED plan reaching this worker is a posture/plan disagreement"})
-    context = _BOUND_CONTEXT_LOADER(conn, draft_id)
+            "reason": "the frozen considered revision holds no grounding context for this "
+                      "draft's candidate; the resolver's bindability fact reads the same source, "
+                      "so a REVIEWED plan reaching this worker without one is a plan/revision "
+                      "disagreement"})
     try:
         return bind_formula_expectation_v2(context, derived)
     except RecipeFormulaPreflightError as exc:
