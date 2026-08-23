@@ -10,9 +10,9 @@ exists; the probe is a projection, never a second model.
 
 The projection is honest about what each side owns: `allowed_source_grains`,
 `distinct_binding_group` and `alternative_concepts` carry over verbatim; `join_role` /
-`temporal_role` translate only where the request's string names a planner vocabulary member
-(anything else stays None — DERIVED by the planner's own concept metadata, never guessed);
-parameters flatten to their RESOLVED values (a request is one variant by contract).
+`temporal_role` are DECLARED at projection time from the request's own facts (S1A-4c —
+`_projected_roles`); parameters flatten to their RESOLVED values (a request is one variant by
+contract).
 
 Deeper SE-8 work (feature-level dataset decisions, event-required operands refusing
 current-only snapshot sources, profile-gated source selection) lands INSIDE the pipeline in
@@ -26,7 +26,31 @@ from featuregen.overlay.upload.feature_planning_contracts import (
     FeaturePlanningRequestV1,
     RequiredOperandV1,
 )
+
+# `_PIT_ROLE_TO_TEMPORAL` is the ONE governed pit_role -> TemporalRole vocabulary map, imported
+# rather than restated: the projection must declare the SAME temporal role `_derive_one` derives,
+# or a probe and a legacy template would disagree about what a concept's time means.
+from featuregen.overlay.upload.need_metadata import _PIT_ROLE_TO_TEMPORAL
 from featuregen.overlay.upload.templates import Need, Template
+
+# The V2 `operand_class` vocabulary (`recipe_contract_v2.OPERAND_CLASSES`, 8 closed values)
+# projected onto the planner's OWN `JoinRole` vocabulary (5 closed values). `entity_key` is not
+# listed because its role depends on WHICH key it is; the two sets below cover everything else,
+# and `test_the_operand_class_vocabulary_is_covered_exhaustively` fails if a new operand class is
+# added without a rule here rather than letting it project no role at all.
+_TIME_OPERAND_CLASSES = frozenset({"event_timestamp", "as_of_timestamp"})
+# The four non-measure value classes ride with `measure` on the STEP-0 design read, not on a
+# guess: `need_metadata._derive_one` resolves every need whose concept has no `entity_link` and a
+# `none` `pit_role` — precisely what a dimension / status / direction / policy_input concept is —
+# to `JoinRole.MEASURE` (measured over the legacy corpus: 264 of 264 such needs, via the
+# `template_default` rung), and `declarations.compile_aggregation` stages exactly the
+# `join_role == "measure"` bindings. So this REPRODUCES legacy semantics rather than inventing a
+# new one. That an operand nobody intended to aggregate is typed as a measure is G2 — a
+# pre-existing semantic SHARED by the legacy and request paths, deliberately left open here and
+# settled by the G3 charter; `JoinRole` has exactly five values and none of them says "dimension",
+# so the probe has no honest alternative to declare.
+_MEASURE_OPERAND_CLASSES = frozenset(
+    {"measure", "dimension", "status", "direction", "policy_input"})
 
 
 def _join_role(raw: str) -> JoinRole | None:
@@ -88,15 +112,73 @@ def _source_anchor(request: FeaturePlanningRequestV1) -> tuple[str | None, str |
     return request.source_grain, candidates[0].role
 
 
+def _pit_role(operand: RequiredOperandV1) -> str:
+    """The concept's governed `pit_role` — the same reading `_derive_one` does, with the same
+    fallback for a concept the registry does not resolve."""
+    resolved = concept(operand.concept)
+    return resolved.pit_role if resolved is not None else "none"
+
+
+def _derived_roles(request: FeaturePlanningRequestV1, operand: RequiredOperandV1,
+                   anchor_role: str | None) -> tuple[JoinRole | None, TemporalRole | None]:
+    """The binding roles this operand's DECLARED facts imply — its `operand_class`, the anchor
+    `_source_anchor` chose, and the governed concept registry's `entity_link` / `pit_role`. Never
+    an operand name, never prose, never tuple position.
+
+    This is CLASS-keyed where `_derive_one`'s ladder is CONCEPT-keyed, so the two agree on 1113 of
+    the 1195 V2 operands and disagree on 82 — every one an operand whose authored class and whose
+    concept's governed facts say different things (a `dimension` on an entity-linked or pit-bearing
+    concept, and `device_sharing_velocity`'s two). The class is the RECIPE AUTHOR's declaration
+    about the slot, so the projection honors it rather than overruling it with a role the author
+    did not choose; `test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_g2_lives`
+    pins the divergence by shape so it cannot widen unnoticed, and settling it is G2's ruling."""
+    if operand.operand_class == "entity_key":
+        if anchor_role is not None and operand.role == anchor_role:
+            return JoinRole.SOURCE_ENTITY_KEY, None
+        # a key the request's own contract says names the grain it PRODUCES at, versus a key it
+        # must pass THROUGH to get there — the plan's roll-up destination versus a hop key.
+        if _entity_link(operand) == request.output_grain:
+            return JoinRole.TARGET_ENTITY_KEY, None
+        return JoinRole.INTERMEDIATE_ENTITY_KEY, None
+    if operand.operand_class in _TIME_OPERAND_CLASSES:
+        return JoinRole.TIME, _PIT_ROLE_TO_TEMPORAL.get(_pit_role(operand), TemporalRole.NONE)
+    if operand.operand_class in _MEASURE_OPERAND_CLASSES:
+        return JoinRole.MEASURE, None
+    return None, None       # an operand class with no rule — no role, never a guessed one
+
+
+def _projected_roles(request: FeaturePlanningRequestV1, operand: RequiredOperandV1,
+                     anchor_role: str | None) -> tuple[JoinRole | None, TemporalRole | None]:
+    """One operand's projected `(join_role, temporal_role)`, per field.
+
+    Declaration precedence is `_derive_one`'s own first rung: a NON-EMPTY declared string wins
+    outright over the derivation. A declared string naming no member of the planner's vocabulary
+    leaves that field unset — the projection refuses to substitute a derived value for a
+    declaration that contradicts it, and it may never mint a role the planner does not have.
+    """
+    derived_join, derived_temporal = _derived_roles(request, operand, anchor_role)
+    return (_join_role(operand.join_role) if operand.join_role else derived_join,
+            _temporal_role(operand.temporal_role) if operand.temporal_role else derived_temporal)
+
+
 def planning_probe(request: FeaturePlanningRequestV1) -> Template:
     """The request's projection into the planner's probe vocabulary — same needs, same bounds,
-    identity keyed on the request's own source definition id."""
+    identity keyed on the request's own source definition id.
+
+    S1A-4c: each projected need also DECLARES its binding roles. `request_contract` metadata
+    resolution deliberately bypasses the legacy resolved-need registry, and 0 of the 1195 operands
+    in the V2 registry declare a `join_role`, so before this the planner saw needs with no roles at
+    all — and `plan._assemble_rollups` starts a roll-up ONLY from a binding whose join role is
+    `source_entity_key`, so no recipe-origin request ever reached its first cross-catalog hop.
+    """
     source_entity, anchor_role = _source_anchor(request)
+    roles = {operand.role: _projected_roles(request, operand, anchor_role)
+             for operand in request.operands}
     needs = tuple(
         Need(role=operand.role, concept=operand.concept, optional=not operand.required,
              allowed_source_grains=operand.allowed_source_grains,
-             join_role=_join_role(operand.join_role),
-             temporal_role=_temporal_role(operand.temporal_role),
+             join_role=roles[operand.role][0],
+             temporal_role=roles[operand.role][1],
              distinct_binding_group=operand.distinct_binding_group or None,
              alternates=operand.alternative_concepts)
         for operand in request.operands)

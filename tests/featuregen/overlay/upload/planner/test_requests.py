@@ -262,8 +262,12 @@ def test_probe_operand_metadata_is_never_shadowed_by_the_legacy_registry(db, mon
     clean = direction(probe, metadata_resolution_mode="request_contract")
     assert clean, "fixture must yield at least one debit_credit_indicator candidate"
     assert {c.required_grains for c in clean} == {("transaction",)}   # the probe's OWN declaration
-    assert {c.join_role for c in clean} == {""}                      # V2 declares neither role...
-    assert {c.temporal_role for c in clean} == {""}                  # ...so the probe carries none
+    # S1A-4c moved these two: the V2 operand still DECLARES neither role, but the probe now
+    # projects them from the operand's own class + concept (`direction` on a concept with no
+    # entity_link and a `none` pit_role -> MEASURE, no temporal role). They used to read `""`.
+    # The bypass proof is unchanged and in fact sharper — both values contradict the poison.
+    assert {c.join_role for c in clean} == {"measure"}                # NOT the poison's key role
+    assert {c.temporal_role for c in clean} == {""}                   # NOT the poison's as_of_time
 
     # the SAME probe under the default mode still eats the sentinel — the mode is what changed,
     # not the template (so this can never be passing for an unrelated reason).
@@ -331,3 +335,259 @@ def test_the_registry_bypass_is_identity_neutral():
     assert recipe_content_hash(ALL_TEMPLATES[0]) == "rh_4bc9a3f80f885743"
     assert canonical_recipe_v2_hash(v2_recipe_by_id("posted_debit_amount")) == (
         "37b37069833163063a90c88a77ec2615107392a281bcb3906fbdc47d2c467b34")
+
+
+# ── S1A-4c: projection-time role declaration ──────────────────────────────────────────────────
+# `planning_probe` now DECLARES each projected need's `join_role`/`temporal_role` from the
+# request's own declared facts (operand_class + the concept registry's entity_link/pit_role),
+# because 0 of the 1195 V2 operands declare either and `metadata_resolution_mode="request_contract"`
+# deliberately never consults the legacy resolved-need registry. Without a declared role no
+# ingredient binding carries `source_entity_key`, and `plan._assemble_rollups` starts a roll-up
+# ONLY from such a binding — so every recipe-origin cross-catalog request died before its first
+# hop (G1). The tests below pin the mapping row by row; the frontier's new honest boundary is
+# pinned in `tests/.../contract/test_governed_lens_requests.py`.
+
+
+def _mapping_request(operands, *, source_grain="transaction", output_grain="customer",
+                     definition_id="probe:role_mapping") -> FeaturePlanningRequestV1:
+    return FeaturePlanningRequestV1(
+        origin="user_definition", source_definition_id=definition_id, source_revision="1",
+        source_content_hash="rolemappinghash", primary_objective=RECIPE.primary_objective,
+        output=RECIPE.output, operands=operands, source_grain=source_grain,
+        output_grain=output_grain, temporal=RECIPE.temporal,
+        computation_kind="conceptual_pattern",
+        conceptual_reason="probe: the projection-time role mapping, one row per rule")
+
+
+# One request carrying a row for every unconditioned rule. `txn` is the ONLY entity key whose
+# declared grains admit the request's source grain, so `_source_anchor` picks it with no tie-break
+# — the other two keys are then classified by their concept's entity_link against the OUTPUT grain.
+_MAPPING_OPERANDS = (
+    RequiredOperandV1(role="txn", concept="transaction_id", operand_class="entity_key",
+                      allowed_source_grains=("transaction",)),
+    RequiredOperandV1(role="customer", concept="customer_id", operand_class="entity_key",
+                      allowed_source_grains=("customer",)),
+    RequiredOperandV1(role="account", concept="account_id", operand_class="entity_key",
+                      allowed_source_grains=("account",)),
+    RequiredOperandV1(role="event_ts", concept="event_timestamp",
+                      operand_class="event_timestamp"),
+    RequiredOperandV1(role="as_of", concept="as_of_date", operand_class="as_of_timestamp"),
+    RequiredOperandV1(role="matures", concept="maturity_date", operand_class="as_of_timestamp"),
+    RequiredOperandV1(role="knowledge_ts", concept="system_time",
+                      operand_class="event_timestamp"),
+    RequiredOperandV1(role="amount", concept="monetary_flow", operand_class="measure"),
+    RequiredOperandV1(role="kind", concept="event_type", operand_class="dimension"),
+    RequiredOperandV1(role="status", concept="booking_status", operand_class="status"),
+    RequiredOperandV1(role="direction", concept="debit_credit_indicator",
+                      operand_class="direction"),
+    RequiredOperandV1(role="allocation", concept="payment_allocation",
+                      operand_class="policy_input"),
+)
+
+
+def _roles(request: FeaturePlanningRequestV1) -> dict[str, tuple[object, object]]:
+    return {n.role: (n.join_role, n.temporal_role) for n in planning_probe(request).needs}
+
+
+def test_the_entity_key_rows_split_source_target_and_intermediate():
+    """The three key rows, each decided by a DECLARED fact: the anchor `_source_anchor` chose, the
+    key whose concept links the request's OWN output grain, and everything else (a hop key)."""
+    roles = _roles(_mapping_request(_MAPPING_OPERANDS))
+    assert roles["txn"] == (JoinRole.SOURCE_ENTITY_KEY, None)     # the chosen anchor
+    assert roles["customer"] == (JoinRole.TARGET_ENTITY_KEY, None)  # entity_link == output_grain
+    assert roles["account"] == (JoinRole.INTERMEDIATE_ENTITY_KEY, None)   # a hop key
+    # …and the anchor really is the one `_source_anchor` picked, not a tuple position
+    assert planning_probe(_mapping_request(_MAPPING_OPERANDS)).source_entity_need_role == "txn"
+
+
+def test_the_timestamp_rows_carry_time_and_the_pit_derived_temporal_role():
+    """`TIME` for both timestamp classes, with the temporal role read out of `_derive_one`'s OWN
+    `pit_role` vocabulary map — never a second table. `maturity_date` is the proof that the map is
+    reused rather than reinvented: its `pit_role` is a business future date, which that map sends
+    to `TemporalRole.NONE`, and no plausible invented mapping would land there."""
+    roles = _roles(_mapping_request(_MAPPING_OPERANDS))
+    assert roles["event_ts"] == (JoinRole.TIME, TemporalRole.EVENT_TIME)
+    assert roles["as_of"] == (JoinRole.TIME, TemporalRole.AS_OF_TIME)
+    assert roles["knowledge_ts"] == (JoinRole.TIME, TemporalRole.INGESTION_TIME)
+    assert roles["matures"] == (JoinRole.TIME, TemporalRole.NONE)
+
+
+def test_the_value_rows_all_land_on_measure_reproducing_the_legacy_derivation():
+    """`measure` plus the four non-key, non-time classes. The Step-0 design read settles these:
+    `need_metadata._derive_one` sends every need whose concept has no `entity_link` and a `none`
+    `pit_role` — which is what a dimension/status/direction/policy_input concept is — to
+    `JoinRole.MEASURE` (measured: 264 of 264 such legacy needs, source `template_default`), and
+    `declarations.compile_aggregation` stages exactly the `join_role == "measure"` bindings. So the
+    projection REPRODUCES legacy semantics here; the misclassification (an operand nobody intended
+    to aggregate typed as a measure) is G2 — a pre-existing semantic shared by both paths, left
+    open on purpose and chartered with G3, not invented here."""
+    roles = _roles(_mapping_request(_MAPPING_OPERANDS))
+    for role in ("amount", "kind", "status", "direction", "allocation"):
+        assert roles[role] == (JoinRole.MEASURE, None), role
+
+
+def test_a_declared_role_string_wins_over_the_class_mapping():
+    """`_derive_one`'s own first rung: an EXPLICIT declaration is never overridden by derivation.
+    Both fields are declared here on operands the class mapping would have decided otherwise."""
+    roles = _roles(_mapping_request((
+        RequiredOperandV1(role="txn", concept="transaction_id", operand_class="entity_key",
+                          allowed_source_grains=("transaction",)),
+        # a measure the author declares is really the hop key
+        RequiredOperandV1(role="amount", concept="monetary_flow", operand_class="measure",
+                          join_role="intermediate_entity_key"),
+        # an event timestamp the author declares carries INGESTION time, not the pit-derived event
+        RequiredOperandV1(role="event_ts", concept="event_timestamp",
+                          operand_class="event_timestamp", temporal_role="ingestion_time"),
+    )))
+    assert roles["amount"] == (JoinRole.INTERMEDIATE_ENTITY_KEY, None)
+    assert roles["event_ts"] == (JoinRole.TIME, TemporalRole.INGESTION_TIME)
+
+
+def test_a_declared_string_naming_no_vocabulary_member_derives_nothing():
+    """Fail closed on a declaration the planner cannot honor: a non-empty string that names no
+    `JoinRole`/`TemporalRole` member leaves THAT field unset rather than quietly substituting the
+    derived value the author's declaration contradicts. The other field is unaffected."""
+    roles = _roles(_mapping_request((
+        RequiredOperandV1(role="txn", concept="transaction_id", operand_class="entity_key",
+                          allowed_source_grains=("transaction",)),
+        RequiredOperandV1(role="amount", concept="monetary_flow", operand_class="measure",
+                          join_role="grouping_key"),
+        RequiredOperandV1(role="event_ts", concept="event_timestamp",
+                          operand_class="event_timestamp", temporal_role="trade_time"),
+    )))
+    assert roles["amount"] == (None, None)                 # NOT JoinRole.MEASURE
+    assert roles["event_ts"] == (JoinRole.TIME, None)      # NOT TemporalRole.EVENT_TIME
+
+
+def test_the_operand_class_vocabulary_is_covered_exhaustively():
+    """The projection's three class sets PARTITION `OPERAND_CLASSES`. A new operand class must be
+    an explicit decision — this fails the moment one is added without a role rule, instead of that
+    class silently projecting no role at all."""
+    from featuregen.overlay.upload.planner import requests as requests_module
+    from featuregen.overlay.upload.recipe_contract_v2 import OPERAND_CLASSES
+
+    key = {"entity_key"}
+    time = set(requests_module._TIME_OPERAND_CLASSES)
+    measure = set(requests_module._MEASURE_OPERAND_CLASSES)
+    assert key | time | measure == set(OPERAND_CLASSES)
+    assert not (key & time) and not (key & measure) and not (time & measure)
+
+
+def test_every_v2_recipe_probe_declares_the_roles_the_frontier_needs():
+    """The registry sweep: after the projection, every entity_key / timestamp / measure operand of
+    every V2 recipe carries a join role, and each probe carrying an anchor resolves EXACTLY one
+    `SOURCE_ENTITY_KEY` — the binding `plan._assemble_rollups` needs to start a roll-up.
+
+    `device_sharing_velocity` is the one recipe with no anchor and therefore no source key: its
+    only `entity_key` operand names `device_fingerprint`, a concept the governed registry links to
+    no entity, so no honest source key exists to declare (`_source_anchor` returns None by design —
+    see `test_probe_anchor_derives_for_every_v2_recipe_or_leaves_planner_fallback`). Its frontier
+    does not start, exactly as before this change; a role invented for it would be a mis-anchor."""
+    from featuregen.overlay.upload.need_metadata import derive_need_metadata
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    roleless, raising, without_source = [], [], []
+    for recipe in V2_RECIPES:
+        request = planning_request_from_recipe(recipe)
+        probe = planning_probe(request)
+        by_role = {n.role: n for n in probe.needs}
+        for operand in request.operands:
+            if (operand.operand_class in ("entity_key", "measure", "event_timestamp",
+                                          "as_of_timestamp")
+                    and by_role[operand.role].join_role is None):
+                roleless.append((recipe.recipe_id, operand.role))
+        sources = [n for n in probe.needs if n.join_role is JoinRole.SOURCE_ENTITY_KEY]
+        if probe.source_entity_need_role is None:
+            without_source.append(recipe.recipe_id)
+        elif len(sources) != 1:
+            raising.append((recipe.recipe_id, len(sources)))
+        try:
+            derive_need_metadata(probe)          # the S1A-1 sweep stays green
+        except ValueError:
+            raising.append((recipe.recipe_id, "derive_need_metadata raised"))
+
+    assert roleless == [], f"{len(roleless)} bindable operands carry no join role: {roleless[:5]}"
+    assert raising == []
+    assert without_source == ["device_sharing_velocity"]
+
+
+def test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_g2_lives():
+    """The projection keys on ``operand_class``; ``_derive_one``'s ladder keys on the CONCEPT
+    (entity_link, then pit_role, then MEASURE). They agree on 1113 of the 1195 V2 operands and
+    disagree on 82 — every one of them an operand whose authored class and whose concept's
+    governed facts say different things. Pinned by SHAPE so the set cannot quietly widen:
+
+    * a ``dimension``/``status``/``policy_input`` operand on an ENTITY-LINKED concept (63): the
+      ladder calls it a hop key, the class calls it a value. This is G2's territory exactly — the
+      recipe author declared it a dimension, and the projection may not overrule that with a role
+      the author did not choose;
+    * a ``dimension``/``policy_input`` operand on a PIT-bearing concept (17): same shape, time
+      instead of an entity;
+    * ``device_sharing_velocity`` (2): its ``entity_key`` operand names a concept the registry
+      links to no entity (ladder: MEASURE; class: a key), and its entity-linked ``account``
+      operand is authored as a ``dimension`` (ladder: the fallback source key; class: a value).
+
+    The count is not asserted — the shape is, plus the fact that NOTHING outside these three
+    kinds diverges. G2 and G3 are chartered together; when G2 is settled this test is the record
+    of exactly which operands its ruling has to decide."""
+    import dataclasses
+
+    from featuregen.overlay.upload.need_metadata import derive_need_metadata
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    entity_link_kinds = {("intermediate_entity_key", "measure", cls)
+                         for cls in ("dimension", "status", "policy_input")}
+    pit_kinds = {("time", "measure", cls) for cls in ("dimension", "policy_input")}
+    no_anchor_kinds = {("measure", "intermediate_entity_key", "entity_key"),
+                       ("source_entity_key", "measure", "dimension")}
+    known = entity_link_kinds | pit_kinds | no_anchor_kinds
+
+    seen, unknown, agreeing = set(), [], 0
+    for recipe in V2_RECIPES:
+        request = planning_request_from_recipe(recipe)
+        probe = planning_probe(request)
+        # the SAME probe with its projected roles stripped — i.e. exactly the concept-keyed
+        # ladder this change layered a declaration on top of, with nothing re-implemented here
+        ladder = {m.role: m for m in derive_need_metadata(dataclasses.replace(
+            probe, needs=tuple(dataclasses.replace(n, join_role=None, temporal_role=None)
+                               for n in probe.needs)))}
+        for need in probe.needs:
+            legacy = ladder[need.role].join_role
+            if legacy is need.join_role:
+                agreeing += 1
+                continue
+            kind = (legacy.value, need.join_role.value if need.join_role else None,
+                    next(o.operand_class for o in request.operands if o.role == need.role))
+            seen.add(kind)
+            if kind not in known:
+                unknown.append((recipe.recipe_id, need.role, kind))
+
+    assert unknown == [], f"{len(unknown)} unexpected divergences: {unknown[:5]}"
+    assert seen <= known
+    assert agreeing > 1000, agreeing        # the divergence is the exception, not the rule
+
+
+def test_the_projection_moves_no_temporal_fact():
+    """The temporal half is a REUSE proof, not a new opinion: for every operand of every V2 recipe
+    the metadata the planner resolves off the probe carries exactly the temporal role
+    `_derive_one` would have derived from the concept's `pit_role` — the projection declares the
+    same value the derivation already produced, so nothing temporal moved."""
+    from featuregen.overlay.upload.concepts import concept as resolve_concept
+    from featuregen.overlay.upload.need_metadata import (
+        _PIT_ROLE_TO_TEMPORAL,
+        derive_need_metadata,
+    )
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    moved = []
+    for recipe in V2_RECIPES:
+        request = planning_request_from_recipe(recipe)
+        resolved = {m.role: m for m in derive_need_metadata(planning_probe(request))}
+        for operand in request.operands:
+            c = resolve_concept(operand.concept)
+            expected = _PIT_ROLE_TO_TEMPORAL.get(c.pit_role if c is not None else "none",
+                                                 TemporalRole.NONE)
+            if resolved[operand.role].temporal_role is not expected:
+                moved.append((recipe.recipe_id, operand.role,
+                              resolved[operand.role].temporal_role, expected))
+    assert moved == [], f"{len(moved)} temporal roles moved: {moved[:5]}"

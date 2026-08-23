@@ -5,14 +5,22 @@ gaps this suite measured on the way in, which decide what each test here can hon
 
 The short version, because it shapes every fixture below:
 
-* the governed cross-catalog path resolves for a request whose operands DECLARE their binding
-  roles (``join_role`` / ``temporal_role``) — an LLM intent may declare them, and the platform's
-  own ``need_metadata.derive_need_metadata`` derives them for any probe;
-* no V2 recipe declares one (0 of 1195 operands across the 317-recipe registry), and
+* the governed cross-catalog path resolves for a request whose operands carry binding roles
+  (``join_role`` / ``temporal_role``) — an LLM intent may declare them, and the platform's own
+  ``need_metadata.derive_need_metadata`` derives them for any probe;
+* no V2 recipe declares one (0 of 1195 operands across the 317-recipe registry) and
   ``metadata_resolution_mode="request_contract"`` deliberately does not consult the legacy
-  resolved-need registry, so a recipe-origin request built by ``planning_request_from_recipe``
-  alone reaches NO cross-catalog plan at all. ``test_as_shipped_recipe_request_reaches_no_plan``
-  pins that as the honest current state, with the seed proved sound by the resolving leg.
+  resolved-need registry — so **S1A-4c made ``planning_probe`` declare them at PROJECTION time**
+  from the request's own facts. That closed G1: a recipe-origin request built by
+  ``planning_request_from_recipe`` alone now assembles a cross-catalog roll-up, and its refusal
+  moved to G3's ``physical_cardinality_unavailable``.
+  ``test_as_shipped_recipe_request_reaches_the_g3_boundary`` pins the NEW boundary and explains
+  the progression, with the seed proved sound by the resolving leg.
+
+The hand-annotating fixtures below are kept as they were: after S1A-4c their role annotations are
+redundant rather than compensating (``test_the_annotating_fixtures_no_longer_compensate_for_g1``
+proves it), and the operand TRIMMING in ``_plannable_request`` still compensates for G3, which is
+open.
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ import pytest
 from tests.featuregen.overlay.upload._bridge_fixtures import seed_verified_bridge
 from tests.featuregen.overlay.upload.planner.test_plan import _freshness, _seed
 
+from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.catalog_realizations import key_entities_for, key_entity
 from featuregen.overlay.upload.concepts import concept
@@ -293,18 +302,52 @@ def test_recipe_origin_option_from_the_real_registry_recipe(db):
     assert option.unmapped_requirement_codes == ()
 
 
-def test_as_shipped_recipe_request_reaches_no_plan(db):
-    """The honest measurement of the gap the fixture above compensates for.
+def test_as_shipped_recipe_request_reaches_the_g3_boundary(db):
+    """The honest measurement of where a SHIPPED recipe-origin request stops today — and the pin
+    that records the boundary MOVING.
 
-    ``governed_requests_for_scope`` mints the request the SHIPPED adapter produces — operands with
-    no declared binding role — and no cross-catalog plan is assembled from it at all. The seed is
-    proved sound by the resolving leg in the same test, so this can never be a silent fixture bug.
+    Read this as the G1 → G3 progression:
+
+    * **Before S1A-4c (G1).** ``governed_requests_for_scope`` mints operands with no declared
+      binding role (still true — asserted below), ``metadata_resolution_mode="request_contract"``
+      never consults the legacy resolved-need registry, and ``plan._assemble_rollups`` starts a
+      roll-up ONLY from a binding whose join role is ``source_entity_key``. So NO cross-catalog
+      plan was assembled at all: this test used to be named ``..._reaches_no_plan`` and asserted
+      only that some rejection existed, because there was no hop to have a reason about.
+    * **After S1A-4c.** ``planning_probe`` DECLARES the roles at projection time from the
+      request's own facts, the frontier starts, a source→target-resolved plan is assembled across
+      both catalogs — and the refusal is now about PHYSICS: the governed bridge hop carries no
+      realization revision, so its cardinality is unavailable and the staged measures refuse with
+      ``physical_cardinality_unavailable``. That is G3, the new honest boundary.
+    * **G3 is chartered, not fixed here.** ``assembly.attach_executable_bridge_realizations`` has
+      zero callers and ``build_compiler_context`` correctly leaves
+      ``allow_provisional_bridge_cardinality`` false (sandbox-only). Attaching a revision changes
+      SEGMENT identity, so that surgery is a follow-on decided at the Stage-1C report with the
+      realization-gap queue's evidence in hand — deliberately not ridden along with a projection
+      change. G2 (``status`` typed as a measure) rides the same charter and stays masked behind
+      G3's short-circuit; ``test_the_measured_refusal_sequence_is_g3_before_g2`` pins that.
+
+    The seed is proved sound by the resolving leg at the bottom, so this can never be a silent
+    fixture bug.
     """
     _two_catalogs(db)
     recipe = v2_recipe_by_id(RECIPE_ID)
     shipped = governed_requests_for_scope(db, eligible_recipe_ids=frozenset({RECIPE_ID}))
     assert [r.source_definition_id for r in shipped] == [RECIPE_ID]
-    assert all(op.join_role == "" for op in shipped[0].operands)
+    # the REQUEST still declares nothing — the roles are the PROJECTION's, which is the whole
+    # point: no recipe was re-authored, and 0 of the 1195 V2 operands gained a declaration.
+    assert all(op.join_role == "" and op.temporal_role == "" for op in shipped[0].operands)
+    probe = planning_probe(shipped[0])
+    assert [(n.role, n.join_role, n.temporal_role) for n in probe.needs] == [
+        ("account", JoinRole.SOURCE_ENTITY_KEY, None),
+        ("event_ts", JoinRole.TIME, TemporalRole.EVENT_TIME),
+        ("amount", JoinRole.MEASURE, None),
+        ("status", JoinRole.MEASURE, None)]
+
+    # the frontier STARTS: a roll-up spanning both catalogs is assembled from the shipped request
+    plan = _cross_plan(db, shipped[0])
+    assert plan.bridge_count == 1
+    assert plan.contract_primary_reason_code is ReasonCode.physical_cardinality_unavailable
 
     options, rejections = _options(db, shipped)
     assert options == []
@@ -313,12 +356,32 @@ def test_as_shipped_recipe_request_reaches_no_plan(db):
     assert rejection["lens"] == "governed"
     assert rejection["recipe_id"] == RECIPE_ID
     assert rejection["request_hash"] == shipped[0].source_content_hash
-    assert isinstance(rejection["reason"], str) and rejection["reason"]
+    assert rejection["reason"] == ReasonCode.physical_cardinality_unavailable.value
     assert rejection["unmet_hops"] == []
 
     # the control: the SAME seed, the SAME recipe, with the binding roles the platform derives
     control, control_rejections = _options(db, [_plannable_request(recipe)])
     assert control_rejections == [] and len(control) == 1
+
+
+def test_the_annotating_fixtures_no_longer_compensate_for_g1():
+    """The two fixtures above annotate roles onto the request by hand. After S1A-4c the projection
+    reaches the SAME answer on its own, so what they add is now redundant rather than
+    compensating — which is the cleanest available proof that G1 is closed at the seam and not
+    just at the assertion. (``_plannable_request`` still TRIMS operands: that compensates for G3,
+    which is still open, and it is why the resolving leg above resolves at all.)"""
+    recipe = v2_recipe_by_id(RECIPE_ID)
+    for annotated in (_plannable_request(recipe), _fully_annotated_request(recipe)):
+        projected = planning_probe(
+            dataclasses.replace(annotated, operands=tuple(
+                dataclasses.replace(op, join_role="", temporal_role="")
+                for op in annotated.operands)))
+        by_role = {n.role: n for n in projected.needs}
+        for operand in annotated.operands:
+            assert str(by_role[operand.role].join_role or "") == operand.join_role
+            # the hand annotation spells the derived NONE explicitly; the projection leaves it
+            # unset, and both mean "carries no time" everywhere the compiler reads it
+            assert str(by_role[operand.role].temporal_role or "none") == operand.temporal_role
 
 
 # ── 2. the same builder, an intent origin ────────────────────────────────────────────────────
