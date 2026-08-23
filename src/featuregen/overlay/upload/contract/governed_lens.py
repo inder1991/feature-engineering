@@ -30,15 +30,30 @@ module, and this module may not fix them (S1A-4b owns no planner file):
   consult the legacy resolved-need registry, which is where a legacy Template's roles are DERIVED).
   ``plan._assemble_rollups`` starts a roll-up only from a binding whose ``join_role`` is
   ``source_entity_key``, so a recipe-origin request assembles no cross-catalog plan at all.
+* **G3 — a governed BRIDGE hop carries no realization revision.** ``plan_bindings`` never runs
+  ``assembly.attach_executable_bridge_realizations``, and ``build_compiler_context`` correctly
+  leaves ``allow_provisional_bridge_cardinality`` false (it is sandbox-only), so a bridge hop's
+  physical cardinality is UNAVAILABLE and any measure staged there fails
+  ``physical_cardinality_unavailable``.
 * **G2 — every non-key, non-time operand derives to a MEASURE.** ``need_metadata._derive_one``
   (the derivation G1's fix would apply) maps an operand with no ``entity_link`` and no ``pit_role``
-  — a ``status``, a ``dimension``, a ``direction`` — to ``JoinRole.MEASURE``. A measure whose
-  additivity is ``not_applicable`` sitting on a fan-in hop is ``aggregation_axis_unsupported``, so
-  the contract fails for an operand nobody intended to aggregate. The V2 ``operand_class``
-  vocabulary is never projected into ``JoinRole``.
-* **G3 — a governed BRIDGE hop carries no realization revision.** ``plan_bindings`` never runs
-  ``assembly.attach_executable_bridge_realizations``, so a bridge hop's physical cardinality is
-  unavailable and any measure staged there fails ``physical_cardinality_unavailable``.
+  — a ``status``, a ``dimension``, a ``direction`` — to ``JoinRole.MEASURE``, so the contract
+  fails for an operand nobody intended to aggregate. The V2 ``operand_class`` vocabulary is never
+  projected into ``JoinRole``.
+
+**The order matters, and an earlier revision of this docstring got it wrong.** The three gaps are
+SEQUENTIAL, not parallel, and only one code is ever emitted at a time:
+
+1. G1 blocks DISCOVERY: no roll-up is assembled, so no contract compiles and no code is emitted;
+2. once G1 closes, a measure crossing the governed bridge hits G3 FIRST —
+   ``compile_aggregation`` short-circuits on ``card is None`` (``declarations.py``) and records
+   ``physical_cardinality_unavailable`` WITHOUT ever running the additivity matrix. That is the
+   primary refusal a cross-catalog recipe actually gets, and
+   ``test_the_measured_refusal_sequence_is_g3_before_g2`` pins it against the real planner;
+3. G2's ``aggregation_axis_unsupported`` is DOWNSTREAM of G3 — it is masked behind that
+   short-circuit and surfaces only once a cardinality is available, which today happens on an
+   INTRA-catalog realization hop (whose declared join supplies one) and will happen on a bridge
+   hop once G3 closes. The same test pins that half too.
 
 The consequence for consumers: a request whose operands DECLARE their binding roles (an LLM
 intent may; the platform's own ``derive_need_metadata`` resolves them for any probe) reaches a
@@ -86,6 +101,13 @@ from featuregen.overlay.upload.planner.requests import plan_planning_request, pl
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.planner.shadow import COMPILE_BUDGET, MAX_COMPILES_PER_RUN
 from featuregen.overlay.upload.recipe_formula_expectations_v2 import has_reviewed_expectation
+
+# `_scalar` is the parameter-value coercion the SAME producer applies before hashing
+# (`semantic_parameters`). Imported for validation parity: hashing a value that producer would
+# refuse is how two spellings of one parameter binding get two hashes.
+from featuregen.overlay.upload.recipe_grounding_context import (
+    _scalar as _scalar_parameter_value,
+)
 from featuregen.overlay.upload.recipe_grounding_context import (
     canonical_recipe_v2_hash,
     semantic_parameter_hash,
@@ -105,7 +127,11 @@ from featuregen.overlay.upload.recipe_review_validity import (
     by_role_at_revision,
     review_validity,
 )
-from featuregen.overlay.upload.validation_requirements import build_requirement
+
+# NOTE: `validation_requirements.build_requirement` — the ONLY sanctioned Requirement factory — is
+# deliberately NOT imported: every builder in `_REQUIREMENT_BUILDERS` currently refuses, so nothing
+# here mints one. Re-import it in the task that adds the first real builder (see the mapping's
+# key-set comment for which code that is and what context it needs).
 
 logger = logging.getLogger(__name__)
 
@@ -170,27 +196,6 @@ class ReasonContextV1:
     object_ref: str
 
 
-def _grain_is_unique(context: ReasonContextV1) -> Requirement | None:
-    """``physical_cardinality_unavailable`` — the hop's fan-in is UNPROVEN, and the external check
-    that proves it is exactly grain uniqueness on the destination key."""
-    if not context.object_ref:
-        return None
-    return build_requirement(
-        code="GRAIN_IS_UNIQUE", operand=(context.catalog_source, context.object_ref),
-        detail="the roll-up hop's physical cardinality is unproven; confirm the destination key "
-               "is unique before this plan may claim a fan-in")
-
-
-def _join_connectivity(context: ReasonContextV1) -> Requirement | None:
-    """``ingredient_not_connected_to_path`` — the operand does not connect along the compiled
-    path; the external check is whether its rows actually join across it."""
-    if not context.object_ref:
-        return None
-    return build_requirement(
-        code="JOIN_CONNECTIVITY", operand=(context.catalog_source, context.object_ref),
-        detail=f"operand {context.role!r} is not connected to the compiled path")
-
-
 def _stays_a_refusal(context: ReasonContextV1) -> Requirement | None:
     """A HARD blocker: no external data check can clear it, so it never becomes a requirement.
 
@@ -204,15 +209,28 @@ def _stays_a_refusal(context: ReasonContextV1) -> Requirement | None:
 
 
 #: The mapping's key set, DECLARED so an addition is deliberate (pinned by test). Every key is a
-#: real ``ReasonCode``; only the first two have a closed requirement code whose semantic matches
-#: EXACTLY. Deliberately ABSENT: ``additivity_source_conflict``, whose natural target
-#: ``ADDITIVITY_SUPPORTS_OPERATION`` requires an ``operation`` parameter that
-#: :class:`ReasonContextV1` does not carry — minting it would need a schema-invalid requirement,
-#: which is the production defect this closed-builder design exists to prevent. It lands in
-#: ``unmapped_requirement_codes`` instead, where it is visible.
+#: real ``ReasonCode``, and TODAY every one of them maps to ``_stays_a_refusal``: no code this
+#: build can emit has both a closed requirement code whose semantic matches exactly AND an operand
+#: this module can name correctly. Three codes are deliberately ABSENT, each for its own reason —
+#: all three land in ``unmapped_requirement_codes``, the honest carrier, where they stay visible:
+#:
+#: * ``additivity_source_conflict`` — its natural target ``ADDITIVITY_SUPPORTS_OPERATION`` REQUIRES
+#:   an ``operation`` parameter that :class:`ReasonContextV1` does not carry. Minting it would need
+#:   a schema-invalid requirement, the production defect this closed-builder design exists to stop.
+#: * ``ingredient_not_connected_to_path`` — a STRUCTURAL refusal: it folds to
+#:   ``unresolved_ingredient_connectivity``, which no data check can clear, so by the
+#:   ``_stays_a_refusal`` doctrine it must not become a requirement. It also names no operand (the
+#:   compiler records the code, not the disconnected role), so a ``JOIN_CONNECTIVITY`` requirement
+#:   built here would name a column it is not about.
+#: * ``physical_cardinality_unavailable`` — a ``GRAIN_IS_UNIQUE`` check IS the right external
+#:   answer, but the right OPERAND is the FAILING HOP's destination key, and a plan carries only
+#:   its final ``output_grain_ref``. On any multi-hop path those differ, so the requirement would
+#:   name the wrong key. This is the one code that becomes live when G3 closes: the task that
+#:   closes it should design this requirement WITH hop context (``HopAggregationV1`` already
+#:   carries ``grouping_keys`` and the execution site), and re-import
+#:   ``validation_requirements.build_requirement``, which is the sanctioned factory and is
+#:   deliberately not imported here while nothing mints.
 REQUIREMENT_BUILDER_CODES: tuple[ReasonCode, ...] = (
-    ReasonCode.physical_cardinality_unavailable,
-    ReasonCode.ingredient_not_connected_to_path,
     ReasonCode.aggregation_axis_unsupported,
     ReasonCode.aggregation_strategy_missing,
     ReasonCode.aggregation_declaration_conflict,
@@ -225,35 +243,29 @@ REQUIREMENT_BUILDER_CODES: tuple[ReasonCode, ...] = (
 )
 
 _REQUIREMENT_BUILDERS: dict[ReasonCode, Callable[[ReasonContextV1], Requirement | None]] = {
-    ReasonCode.physical_cardinality_unavailable: _grain_is_unique,
-    ReasonCode.ingredient_not_connected_to_path: _join_connectivity,
-    ReasonCode.aggregation_axis_unsupported: _stays_a_refusal,
-    ReasonCode.aggregation_strategy_missing: _stays_a_refusal,
-    ReasonCode.aggregation_declaration_conflict: _stays_a_refusal,
-    ReasonCode.semi_additive_temporal_strategy_missing: _stays_a_refusal,
-    ReasonCode.temporal_anchor_missing: _stays_a_refusal,
-    ReasonCode.temporal_anchor_ambiguous: _stays_a_refusal,
-    ReasonCode.leakage_anchor_read: _stays_a_refusal,
-    ReasonCode.protected_attribute_read: _stays_a_refusal,
-    ReasonCode.binding_safety_rejected: _stays_a_refusal,
+    code: _stays_a_refusal for code in REQUIREMENT_BUILDER_CODES
 }
 
-#: Codes that describe the PATH, not one ingredient: their requirement (when they have one) names
-#: the plan's destination grain key, never a measure that happened to be staged at the same hop.
-_PLAN_LEVEL_CODES = frozenset({
+#: Codes that describe the PATH, not one ingredient — and that no ref this module holds names
+#: correctly. They are carried WITHOUT an operand: the plan's final ``output_grain_ref`` is NOT
+#: the failing hop's destination key on a multi-hop path, and the staged measure that surfaced the
+#: code is not its subject either. A ref-less context can never mint a requirement (every builder
+#: needs an operand), so the wrong-anchor hazard is closed structurally rather than by convention.
+_PATH_LEVEL_CODES = frozenset({
     ReasonCode.physical_cardinality_unavailable,
     ReasonCode.ingredient_not_connected_to_path,
 })
 
 
 def _reason_contexts(plan: BindingPlanV1) -> tuple[ReasonContextV1, ...]:
-    """Every reason code this plan OBSERVED, paired with the operand it concerns.
+    """Every reason code this plan OBSERVED, paired with the operand it concerns — or with NO
+    operand where naming one would be a guess.
 
     Per-ingredient codes come from the binding (candidate stage) and from the aggregation stage
-    (contract stage), both of which name their operand. Plan-level codes are anchored on the
-    plan's qualified output grain — the only ref a whole-path verdict is about — and are dropped
-    when the plan reached no output grain. Anything left over is carried WITHOUT a ref, so it can
-    never mint a requirement naming an operand it does not concern."""
+    (contract stage), both of which name their own operand. A path-level code
+    (:data:`_PATH_LEVEL_CODES`) and any leftover contract code are carried ref-less: no operand
+    this plan holds is their subject, and a ref-less context can never mint a requirement about a
+    column it does not concern."""
     catalog_of = {b.need_role: b.bound_catalog_source for b in plan.ingredient_bindings}
     contexts: list[ReasonContextV1] = []
     placed: set[ReasonCode] = set()
@@ -266,21 +278,14 @@ def _reason_contexts(plan: BindingPlanV1) -> tuple[ReasonContextV1, ...]:
     for hop in plan.hop_aggregations:
         for stage in hop.ingredient_stages:
             for code in stage.reason_codes:
-                if code in _PLAN_LEVEL_CODES:
-                    continue        # anchored on the grain below, never on the staged measure
+                if code in _PATH_LEVEL_CODES:
+                    continue        # ref-less below — the staged measure is not its subject
                 contexts.append(ReasonContextV1(
                     code=code, role=stage.need_role,
                     catalog_source=catalog_of.get(stage.need_role, ""),
                     object_ref=stage.bound_object_ref))
                 placed.add(code)
-    grain = plan.output_grain_ref
     for code in plan.contract_reason_codes:
-        if code in _PLAN_LEVEL_CODES:
-            if grain is not None and code not in placed:
-                contexts.append(ReasonContextV1(code=code, role="output_grain",
-                                                catalog_source=grain[0], object_ref=grain[1]))
-                placed.add(code)
-            continue
         if code in placed:
             continue
         contexts.append(ReasonContextV1(code=code, role="", catalog_source="", object_ref=""))
@@ -354,12 +359,17 @@ def _parameter_binding_hash(request: FeaturePlanningRequestV1) -> str:
     """The SEMANTIC parameter binding hash the engine mints elsewhere
     (``recipe_grounding_context.semantic_parameter_hash``), reached from the request's own
     resolved ``(name, value)`` pairs. A request that binds no parameter has no parameter binding:
-    ``""``, the honest absence the identity contract requires (never ``None``)."""
+    ``""``, the honest absence the identity contract requires (never ``None``).
+
+    Values pass through the sibling producer's own ``_scalar`` coercion, so an unsupported
+    parameter type RAISES here exactly as it does in ``semantic_parameters`` — the same validation,
+    rather than silently hashing a repr this side of the seam."""
     if not request.parameter_values:
         return ""
     return semantic_parameter_hash(
         request.source_definition_id,
-        tuple(sorted(request.parameter_values, key=lambda pair: pair[0])))
+        tuple((name, _scalar_parameter_value(value))
+              for name, value in sorted(request.parameter_values, key=lambda pair: pair[0])))
 
 
 def _variant_identity_for(request: FeaturePlanningRequestV1, plan: BindingPlanV1, *,
@@ -431,13 +441,26 @@ def _display_for(request: FeaturePlanningRequestV1, definition) -> tuple[str, st
 _POLICY_OPERAND_CLASSES = frozenset({"policy_input"})
 
 
+#: The temporal codes that actually BLOCK a declaration — the same pair
+#: ``declarations._TEMPORAL_BLOCKING_CODES`` folds on (mirrored rather than imported: it is private
+#: there, and `test_temporal_blockers_track_the_compilers_blocking_set` asserts the two agree).
+#: Filtering to it means a future NON-blocking temporal annotation — an advisory the compiler adds
+#: to `reason_codes` without failing the declaration — cannot silently demote a readiness the
+#: compiler itself considers fine.
+_TEMPORAL_BLOCKING_CODES = frozenset({
+    ReasonCode.temporal_anchor_missing,
+    ReasonCode.temporal_anchor_ambiguous,
+})
+
+
 def _temporal_blockers(plan: BindingPlanV1) -> tuple[str, ...]:
-    """A compiled temporal declaration with no codes blocks nothing; anything else contributes the
-    NAMED codes the plan already carries. Nothing is invented here."""
+    """A compiled temporal declaration contributes only its BLOCKING codes; an absent declaration
+    contributes the named absence. Nothing is invented here."""
     declaration = plan.temporal_declaration
     if declaration is None:
         return (ReasonCode.missing_temporal_declaration.value,)
-    return tuple(dict.fromkeys(code.value for code in declaration.reason_codes))
+    return tuple(dict.fromkeys(code.value for code in declaration.reason_codes
+                               if code in _TEMPORAL_BLOCKING_CODES))
 
 
 def _binding_blockers(plan: BindingPlanV1) -> tuple[str, ...]:

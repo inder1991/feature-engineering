@@ -42,8 +42,10 @@ from featuregen.overlay.upload.feature_planning_contracts import (
     planning_request_hash,
 )
 from featuregen.overlay.upload.need_metadata import derive_need_metadata
-from featuregen.overlay.upload.planner.contracts import ReasonCode
-from featuregen.overlay.upload.planner.requests import planning_probe
+from featuregen.overlay.upload.planner.contracts import PathResolutionStatus, ReasonCode
+from featuregen.overlay.upload.planner.declarations import CompileBudget, build_compiler_context
+from featuregen.overlay.upload.planner.requests import plan_planning_request, planning_probe
+from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.recipe_contract_v2 import OutputSpecV2
 from featuregen.overlay.upload.recipe_readiness import fold_request_readiness
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
@@ -197,6 +199,33 @@ def _intent_request(recipe, *, window: int = 90) -> FeaturePlanningRequestV1:
 def _options(db, requests, **kwargs):
     return governed_options_from_requests(
         db, requests=tuple(requests), target_entity="account", roles=(), now=_NOW, **kwargs)
+
+
+def _fully_annotated_request(recipe) -> FeaturePlanningRequestV1:
+    """The recipe's FULL operand set carrying the roles the platform's own derivation resolves.
+
+    This is what a G1 fix would hand the planner, and it is how G2 is reached: ``amount`` AND
+    ``status`` both derive to ``JoinRole.MEASURE`` (neither concept links an entity or carries a
+    pit_role), so both are staged on the fan-in hop."""
+    base = planning_request_from_recipe(recipe)
+    resolved = {m.role: m for m in derive_need_metadata(planning_probe(base))}
+    return dataclasses.replace(base, operands=tuple(
+        dataclasses.replace(op, join_role=str(resolved[op.role].join_role),
+                            temporal_role=str(resolved[op.role].temporal_role))
+        for op in base.operands))
+
+
+def _cross_plan(db, request, *, target_entity: str = "account"):
+    """The one source→target-resolved candidate for this request, compiled."""
+    scope = resolve_catalog_scope(db, roles=(), target_entity=target_entity, now=_NOW)
+    result = plan_planning_request(
+        db, request=request, target_entity=target_entity, scope=scope, roles=(), now=_NOW,
+        compile_ctx=build_compiler_context(db, scope, (), _NOW),
+        budget=CompileBudget(remaining=64, deadline_monotonic=1e9, clock=lambda: 0.0))
+    crossings = [p for p in result.candidate_plans
+                 if p.path_resolution_status is PathResolutionStatus.source_to_target_resolved]
+    assert len(crossings) == 1, f"expected one roll-up candidate, got {len(crossings)}"
+    return crossings[0]
 
 
 # ── 1. the real registry recipe, resolved across two catalogs ────────────────────────────────
@@ -408,11 +437,66 @@ def test_a_retired_definition_folds_readiness_retired(db, monkeypatch):
 # ── 6. the closed requirement builders ───────────────────────────────────────────────────────
 
 
+def test_the_measured_refusal_sequence_is_g3_before_g2(db):
+    """The SEQUENCING record the module docstring states, measured against the real planner.
+
+    Over a governed BRIDGE hop the compiler short-circuits on an unavailable cardinality (G3) and
+    never runs the additivity matrix, so ``physical_cardinality_unavailable`` is the primary
+    refusal and G2's ``aggregation_axis_unsupported`` is MASKED behind it — even though this
+    request stages two operands (``amount``, ``status``) that G2 is about. An earlier revision of
+    the docstring claimed G2's code was what a recipe gets; this is why that was wrong."""
+    _two_catalogs(db)
+    recipe = v2_recipe_by_id(RECIPE_ID)
+    request = _fully_annotated_request(recipe)
+    assert {op.role for op in request.operands if op.join_role == "measure"} == {"amount",
+                                                                                 "status"}
+
+    plan = _cross_plan(db, request)
+    assert plan.contract_primary_reason_code is ReasonCode.physical_cardinality_unavailable
+    assert ReasonCode.aggregation_axis_unsupported not in plan.contract_reason_codes
+
+    # …and through the builder it is a rejection carrying exactly that code
+    options, rejections = _options(db, [request])
+    assert options == []
+    (rejection,) = rejections
+    assert rejection["reason"] == ReasonCode.physical_cardinality_unavailable.value
+
+    # the path-level code is carried REF-LESS and lands unmapped — never a requirement naming the
+    # plan's final grain key (which is not the failing hop's destination on a multi-hop path)
+    contexts = lens._reason_contexts(plan)
+    carried = [c for c in contexts if c.code is ReasonCode.physical_cardinality_unavailable]
+    assert len(carried) == 1
+    assert (carried[0].object_ref, carried[0].catalog_source, carried[0].role) == ("", "", "")
+    requirements, unmapped = lens._project_requirements(contexts)
+    assert requirements == ()
+    assert "physical_cardinality_unavailable" in unmapped
+
+
+def test_g2_surfaces_only_once_a_cardinality_is_available(db):
+    """The other half of the sequence: an INTRA-catalog realization hop supplies the cardinality
+    the bridge hop withholds, the additivity matrix finally runs, and G2's code appears — for the
+    ``status`` operand the derivation typed as a measure and nobody intended to aggregate."""
+    _seed(db, "solo", [
+        (CanonicalRow("solo", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("solo", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("solo", "transactions", "amount", "numeric", additivity="additive",
+                      currency="USD"), "monetary_flow"),
+        (CanonicalRow("solo", "transactions", "event_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow("solo", "transactions", "status", "text"), "booking_status"),
+        (CanonicalRow("solo", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    _freshness(db, "solo")
+    plan = _cross_plan(db, _fully_annotated_request(v2_recipe_by_id(RECIPE_ID)))
+    assert plan.bridge_count == 0                       # the declared join realizes this hop
+    assert plan.contract_primary_reason_code is ReasonCode.aggregation_axis_unsupported
+    assert ReasonCode.physical_cardinality_unavailable not in plan.contract_reason_codes
+
+
 def test_the_requirement_builder_key_set_is_declared_verbatim():
     assert tuple(lens._REQUIREMENT_BUILDERS) == REQUIREMENT_BUILDER_CODES
     assert REQUIREMENT_BUILDER_CODES == (
-        ReasonCode.physical_cardinality_unavailable,
-        ReasonCode.ingredient_not_connected_to_path,
         ReasonCode.aggregation_axis_unsupported,
         ReasonCode.aggregation_strategy_missing,
         ReasonCode.aggregation_declaration_conflict,
@@ -424,25 +508,31 @@ def test_the_requirement_builder_key_set_is_declared_verbatim():
         ReasonCode.binding_safety_rejected,
     )
     assert all(isinstance(code, ReasonCode) for code in REQUIREMENT_BUILDER_CODES)
+    # the two PATH-level codes are NOT in the mapping: neither has an operand this module can
+    # name correctly, so both stay unmapped rather than minting a requirement about the wrong one
+    assert not (set(lens._PATH_LEVEL_CODES) & set(REQUIREMENT_BUILDER_CODES))
 
 
-def test_requirements_are_built_from_the_registry_and_unmapped_codes_are_carried():
-    ref = ("rev", "public.accounts.account_id")
+def test_path_level_codes_are_carried_unmapped_never_as_a_requirement():
+    """Both path-level codes reach ``unmapped_requirement_codes`` — the honest carrier — and
+    neither mints a requirement. A code whose builder REFUSES is neither, and a code with no
+    builder at all is unmapped: three outcomes, no overlap."""
     contexts = (
-        ReasonContextV1(code=ReasonCode.physical_cardinality_unavailable,
-                        role="output_grain", catalog_source=ref[0], object_ref=ref[1]),
+        ReasonContextV1(code=ReasonCode.physical_cardinality_unavailable, role="",
+                        catalog_source="", object_ref=""),
+        ReasonContextV1(code=ReasonCode.ingredient_not_connected_to_path, role="",
+                        catalog_source="", object_ref=""),
         ReasonContextV1(code=ReasonCode.temporal_anchor_missing, role="event_ts",
                         catalog_source="ops", object_ref="public.transactions.event_ts"),
         ReasonContextV1(code=ReasonCode.freshness_stamp_unavailable, role="",
-                        catalog_source="ops", object_ref="public.transactions.event_ts"),
+                        catalog_source="", object_ref=""),
     )
     requirements, unmapped = lens._project_requirements(contexts)
-    assert [r.code for r in requirements] == ["GRAIN_IS_UNIQUE"]
-    assert requirements[0].operand == ref
-    assert requirements[0].schema_version == "v1"       # the REGISTRY's version for this code
-    assert requirements[0].params == ()
-    # a builder that returns None keeps its code a refusal, never a requirement and never unmapped
-    assert unmapped == ("freshness_stamp_unavailable",)
+    assert requirements == ()
+    assert unmapped == ("physical_cardinality_unavailable", "ingredient_not_connected_to_path",
+                        "freshness_stamp_unavailable")
+    # `temporal_anchor_missing` HAS a builder, which refuses — so it is not unmapped either
+    assert "temporal_anchor_missing" not in unmapped
 
 
 # ── 7. the one identity helper's boundary assertions ─────────────────────────────────────────
@@ -519,6 +609,45 @@ def test_key_entities_for_matches_key_entity_per_ref(db):
     assert batched == {ref: key_entity(db, *ref) for ref in refs}
     assert batched[("rev", "public.accounts.account_id")] == "account"
     assert batched[("rev", "public.accounts.missing")] is None
+
+
+def test_temporal_blockers_track_the_compilers_blocking_set():
+    """The mirrored set must equal the compiler's own, and only BLOCKING codes may demote
+    readiness: a temporal annotation the compiler does not fail on must not fail the fold either.
+    """
+    import types
+
+    from featuregen.overlay.upload.planner import declarations
+    from featuregen.overlay.upload.planner.contracts import (
+        ParamBindingV1,
+        TemporalDeclarationV1,
+    )
+
+    assert lens._TEMPORAL_BLOCKING_CODES == declarations._TEMPORAL_BLOCKING_CODES
+
+    declaration = TemporalDeclarationV1(
+        pit_anchor="event_time", anchor_binding="public.transactions.event_ts", window=None,
+        param_binding=ParamBindingV1(values=(), is_representative=True),
+        time_axis_aggregating=False,
+        reason_codes=(ReasonCode.freshness_stamp_unavailable,      # observation, NOT blocking
+                      ReasonCode.temporal_anchor_ambiguous),      # blocking
+        anchor_catalog_source="ops")
+    assert lens._temporal_blockers(
+        types.SimpleNamespace(temporal_declaration=declaration)) == ("temporal_anchor_ambiguous",)
+    assert lens._temporal_blockers(
+        types.SimpleNamespace(temporal_declaration=None)) == ("missing_temporal_declaration",)
+
+
+def test_parameter_binding_hash_refuses_a_non_scalar_value():
+    """Validation parity with the sibling producer: a value ``semantic_parameters`` would refuse
+    is refused here too, rather than hashed as a repr."""
+    request = _plannable_request(v2_recipe_by_id(RECIPE_ID))
+    assert lens._parameter_binding_hash(request)                     # the real window binds
+    assert lens._parameter_binding_hash(
+        dataclasses.replace(request, parameter_values=())) == ""     # honest absence, never None
+    with pytest.raises(ValueError):
+        lens._parameter_binding_hash(
+            dataclasses.replace(request, parameter_values=(("window", [30]),)))
 
 
 def test_fold_request_readiness_folds_the_requests_own_kind():
