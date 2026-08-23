@@ -1447,13 +1447,30 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     frozen = None
     if choice.considered_revision_id and choice.option_id:
         from featuregen.overlay.upload.semantic_option_decision import (
+            OPTION_DECISION_INTEGRITY_CODE,
+            OPTION_DECISION_INTEGRITY_NEXT_STEP,
+            OptionDecisionIntegrityError,
             assemble_current_activation_state,
             load_frozen_option_facts,
         )
 
-        frozen = load_frozen_option_facts(
-            conn, considered_revision_id=choice.considered_revision_id,
-            option_id=choice.option_id)
+        try:
+            frozen = load_frozen_option_facts(
+                conn, considered_revision_id=choice.considered_revision_id,
+                option_id=choice.option_id)
+        except OptionDecisionIntegrityError as e:
+            # S1A-5a §4. The frozen decision row disagrees with itself — its plan fails the
+            # manifest's seal, or its governed cross-catalog read set names a column nobody can
+            # attribute to a catalog. Both are conditions in which a governed reader must refuse
+            # rather than carry on, and NEITHER is a server fault: unhandled, this reached
+            # `app.py`'s catch-all as an opaque 500 with no code and no next step, for something a
+            # person fixes by regenerating. 409 with the error's own message, like every other
+            # typed governed conflict this route returns.
+            raise HTTPException(status_code=409, detail={
+                "code": OPTION_DECISION_INTEGRITY_CODE,
+                "message": str(e),
+                "next_step": OPTION_DECISION_INTEGRITY_NEXT_STEP,
+            }) from e
     if frozen is not None:
         current = assemble_current_activation_state(
             conn, frozen=frozen, snapshot_id=lineage_snapshot_id,
@@ -1592,13 +1609,25 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     option_key: tuple[str, str] | None = None
     if recorded_choice.considered_revision_id and recorded_choice.option_id:
         from featuregen.overlay.upload.semantic_option_decision import (
+            OPTION_DECISION_INTEGRITY_CODE,
+            OPTION_DECISION_INTEGRITY_NEXT_STEP,
+            OptionDecisionIntegrityError,
             assemble_current_activation_state,
             load_frozen_option_facts,
         )
 
-        frozen = load_frozen_option_facts(
-            conn, considered_revision_id=recorded_choice.considered_revision_id,
-            option_id=recorded_choice.option_id)
+        try:
+            frozen = load_frozen_option_facts(
+                conn, considered_revision_id=recorded_choice.considered_revision_id,
+                option_id=recorded_choice.option_id)
+        except OptionDecisionIntegrityError as e:
+            # S1A-5a §4 — the same refusal at the GOVERNING write, which is never softer than the
+            # draft. See the draft route's note for why this is a 409 rather than a 500.
+            raise HTTPException(status_code=409, detail={
+                "code": OPTION_DECISION_INTEGRITY_CODE,
+                "message": str(e),
+                "next_step": OPTION_DECISION_INTEGRITY_NEXT_STEP,
+            }) from e
         if frozen is not None:
             option_key = (recorded_choice.considered_revision_id, recorded_choice.option_id)
             current = assemble_current_activation_state(

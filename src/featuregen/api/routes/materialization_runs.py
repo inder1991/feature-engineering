@@ -498,12 +498,28 @@ def _require_the_option_allows_materialization(
 
     from featuregen.overlay.upload.activation_policy import activation_decision
     from featuregen.overlay.upload.semantic_option_decision import (
+        OPTION_DECISION_INTEGRITY_CODE,
+        OPTION_DECISION_INTEGRITY_NEXT_STEP,
+        OptionDecisionIntegrityError,
         assemble_current_activation_state,
         load_frozen_option_facts,
     )
 
-    frozen = load_frozen_option_facts(
-        conn, considered_revision_id=body.considered_revision_id, option_id=body.option_id)
+    try:
+        frozen = load_frozen_option_facts(
+            conn, considered_revision_id=body.considered_revision_id, option_id=body.option_id)
+    except OptionDecisionIntegrityError as e:
+        # S1A-5a §4. The cited decision row cannot authenticate itself — its plan fails the
+        # manifest's seal, or its governed cross-catalog read set carries a column nobody can
+        # attribute to a catalog. Unhandled this was an opaque 500; it is a 409 for the same
+        # reason a blocked option is: a durable governed record is in a state this request cannot
+        # be served from, and the caller's move is to regenerate. Raised BEFORE anything is
+        # minted, like every other refusal on this path.
+        raise HTTPException(status_code=409, detail={
+            "code": OPTION_DECISION_INTEGRITY_CODE,
+            "message": str(e),
+            "next_step": OPTION_DECISION_INTEGRITY_NEXT_STEP,
+        }) from e
     if frozen is None:
         raise HTTPException(
             status_code=404,

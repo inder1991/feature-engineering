@@ -25,6 +25,15 @@ class OptionDecisionIntegrityError(RuntimeError):
     ``ShadowIntegrityError`` is — a caller that wants to classify this must not be reduced to
     matching a message."""
 
+
+#: S1A-5a §4 — the WIRE vocabulary every route serves this refusal under. It lives beside the error
+#: rather than inline at each call site because three routes load frozen facts, and three
+#: independently-spelled literals for ONE condition is how a client ends up handling two of them.
+#: The condition is a 409, never a 500: a governed record disagreeing with itself is not a fault,
+#: it is a conflict a person resolves by regenerating.
+OPTION_DECISION_INTEGRITY_CODE = "OPTION_DECISION_INTEGRITY"
+OPTION_DECISION_INTEGRITY_NEXT_STEP = "regenerate from the current considered set"
+
 #: origin (planning contract) -> server-assigned generation_source. The DECISION row is honest
 #: about origin even while the wire projection still labels intents as recipes (GEN-05 — fixed
 #: by remediation B4); activation must never inherit that lie.
@@ -310,6 +319,52 @@ def _verified_plan(column, story, manifest, label: str) -> dict | None:
     return plan
 
 
+GOVERNED_CROSS_CATALOG = "governed_cross_catalog"
+
+
+def _governed_read_set_pairs(plan: dict, label: str) -> tuple[tuple[str, str], ...]:
+    """S1A-5a — a ``governed_cross_catalog`` read set, PARSED into (catalog, object_ref) pairs.
+
+    A single-catalog plan stores bare ``schema.table.column`` refs and one ``catalog_source`` every
+    entry inherits. A cross-catalog plan has no single catalog to inherit from, so each entry is a
+    fully qualified ``source::schema.table.column`` and must be attributed to its OWN catalog
+    before any authority can be measured against it.
+
+    The parsing is strict and it is all-or-nothing, for the same reason :func:`_verified_plan`
+    refuses a plan that fails its seal: the read set is the complete statement of what a
+    materialization may read. An entry nobody can parse cannot be attributed to a catalog, and
+    skipping it would produce an authority floor measured over a SUBSET of the plan while
+    reporting it as the whole. So one malformed entry refuses the whole load, and the refusal
+    carries the option key (which decision to regenerate) and the parser's own message (what is
+    wrong with it).
+
+    The count equality is not decoration either: it is the invariant that nothing was deduped,
+    dropped or expanded between the bytes the decision froze and the pairs the floor will measure.
+    """
+    from featuregen.overlay.upload.qualified_ref import parse_qualified_ref
+
+    stored = list(plan.get("read_set") or ())
+    parsed = []
+    for entry in stored:
+        try:
+            parsed.append(parse_qualified_ref(entry))
+        except ValueError as e:
+            raise OptionDecisionIntegrityError(
+                f"the frozen governed cross-catalog plan of option decision {label} carries a "
+                f"read-set entry that is not a governed qualified ref: {e}. Every entry of a "
+                f"cross-catalog read set must name its own catalog "
+                f"(source::schema.table.column), because there is no single plan catalog for it "
+                f"to inherit — an entry nobody can attribute is one nobody can measure an "
+                f"execution authority against") from e
+    if len(parsed) != len(stored):    # pragma: no cover — the loop appends exactly once per entry
+        raise OptionDecisionIntegrityError(
+            f"the frozen governed cross-catalog plan of option decision {label} stores "
+            f"{len(stored)} read-set entries but {len(parsed)} parsed: a read set that changed "
+            f"size between storage and measurement is not the one this decision recorded")
+    return tuple((ref.catalog_source, f"{ref.schema_name}.{ref.table}.{ref.column}")
+                 for ref in parsed)
+
+
 def load_frozen_option_facts(conn, *, considered_revision_id: str,
                              option_id: str) -> FrozenOptionFactsV1 | None:
     """The activation policy's frozen layer, from the exact (revision, option) key.
@@ -318,8 +373,15 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
     where the row has one, the ``dataset_story`` copy where it does not (:func:`_verified_plan`) —
     so a legacy row keeps answering exactly as it did while a new row reads its own field.
 
+    S1A-5a adds ``plan_kind`` and, for a ``governed_cross_catalog`` plan only,
+    ``read_set_pairs`` — every entry parsed and proven by :func:`_governed_read_set_pairs`. The
+    gate is the plan KIND: a ``single_source`` read set holds BARE refs that the governed parser
+    refuses by design, so parsing unconditionally would refuse every legacy row in the table.
+    Legacy rows are byte-identical to what they loaded before.
+
     Raises:
-        OptionDecisionIntegrityError: the stored plan disagrees with the manifest's seal.
+        OptionDecisionIntegrityError: the stored plan disagrees with the manifest's seal, or a
+            governed cross-catalog read set carries an entry that is not a qualified ref.
     """
     row = conn.execute(
         "SELECT binding_state, generation_source, computation_kind, readiness, "
@@ -338,8 +400,11 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
      review_current, recipe_revision_hash, confirmation_roles, has_reviewed, plan_present,
      validation_status, outstanding, pins, formula_revision, snapshot_id, story,
      plan_column, manifest) = row
-    plan = _verified_plan(plan_column, story, manifest,
-                          f"{considered_revision_id}/{option_id}") or {}
+    label = f"{considered_revision_id}/{option_id}"
+    plan = _verified_plan(plan_column, story, manifest, label) or {}
+    plan_kind = plan.get("plan_kind") or ""
+    read_set_pairs = (_governed_read_set_pairs(plan, label)
+                      if plan_kind == GOVERNED_CROSS_CATALOG else ())
     return FrozenOptionFactsV1(
         binding_state=binding_state,
         generation_source=generation_source,
@@ -362,7 +427,9 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         read_set=tuple(plan.get("read_set") or ()),
         plan_catalog_source=plan.get("catalog_source") or "",
         operand_authorities=tuple(sorted(
-            ((story or {}).get("operand_authorities") or {}).items())))
+            ((story or {}).get("operand_authorities") or {}).items())),
+        plan_kind=plan_kind,
+        read_set_pairs=read_set_pairs)
 
 
 def _latest_confirmed_uoa(conn, intent_id: str) -> str | None:
@@ -495,6 +562,63 @@ def _requirements_closed(conn, contract_id: str | None,
         return False
 
 
+def _pin_authority(pin) -> str:
+    """The authority a bound operand may claim from its CURRENT resolution pin.
+
+    The WINNING evidence's ``producer/strength``, and ``absent`` when there is no pin, no winning
+    evidence, or the resolver's verdict is a CONFLICT — two contradictory views it refuses to
+    choose between. A field whose meaning is actively disputed has no authority to lend, and it
+    must not underwrite an authoring or an execution floor.
+
+    ▲ **This deliberately does NOT gate on ``load_bearing`` / ``conflict_state == "resolved"``**,
+    the way ``contract/governed_lens._authority`` (D4) does on the serving side. The floors read
+    exactly ONE field — ``concept`` — and ``field_policies._CONCEPT`` is a RECOMMENDATION-tier
+    policy (``influence_max=InfluenceTier.RECOMMENDATION``). ``resolve_field_authority``
+    short-circuits on that ceiling BEFORE it ever selects a load-bearing value, so EVERY concept
+    pin in the system — a human-confirmed one included — comes back as::
+
+        ResolutionPinV1(producer='human', strength='confirmed',
+                        conflict_state='influence_not_operational', load_bearing=False)
+
+    Gating on either clause would therefore read ``absent`` for every column in every catalog, and
+    the authoring and execution floors would become permanently unmeetable — not a stricter
+    platform, an inoperable one. For an advisory-tier field the load-bearing question is simply
+    not the right one: ``AUTHORITY_MATRIX`` is the gate that decides what a concept's
+    producer/strength may authorize, and it already refuses ``llm/proposed`` at every rung and
+    ``source/declared`` at execution.
+
+    The conflict gate is the half that IS real, and it is belt-and-braces rather than new
+    behaviour: on a genuine concept conflict the resolver already blanks ``producer``/``strength``
+    (there is no winning view), so such a pin read ``absent`` before this too. Stating the rule
+    explicitly means the safety no longer depends on that incidental blanking.
+    """
+    if pin is None or not pin.producer or pin.conflict_state == "conflict":
+        return "absent"
+    return f"{pin.producer}/{pin.strength}"
+
+
+def _authority_floors(conn, logical_refs: list[str]) -> tuple[bool, bool]:
+    """C2's two floors over an already-qualified set of logical refs: ``(authoring, execution)``.
+
+    ONE batched resolver read (C1's read-only pins — the same law generation served from), one
+    authority per ref through :func:`_pin_authority`, and one ``clears`` fold per floor. The set is
+    authorized as a WHOLE or not at all: a materialization reads every column in its read set, so
+    one operand short of the floor is the whole plan short of it.
+
+    An empty ref list clears nothing — ``all()`` over nothing is vacuously true, and a floor that
+    passed because it measured no columns would be the most dangerous answer this function could
+    give. The CALLER decides whether an empty measurement counts as evaluated at all.
+    """
+    from featuregen.overlay.upload.field_resolution import current_resolution_pins
+    from featuregen.overlay.upload.semantic_eligibility import clears
+
+    refs = list(dict.fromkeys(logical_refs))
+    pins = current_resolution_pins(conn, logical_refs=refs, fields=("concept",))
+    authorities = [_pin_authority(pins.get((logical, "concept"))) for logical in refs]
+    return (bool(authorities) and all(clears(a, "authoring") for a in authorities),
+            bool(authorities) and all(clears(a, "execution_at_governed") for a in authorities))
+
+
 def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
                                       snapshot_id: str | None,
                                       intent_id: str | None = None,
@@ -547,14 +671,32 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
     # frozen plan's read set must STILL clear the matrix column under its CURRENT resolved
     # authority (C1's read-only pins — the same resolver law generation served from). No
     # read set (no plan) → the floors are honestly UNEVALUATED and fail closed.
+    #
+    # S1A-5a: TWO arms, ONE fold. The arms differ only in how a read-set entry is qualified into a
+    # logical ref — a governed cross-catalog plan carries each entry's own catalog, a single-source
+    # plan has one the whole read set inherits. Everything after that (the batched pin read, the
+    # `_pin_authority` rule, the two `clears` folds) is `_authority_floors`, shared, so the two
+    # cannot drift into two answers about the same pin. The PAIR arm goes first: where both shapes
+    # are present the per-entry attribution is the precise one, and falling back to a plan-wide
+    # catalog is exactly what a cross-catalog plan must never do.
     authoring_now = False
     execution_evaluated = False
     execution_now = False
-    if frozen.read_set and frozen.plan_catalog_source:
+    if frozen.read_set_pairs:
         try:
-            from featuregen.overlay.upload.field_resolution import current_resolution_pins
             from featuregen.overlay.upload.object_ref import normalize_ref
-            from featuregen.overlay.upload.semantic_eligibility import clears
+
+            authoring_now, execution_now = _authority_floors(
+                conn, [normalize_ref(catalog, *ref.split(".")[-3:])
+                       for catalog, ref in frozen.read_set_pairs])
+            execution_evaluated = True        # pairs were measured, whatever they measured to
+        except Exception:                     # unreadable floors → unevaluated, fail closed
+            authoring_now = False
+            execution_evaluated = False
+            execution_now = False
+    elif frozen.read_set and frozen.plan_catalog_source:
+        try:
+            from featuregen.overlay.upload.object_ref import normalize_ref
 
             logical_by_ref = {}
             for ref in frozen.read_set:
@@ -562,17 +704,8 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
                 if len(parts) >= 3:
                     logical_by_ref[ref] = normalize_ref(
                         frozen.plan_catalog_source, parts[-3], parts[-2], parts[-1])
-            pins = current_resolution_pins(
-                conn, logical_refs=list(logical_by_ref.values()), fields=("concept",))
-            authorities = []
-            for logical in logical_by_ref.values():
-                pin = pins.get((logical, "concept"))
-                authorities.append(f"{pin.producer}/{pin.strength}"
-                                   if pin is not None and pin.producer else "absent")
-            authoring_now = bool(authorities) and all(
-                clears(a, "authoring") for a in authorities)
-            execution_now = bool(authorities) and all(
-                clears(a, "execution_at_governed") for a in authorities)
+            authoring_now, execution_now = _authority_floors(
+                conn, list(logical_by_ref.values()))
             execution_evaluated = True
         except Exception:                     # unreadable floors → unevaluated, fail closed
             authoring_now = False
@@ -656,7 +789,9 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
         authoring_floor_met=authoring_now)
 
 
-__all__ = ["OptionDecisionIntegrityError", "assemble_current_activation_state",
-           "decision_facts_for_candidate", "frozen_binding_plan",
-           "has_reviewed_formula_expectation", "load_frozen_option_facts",
-           "load_option_decision_record", "persist_option_decisions"]
+__all__ = ["GOVERNED_CROSS_CATALOG", "OPTION_DECISION_INTEGRITY_CODE",
+           "OPTION_DECISION_INTEGRITY_NEXT_STEP", "OptionDecisionIntegrityError",
+           "assemble_current_activation_state", "decision_facts_for_candidate",
+           "frozen_binding_plan", "has_reviewed_formula_expectation",
+           "load_frozen_option_facts", "load_option_decision_record",
+           "persist_option_decisions"]

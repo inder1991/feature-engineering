@@ -1,6 +1,7 @@
 """Remediation A1 — the activation policy: every rule row proven in both directions."""
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from dataclasses import replace
 
@@ -304,3 +305,41 @@ def test_FORMULA_SCHEMA_UNSUPPORTED_is_reserved_for_a_measured_no():
     assert R.FORMULA_SCHEMA_UNSUPPORTED in codes(decision)
     assert R.FORMULA_REVIEW_UNMEASURED not in codes(decision)
     assert R.ENGINE_CAPABILITY_UNMEASURED not in codes(decision)
+
+
+# ── Task S1A-5a — the two appended facts, and the compatibility they must not break ────────────
+
+def test_the_cross_catalog_facts_are_APPENDED_and_DEFAULTED():
+    """``FrozenOptionFactsV1`` is constructed positionally in production code and across the
+    fixtures. The two new facts therefore go at the END with defaults whose meaning is "nobody
+    said" — an empty plan kind and no pairs, which every fold reads as "measure nothing here"."""
+    frozen = FrozenOptionFactsV1(
+        binding_state="bound", generation_source="recipe",
+        computation_kind="deterministic_formula", readiness="FORMULA_VALIDATED",
+        review_current=True)
+
+    assert frozen.plan_kind == ""
+    assert frozen.read_set_pairs == ()
+    fields = [f.name for f in dataclasses.fields(FrozenOptionFactsV1)]
+    assert fields[-2:] == ["plan_kind", "read_set_pairs"], fields
+
+
+def test_the_positional_construction_every_existing_caller_uses_still_works():
+    """The five required facts, positionally, exactly as ``CLEAN_FROZEN`` and the production
+    assembler spell them — the compatibility this task promised to verify rather than assume."""
+    frozen = FrozenOptionFactsV1("bound", "recipe", "deterministic_formula",
+                                 "FORMULA_VALIDATED", True)
+
+    assert (frozen.binding_state, frozen.readiness) == ("bound", "FORMULA_VALIDATED")
+    assert (frozen.plan_kind, frozen.read_set_pairs) == ("", ())
+
+
+def test_the_pairs_are_carried_verbatim_and_stay_hashable():
+    """The facts record is frozen and used as a value — the pairs must be a tuple of tuples, not
+    a list of lists that would make the whole record unhashable the moment one is present."""
+    pairs = (("bank", "public.accounts.acct_id"), ("crm", "sales.customers.cust_id"))
+    governed = replace(CLEAN_FROZEN, plan_kind="governed_cross_catalog", read_set_pairs=pairs)
+
+    assert governed.read_set_pairs == pairs
+    assert len({governed, replace(CLEAN_FROZEN, plan_kind="governed_cross_catalog",
+                                  read_set_pairs=pairs)}) == 1

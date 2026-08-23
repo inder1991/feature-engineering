@@ -53,6 +53,21 @@ PLAN = {
     "window": 90,
 }
 
+#: Task S1A-5a — the CROSS-CATALOG shape. Its read set spans catalogs, so every entry carries its
+#: own catalog in the canonical ``source::schema.table.column`` form; there is no one
+#: ``catalog_source`` for entries to inherit, and inventing one would attribute a foreign column to
+#: the wrong catalog.
+GOVERNED_PLAN = {
+    "plan_kind": "governed_cross_catalog",
+    "population_ref": "accounts",
+    "read_set": ["bank::public.accounts.acct_id", "crm::sales.customers.cust_id"],
+    "role_bindings": {"grain": "bank::public.accounts.acct_id",
+                      "who": "crm::sales.customers.cust_id"},
+    "pit": "as-of state at the cutoff",
+    "output_grain": "account",
+    "window": None,
+}
+
 #: Exactly the columns ``semantic_option_decision`` had BEFORE migration 1066 — the legacy shape
 #: the audit seeds and the shape a rollback would read.
 _PRE_1066_COLUMNS = (
@@ -246,6 +261,122 @@ def test_a_row_predating_the_manifest_is_read_not_refused(conn):
     frozen = load_frozen_option_facts(
         conn, considered_revision_id=revision_id, option_id=option_id)
     assert frozen is not None and frozen.read_set == tuple(PLAN["read_set"])
+
+
+# ── Task S1A-5a: the governed read set is PARSED, not carried ────────────────────────────────────
+#
+# A ``governed_cross_catalog`` plan's read set is the input to the per-catalog execution-authority
+# floor. Every entry has to be attributed to a catalog before any authority can be measured, and an
+# entry nobody can attribute must stop the load — the same posture ``_verified_plan``'s seal check
+# already takes, and for the same reason: an execution authority judged against a read set nobody
+# can authenticate is not an authority.
+
+
+def test_a_legacy_single_source_row_reads_BYTE_IDENTICALLY(conn):
+    """The compatibility floor of the whole change: a ``single_source`` row keeps every field it
+    had, gains its honest ``plan_kind``, and gains NO pairs — its bare refs are attributed by the
+    plan's one ``catalog_source``, exactly as before."""
+    revision_id, option_id = _freeze(conn, _facts(binding_plan=PLAN), key="s1a5a_legacy")
+
+    frozen = load_frozen_option_facts(
+        conn, considered_revision_id=revision_id, option_id=option_id)
+    assert frozen is not None
+    assert frozen.plan_kind == "single_source"
+    assert frozen.read_set_pairs == ()
+    assert frozen.read_set == tuple(PLAN["read_set"])
+    assert frozen.plan_catalog_source == "bank"
+
+
+def test_a_row_with_no_plan_at_all_carries_an_empty_plan_kind(conn):
+    """Honest absence, not an invented kind: a candidate that folded no plan has no plan kind."""
+    revision_id, option_id = _freeze(conn, _facts(binding_plan=None), key="s1a5a_noplan")
+
+    frozen = load_frozen_option_facts(
+        conn, considered_revision_id=revision_id, option_id=option_id)
+    assert frozen is not None
+    assert frozen.plan_kind == "" and frozen.read_set_pairs == ()
+
+
+def test_a_governed_read_set_is_split_into_catalog_and_object_ref_pairs(conn):
+    """The forward half: each canonical entry becomes ``(catalog_source, bare schema.table.column)``
+    — the shape the floor needs to ask ONE catalog's resolver about ONE object."""
+    revision_id, option_id = _freeze(conn, _facts(binding_plan=GOVERNED_PLAN), key="s1a5a_xcat")
+
+    frozen = load_frozen_option_facts(
+        conn, considered_revision_id=revision_id, option_id=option_id)
+    assert frozen is not None
+    assert frozen.plan_kind == "governed_cross_catalog"
+    assert frozen.read_set_pairs == (("bank", "public.accounts.acct_id"),
+                                     ("crm", "sales.customers.cust_id"))
+    # The raw read set is untouched — the pairs are a projection, never a replacement.
+    assert frozen.read_set == tuple(GOVERNED_PLAN["read_set"])
+
+
+def test_every_stored_entry_produces_exactly_one_pair(conn):
+    """Count equality, asserted on a read set carrying a DUPLICATE: nothing is silently deduped,
+    dropped or expanded between what was stored and what the floor will measure. A read set that
+    quietly shrank would be a floor measured over fewer columns than the plan actually reads."""
+    plan = {**GOVERNED_PLAN,
+            "read_set": [*GOVERNED_PLAN["read_set"], "bank::public.accounts.acct_id"]}
+    revision_id, option_id = _freeze(conn, _facts(binding_plan=plan), key="s1a5a_count")
+
+    frozen = load_frozen_option_facts(
+        conn, considered_revision_id=revision_id, option_id=option_id)
+    assert frozen is not None
+    assert len(frozen.read_set_pairs) == len(plan["read_set"]) == 3
+
+
+@pytest.mark.parametrize(("bad", "expected_phrase"), [
+    ("public.accounts.acct_id", "not a normalized logical_ref"),      # unqualified — no catalog
+    ("bank::public.accounts", "must name a column"),                  # a TABLE in a read set
+    ("BANK::public.accounts.acct_id", "not in canonical form"),       # a spelling drift
+    ("::public.accounts.acct_id", "blank catalog_source"),            # names no catalog at all
+    ("bank::public.accounts.acct_id.extra", "not a normalized logical_ref"),
+])
+def test_ONE_malformed_governed_ref_refuses_the_whole_load(conn, bad, expected_phrase):
+    """Fail closed, not "skip the bad one". A read set is the complete statement of what a
+    materialization may read; dropping an entry nobody can parse would produce a floor measured
+    over a SUBSET and call it the whole. The refusal carries the option key (so an operator knows
+    which decision to regenerate) and the parser's own message (so they know what is wrong)."""
+    key = "s1a5a_bad"                        # each param runs on its own rolled-back connection
+    plan = {**GOVERNED_PLAN, "read_set": ["bank::public.accounts.acct_id", bad]}
+    revision_id, option_id = _freeze(conn, _facts(binding_plan=plan), key=key)
+
+    with pytest.raises(OptionDecisionIntegrityError) as excinfo:
+        load_frozen_option_facts(
+            conn, considered_revision_id=revision_id, option_id=option_id)
+    message = str(excinfo.value)
+    assert expected_phrase in message
+    assert f"{revision_id}/{option_id}" in message
+    assert repr(bad) in message
+
+
+def test_a_single_source_plan_is_NOT_subjected_to_the_governed_parser(conn):
+    """The gate is the plan KIND, and this is the test that proves it. A ``single_source`` read
+    set holds bare refs — every one of which the governed parser refuses — so a loader that parsed
+    unconditionally would refuse every legacy row in the table. Same bytes, opposite outcome."""
+    unqualified = {**GOVERNED_PLAN, "plan_kind": "single_source", "catalog_source": "bank",
+                   "read_set": ["public.accounts.acct_id"]}
+    revision_id, option_id = _freeze(conn, _facts(binding_plan=unqualified), key="s1a5a_bare")
+
+    frozen = load_frozen_option_facts(
+        conn, considered_revision_id=revision_id, option_id=option_id)
+    assert frozen is not None
+    assert frozen.read_set == ("public.accounts.acct_id",)          # raw, unparsed
+    assert frozen.plan_kind == "single_source"
+    assert frozen.read_set_pairs == ()
+
+
+def test_a_governed_plan_with_an_empty_read_set_loads_with_no_pairs(conn):
+    """Empty is not malformed. It measures NOTHING, which the floor then reports as unevaluated —
+    a refusal at load would confuse "authorizes nothing" with "cannot be authenticated"."""
+    plan = {**GOVERNED_PLAN, "read_set": []}
+    revision_id, option_id = _freeze(conn, _facts(binding_plan=plan), key="s1a5a_empty")
+
+    frozen = load_frozen_option_facts(
+        conn, considered_revision_id=revision_id, option_id=option_id)
+    assert frozen is not None
+    assert frozen.plan_kind == "governed_cross_catalog" and frozen.read_set_pairs == ()
 
 
 # ── the migration audit (CI is blind to legacy data) ─────────────────────────────────────────────

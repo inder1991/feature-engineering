@@ -80,6 +80,18 @@ class FrozenOptionFactsV1:
     read_set: tuple[str, ...] = ()              # the frozen plan's bound refs (C2 floor input)
     plan_catalog_source: str = ""
     operand_authorities: tuple[tuple[str, str], ...] = ()  # (ref, measured authority) at serving
+    # ── S1A-5a: the CROSS-CATALOG half of the read set. Appended at the END, both defaulted, so
+    # every existing (largely positional) construction keeps working unchanged.
+    plan_kind: str = ""                         # "" | single_source | governed_cross_catalog
+    read_set_pairs: tuple[tuple[str, str], ...] = ()
+    #                                             (catalog_source, object_ref) — `object_ref` is
+    #                                             the BARE `schema.table.column` half. A
+    #                                             single-catalog plan attributes its bare refs via
+    #                                             `plan_catalog_source`; a governed cross-catalog
+    #                                             plan has no single catalog to inherit from, so
+    #                                             each entry carries its own — parsed and proven
+    #                                             at load (`qualified_ref.parse_qualified_ref`),
+    #                                             never split by string here.
 
 
 @dataclass(frozen=True, slots=True)
