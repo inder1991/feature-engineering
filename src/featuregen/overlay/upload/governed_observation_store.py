@@ -139,6 +139,14 @@ def claim_telemetry_work(conn: DbConn, *, owner: str, lease_seconds: int = 300) 
     ordered single-row CTE, then one UPDATE that flips the status, stamps the owner, extends the
     lease and bumps both the attempt count and a monotonically increasing fence). Returns the whole
     row as a dict, or None when nothing is claimable.
+
+    ``FOR UPDATE SKIP LOCKED`` is load-bearing and is pinned by a two-connection test: without it a
+    concurrent claimer BLOCKS on the row another worker is mid-claim on, and then completes the
+    UPDATE against the row it already selected — two workers holding one item.
+
+    **The returned ``lease_fence`` is the caller's completion token.** It rises on every claim
+    (including a reclaim after expiry), so a worker that hands its fence back to
+    ``complete_telemetry_work`` can only terminalize the lease it actually holds.
     """
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -162,16 +170,41 @@ def claim_telemetry_work(conn: DbConn, *, owner: str, lease_seconds: int = 300) 
     return dict(row) if row is not None else None
 
 
-def complete_telemetry_work(conn: DbConn, *, work_item_id: str, ok: bool, error: str = "") -> None:
-    """Terminalize one work item. ``failed`` is terminal, not a retry: an item that failed for a
-    reason worth re-running is re-enqueued deliberately, with its own row and its own frozen
-    inputs, rather than silently re-attempted under inputs nobody re-checked."""
-    conn.execute(
+def complete_telemetry_work(conn: DbConn, *, work_item_id: str, owner: str, fence: int,
+                            ok: bool, error: str = "") -> bool:
+    """FENCED terminalization: completes the item only if this caller still holds its lease.
+
+    Returns True when the completion took, False when it did not — and a False is INFORMATION, not
+    a nuisance. It is how a worker whose lease expired mid-flight LEARNS that somebody else has the
+    item now, instead of overwriting a colleague's verdict and carrying on believing it finished
+    the work. A caller that ignores the return value is the bug this guard exists to make visible.
+
+    Three ways it returns False, all of them the same statement — *you do not hold this lease*:
+      * the item was reclaimed after your lease expired (the fence moved past yours);
+      * somebody else owns it (``lease_owner`` differs);
+      * it is already terminal (``status`` is no longer ``leased``), so a second complete cannot
+        rewrite a recorded ``done`` into a ``failed`` or move a ``completed_at``.
+
+    Deliberately NOT guarded on ``lease_expires_at > now()``, which is where this parts company
+    with ``runtime/queue.py``'s otherwise identical completion. The fence already refuses a
+    RECLAIMED item, and that is the case that corrupts. Refusing on expiry alone would additionally
+    throw away finished work whenever a slow-but-uncontested worker overran its lease — punishing
+    slowness by discarding the result, which is not what the lease is for.
+
+    ``failed`` is terminal, not a retry: an item that failed for a reason worth re-running is
+    re-enqueued deliberately, with its own row and its own frozen inputs, rather than silently
+    re-attempted under inputs nobody re-checked.
+    """
+    row = conn.execute(
         "UPDATE governed_telemetry_outbox "
         "   SET status = %s, last_error = %s, completed_at = now(),"
         "       lease_owner = '', lease_expires_at = NULL "
-        " WHERE work_item_id = %s",
-        ("done" if ok else "failed", "" if ok else error, work_item_id))
+        " WHERE work_item_id = %s AND status = 'leased'"
+        "   AND lease_owner = %s AND lease_fence = %s "
+        "RETURNING work_item_id",
+        ("done" if ok else "failed", "" if ok else error,
+         work_item_id, owner, fence)).fetchone()
+    return row is not None
 
 
 # ── the observations (1120) ────────────────────────────────────────────────────────────────────
@@ -266,7 +299,10 @@ def record_bridge_demand(conn: DbConn, *, observation_id: str,
             material = (revision_hash, verdict, anchor, GRAPH_VERSION, PLANNER_VERSION)
         else:
             hop = {field: str(rejection.get(field) or "") for field in _HOP_TEXT_FIELDS}
-            hop["hop_index"] = int(rejection.get("hop_index", -1))
+            # An EXPLICIT None means the same thing as an absent key — "no hop index" — and the
+            # planner-side adapter is the likely source of one. `int(None)` would raise instead.
+            raw_hop_index = rejection.get("hop_index")
+            hop["hop_index"] = -1 if raw_hop_index is None else int(raw_hop_index)
             material = (revision_hash, hop["relationship_id"], hop["relationship_version"],
                         hop["from_entity"], hop["to_entity"], hop["position_catalog"],
                         hop["position_table_ref"], str(hop["hop_index"]), verdict,

@@ -294,6 +294,23 @@ def test_the_endpoint_hint_never_enters_identity(conn) -> None:
     assert rows == 1, "an advisory hint must not fork the demand's identity"
 
 
+def test_an_explicit_none_hop_index_means_the_same_as_an_absent_one(conn) -> None:
+    """The planner-side adapter is the likely source of an explicit None; `int(None)` would raise."""
+    intent_id, run_id = _seed_run(conn, "none_hop")
+    observation_id = record_planning_observations(
+        conn, generation_run_id=run_id, intent_id=intent_id, observation_mode="live",
+        rows=[_observation(resolution_status="unresolved")])[0]
+    explicit = dict(_rejection())
+    explicit["hop_index"] = None
+    absent = dict(_rejection())
+    del absent["hop_index"]
+    record_bridge_demand(conn, observation_id=observation_id, rejections=[explicit, absent])
+    rows = conn.execute(
+        "SELECT hop_index FROM bridge_demand_observation WHERE observation_id = %s",
+        (observation_id,)).fetchall()
+    assert rows == [(-1,)], "both spellings are one demand, at the schema's default hop index"
+
+
 def test_capacity_verdict_uses_the_reduced_material_and_routes_to_planner_capacity(conn) -> None:
     intent_id, run_id = _seed_run(conn, "capacity")
     observation_id = record_planning_observations(
@@ -430,6 +447,7 @@ def test_lease_lifecycle(conn) -> None:
     assert claimed["status"] == "leased"
     assert claimed["lease_owner"] == "worker-a"
     assert claimed["attempt_count"] == 1
+    assert claimed["lease_fence"] == 1, "the claim hands back the fence it minted"
     assert claimed["lease_expires_at"] is not None
     assert claimed["frozen_inputs"]["target_entity"] == "party"
 
@@ -444,8 +462,11 @@ def test_lease_lifecycle(conn) -> None:
     assert reclaimed["work_item_id"] == work_item_id
     assert reclaimed["lease_owner"] == "worker-b"
     assert reclaimed["attempt_count"] == 2, "a reclaim is another attempt, counted"
+    assert reclaimed["lease_fence"] == 2, "and the fence moves past the lease it displaced"
 
-    complete_telemetry_work(conn, work_item_id=work_item_id, ok=True)
+    assert complete_telemetry_work(conn, work_item_id=work_item_id,
+                                   owner="worker-b", fence=reclaimed["lease_fence"],
+                                   ok=True) is True
     done = conn.execute(
         "SELECT status, completed_at, last_error, lease_owner FROM governed_telemetry_outbox "
         "WHERE work_item_id = %s", (work_item_id,)).fetchone()
@@ -457,11 +478,130 @@ def test_completing_with_a_failure_records_the_error(conn) -> None:
     _, run_id = _seed_run(conn, "lease_fail", with_intent=False)
     work_item_id = enqueue_governed_telemetry(conn, generation_run_id=run_id, intent_id=None,
                                               frozen_inputs={})
-    claim_telemetry_work(conn, owner="worker-a")
-    complete_telemetry_work(conn, work_item_id=work_item_id, ok=False, error="planner exploded")
+    claimed = claim_telemetry_work(conn, owner="worker-a")
+    assert complete_telemetry_work(conn, work_item_id=work_item_id, owner="worker-a",
+                                   fence=claimed["lease_fence"], ok=False,
+                                   error="planner exploded") is True
     row = conn.execute("SELECT status, last_error FROM governed_telemetry_outbox "
                        "WHERE work_item_id = %s", (work_item_id,)).fetchone()
     assert row == ("failed", "planner exploded")
+
+
+def test_a_zombie_worker_cannot_complete_an_item_that_was_reclaimed(conn) -> None:
+    """A whose lease expired must LOSE, visibly. The fence is what tells it so."""
+    _, run_id = _seed_run(conn, "zombie", with_intent=False)
+    work_item_id = enqueue_governed_telemetry(conn, generation_run_id=run_id, intent_id=None,
+                                              frozen_inputs={"n": 1})
+    a_claim = claim_telemetry_work(conn, owner="worker-a")
+    assert a_claim is not None
+
+    conn.execute(
+        "UPDATE governed_telemetry_outbox SET lease_expires_at = now() - interval '1 hour' "
+        "WHERE work_item_id = %s", (work_item_id,))
+    b_claim = claim_telemetry_work(conn, owner="worker-b")
+    assert b_claim is not None and b_claim["lease_fence"] > a_claim["lease_fence"]
+
+    # A wakes up and tries to finish work it no longer owns.
+    assert complete_telemetry_work(conn, work_item_id=work_item_id, owner="worker-a",
+                                   fence=a_claim["lease_fence"], ok=True,
+                                   error="") is False, "the stale worker must SEE that it lost"
+    still_leased = conn.execute(
+        "SELECT status, lease_owner, completed_at FROM governed_telemetry_outbox "
+        "WHERE work_item_id = %s", (work_item_id,)).fetchone()
+    assert still_leased == ("leased", "worker-b", None), "A's no-op left B's lease untouched"
+
+    # B, which does hold it, completes normally.
+    assert complete_telemetry_work(conn, work_item_id=work_item_id, owner="worker-b",
+                                   fence=b_claim["lease_fence"], ok=True) is True
+    assert conn.execute("SELECT status FROM governed_telemetry_outbox WHERE work_item_id = %s",
+                        (work_item_id,)).fetchone()[0] == "done"
+
+
+def test_completing_a_terminal_item_is_a_no_op(conn) -> None:
+    """A recorded verdict is not rewritable by a late second completion."""
+    _, run_id = _seed_run(conn, "terminal", with_intent=False)
+    work_item_id = enqueue_governed_telemetry(conn, generation_run_id=run_id, intent_id=None,
+                                              frozen_inputs={})
+    claimed = claim_telemetry_work(conn, owner="worker-a")
+    assert complete_telemetry_work(conn, work_item_id=work_item_id, owner="worker-a",
+                                   fence=claimed["lease_fence"], ok=True) is True
+    before = conn.execute(
+        "SELECT status, last_error, completed_at FROM governed_telemetry_outbox "
+        "WHERE work_item_id = %s", (work_item_id,)).fetchone()
+
+    assert complete_telemetry_work(conn, work_item_id=work_item_id, owner="worker-a",
+                                   fence=claimed["lease_fence"], ok=False,
+                                   error="second thoughts") is False
+    assert conn.execute(
+        "SELECT status, last_error, completed_at FROM governed_telemetry_outbox "
+        "WHERE work_item_id = %s", (work_item_id,)).fetchone() == before
+
+
+def test_completing_an_item_owned_by_somebody_else_is_a_no_op(conn) -> None:
+    _, run_id = _seed_run(conn, "wrong_owner", with_intent=False)
+    work_item_id = enqueue_governed_telemetry(conn, generation_run_id=run_id, intent_id=None,
+                                              frozen_inputs={})
+    claimed = claim_telemetry_work(conn, owner="worker-a")
+    assert complete_telemetry_work(conn, work_item_id=work_item_id, owner="worker-impostor",
+                                   fence=claimed["lease_fence"], ok=True) is False
+    assert conn.execute("SELECT status, lease_owner FROM governed_telemetry_outbox "
+                        "WHERE work_item_id = %s", (work_item_id,)).fetchone() \
+        == ("leased", "worker-a")
+
+
+def test_a_live_claim_is_invisible_to_a_second_connection(_dsn) -> None:
+    """The claim's concurrency safety, pinned by two REAL connections.
+
+    Without ``FOR UPDATE SKIP LOCKED`` the second claimer does not politely return None — it BLOCKS
+    on the row the first claimer is mid-claim on, and then applies its already-planned UPDATE to
+    that same row once the lock clears. So B carries a short ``lock_timeout``: a blocking
+    implementation fails this test loudly instead of hanging it.
+
+    This test COMMITS (cross-connection visibility is the whole point), so it owns its cleanup: the
+    outbox is mutable and the run manifest is not write-once, and both are removed in ``finally``.
+    Nothing it writes outlives it, so no later test can claim its rows.
+    """
+    run_id = "s1b1_run_concurrency"
+    setup = psycopg.connect(_dsn)
+    worker_a = psycopg.connect(_dsn)
+    worker_b = psycopg.connect(_dsn)
+    try:
+        setup.execute("INSERT INTO feature_generation_run (generation_run_id, intent_id, actor) "
+                      "VALUES (%s, NULL, '{}'::jsonb)", (run_id,))
+        first = enqueue_governed_telemetry(setup, generation_run_id=run_id, intent_id=None,
+                                           frozen_inputs={"n": 1})
+        setup.commit()
+        worker_b.execute("SET lock_timeout = '2s'")
+
+        claimed_a = claim_telemetry_work(worker_a, owner="worker-a")   # NOT committed
+        assert claimed_a is not None and claimed_a["work_item_id"] == first
+
+        assert claim_telemetry_work(worker_b, owner="worker-b") is None, \
+            "the only candidate row is locked by an in-flight claim: skip it, never share it"
+
+        # A finishes and commits; the item is terminal, so B still gets nothing from it...
+        assert complete_telemetry_work(worker_a, work_item_id=first, owner="worker-a",
+                                       fence=claimed_a["lease_fence"], ok=True) is True
+        worker_a.commit()
+        assert claim_telemetry_work(worker_b, owner="worker-b") is None
+
+        # ...but B is not wedged: the next item that arrives is claimable by it.
+        second = enqueue_governed_telemetry(setup, generation_run_id=run_id, intent_id=None,
+                                            frozen_inputs={"n": 2})
+        setup.commit()
+        worker_b.rollback()                       # a fresh snapshot, as a real worker loop has
+        claimed_b = claim_telemetry_work(worker_b, owner="worker-b")
+        assert claimed_b is not None and claimed_b["work_item_id"] == second
+    finally:
+        for connection in (worker_a, worker_b):
+            connection.rollback()
+            connection.close()
+        setup.rollback()
+        setup.execute("DELETE FROM governed_telemetry_outbox WHERE generation_run_id = %s",
+                      (run_id,))
+        setup.execute("DELETE FROM feature_generation_run WHERE generation_run_id = %s", (run_id,))
+        setup.commit()
+        setup.close()
 
 
 # ── the rollups ────────────────────────────────────────────────────────────────────────────────
@@ -498,14 +638,26 @@ def _seed_demand_group(conn, suffix: str, *, relationship_id: str, mode: str = "
 
 
 def test_rollup_aggregates_the_full_population_then_limits(conn) -> None:
+    """Aggregate-FIRST, limit second — and the totals half is what proves it.
+
+    ``rel_02`` is deliberately the FAT group and deliberately lands at the top of page 2. An
+    implementation that took the latest N demands and grouped those would still produce the right
+    group KEYS here, but ``rel_02``'s counts would come back truncated. The key list alone cannot
+    tell the two implementations apart; the counts can.
+    """
     for index in range(5):
         _seed_demand_group(conn, f"rollup_{index}", relationship_id=f"rel_{index:02d}")
+    for extra in range(3):                      # rel_02 -> 4 observations across 4 runs
+        _seed_demand_group(conn, f"rollup_fat_{extra}", relationship_id="rel_02")
+
     page1 = observation_queues(conn, limit=2)
     groups1 = page1["queues"]["bridge_demand"]
     assert len(groups1) == 2
     assert [g["relationship_id"] for g in groups1] == ["rel_00", "rel_01"]
     assert page1["next_cursor"] is not None
     assert isinstance(page1["as_of"], datetime), "as_of is echoed, resolved when not supplied"
+    assert all(group["relationship_id"] != "rel_02" for group in groups1), \
+        "the fat group must NOT be on page 1 — that is what makes it a boundary case"
 
     seen = list(groups1)
     cursor = page1["next_cursor"]
@@ -514,9 +666,17 @@ def test_rollup_aggregates_the_full_population_then_limits(conn) -> None:
         seen.extend(page["queues"]["bridge_demand"])
         cursor = page["next_cursor"]
     assert [g["relationship_id"] for g in seen] == [f"rel_{i:02d}" for i in range(5)]
-    # a group absent from page 1 still carries its own correct totals
-    assert all(g["observations"] == 1 for g in seen)
-    assert seen[4]["nested"][0]["position_table_ref"] == "core_banking.party"
+
+    by_relationship = {group["relationship_id"]: group for group in seen}
+    fat = by_relationship["rel_02"]
+    assert fat["observations"] == 4, "the whole group is counted, not the slice on this page"
+    assert fat["distinct_runs"] == 4
+    assert fat["distinct_intents"] == 4
+    assert fat["nested"][0]["observations"] == 4, "and the nested level aggregates fully too"
+    assert sum(group["observations"] for group in seen) == 8
+    for thin in ("rel_00", "rel_01", "rel_03", "rel_04"):
+        assert by_relationship[thin]["observations"] == 1
+    assert by_relationship["rel_04"]["nested"][0]["position_table_ref"] == "core_banking.party"
 
 
 def test_rollup_counts_intents_and_runs_separately(conn) -> None:
