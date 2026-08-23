@@ -162,6 +162,25 @@ describe('app shell', () => {
     expect(screen.queryByText(/runs-list-screen/)).not.toBeInTheDocument()
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page')
+    // The detail opens with its own hero (name, id, owner), so the page head drops to the
+    // breadcrumb: the list's title and description would restate one run's record at lower
+    // quality, and its copy ("Every feature-generation workflow…") describes the wrong surface.
+    expect(screen.getByText('CATALOG · RUNS')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 1, name: 'Feature runs' })).not.toBeInTheDocument()
+
+    // An empty id is the LIST — '#/runs/' parses to run_id='', and a detail sheet pointed at
+    // nothing would ask the server for a run whose id is the empty string.
+    arriveAt('#/runs/')
+    expect(screen.getByText(/runs-list-screen/)).toBeInTheDocument()
+    expect(screen.queryByText(/run-detail-screen/)).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Feature runs' })).toBeInTheDocument()
+
+    // The query form is the same destination as the path form: navigate('runs', {run_id}) writes
+    // it, so the list's own row click has to land on the detail exactly as a shared link does.
+    arriveAt('#/runs?run_id=grun_x')
+    expect(screen.getByText('run-detail-screen for grun_x')).toBeInTheDocument()
+    expect(screen.queryByText(/runs-list-screen/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 1, name: 'Feature runs' })).not.toBeInTheDocument()
   })
 
   it('overview start-here button navigates to Ingest (the route hash stays #/upload)', async () => {

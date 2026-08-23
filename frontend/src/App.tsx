@@ -389,6 +389,22 @@ const SUGGESTED_PAGE = {
     + 'are proposals with the engine’s own statuses, and nothing here changes the catalog.',
 }
 
+// The run detail's page-head. Unlike the sheets above it SHARES its route with a list ('#/runs' and
+// '#/runs/<id>' are one destination, one rail item), so it cannot be keyed into DETAIL_PAGES — it is
+// selected by the same run_id param that decides which screen renders below. The detail opens with
+// its own hero (name, id, owner, hypothesis), so the list's title and description would restate one
+// run's record at lower quality: eyebrow only.
+const RUN_DETAIL_PAGE = {
+  route: 'runs' as Route,
+  label: 'Run detail',
+  eyebrow: 'CATALOG · RUNS',
+  title: 'Feature run',
+  description:
+    'One feature-generation run opened to its record — identity, milestones, authoring rows and '
+    + 'the stage rail, exactly as the spine derives them. Read-only.',
+  crumbOnly: true,
+}
+
 // A page head. `crumbOnly` suppresses the title + description for screens that open with their own
 // hero, leaving the eyebrow as a breadcrumb.
 type PageHead = {
@@ -434,7 +450,11 @@ export default function App() {
   // Overview's copy.
   // A detail route (absent from PAGES, so no rail item highlights) selects its dedicated page-head
   // instead of falling back to Overview's copy.
-  const page = DETAIL_PAGES[route] ?? (pages.find(p => p.route === route) ?? pages[0])
+  // Read ONCE, and by both the head and the screen below: a run_id that selected the detail head
+  // but not the detail screen would put a breadcrumb over the list.
+  const runId = params.get('run_id')
+  const page = (route === 'runs' && runId ? RUN_DETAIL_PAGE : DETAIL_PAGES[route])
+    ?? (pages.find(p => p.route === route) ?? pages[0])
   return (
     <div className="shell">
       <aside className="rail">
@@ -489,8 +509,8 @@ export default function App() {
         {/* One route, two surfaces: '#/runs' is the grouped list, '#/runs/<id>' one run's record.
             The id rides the PATH (nav.ts decodes it into run_id), so an absent param is the list —
             never a detail sheet silently pointed at nothing. */}
-        {route === 'runs' && (params.get('run_id')
-          ? <RunDetailScreen runId={params.get('run_id') ?? ''} />
+        {route === 'runs' && (runId
+          ? <RunDetailScreen runId={runId} />
           : <RunsScreen navigate={navigate} />)}
         {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
         {route === 'semantics' && (
