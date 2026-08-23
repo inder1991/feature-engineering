@@ -235,9 +235,15 @@ def request_formula_method_override(
         request_method_override,
     )
 
-    expires = conn.execute(
-        "SELECT (now() + make_interval(hours => %s))::text",
-        (body.expires_in_hours,)).fetchone()[0]
+    from featuregen.overlay.upload.llm_spend import canonical_approval_expiry
+
+    # Day-floored for the same replay reason as spend approvals: a replayed override request
+    # computing a fresh now()+N would otherwise mint a new revision per replay, quietly
+    # extending the override's life one replay at a time.
+    expires = canonical_approval_expiry(
+        conn,
+        conn.execute("SELECT (now() + make_interval(hours => %s))::text",
+                     (body.expires_in_hours,)).fetchone()[0])
     try:
         override_id, created = request_method_override(
             conn, considered_revision_id=revision_id, option_id=option_id,
