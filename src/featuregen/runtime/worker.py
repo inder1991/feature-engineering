@@ -638,6 +638,21 @@ def run_worker_once(
 
     verifications_processed = _stage("verification")(_verifications, 0)
 
+    def _code_generation_jobs() -> int:
+        # Step 5a — the preview coordinator. Rides the GENERATION switch (child D9: no new
+        # rollout flags — the journey ends in a generation, so a deployment with generation off
+        # cannot run any of it). One job, one stage, per tick; the lease paces the waits.
+        from featuregen.materialize.code_generation_coordinator import (
+            process_code_generation_once,
+        )
+        from featuregen.materialize.generation_lane import generation_enabled
+
+        if not generation_enabled():
+            return 0
+        return 1 if process_code_generation_once(conn, worker_id=owner) else 0
+
+    code_generation_processed = _stage("code_generation")(_code_generation_jobs, 0)
+
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so
         # this stage runs on the raw autocommit connection — NOT wrapped in _tx (SP-0.5 round-2).

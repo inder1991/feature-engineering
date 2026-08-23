@@ -263,6 +263,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # this file. `create_app` already uses local imports for the same reason elsewhere.
     from featuregen.api.routes import (
         build_sets,
+        code_generation_jobs,
         feature_execution,
         formula_drafts,
         materialization_runs,
@@ -279,6 +280,11 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # and a deployment cutting traffic from V1 to V2 needs to run them in either
     # combination. One switch would make "V2 only" and "V1 only" the same setting.
     app.include_router(build_sets.router)
+    # Step 5a — the preview coordinator's surface (plan / request / watch / cancel). Behind the
+    # generation switch by construction: it shares `build_sets.require_generation_enabled`, since
+    # the journey it coordinates ends in a generation and a flag-off deployment must not quote
+    # costs for work its worker never runs.
+    app.include_router(code_generation_jobs.router)
     # Draft formula (async). NOT behind the materialization switch: drafting a formula for
     # inspection runs no cluster job and publishes nothing, so gating it on the materialization
     # flag would tie "may I look at a formula" to "does this deployment materialize" — two

@@ -2977,7 +2977,23 @@ three-part-commit rule, and `READINESS_NOT_MATERIALIZATION_READY` is DROPPED in 
 chain — readiness authorizes nothing executable). Step **4** is done except §11.3's method-override
 revision (deferred with its migration slot). Step **6 is DONE** (the §9.0 verification worker,
 behind `FEATUREGEN_VERIFICATION_V2_ENABLED` default OFF; §12.2 wiring waits on step 9's runner).
-**Next engineering: step 5.** Steps 0/0b remain OPERATOR; 7–10 are release-readiness per §0.1.0.
+**Step 5a is DONE** (2026-08-23): migration 1111 (`code_generation_job` + `_member` + `_event` +
+`_action` — one authorization/decision row PER action, R7; live-scope idempotency index mirroring
+1107; lease/fence/attempts from day one per §15.1), the shared draft-request composition extracted
+VERBATIM into `overlay/upload/formula_draft_service.py` (the route is now its HTTP adapter — §8.3:
+one composition, two callers), `materialize/code_generation_coordinator.py` (one stage per claim,
+CAS advances, lease released with each landed stage, BLOCKED-vs-FAILED split, the build stage
+composing the REAL chain: bindings → build set → server-minted approval → the one decision service
+→ generation request + queue row), routes `/code-generation-jobs[/plan|/{id}|/{id}/cancel]`
+(plan `ask`s and writes NOTHING; LLM work without a recorded cost confirmation is a 409; the §11.2
+ceiling lands durable and content-addressed via `authorize_spend` keyed on the job identity), and
+the worker tick stage riding the generation switch (child D9 — no new flags). 30 new tests; the
+route test caught a real spelling bug (lowercase strategy compare → LLM members counted zero →
+spend never required). **OWED inside step 5**: (a) *5a-spend-thread* — the draft worker must
+resolve the job's recorded spend authorization into `DispatchAuditContext.spend_authorization_id`
+so the ceiling RESERVES at the physical seam (today it is durable but not yet consulted on this
+path); (b) **5b — the frontend journey**. Steps 0/0b remain OPERATOR; 7–10 are release-readiness
+per §0.1.0.
 
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`

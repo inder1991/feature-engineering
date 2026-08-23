@@ -867,6 +867,12 @@ its sealed member says `LLM_AUTHORED`.
 
 ### Step 5 (CHILD) — durable coordinator and preview generation
 
+> **STATUS 2026-08-23: 5a DONE** — see the parent's execution-status block (§17) for the build
+> record; migration renumbered to **1111** at write time (1109/1110 were taken by the V1-companion
+> backfill and the verification substrate). The aggregate is a PREVIEW coordinator exactly as
+> §3.5 settled: terminal at `PREVIEW_READY`, links to what follows. Owed: the spend-thread wire
+> (the recorded §11.2 ceiling into the dispatch seam) and **5b**, below.
+
 **5a — the coordinator**
 
 1. `POST /code-generation-jobs/plan` — read-only cost/readiness preview. Returns ordered selected
