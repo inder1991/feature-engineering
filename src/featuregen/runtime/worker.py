@@ -620,6 +620,24 @@ def run_worker_once(
 
     spend_reconciled = _stage("spend_reconcile")(_reconcile_spend, 0)
 
+    def _verifications() -> int:
+        # §9.0 — the sandbox verification lane, behind its OWN switch (default OFF, same
+        # discipline as generation: flag off is byte-identical to the tick before the lane
+        # existed). One request per tick, like the other lanes.
+        from featuregen.materialize.verification_lane import (
+            process_verification_once,
+            reconcile_abandoned_verifications,
+            verification_enabled,
+        )
+
+        if not verification_enabled():
+            return 0
+        outcome = process_verification_once(conn, owner=owner)
+        reconciled = len(reconcile_abandoned_verifications(conn))
+        return (1 if outcome is not None else 0) + reconciled
+
+    verifications_processed = _stage("verification")(_verifications, 0)
+
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so
         # this stage runs on the raw autocommit connection — NOT wrapped in _tx (SP-0.5 round-2).

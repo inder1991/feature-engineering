@@ -71,6 +71,15 @@ _FROM_ANYWHERE = frozenset({
     VerificationStatusV1.REFUSED, VerificationStatusV1.FAILED, VerificationStatusV1.CANCELLED})
 
 
+class VerificationMovedUnderneath(RuntimeError):
+    """The row changed between the read and the write — another worker advanced it.
+
+    The same second line of defence `advance_request` grew for generation: the queue lease is what
+    stops two workers holding one request, and this is what stops an expired lease's still-alive
+    holder finishing the job as though nothing happened.
+    """
+
+
 class InvalidVerificationMove(ValueError):
     """A move off the lifecycle's path — a caller error, never a governed verdict."""
 
@@ -146,12 +155,24 @@ def advance_verification(
             f"A re-verification is a NEW request against the same artifact, never a step backwards")
 
     payload = json.dumps([dict(finding) for finding in findings]) if findings else None
-    conn.execute(
+    # ▲ COMPARE-AND-SET, not read-then-write — hardened when the worker arrived (§9.0). The read
+    # above validates the move; the UPDATE re-states the status in its own WHERE clause, so the row
+    # is only written if it is still what was validated. Without this, two workers both read
+    # REQUESTED, both find CLAIMED legal, and both write it — the second silently overwriting the
+    # first with a lifecycle table that permitted every individual step.
+    moved = conn.execute(
         "UPDATE verification_request SET status = %s, "
         "execution_hash = COALESCE(%s, execution_hash), "
         "findings = CASE WHEN %s::jsonb IS NULL THEN findings ELSE %s::jsonb END, "
-        "failure_reason = %s, updated_at = now() WHERE request_id = %s",
-        (to.value, execution_hash, payload, payload, failure_reason, request_id))
+        "failure_reason = %s, updated_at = now() "
+        "WHERE request_id = %s AND status = %s RETURNING status",
+        (to.value, execution_hash, payload, payload, failure_reason, request_id,
+         current.value)).fetchone()
+    if moved is None:
+        raise VerificationMovedUnderneath(
+            f"verification request {request_id} was {current.value} when this move was validated "
+            f"and is not any more: another worker advanced it. This move is ABANDONED rather than "
+            f"applied over theirs")
     return to
 
 

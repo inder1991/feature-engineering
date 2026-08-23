@@ -342,28 +342,59 @@ def request_verification(
                             detail={"detail": "the artifact disappeared between the gate and the "
                                               "record; nothing was written"})
 
-    identity_v1 = VerificationExecutionIdentityV1(
-        generation_authorization_revision_id=sealed.generation_authorization_revision_id,
-        check_set_hash=body.check_set_hash,
-        inventory_observation_id=body.inventory_observation_id,
-        attempt=body.attempt)
-    try:
-        execution_hash = record_verification_attempt(
-            conn, identity_v1, sealed_artifact_id=body.sealed_artifact_id,
-            staging_root=STAGING_ROOT, started_at=_now(conn))
-    except StagingPathCollision as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # ▲ THE ROUTE RECORDS A REQUEST, NOT AN ATTEMPT — §9.0, and this is the correction the old
+    # docstring's own promise demanded. It used to write `verification_attempt` HERE: an attempt
+    # that never ran, minted at request time, while "a worker executes it" was a sentence with no
+    # worker behind it. Now the LIFECYCLE row is created (1094's store, gaining its first
+    # production caller), the request-time decision is recorded, and the job is enqueued in the
+    # same transaction — the attempt evidence is written by the worker WHEN EXECUTION HAPPENS.
+    from featuregen.materialize.action_authorization import ActionV1, authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+    from featuregen.materialize.verification_lane import (
+        enqueue_verification,
+        verification_evidence_pins,
+    )
+    from featuregen.overlay.upload.verification_request_store import request_verification
 
-    response.headers[VERIFICATION_ID_HEADER] = execution_hash
-    counters.incr("featuregen.verify.requested")
-    log("featuregen.verify.requested", execution_hash=execution_hash,
-        artifact_id=body.sealed_artifact_id, attempt=body.attempt)
+    request_id, created = request_verification(
+        conn, request_id=mint_id("vfr"),
+        sealed_artifact_id=body.sealed_artifact_id,
+        environment_id=sealed.environment_id,
+        requested_by=identity.subject, requested_at=_now(conn))
+    if created:
+        authorization = authorize_action(
+            conn, action=ActionV1.EXECUTE_SANDBOX,
+            resource_identity_hash=body.sealed_artifact_id,
+            actor_subject=identity.subject, environment_id=sealed.environment_id)
+        decision_id, _decision = decide(
+            conn,
+            ActionRequestV1(
+                action=ActionV1.EXECUTE_SANDBOX,
+                resource_identity_hash=body.sealed_artifact_id,
+                evidence_pins=verification_evidence_pins(
+                    sealed_artifact_id=body.sealed_artifact_id,
+                    environment_id=sealed.environment_id)),
+            authorization_id=authorization.authorization_id)
+        conn.execute(
+            "UPDATE verification_request SET action_decision_revision_id = %s "
+            "WHERE request_id = %s", (decision_id, request_id))
+        enqueue_verification(
+            conn, request_id=request_id,
+            sealed_artifact_id=body.sealed_artifact_id,
+            environment_id=sealed.environment_id)
+
+    response.headers[VERIFICATION_ID_HEADER] = request_id
+    counters.incr("featuregen.verify.requested" if created
+                  else "featuregen.verify.deduplicated")
+    log("featuregen.verify.requested", request_id=request_id,
+        artifact_id=body.sealed_artifact_id, created=created)
     return {
-        "execution_hash": execution_hash,
+        "request_id": request_id,
+        "created": created,
         "sealed_artifact_id": body.sealed_artifact_id,
-        "attempt": body.attempt,
-        "staging_path": identity_v1.staging_path(STAGING_ROOT),
-        "detail": "the verification request was recorded; a worker executes it",
+        "detail": ("the verification was requested; the durable worker executes it"
+                   if created else
+                   "a verification of this artifact is already live in this environment"),
     }
 
 

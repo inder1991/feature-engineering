@@ -57,9 +57,16 @@ FORMULA_DRAFT_QUEUE_HANDLERS = frozenset({"formula_draft.author.v1"})
 # then fail to find the row it expects. Spelled here rather than imported for that set's reason:
 # `materialize/generation_lane.py` imports THIS module, and a test asserts the two spellings agree.
 GENERATION_QUEUE_HANDLERS = frozenset({"generation.v2.build"})
+#: ▲ The sandbox VERIFICATION lane (§9.0) — its OWN handler set and its own partition namespace
+#: (`verification:{environment}:{artifact}`), per §9.0.2's decision: sharing the generation set
+#: would make the partition exclusion serialize a verification against a compile that happens to
+#: share a partition key, and they are different acts. The guarantee is the same one the others
+#: lean on: `queue_one_inflight_per_partition`, the partial unique index — the NOT-IN predicate is
+#: the optimization, and the UniqueViolation catch is the handler.
+VERIFICATION_QUEUE_HANDLERS = frozenset({"verification.v2.run"})
 _DEDICATED_HANDLERS = (
     CONTROL_SIGNAL_HANDLERS | FORMULA_SHADOW_QUEUE_HANDLERS | MATERIALIZATION_QUEUE_HANDLERS
-    | FORMULA_DRAFT_QUEUE_HANDLERS | GENERATION_QUEUE_HANDLERS)
+    | FORMULA_DRAFT_QUEUE_HANDLERS | GENERATION_QUEUE_HANDLERS | VERIFICATION_QUEUE_HANDLERS)
 
 
 class BackpressureError(RuntimeError):
@@ -575,6 +582,45 @@ def renew_generation(
         (lease_seconds, claim.id, claim.lease_owner, claim.lease_fence),
     ).fetchone()
     return row is not None
+
+
+def claim_verification(
+    conn: psycopg.Connection, *, owner: str, lease_seconds: float = 120.0,
+) -> GenerationQueueClaim | None:
+    """One leased verification job, or ``None``. The generation claim's exact shape over the
+    verification handler set — same fence, same partition exclusion, same UniqueViolation-as-miss —
+    reusing the claim dataclass because the fields ARE the same and a third copy would be a third
+    place for the fence discipline to drift."""
+    row = None
+    try:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "WITH c AS ("
+                    " SELECT id FROM queue"
+                    " WHERE status='ready' AND available_at <= now()"
+                    "   AND handler = ANY(%s)"
+                    "   AND partition_key NOT IN "
+                    "       (SELECT partition_key FROM queue WHERE status='leased')"
+                    " ORDER BY priority, available_at, id"
+                    " FOR UPDATE SKIP LOCKED LIMIT 1"
+                    ") "
+                    "UPDATE queue q SET status='leased', lease_owner=%s, "
+                    " lease_expires_at=now() + make_interval(secs => %s), "
+                    " attempts=q.attempts + 1, lease_fence=q.lease_fence + 1 "
+                    "FROM c WHERE q.id=c.id RETURNING q.*",
+                    (list(VERIFICATION_QUEUE_HANDLERS), owner, lease_seconds),
+                )
+                row = cur.fetchone()
+    except psycopg.errors.UniqueViolation:
+        return None
+    if row is None:
+        return None
+    return GenerationQueueClaim(
+        id=row["id"], message_id=row["message_id"], partition_key=row["partition_key"],
+        handler=row["handler"], payload=row["payload"], attempts=row["attempts"],
+        max_attempts=row["max_attempts"], lease_owner=row["lease_owner"],
+        lease_fence=row["lease_fence"])
 
 
 def complete_generation(conn: psycopg.Connection, claim: GenerationQueueClaim) -> bool:
