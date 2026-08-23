@@ -220,6 +220,16 @@ Enrichment rules:
 - [ ] Tests: the real-recipe cross-catalog resolution (pin one TRANSACTION_FOUNDATION recipe by the documented discovery rule; seeds derived from its operands, failing loudly via verdict codes when wrong); the intent-origin request through the same builder; the two invariants above; exact display values for both fixtures; conflict-gated authority (a pin with `conflict_state="conflict"` yields `"absent"` and blocks the floor later); batched-read pin (query counter: enrichment issues a CONSTANT number of queries regardless of request count — assert with a counting cursor wrapper); origin purity; retirement (a RETIRED recipe folds RETIRED, never active).
 - [ ] Commit — `feat(governed-lens): complete governed options — batched frozen evidence, conflict-gated authority, origin purity`
 
+## Task S1A-4c (added by execution ruling 2026-08-23): projection-time role declaration
+
+**Why (verified during S1A-4b review):** 0 of the V2 registry's 1195 operands declares a `join_role`/`temporal_role`, and request-contract discovery reads the operand's OWN field (never derives) — so no recipe-origin cross-catalog frontier can start (G1). The naive legacy derivation would misclassify status/dimension operands as MEASURE (G2), and every genuine measure over a bridge refuses `physical_cardinality_unavailable` because no plan ever carries a bridge-realization revision (`attach_executable_bridge_realizations` has zero callers; G3 — CONFIRMED on the legacy path too: the old fixture resolved only because it had no measure at all).
+
+**Scope:** `planning_probe` sets explicit `join_role`/`temporal_role` on each projected `Need` from DECLARED operand facts only — `operand_class` + the concept registry's `entity_link`/`pit_role` — with a design-read step first: how does the legacy derivation treat the SAME concepts for dimension/status-class operands, and what role keeps them out of aggregation staging honestly? Registry-wide sweep tests; identity pins.
+
+**Acceptance:** the pinned pack recipe's frontier STARTS (past G1), and the primary refusal becomes `physical_cardinality_unavailable` — pinned as the honest boundary until the G3 charter closes.
+
+**G3 + G2-residual are NOT Stage-1A scope:** realization attachment changes bridge-segment identity (the revision enters segment identity material) and belongs with the bridge-admission machinery; the decision on WHERE it lands is taken at the Stage-1C report with the realization-gap queue's evidence in hand. Recorded as a first-class charter: until it closes, recipe-origin cross-catalog RESOLUTION rate is structurally 0 and the telemetry's value is the refusal taxonomy + demand queues.
+
 ## Task S1A-5: qualified-ref wrapper + conflict-gated floors (shared fix)
 
 **Files:** `src/featuregen/overlay/upload/qualified_ref.py` (thin wrapper over `object_ref`); `semantic_option_decision.py` (loader + BOTH floor arms); `activation_policy.py` (two appended defaulted fields on `FrozenOptionFactsV1`: `plan_kind: str = ""`, `read_set_pairs: tuple[tuple[str, str], ...] = ()`); tests in the module's suites.
