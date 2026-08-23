@@ -11,6 +11,7 @@ from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1, active_b
 from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
 from featuregen.overlay.upload.catalog_realizations import (
     derive_catalog_realizations,
+    key_entities_for,
     key_entity,
     object_grain,
     table_of,
@@ -482,8 +483,8 @@ def _child(state: _State, move: _Move, *, advance: bool) -> _State:
 
 def _hop_realizers(
         conn, hop: EntityRelationshipRefV1, scope: CatalogScopeV1, current_catalog: str,
-        cache: dict[str, tuple[CatalogEntityRelationshipV1, ...]]
-) -> tuple[RealizerFactV1, ...]:
+        cache: dict[str, tuple[CatalogEntityRelationshipV1, ...]],
+        *, first_hit: bool = False) -> tuple[RealizerFactV1, ...]:
     """The dead-end taxonomy probe: WHICH other authorized catalogs hold a VALID realization of
     this hop, and over which key columns. Non-empty -> the dead end is an UNSANCTIONED crossing (a
     realizer exists but no AVAILABLE bridge reaches it); empty -> missing_realization. Only
@@ -494,6 +495,11 @@ def _hop_realizers(
     are exactly what a bridge-demand row needs: they name the two columns somebody would have to
     link. Deterministic — catalogs in frozen scope order, realizations by ``realization_id``.
 
+    ``first_hit`` restores the pre-S1B-2 early exit for a caller that collects no evidence (see
+    :func:`assemble_paths`): it returns as soon as ONE realizer is found, which is precisely what
+    the verdict needs — "a realizer exists" is exactly the old bool. The verdict is therefore
+    identical in both modes; only how many realizers ride out on the hop differs.
+
     (The pre-S1B-2 docstring said "no VERIFIED bridge reaches it". That has not been true since
     ``active_bridges`` began admitting DRAFT/PARTIALLY_CONFIRMED links as well — see the Task-B3
     banner above, which corrected the same dead claim in the transition physics.)"""
@@ -503,13 +509,18 @@ def _hop_realizers(
             continue
         if cat not in cache:
             cache[cat] = derive_catalog_realizations(conn, cat).realizations
+        matches = sorted((r for r in cache[cat]
+                          if r.from_object_grain == hop.from_entity
+                          and r.to_object_grain == hop.to_entity),
+                         key=lambda r: r.realization_id)
+        if first_hit and matches:
+            matches = matches[:1]
         facts.extend(
             RealizerFactV1(catalog_source=cat, to_object_ref=r.to_object_ref,
                            from_key_ref=r.from_key_ref, to_key_ref=r.to_key_ref)
-            for r in sorted((r for r in cache[cat]
-                             if r.from_object_grain == hop.from_entity
-                             and r.to_object_grain == hop.to_entity),
-                            key=lambda r: r.realization_id))
+            for r in matches)
+        if first_hit and facts:
+            break               # the verdict is settled; no further catalog need be derived
     return tuple(facts)
 
 
@@ -521,39 +532,57 @@ def _hop_realizers(
 #: refusal, never a verdict, a segment or an identity.
 MAX_NEAR_SIDE_COLUMNS_WALKED = 50
 
+#: Why a hop's ``near_side_key_refs`` is what it is — so an empty tuple stops meaning three
+#: different things. `walked` = the whole table was read and these are all of it (possibly none);
+#: `capped` = the read stopped at MAX_NEAR_SIDE_COLUMNS_WALKED, so absence proves nothing beyond
+#: that prefix; `deadline_skipped` / `not_collected` = no read happened at all.
+NEAR_SIDE_WALKED = "walked"
+NEAR_SIDE_CAPPED = "capped"
+NEAR_SIDE_DEADLINE_SKIPPED = "deadline_skipped"
+NEAR_SIDE_NOT_COLLECTED = "not_collected"
+
 
 def _near_side_key_refs(conn, pos: _Position, to_entity: str,
-                        cache: dict[tuple[str, str, str], tuple[str, ...]],
-                        budget: CompileBudget | None) -> tuple[str, ...]:
+                        cache: dict[tuple[str, str, str], tuple[tuple[str, ...], str]],
+                        budget: CompileBudget | None) -> tuple[tuple[str, ...], str]:
     """The columns ON THE CURRENT TABLE that are keyed to the hop's far entity — i.e. the near-side
-    anchors a bridge out of this dead end would have to be built on. Resolved AT the refusal site
-    (never threaded down from :func:`rollup_bridges`, which computes this only in the case where a
-    bridge already exists and so is silent about exactly the tables that need one), through the
-    same governed ``key_entity`` reading every other transition uses.
+    anchors a bridge out of this dead end would have to be built on — plus the STATE that says how
+    that answer was reached. Resolved AT the refusal site (never threaded down from
+    :func:`rollup_bridges`, which computes this only in the case where a bridge already exists and
+    so is silent about exactly the tables that need one), through the same governed key-entity
+    reading every other transition uses.
 
-    Bounded three ways, because this runs on a hot path:
+    Bounded four ways, because this runs on a hot path:
 
+    * ONE batched ``key_entities_for`` read for the whole (already capped) column list, never
+      ``key_entity`` per column. Semantically identical — the same governed reading, the same
+      per-ref answers — and it removes the N+1 that made this expensive in the first place;
     * a cache keyed on ``(catalog, table_ref, to_entity)``, threaded like ``realization_cache``, so
       repeated dead ends on one table cost ONE walk. The entity is part of the key deliberately:
       the answer is a function of the hop's far entity as well as the table, and two hops dead-
       ending on the same table would otherwise read each other's answer;
-    * ``MAX_NEAR_SIDE_COLUMNS_WALKED`` columns, in ``_table_columns``' deterministic order;
-    * the run's compile budget. Past the deadline the walk is SKIPPED and the result is honestly
-      empty rather than cached — the hop still carries everything that was already in hand. The
-      skip deliberately does not touch ``budget.stopped_by_time``/``remaining``: that pair records
-      what truncated the CONTRACT COMPILE, and evidence collection is not a compile."""
+    * ``MAX_NEAR_SIDE_COLUMNS_WALKED`` columns, in ``_table_columns``' deterministic order — and
+      hitting that bound is REPORTED (`capped`), never silently indistinguishable from a full read;
+    * the run's compile budget. ``budget is None`` means the caller collects no evidence at all
+      (`not_collected`); past the deadline the walk is skipped (`deadline_skipped`). Neither is
+      cached — an unknown must never be read back as a known empty — and neither touches
+      ``budget.stopped_by_time``/``remaining``: that pair records what truncated the CONTRACT
+      COMPILE, and evidence collection is not a compile."""
+    if budget is None:
+        return (), NEAR_SIDE_NOT_COLLECTED
     key = (pos.catalog, pos.table_ref, to_entity)
     if key in cache:
         return cache[key]
-    if budget is not None and budget.clock() >= budget.deadline_monotonic:
-        return ()                       # unknown, not empty — and never cached as if it were known
-    refs = tuple(
-        col_ref
-        for col_ref, _is_grain in _table_columns(
-            conn, pos.catalog, pos.table_ref)[:MAX_NEAR_SIDE_COLUMNS_WALKED]
-        if key_entity(conn, pos.catalog, col_ref) == to_entity)
-    cache[key] = refs
-    return refs
+    if budget.clock() >= budget.deadline_monotonic:
+        return (), NEAR_SIDE_DEADLINE_SKIPPED
+    columns = _table_columns(conn, pos.catalog, pos.table_ref)
+    walked = columns[:MAX_NEAR_SIDE_COLUMNS_WALKED]
+    entities = key_entities_for(conn, [(pos.catalog, col_ref) for col_ref, _is_grain in walked])
+    result = (tuple(col_ref for col_ref, _is_grain in walked
+                    if entities[(pos.catalog, col_ref)] == to_entity),
+              NEAR_SIDE_CAPPED if len(columns) > len(walked) else NEAR_SIDE_WALKED)
+    cache[key] = result
+    return result
 
 
 def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySemanticPathV1,
@@ -566,9 +595,15 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
     hop realized AND the target entity held is a COMPLETE executable path (an EXACT zero-hop path
     completes in place — the zero-bridge roll-up). Read-only, pure, deterministic.
 
-    ``budget`` is CONSULTED, never spent: the only thing it gates is the near-side column walk on
-    a dead end (see :func:`_near_side_key_refs`). Which plans exist, and their identities, do not
-    depend on it — passing None simply collects that evidence unconditionally."""
+    ``budget`` is CONSULTED, never spent, and it is also the EVIDENCE SWITCH. Passing one (the
+    governed lens, the shadow planner) means "collect the demand evidence, within this deadline":
+    every realizer, and the near-side walk. Passing None means "verdicts only" — the realizer probe
+    reverts to its pre-S1B-2 early exit and the near-side walk does not run at all. That is not a
+    degraded mode by accident: the two multi-source callers read ``assembly.complete`` and never
+    look at a rejected plan, so collecting a rejection's evidence for them would be pure cost on a
+    hot path. WHICH PLANS EXIST AND WHAT THEY ARE REFUSED FOR IS IDENTICAL EITHER WAY — "a realizer
+    exists" settles the verdict and both modes answer it the same; only the richness of what rides
+    out on ``unmet_hop`` differs, and ``near_side_state`` says which mode produced it."""
     hops = semantic_path.hops
     prefix = (BindingPathSegmentV1(segment_kind=SegmentKind.direct_catalog,
                                    catalog_source=source_position.catalog),)
@@ -598,7 +633,7 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
     complete: list[BindingPlanV1] = []
     rejected: list[BindingPlanV1] = []
     realization_cache: dict[str, tuple[CatalogEntityRelationshipV1, ...]] = {}
-    near_side_cache: dict[tuple[str, str, str], tuple[str, ...]] = {}
+    near_side_cache: dict[tuple[str, str, str], tuple[tuple[str, ...], str]] = {}
     states_expanded = 0
     bridge_transitions = 0
     realizations_truncated = False
@@ -674,9 +709,11 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
                 # exactly as before, and to ride out on the typed hop. They are now computed on the
                 # budget-blocked branch too (which used to short-circuit past the probe): a
                 # capacity refusal is still somebody's missing crossing, and the catalog reads are
-                # already cached per run.
+                # already cached per run. With no budget (= no evidence collection) the probe
+                # early-exits on the first hit, which is all the verdict has ever needed.
                 realizers = (() if hop is None else _hop_realizers(
-                    conn, hop, scope, state.position.catalog, realization_cache))
+                    conn, hop, scope, state.position.catalog, realization_cache,
+                    first_hit=budget is None))
                 if budget_blocked:
                     status = PlanResolutionStatus.bounded_out
                     primary = ReasonCode.bounded_out_max_bridges
@@ -686,6 +723,9 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
                 else:
                     status = PlanResolutionStatus.unresolved
                     primary = ReasonCode.missing_realization
+                near_side_refs, near_side_state = (
+                    ((), NEAR_SIDE_NOT_COLLECTED) if hop is None else _near_side_key_refs(
+                        conn, state.position, hop.to_entity, near_side_cache, budget))
                 rejected.append(_mint(
                     state, resolution_status=status,
                     path_status=PathResolutionStatus.source_to_target_rejected, primary=primary,
@@ -700,8 +740,8 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
                         position_table_ref=state.position.table_ref,
                         hop_index=state.hop_index, verdict=primary.value,
                         realizers=realizers,
-                        near_side_key_refs=_near_side_key_refs(
-                            conn, state.position, hop.to_entity, near_side_cache, budget))))
+                        near_side_key_refs=near_side_refs,
+                        near_side_state=near_side_state)))
                 continue
 
             for m in r_moves:                       # same tier: the hop advances, no crossing

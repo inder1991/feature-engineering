@@ -68,6 +68,7 @@ until G3 closes.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -675,10 +676,41 @@ def _rejection(request: FeaturePlanningRequestV1, result: BindingPlanningResultV
     candidate that named the hop it died on (S1B-2). It stays EMPTY, honestly, for a refusal that
     has no unmet hop behind it at all — a contract-compile refusal on a path that DID resolve
     source→target mints no rejected candidate, and the frontier-truncation reject deliberately
-    names no hop."""
-    unmet = [_unmet_hop_demand(plan.unmet_hop) for plan in result.candidate_plans
-             if plan.path_resolution_status is PathResolutionStatus.source_to_target_rejected
-             and plan.unmet_hop is not None]
+    names no hop.
+
+    **``reason`` and ``unmet_hops`` are different questions, and an adapter must not conflate
+    them.** ``reason`` is the ONE headline for why this request has no governed contract, chosen by
+    ``_rejection_reason``'s precedence — which prefers the SELECTED plan's contract refusal. A run
+    can therefore hand back a contract-refusal headline (say
+    ``physical_cardinality_unavailable``) while other candidates in the same run dead-ended and are
+    carrying real, demand-bearing hops. Both are true at once. Anything filing demand rows must key
+    off each hop's OWN ``verdict``, never off the rejection's ``reason``.
+
+    **The ``planner_capacity`` queue is asymmetric, by design and permanently.** Both capacity
+    verdicts route to the same queue in ``governed_observation_store.DEMAND_VERDICT_QUEUES``, but
+    only one of them can ever arrive through this list: ``bounded_out_max_bridges`` names the
+    crossing it could not afford, so its reject carries a populated hop and appears here;
+    ``bounded_out_max_frontier_states`` is minted from the START state, which realized nothing, so
+    it carries ``unmet_hop=None`` and is structurally invisible to ``unmet_hops``. A consumer that
+    wants frontier-exhaustion counted must read it from the run's bounding metrics or file it from
+    the rejection level — it will never appear here, and its absence is not a defect to fix.
+
+    Identical hop dicts are collapsed: two rejected candidates can dead-end on the SAME hop at the
+    SAME position by different routes (the diamond case), and that is one demand, not two. The
+    store would dedupe them anyway on ``demand_identity_hash``; doing it here keeps the payload
+    honest about how many distinct demands were actually found. Order is preserved."""
+    unmet: list[dict] = []
+    seen: set[str] = set()
+    for plan in result.candidate_plans:
+        if (plan.path_resolution_status is not PathResolutionStatus.source_to_target_rejected
+                or plan.unmet_hop is None):
+            continue
+        demand = _unmet_hop_demand(plan.unmet_hop)
+        marker = json.dumps(demand, sort_keys=True)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unmet.append(demand)
     return {"lens": _LENS, "reason": _rejection_reason(result),
             "recipe_id": request.source_definition_id,
             "request_hash": request.source_content_hash,

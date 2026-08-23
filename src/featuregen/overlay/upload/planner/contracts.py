@@ -536,6 +536,12 @@ class UnmetHopV1:
     verdict: str
     realizers: tuple[RealizerFactV1, ...] = ()
     near_side_key_refs: tuple[str, ...] = ()
+    # WHY near_side_key_refs is what it is, so `()` stops meaning three different things: the walk
+    # ran and found none (`walked`), it stopped at the column cap so absence proves nothing past
+    # that prefix (`capped`), or no walk happened at all (`deadline_skipped` / `not_collected` —
+    # see assembly.NEAR_SIDE_*). Defaulted + appended, and hashed by nothing, like the rest of
+    # this type — it describes how evidence was gathered, never what was refused.
+    near_side_state: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -464,6 +464,14 @@ def test_new_plan_facts_move_no_identity(db):
 from featuregen.overlay.upload.planner import assembly as _assembly
 
 
+def _live_budget() -> CompileBudget:
+    """A budget with room and a deadline far in the future. Its presence is what asks the
+    assembler to COLLECT a rejection's evidence at all (`assemble_paths`' docstring): a caller that
+    passes none gets identical verdicts with leaner hops, which
+    `test_a_caller_with_no_budget_gets_the_same_verdicts_with_leaner_evidence` pins."""
+    return CompileBudget(remaining=64, deadline_monotonic=1e9, clock=lambda: 0.0)
+
+
 def _far_realizer_split(db):
     """`ops` holds the transaction-grain table with an account FK and NO intra-catalog join; `rev`
     holds a transactions table that DOES declare the transaction -> account join (so `rev` VALIDLY
@@ -492,7 +500,7 @@ def _rejects(result):
 def test_unsanctioned_bridge_reject_carries_the_hop_and_its_far_realizer(db):
     _far_realizer_split(db)
     result = plan_bindings(db, template=_txn_template(), target_entity="account",
-                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW, budget=_live_budget())
     ops_rejects = [p for p in _rejects(result) if p.catalog_source == "ops"]
     assert len(ops_rejects) == 1
     reject = ops_rejects[0]
@@ -528,7 +536,7 @@ def test_missing_realization_reject_carries_the_hop_with_no_realizers(db):
     somebody's unbuilt bridge."""
     _split(db)
     result = plan_bindings(db, template=_txn_template(), target_entity="account",
-                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW, budget=_live_budget())
     (reject,) = _rejects(result)
     assert reject.primary_reason_code is ReasonCode.missing_realization
     hop = reject.unmet_hop
@@ -585,7 +593,8 @@ def test_repeated_dead_ends_on_one_table_walk_its_columns_once(db, monkeypatch):
 
     monkeypatch.setattr(_assembly, "_table_columns", counted)
     result = plan_bindings(db, template=tmpl, target_entity="account",
-                           scope=_scope("ops", "m1", "m2", "hub"), roles=(), now=_NOW)
+                           scope=_scope("ops", "m1", "m2", "hub"), roles=(), now=_NOW,
+                           budget=_live_budget())
     hub_rejects = [p for p in _rejects(result)
                    if p.unmet_hop is not None and p.unmet_hop.position_catalog == "hub"]
     assert len(hub_rejects) == 2, "two distinct two-bridge routes both dead-end on hub"
@@ -598,6 +607,77 @@ def test_repeated_dead_ends_on_one_table_walk_its_columns_once(db, monkeypatch):
     # `reposition_bridges` (2 states) plus ONCE by the near-side walk — 3, not 4. Without the
     # cache the second dead end would walk the same table again.
     assert calls.count(("hub", "public.transactions")) == 3
+
+
+def test_the_near_side_walk_is_one_batched_read_not_one_per_column(db, monkeypatch):
+    """The walk reads the column list once and resolves EVERY key entity in ONE
+    `key_entities_for` query — never `key_entity` per column, which is the N+1 the batched reader
+    exists to forbid. Same governed reading, same answer, one round trip."""
+    _far_realizer_split(db)
+    batched: list[list[tuple[str, str]]] = []
+    real = _assembly.key_entities_for
+
+    def counted(conn, refs):
+        refs = list(refs)
+        batched.append(refs)
+        return real(conn, refs)
+
+    monkeypatch.setattr(_assembly, "key_entities_for", counted)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW,
+                           budget=_live_budget())
+    (reject,) = [p for p in _rejects(result) if p.catalog_source == "ops"]
+    assert reject.unmet_hop.near_side_key_refs == ("public.transactions.account_id",)
+    # ONE call, carrying the WHOLE table in it — not one call per column, and not one per reject
+    assert len(batched) == 1
+    assert batched[0] == [("ops", "public.transactions.account_id"),
+                          ("ops", "public.transactions.transaction_id")]
+    assert reject.unmet_hop.near_side_state == "walked"
+
+
+def test_a_caller_with_no_budget_gets_the_same_verdicts_with_leaner_evidence(db):
+    """The two multi-source callers read only `assembly.complete`, so collecting a REJECTED plan's
+    evidence for them is pure cost on a hot path. Passing no budget turns evidence collection off:
+    the realizer probe early-exits on the first hit and the near-side walk does not run. What must
+    NOT move is the refusal itself — same plans, same verdicts, same identities."""
+    _two_far_realizers(db)
+    scope = _scope("ops", "rev", "arc")
+    rich = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
+                         roles=(), now=_NOW, budget=_live_budget())
+    lean = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
+                         roles=(), now=_NOW)
+    # the REFUSAL is identical: same plans, same order, same ids, same verdicts
+    assert [(p.physical_plan_id, p.path_resolution_status, p.primary_reason_code)
+            for p in rich.candidate_plans] == \
+           [(p.physical_plan_id, p.path_resolution_status, p.primary_reason_code)
+            for p in lean.candidate_plans]
+    (rich_reject,) = [p for p in _rejects(rich) if p.catalog_source == "ops"]
+    (lean_reject,) = [p for p in _rejects(lean) if p.catalog_source == "ops"]
+    assert rich_reject.primary_reason_code is ReasonCode.unsanctioned_bridge
+    assert lean_reject.primary_reason_code is ReasonCode.unsanctioned_bridge
+    # ...the EVIDENCE is not. Two catalogs realize the hop; the lean probe stops at the first,
+    # which is all the verdict ever needed.
+    assert [r.catalog_source for r in rich_reject.unmet_hop.realizers] == ["rev", "arc"]
+    assert [r.catalog_source for r in lean_reject.unmet_hop.realizers] == ["rev"]
+    assert rich_reject.unmet_hop.near_side_key_refs == ("public.transactions.account_id",)
+    assert rich_reject.unmet_hop.near_side_state == "walked"
+    assert lean_reject.unmet_hop.near_side_key_refs == ()
+    assert lean_reject.unmet_hop.near_side_state == "not_collected"   # never "found none"
+
+
+def _two_far_realizers(db):
+    """`_far_realizer_split` plus a SECOND far catalog that also realizes transaction -> account,
+    so full evidence carries two realizers and first-hit evidence carries one. The probe walks the
+    FROZEN SCOPE order — `("ops", "rev", "arc")` below, not alphabetical — so `rev` is the first
+    hit; the assertions state that order rather than assuming a sort."""
+    _far_realizer_split(db)
+    _seed(db, "arc", [
+        (CanonicalRow("arc", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("arc", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("arc", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
 
 
 def test_an_expired_compile_budget_skips_the_near_side_walk(db):
@@ -615,6 +695,7 @@ def test_an_expired_compile_budget_skips_the_near_side_walk(db):
     assert hop.relationship_id == "transaction_to_account"
     assert hop.realizers and hop.realizers[0].catalog_source == "rev"
     assert hop.near_side_key_refs == ()
+    assert hop.near_side_state == "deadline_skipped"   # skipped, NOT "walked and found none"
     # the walk skip is NOT a compile-budget stop: it must not claim the run's truncation reason
     assert past.stopped_by_time is None and past.remaining == 5
 
@@ -640,7 +721,7 @@ def test_the_same_reject_keeps_its_id_whether_or_not_the_hop_is_carried(db):
     from featuregen.overlay.upload.planner.contracts import make_binding_plan
     _far_realizer_split(db)
     result = plan_bindings(db, template=_txn_template(), target_entity="account",
-                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW, budget=_live_budget())
     (reject,) = [p for p in _rejects(result) if p.catalog_source == "ops"]
     assert reject.unmet_hop is not None
     bare = make_binding_plan(

@@ -60,9 +60,18 @@ DEMAND_VERDICT_QUEUES: MappingProxyType[str, str] = MappingProxyType({
     ReasonCode.bounded_out_max_frontier_states.value: "planner_capacity",
 })
 
-#: Capacity verdicts have NO unmet hop by design — the search stopped before reaching one — so
-#: their identity material is reduced and their hop columns stay at the schema's defaults. Hashing
-#: whatever hop the frontier happened to be sitting on would mint a fresh "demand" per run.
+#: Capacity rows DROP whatever hop reached them, by ruling: their identity material is reduced and
+#: their hop columns stay at the schema's defaults. Hashing the hop the frontier happened to be
+#: sitting on when it ran out of budget would mint a fresh "demand" per run — the demand is the
+#: CAPACITY, not that hop.
+#:
+#: The two members differ in what there is to drop, and S1B-2 made the difference real:
+#:   * ``bounded_out_max_bridges`` — the search DID reach a specific crossing it could not spend a
+#:     bridge on, so its rejected plan carries a fully populated ``unmet_hop``. This set is what
+#:     discards it here. (Both JSONB evidence columns are still written from the rejection, so a
+#:     capacity row keeps its realizers/near-side sample even though its hop identity is reduced.)
+#:   * ``bounded_out_max_frontier_states`` — genuinely has no hop at all: that reject is minted from
+#:     the START state, which realized nothing, so the planner carries ``unmet_hop=None``.
 CAPACITY_VERDICTS = frozenset({
     ReasonCode.bounded_out_max_bridges.value,
     ReasonCode.bounded_out_max_frontier_states.value,

@@ -229,15 +229,20 @@ _MODULE_BODY = "<module-level statements and imports>"
 #                          already computing instead of a bool. The RENAME is why two names appear:
 #                          the old one is gone from the head file, so the per-symbol differ reports
 #                          both halves of one change.
-#   `_near_side_key_refs`, `MAX_NEAR_SIDE_COLUMNS_WALKED`
+#   `_near_side_key_refs`, `MAX_NEAR_SIDE_COLUMNS_WALKED`, `NEAR_SIDE_WALKED` /
+#   `NEAR_SIDE_CAPPED` / `NEAR_SIDE_DEADLINE_SKIPPED` / `NEAR_SIDE_NOT_COLLECTED`
 #                        — new: the near-side key columns a bridge out of this dead end would
 #                          anchor on, resolved AT the refusal site through the same governed
-#                          `key_entity` reading the transitions use, cached per
-#                          (catalog, table, entity) and capped.
+#                          key-entity reading the transitions use, in ONE batched
+#                          `key_entities_for` query (never `key_entity` per column), cached per
+#                          (catalog, table, entity), capped, and reporting WHICH of the four ways
+#                          it reached its answer so `()` never means three different things.
 #   `assemble_paths`     — already listed: mints the dead-end reject with the typed hop attached,
 #                          and threads the two caches + the (consulted, never spent) compile budget.
-#   `<module-level ...>` — two imports: `RealizerFactV1`/`UnmetHopV1` from contracts, and a
-#                          TYPE_CHECKING-only `CompileBudget` (no runtime import graph change).
+#   `<module-level ...>` — three imports: `RealizerFactV1`/`UnmetHopV1` from contracts,
+#                          `key_entities_for` from the same `catalog_realizations` module
+#                          `key_entity` already came from, and a TYPE_CHECKING-only `CompileBudget`
+#                          (no runtime import graph change).
 #   `_assemble_rollups`  — plan.py: passes the run-owned budget the assembler now consults.
 #
 # The basis, stated so it is checkable rather than asserted:
@@ -252,16 +257,27 @@ _MODULE_BODY = "<module-level statements and imports>"
 #     `test_the_same_reject_keeps_its_id_whether_or_not_the_hop_is_carried`.
 #   * THE BUDGET GATES EVIDENCE, NEVER A PLAN. It is consulted (clock vs deadline) and never spent:
 #     `remaining`/`stopped_by_time` are untouched, so a walk skipped past the deadline cannot
-#     masquerade as the compile pass's truncation. Which plans exist does not depend on it.
-#   * ONE REAL COST DELTA, DELIBERATE: the realizer probe now also runs on the budget-blocked
-#     branch, which used to short-circuit past it. A capacity refusal is still somebody's missing
-#     crossing, and the underlying catalog reads are already cached per run.
+#     masquerade as the compile pass's truncation. Which plans exist does not depend on it — and
+#     neither does WHY they were refused. `budget is None` (which is exactly the two multi-source
+#     callers, both of which read only `assembly.complete`) turns evidence collection OFF: the
+#     realizer probe reverts to its pre-S1B-2 first-hit early exit, and the near-side walk does not
+#     run at all. "A realizer exists" is what the verdict has always asked, and both modes answer
+#     it identically — pinned end-to-end by
+#     `test_plan.py::test_a_caller_with_no_budget_gets_the_same_verdicts_with_leaner_evidence`
+#     (same plans, same ids, same primary reason codes; only the hop's evidence differs).
+#   * ONE REAL COST DELTA, DELIBERATE AND BOUNDED: with a budget present the realizer probe also
+#     runs on the budget-blocked branch, which used to short-circuit past it. A capacity refusal is
+#     still somebody's missing crossing, and the underlying catalog reads are already cached per
+#     run. Nothing here adds a per-column read: the near-side walk is ONE batched
+#     `key_entities_for` query per (catalog, table, entity), pinned by
+#     `test_the_near_side_walk_is_one_batched_read_not_one_per_column`.
 #   * Proof 2 (RUNTIME) compares no value any of this touches, and still passes.
 _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
     "src/featuregen/overlay/upload/planner/assembly.py": frozenset({
         "_grain_key_ref", "assemble_paths",
         "_hop_realizable_elsewhere", "_hop_realizers", "_near_side_key_refs",
-        "MAX_NEAR_SIDE_COLUMNS_WALKED", _MODULE_BODY,
+        "MAX_NEAR_SIDE_COLUMNS_WALKED", "NEAR_SIDE_WALKED", "NEAR_SIDE_CAPPED",
+        "NEAR_SIDE_DEADLINE_SKIPPED", "NEAR_SIDE_NOT_COLLECTED", _MODULE_BODY,
     }),
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
         "_hop_evidence", "CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN", "CompilerContext",
