@@ -1001,3 +1001,54 @@ def test_SECOND_FAILURE_a_fresh_approval_is_a_FRESH_coupon_not_the_exhausted_one
         provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
     assert was_created is True
     advance(db, second, DraftStateV1.AUTHORING)   # and it can run — not dead on arrival
+
+
+def test_ORDINAL_EDGES_no_stacking_while_live_and_no_resurrection_after_newer(db):
+    """Round-4 delta probes: (a) an identical re-approval while a coupon LIVES converges on that
+    coupon — the ordinal is unchanged, so the identity is, so ON CONFLICT collapses it: no
+    stacking. (b) After exhaustion mints generation 1, a replay of the ORIGINAL approval also
+    lands on generation 1 — the ordinal counts exhausted coupons, so the old request's identity
+    now points at the newest generation: no resurrection, no third coupon."""
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        approve_regeneration_exception,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-ord")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-ord",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-ord",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+
+    def _approve():
+        return approve_regeneration_exception(
+            db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+            strategy_identity_hash="sih-llm", actor_subject="user:owner",
+            llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z",
+            scope_key=scope)
+
+    gen0, created0 = _approve()
+    again, created_again = _approve()
+    assert created0 is True and created_again is False
+    assert again == gen0, "(a) live coupon: identical re-approval is THAT coupon, not a stack"
+
+    minted, _ = _request_again(db, draft_id="fd-ord-retry", option_id="opt-fd-ord",
+                               provider_contract_hash="sha256:llm",
+                               strategy_identity_hash="sih-llm")
+    db.execute("UPDATE formula_draft SET state = 'FAILED', failure_reason = 'again' "
+               "WHERE formula_draft_id = %s", (minted,))
+    gen1, created1 = _approve()
+    assert created1 is True and gen1 != gen0, "post-exhaustion: a fresh generation"
+
+    replay, created_replay = _approve()
+    assert created_replay is False
+    assert replay == gen1, "(b) the old request's replay lands on the NEWEST generation"
+    total = db.execute(
+        "SELECT COUNT(*) FROM formula_draft_regeneration_exception "
+        "WHERE target_formula_identity_hash = %s", (identity,)).fetchone()
+    assert total == (2,), "two generations, never a third from replays"

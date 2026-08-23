@@ -318,6 +318,34 @@ def approve_regeneration_exception(
     """
     from featuregen.canonical import jcs_sha256
 
+    # ▲ UNDER THE SCOPE LOCK (round-4 delta probe): the ordinal read, the covering-set read and
+    # the coupon INSERTs serialize on the SAME advisory lock the minting transaction holds — so
+    # an approval can never race the consume that exhausts its predecessor into computing a
+    # stale ordinal, and two concurrent identical approvals converge on one coupon twice over
+    # (the lock, and the content-addressed ON CONFLICT beneath it).
+    with scope_locked(conn, scope_key):
+        return _approve_locked(
+            conn, target_formula_identity_hash=target_formula_identity_hash,
+            provider_contract_hash=provider_contract_hash,
+            strategy_identity_hash=strategy_identity_hash, actor_subject=actor_subject,
+            llm_spend_authorization_id=llm_spend_authorization_id, expires_at=expires_at,
+            scope_key=scope_key, max_uses=max_uses, jcs_sha256=jcs_sha256)
+
+
+def _approve_locked(
+    conn, *, target_formula_identity_hash, provider_contract_hash, strategy_identity_hash,
+    actor_subject, llm_spend_authorization_id, expires_at, scope_key, max_uses, jcs_sha256,
+) -> tuple[tuple[str, ...], bool]:
+    """The approval body, with the scope lock already held.
+
+    ▲ One EXPIRY edge, stated so it is a decision rather than a discovery (round-4 delta): the
+    ordinal counts EXHAUSTED coupons only — an EXPIRED-but-unexhausted coupon does not bump it,
+    so an identical re-approval returns that dead coupon (`created=False`). Deliberate: expiry
+    is time's own refusal, day-floored expiry makes the same-day identical case reachable only
+    through the rare sub-day exact windows, and re-arming past an expiry requires a genuinely
+    new approval window (next day's floor, or changed terms) rather than a silent re-mint of
+    terms whose validity lapsed.
+    """
     covering = covering_tombstones(
         conn, scope_key=scope_key, formula_identity_hash=target_formula_identity_hash)
     tombstone_ids: tuple[str | None, ...] = (
