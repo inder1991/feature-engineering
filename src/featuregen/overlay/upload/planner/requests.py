@@ -21,7 +21,11 @@ later parts — this seam is what lets those rules serve every origin at once wh
 from __future__ import annotations
 
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
-from featuregen.overlay.upload.feature_planning_contracts import FeaturePlanningRequestV1
+from featuregen.overlay.upload.concepts import concept
+from featuregen.overlay.upload.feature_planning_contracts import (
+    FeaturePlanningRequestV1,
+    RequiredOperandV1,
+)
 from featuregen.overlay.upload.templates import Need, Template
 
 
@@ -39,9 +43,55 @@ def _temporal_role(raw: str) -> TemporalRole | None:
         return None
 
 
+def _entity_link(operand: RequiredOperandV1) -> str | None:
+    """The entity a key operand NAMES, read off the governed concept registry — the same reading
+    `need_metadata` does. A key whose concept links to no entity can never be the anchor: the
+    planner refuses a `source_entity_need_role` that does not name an entity-linked need."""
+    resolved = concept(operand.concept)
+    return resolved.entity_link if resolved is not None else None
+
+
+def _source_anchor(request: FeaturePlanningRequestV1) -> tuple[str | None, str | None]:
+    """The probe's source anchor from the V2 contract's own declarations: the entity_key
+    operand COMPATIBLE with the source grain (allowed grains name it, or are unconstrained).
+    None/None when absent or ambiguous — the planner's fallback then applies and a genuinely
+    ambiguous recipe fails with the planner's NAMED error instead of raising.
+
+    Two DECLARED tie-breaks settle the recipes carrying several compatible keys, applied in this
+    order and only while more than one candidate remains:
+
+    1. the key naming the request's own OUTPUT grain — the entity the feature is produced at is
+       the anchor even where the contract also requires a relationship to reach it
+       (`household_relationship_value` is exactly that shape, so this tie-break must come first);
+    2. the key declaring NO `relationship_requirement` — a key the contract says is reachable
+       only THROUGH a verified relationship to another entity is a related key, never the source
+       row's own anchor (`own_transfer_outflow_amount`'s payee, `first_time_payee_high_value`'s).
+
+    Every one of them is a recipe declaration; nothing here reads a column, a role name or an
+    operand's tuple position."""
+    candidates = [op for op in request.operands
+                  if op.operand_class == "entity_key"
+                  and _entity_link(op) is not None
+                  and (not op.allowed_source_grains
+                       or request.source_grain in op.allowed_source_grains)]
+    if len(candidates) > 1:
+        at_output_grain = [op for op in candidates
+                           if _entity_link(op) == request.output_grain]
+        if len(at_output_grain) == 1:
+            candidates = at_output_grain
+    if len(candidates) > 1:
+        unrelated = [op for op in candidates if not op.relationship_requirement]
+        if len(unrelated) == 1:
+            candidates = unrelated
+    if len(candidates) != 1:
+        return None, None
+    return request.source_grain, candidates[0].role
+
+
 def planning_probe(request: FeaturePlanningRequestV1) -> Template:
     """The request's projection into the planner's probe vocabulary — same needs, same bounds,
     identity keyed on the request's own source definition id."""
+    source_entity, anchor_role = _source_anchor(request)
     needs = tuple(
         Need(role=operand.role, concept=operand.concept, optional=not operand.required,
              allowed_source_grains=operand.allowed_source_grains,
@@ -60,7 +110,9 @@ def planning_probe(request: FeaturePlanningRequestV1) -> Template:
                      else "conceptual"),
         additivity=request.output.additivity,
         explain="M", use_cases=(),
-        pit=request.temporal.anchor_kind)
+        pit=request.temporal.anchor_kind,
+        source_entity=source_entity,
+        source_entity_need_role=anchor_role)
 
 
 def plan_planning_request(conn, *, request: FeaturePlanningRequestV1,
