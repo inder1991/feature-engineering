@@ -605,6 +605,21 @@ def run_worker_once(
 
     generations_reconciled = _stage("generation_reconcile")(_reconcile_generations, 0)
 
+    def _reconcile_spend() -> int:
+        # ▲ §15.1's rule applied to MONEY: a reservation is a lifecycle state only a live worker can
+        # leave. An expired unsettled one already released its budget by arithmetic — this stage
+        # re-charges the ones whose dispatch outcome says (or cannot deny) that the money was
+        # spent, and settles transport failures at zero explicitly. Reconciled against the outcome,
+        # never assumed — assuming unspent is the error that buys the tokens twice.
+        from datetime import UTC, datetime
+
+        from featuregen.overlay.upload.llm_spend import reconcile_expired_spend
+
+        tallies = reconcile_expired_spend(conn, now=datetime.now(UTC))
+        return tallies["recharged_worst_case"] + tallies["released_transport_failed"]
+
+    spend_reconciled = _stage("spend_reconcile")(_reconcile_spend, 0)
+
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so
         # this stage runs on the raw autocommit connection — NOT wrapped in _tx (SP-0.5 round-2).

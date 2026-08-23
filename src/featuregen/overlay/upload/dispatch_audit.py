@@ -37,12 +37,14 @@ from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.formula.control import LeaseFence, LeaseFenceLost
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import (
+    PROVIDER_AUTH_ERROR,
     PROVIDER_TRANSIENT,
     LLMClient,
     LLMRequest,
     LLMResult,
     compute_input_hash,
 )
+from featuregen.overlay.upload.llm_spend import SpendExhausted
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,9 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
                     schema_version: int | None = None,
                     physical_request_hash: str | None = None,
                     authoring_run_id: str | None = None,
+                    spend_authorization_id: str | None = None,
+                    spend_call_tokens: int = 0,
+                    spend_call_cost: str = "0",
                     call_role: str | None = None,
                     turn_index: int | None = None,
                     canonical_turn_input_hash: str | None = None,
@@ -170,6 +175,20 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
                 "canonical_turn_input_hash,provider_contract_hash,prompt_content_hash,"
                 "schema_content_hash,queue_id,lease_owner,lease_fence) "
             )
+            # ▲ THE RESERVATION RIDES THE SAME TRANSACTION AS THE DISPATCH ROW, bound to its ref.
+            # SpendExhausted raises out of this `with`, the transaction rolls back, and the
+            # dispatch row vanishes with it — no audited egress exists for an attempt the budget
+            # refused, which is exactly the fail-closed shape AuditUnavailable already has. Placed
+            # BEFORE the dispatch INSERT so an exhausted budget costs zero writes.
+            if spend_authorization_id is not None:
+                from datetime import UTC, datetime
+
+                from featuregen.overlay.upload.llm_spend import reserve_spend
+
+                reserve_spend(
+                    audit_conn, spend_authorization_id=spend_authorization_id,
+                    calls=1, tokens=spend_call_tokens, cost=spend_call_cost,
+                    now=datetime.now(UTC), dispatch_ref=dispatch_ref)
             if lease_fence is None:
                 row = audit_conn.execute(
                     "INSERT INTO llm_dispatch " + columns
@@ -504,6 +523,17 @@ class DispatchAuditContext:
     prompt_content_hash: str | None = None
     schema_content_hash: str | None = None
     lease_fence: LeaseFence | None = None
+    #: ▲ THE MONEY, at the ONE seam that sees every PHYSICAL attempt (owner ruling 2026-08-23
+    #: item 3). `drive_structured_call` retries and repairs beneath the logical call — up to
+    #: 1 + 2 retries + 2 repairs = 5 physical calls per structured call — so a ceiling enforced
+    #: anywhere above this seam under-counts by exactly the retries. When set, every physical
+    #: attempt reserves WORST CASE before egress, in the same pre-dispatch transaction as its
+    #: audit row, and settles actuals after the response.
+    spend_authorization_id: str | None = None
+    #: Worst case for ONE physical call, priced by the caller on the SAME basis as the
+    #: authorization's ceiling — pricing policy stays out of the audit seam.
+    spend_call_tokens: int = 0
+    spend_call_cost: str = "0"
 
 
 class AuditingClient:
@@ -578,6 +608,9 @@ class AuditingClient:
                 schema_version=request.output_schema_version,
                 physical_request_hash=compute_physical_request_hash(request),
                 authoring_run_id=self._ctx.authoring_run_id,
+                spend_authorization_id=self._ctx.spend_authorization_id,
+                spend_call_tokens=self._ctx.spend_call_tokens,
+                spend_call_cost=self._ctx.spend_call_cost,
                 call_role=self._ctx.call_role,
                 turn_index=self._ctx.turn_index,
                 canonical_turn_input_hash=compute_input_hash(request.inputs),
@@ -591,6 +624,18 @@ class AuditingClient:
                 "(fail closed)", self._logical_call_ref, self._attempt_no)
             return LLMResult(output={}, self_reported_scores={}, call_ref="",
                              status=PROVIDER_TRANSIENT)
+        except SpendExhausted as exc:
+            # ▲ NO EGRESS, and NOT transient. A transient result would have the driver retry —
+            # burning its retry budget to re-ask a ceiling that cannot change mid-run. AUTH_ERROR
+            # is the driver's fail-closed-immediately arm (security-audit signalled), which is the
+            # honest classification: this deployment is not authorized to spend on this call. The
+            # reservation AND the dispatch row rolled back together — an attempt the budget refused
+            # leaves no audited egress, because none happened.
+            logger.warning(
+                "spend authorization refused %s attempt %s — provider NOT called: %s",
+                self._logical_call_ref, self._attempt_no, exc)
+            return LLMResult(output={}, self_reported_scores={}, call_ref="",
+                             status=PROVIDER_AUTH_ERROR)
         # The attempt is durably authorized — record it for llm_call linkage (C5-T4) BEFORE the
         # provider call, so even a transport raise stays attributable to the logical call.
         self._dispatch_refs.append(dispatch_ref)
@@ -598,10 +643,46 @@ class AuditingClient:
             result = self._inner.call(request)
         except Exception:
             # a REAL transport raise stays a raise — recorded first, then re-raised unchanged.
+            # ▲ The reservation is deliberately NOT settled here: whether the provider billed a
+            # transport-level failure is unknowable at this seam, so the reservation ages out and
+            # the RECONCILER settles it against this very outcome row (transport_failed -> zero).
             self._record_outcome(dispatch_ref, "transport_failed")
             raise
         self._record_outcome(dispatch_ref, "response_received")
+        self._settle_spend(dispatch_ref, result)
         return result
+
+    def _settle_spend(self, dispatch_ref: str, result: LLMResult) -> None:
+        # POST-egress best-effort, the `_record_outcome` stance: the money was already committed at
+        # reservation time, so a settlement failure must never mask the provider's result — the
+        # reconciler settles an aged unsettled reservation from the outcome row instead. Actuals
+        # come from the provider's own usage when reported; a response with NO usage settles at
+        # WORST CASE, because assuming an unreported call was free buys its tokens twice.
+        if self._ctx.spend_authorization_id is None:
+            return
+        try:
+            from featuregen.overlay.upload.llm_spend import (
+                reservation_for_dispatch,
+                settle_spend,
+            )
+
+            usage = result.cost_metadata or {}
+            tokens = sum(int(v) for k, v in usage.items()
+                         if k.endswith("_tokens") and isinstance(v, (int, float))
+                         and not isinstance(v, bool))
+            with psycopg.connect(get_settings().dsn) as conn:
+                reservation = reservation_for_dispatch(conn, dispatch_ref)
+                if reservation is not None:
+                    settle_spend(
+                        conn, reservation,
+                        actual_calls=1,
+                        actual_tokens=tokens if tokens else self._ctx.spend_call_tokens,
+                        actual_cost=(usage.get("cost")
+                                     if isinstance(usage.get("cost"), (int, float))
+                                     else self._ctx.spend_call_cost))
+        except Exception:  # noqa: BLE001
+            logger.exception("spend settlement failed for %s (reconciler will settle it)",
+                             dispatch_ref)
 
     def _record_outcome(self, dispatch_ref: str, outcome: str) -> None:
         # POST-egress best-effort: the dispatch already happened under a durable pre-dispatch

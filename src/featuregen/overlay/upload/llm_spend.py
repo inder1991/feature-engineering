@@ -27,7 +27,9 @@ __all__ = [
     "SpendExhausted",
     "SpendRemaining",
     "authorize_spend",
+    "reconcile_expired_spend",
     "remaining_spend",
+    "reservation_for_dispatch",
     "reserve_spend",
     "settle_spend",
     "sweep_expired_reservations",
@@ -182,6 +184,53 @@ def settle_spend(
         "INSERT INTO llm_spend_settlement (reservation_id, actual_calls, actual_tokens, "
         "actual_cost) VALUES (%s, %s, %s, %s) ON CONFLICT (reservation_id) DO NOTHING",
         (reservation_id, actual_calls, actual_tokens, actual_cost))
+
+
+def reservation_for_dispatch(conn, dispatch_ref: str) -> str | None:
+    """The reservation bound to one physical dispatch, or ``None`` for an unmetered call."""
+    row = conn.execute(
+        "SELECT reservation_id FROM llm_spend_reservation WHERE dispatch_ref = %s",
+        (dispatch_ref,)).fetchone()
+    return None if row is None else row[0]
+
+
+def reconcile_expired_spend(conn, *, now) -> dict[str, int]:
+    """Settle expired unsettled reservations AGAINST THE DISPATCH OUTCOME — owner ruling 2026-08-23
+    item 3: reconciled before budget release, never assumed.
+
+    ▲ The budget already released by ARITHMETIC the moment the reservation expired unsettled
+    (`_committed` stops counting it) — so the reconciler's real job is the opposite of releasing:
+    **re-charging** the budget for money that WAS plausibly spent. Per expired unsettled reservation
+    with a dispatch:
+
+    * ``response_received`` — the provider answered; the money is real. Settle at WORST CASE
+      (the actuals died with the worker) so the budget re-charges conservatively.
+    * **no outcome row** — the worker died between egress and the outcome write, so spend is
+      UNKNOWABLE. Settle at worst case too: assuming it was never spent is the opposite error,
+      and it buys the tokens twice.
+    * ``transport_failed`` — the provider was never reached past transport. Settle at ZERO,
+      explicitly, so the ledger says "checked and unspent" rather than merely "expired".
+
+    Reservations with NO dispatch ref are left to expiry arithmetic — they were never bound to an
+    egress, so there is no outcome to reconcile against.
+    """
+    rows = conn.execute(
+        "SELECT r.reservation_id, r.reserved_calls, r.reserved_tokens, r.reserved_cost, o.outcome "
+        "  FROM llm_spend_reservation r "
+        "  LEFT JOIN llm_spend_settlement s ON s.reservation_id = r.reservation_id "
+        "  LEFT JOIN llm_dispatch_outcome o ON o.dispatch_ref = r.dispatch_ref "
+        " WHERE s.reservation_id IS NULL AND r.expires_at <= %s AND r.dispatch_ref IS NOT NULL",
+        (now,)).fetchall()
+    tallies = {"recharged_worst_case": 0, "released_transport_failed": 0}
+    for reservation_id, calls, tokens, cost, outcome in rows:
+        if outcome == "transport_failed":
+            settle_spend(conn, reservation_id, actual_calls=0, actual_tokens=0, actual_cost=0)
+            tallies["released_transport_failed"] += 1
+        else:
+            settle_spend(conn, reservation_id, actual_calls=calls, actual_tokens=tokens,
+                         actual_cost=cost)
+            tallies["recharged_worst_case"] += 1
+    return tallies
 
 
 def sweep_expired_reservations(conn, *, now) -> int:
