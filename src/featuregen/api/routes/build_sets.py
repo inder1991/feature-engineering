@@ -92,6 +92,30 @@ _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 
 
+def _refuse_pre_pin(conn: psycopg.Connection) -> None:
+    """Spec §7 [R3.1]: while the 1101 binding table is absent, every build set written closes the
+    zero-row NOT NULL branch — so declaration is withheld, server-side.
+
+    **Self-retiring by design.** There is no flag and nothing to remember to remove: the moment
+    migration 1101 applies, `to_regclass` returns the relation and this refusal disappears with zero
+    code change. It is a guard whose whole purpose is to stop being reachable.
+
+    Called FIRST in both producers, ahead of every validation and lookup, because the thing being
+    protected is the WRITE and a guard placed after one has already done the damage.
+
+    ▲ Same fact, and deliberately the same code string, as `runs.projection._pin_exists` — which is
+    what makes the run rail label `GENERATE_PREVIEW` UNAVAILABLE with this exact reason. The rail
+    tells a person the entrance is shut; this is the entrance shutting.
+    """
+    if conn.execute("SELECT to_regclass('selection_formula_binding')").fetchone()[0] is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "BUILD_SET_DECLARATION_WITHHELD_PRE_PIN",
+            "message": "build-set declaration is withheld until the selection→formula binding "
+                       "(migration 1101) exists — a build set written before the pin would force "
+                       "a nullable column and a backfill of exactly the rows the pin constrains",
+        })
+
+
 def _now(conn: psycopg.Connection) -> str:
     """The DATABASE's clock, not this process's. Two API replicas with drifting clocks would
     otherwise stamp one lifecycle with times that go backwards."""
@@ -147,6 +171,7 @@ def declare_build_set(
     existing set with `created: false`, because minting a second identical set would split its
     attempts across two roots and make "how did this build go" a question with two answers.
     """
+    _refuse_pre_pin(conn)
     try:
         try:
             declaration = decode_declaration(body.declaration)
@@ -207,6 +232,7 @@ def request_build(
     composite foreign key would then refuse the write with a message about keys rather than about
     permission.
     """
+    _refuse_pre_pin(conn)
     authorization = load_generation_authorization(
         conn, body.generation_authorization_revision_id)
     if authorization is None:
