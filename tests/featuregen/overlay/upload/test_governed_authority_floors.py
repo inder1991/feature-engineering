@@ -13,13 +13,19 @@ the tests assert exactly that: same evidence, both shapes, same three answers.
 
 **The conflict gate, and the clause that is deliberately absent.** An authority is the WINNING
 evidence's ``producer/strength``, and a pin the resolver calls a CONFLICT lends none. The gate does
-NOT also require ``load_bearing`` / ``conflict_state == "resolved"`` the way
-``contract/governed_lens._authority`` does, and ``test_a_human_confirmed_concept_is_NOT_load_bearing_
-and_must_still_clear`` is the regression pin that says why: ``concept`` — the only field these
-floors read — is a RECOMMENDATION-tier policy, so no concept pin is EVER load-bearing or ever
-"resolved". Gating on either clause would make both floors permanently unmeetable for every column
-in every catalog. That test fails the moment somebody re-applies the D4 clause here, which is the
-whole point of it.
+NOT also require ``load_bearing`` / ``conflict_state == "resolved"`` — the verbatim D4 clause — and
+``test_a_human_confirmed_concept_is_NOT_load_bearing_and_must_still_clear`` is the regression pin
+that says why: ``concept`` — the only field these floors read — is a RECOMMENDATION-tier policy, so
+no concept pin is EVER load-bearing or ever "resolved". Gating on either clause would make both
+floors permanently unmeetable for every column in every catalog. That test fails the moment somebody
+re-applies the D4 clause here, which is the whole point of it.
+
+**S1A-5b collapsed the two copies into one.** ``contract/governed_lens`` used to apply the verbatim
+D4 clause on the SERVING side, so the same pin could lend ``human/confirmed`` to a floor here and
+read ``absent`` on the card it was served from — and D4 was inert against real data for exactly the
+reason above. Both sides now call ``field_resolution.pin_authority``;
+``test_the_lens_and_the_activation_floors_share_ONE_authority_law``
+(``contract/test_governed_lens_requests.py``) pins the sharing by identity.
 """
 from __future__ import annotations
 
@@ -218,16 +224,16 @@ def test_the_two_arms_answer_IDENTICALLY_about_the_same_evidence(conn):
 
 
 def test_a_human_confirmed_concept_is_NOT_load_bearing_and_must_still_clear(conn):
-    """**THE REGRESSION PIN, and the reason ``_pin_authority`` diverges from D4.**
+    """**THE REGRESSION PIN, and the reason ``pin_authority`` diverges from D4.**
 
     ``field_policies._CONCEPT`` is RECOMMENDATION-tier, so ``resolve_field_authority``
     short-circuits on the influence ceiling before it ever selects a load-bearing value: EVERY
     concept pin — a human confirmation included — comes back ``load_bearing=False`` with
     ``conflict_state='influence_not_operational'``, never ``'resolved'``.
 
-    So a floor gated on ``load_bearing`` or on ``conflict_state == 'resolved'`` (the D4 rule
-    ``contract/governed_lens._authority`` applies on the serving side) would read ``absent`` for
-    every column in every catalog, and BOTH floors would be permanently unmeetable — no governed
+    So a floor gated on ``load_bearing`` or on ``conflict_state == 'resolved'`` (the verbatim D4
+    rule ``contract/governed_lens`` applied on the serving side until S1A-5b) would read ``absent``
+    for every column in every catalog, and BOTH floors would be permanently unmeetable — no governed
     contract, no materialization, anywhere. For an advisory-tier field the load-bearing question
     is not the right one; ``AUTHORITY_MATRIX`` is the gate, and it already refuses what it should.
 

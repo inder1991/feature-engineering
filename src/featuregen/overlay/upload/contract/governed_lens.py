@@ -20,46 +20,51 @@ Two properties are structural rather than conventional:
   union of the resolved plans, and project every option from that frozen batch. No option re-reads
   anything, so the read count does not grow with the option count.
 
-WHAT THIS BUILDER CANNOT DO TODAY (measured on the way in, 2026-08-23) — three planner gaps stand
-between a V2 RECIPE and a resolved governed cross-catalog contract. None of them is in this
-module, and this module may not fix them (S1A-4b owns no planner file):
+WHERE THE CROSS-CATALOG FRONTIER STANDS (re-measured 2026-08-23, after S1A-4c ``1c656743``). Two
+planner gaps remain between a V2 RECIPE and a resolved governed cross-catalog contract. Neither is
+in this module, and this module may not fix them (it owns no planner file):
 
-* **G1 — no binding roles on a request-contract probe.** ``planning_probe`` projects each operand's
-  ``join_role``/``temporal_role`` verbatim, and ZERO of the 1195 operands in the 317-recipe V2
-  registry declares either (``metadata_resolution_mode="request_contract"`` deliberately does not
-  consult the legacy resolved-need registry, which is where a legacy Template's roles are DERIVED).
-  ``plan._assemble_rollups`` starts a roll-up only from a binding whose ``join_role`` is
-  ``source_entity_key``, so a recipe-origin request assembles no cross-catalog plan at all.
-* **G3 — a governed BRIDGE hop carries no realization revision.** ``plan_bindings`` never runs
+* **G1 — CLOSED.** ``planning_probe`` no longer projects the operands' ``join_role`` /
+  ``temporal_role`` verbatim: it DECLARES them at projection time from the request's own facts —
+  the V2 ``operand_class`` vocabulary plus the concept registry's ``entity_link`` / ``pit_role``.
+  Still ZERO of the 1195 operands in the 317-recipe registry declares a role (no recipe was
+  re-authored, and none needs to be), yet a request built by ``planning_request_from_recipe``
+  ALONE now yields ``account → source_entity_key`` and ``event_ts → time/event_time``,
+  ``plan._assemble_rollups`` starts its frontier, and a roll-up spanning both catalogs is
+  assembled. ``test_as_shipped_recipe_request_reaches_the_g3_boundary`` pins the shipped request's
+  whole projection.
+* **G3 — the LIVE boundary.** ``plan_bindings`` never runs
   ``assembly.attach_executable_bridge_realizations``, and ``build_compiler_context`` correctly
-  leaves ``allow_provisional_bridge_cardinality`` false (it is sandbox-only), so a bridge hop's
-  physical cardinality is UNAVAILABLE and any measure staged there fails
-  ``physical_cardinality_unavailable``.
-* **G2 — every non-key, non-time operand derives to a MEASURE.** ``need_metadata._derive_one``
-  (the derivation G1's fix would apply) maps an operand with no ``entity_link`` and no ``pit_role``
-  — a ``status``, a ``dimension``, a ``direction`` — to ``JoinRole.MEASURE``, so the contract
-  fails for an operand nobody intended to aggregate. The V2 ``operand_class`` vocabulary is never
-  projected into ``JoinRole``.
+  leaves ``allow_provisional_bridge_cardinality`` false (it is sandbox-only), so a governed BRIDGE
+  hop's physical cardinality is UNAVAILABLE and any measure staged there fails
+  ``physical_cardinality_unavailable``. That — not a discovery failure — is what a shipped
+  recipe-origin request refuses with today.
+* **G2 — real, and MASKED BEHIND G3.** ``need_metadata._derive_one`` maps an operand with no
+  ``entity_link`` and no ``pit_role`` — a ``status``, a ``dimension``, a ``direction`` — to
+  ``JoinRole.MEASURE``, so the contract fails for an operand nobody intended to aggregate. It is
+  invisible on a bridge hop because ``compile_aggregation`` short-circuits on ``card is None``
+  (``declarations.py``) BEFORE the additivity matrix runs; it surfaces the moment a cardinality is
+  available, which today happens on an INTRA-catalog realization hop (whose declared join supplies
+  one). ``test_the_measured_refusal_sequence_is_g3_before_g2`` and
+  ``test_g2_surfaces_only_once_a_cardinality_is_available`` pin both halves.
 
-**The order matters, and an earlier revision of this docstring got it wrong.** The three gaps are
-SEQUENTIAL, not parallel, and only one code is ever emitted at a time:
+**Both are CHARTERED, not fixed here.** ``assembly.attach_executable_bridge_realizations`` has zero
+callers and attaching a revision moves SEGMENT identity, so G3 is a follow-on decided at the
+Stage-1C report with the realization-gap queue's evidence in hand — deliberately not ridden along
+with a projection change. G2 rides the same charter and carries an 82-OPERAND WORKLIST: the
+class-keyed projection and ``_derive_one``'s concept-keyed ladder agree on 1113 of the 1195 V2
+operands and DISAGREE on 82 (measured at ``1c656743``) — 63 value-classed operands on an
+entity-linked concept, 17 on a pit-bearing one, and ``device_sharing_velocity``'s two.
+``test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_g2_lives``
+(``planner/test_requests.py``) pins that divergence BY SHAPE in both directions, so the worklist
+G2's ruling has to decide stays self-maintaining rather than rotting silently.
 
-1. G1 blocks DISCOVERY: no roll-up is assembled, so no contract compiles and no code is emitted;
-2. once G1 closes, a measure crossing the governed bridge hits G3 FIRST —
-   ``compile_aggregation`` short-circuits on ``card is None`` (``declarations.py``) and records
-   ``physical_cardinality_unavailable`` WITHOUT ever running the additivity matrix. That is the
-   primary refusal a cross-catalog recipe actually gets, and
-   ``test_the_measured_refusal_sequence_is_g3_before_g2`` pins it against the real planner;
-3. G2's ``aggregation_axis_unsupported`` is DOWNSTREAM of G3 — it is masked behind that
-   short-circuit and surfaces only once a cardinality is available, which today happens on an
-   INTRA-catalog realization hop (whose declared join supplies one) and will happen on a bridge
-   hop once G3 closes. The same test pins that half too.
-
-The consequence for consumers: a request whose operands DECLARE their binding roles (an LLM
-intent may; the platform's own ``derive_need_metadata`` resolves them for any probe) reaches a
-resolved governed cross-catalog contract through this builder today. A request built by
-``planning_request_from_recipe`` alone does not — it becomes an evidence-bearing REJECTION, which
-is the honest answer until the planner seam closes.
+The consequence for consumers: a request whose operands reach the planner with binding roles — the
+projection now derives them for ANY request, and an LLM intent may also declare its own — assembles
+a cross-catalog plan today. Whether it RESOLVES depends on what it stages over the bridge hop: a
+key/time-only contract resolves; a contract staging a MEASURE across the governed bridge becomes an
+evidence-bearing REJECTION naming ``physical_cardinality_unavailable``, which is the honest answer
+until G3 closes.
 """
 from __future__ import annotations
 
@@ -81,7 +86,11 @@ from featuregen.overlay.upload.feature_planning_contracts import (
     planning_request_from_recipe,
     planning_request_hash,
 )
-from featuregen.overlay.upload.field_resolution import ResolutionPinV1, current_resolution_pins
+from featuregen.overlay.upload.field_resolution import (
+    ResolutionPinV1,
+    current_resolution_pins,
+    pin_authority,
+)
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
@@ -704,16 +713,6 @@ def _load_evidence(conn, planned: Sequence[_PlannedRequestV1]) -> _FrozenEvidenc
     return _FrozenEvidenceV1(pins=pins, key_entities=key_entities, events_by_recipe=events)
 
 
-def _authority(pin: ResolutionPinV1 | None) -> str:
-    """D4 — the authority a binding may claim: the WINNING evidence's producer/strength, and only
-    while the resolver itself says the field is resolved AND load-bearing. A conflicted or
-    display-only pin is ``absent``: an unresolved field has no authority to lend."""
-    if (pin is not None and pin.producer and pin.conflict_state == "resolved"
-            and pin.load_bearing):
-        return f"{pin.producer}/{pin.strength}"
-    return "absent"
-
-
 def _role_bindings(plan: BindingPlanV1,
                    pins: dict[tuple[str, str], ResolutionPinV1]) -> tuple[RoleBinding, ...]:
     bindings = []
@@ -723,7 +722,12 @@ def _role_bindings(plan: BindingPlanV1,
         bindings.append(RoleBinding(
             role=binding.need_role,
             ref=(binding.bound_catalog_source, binding.bound_object_ref),
-            authority=_authority(pin),
+            # S1A-5b (ruling): ONE authority law, shared with the durable write's C2 floors. The
+            # verbatim D4 clause that used to live here (`conflict_state == "resolved" and
+            # load_bearing`) was INERT against real data — `concept` is a RECOMMENDATION-tier
+            # policy, so no concept pin is ever either, and every genuinely human-confirmed
+            # binding read `absent`. `pin_authority` documents why in full.
+            authority=pin_authority(pin),
             confirmation_required=False,
             evidence_ids=(pin.evidence_id,) if pin is not None and pin.evidence_id else ()))
     return tuple(bindings)
@@ -758,6 +762,62 @@ def _grain_table(plan: BindingPlanV1, *, target_entity: str,
     if entity is None or entity.strip().lower() != target_entity.strip().lower():
         return None
     return table_of(grain[1])
+
+
+def fold_governed_binding_plan(idea: FeatureIdea) -> dict | None:
+    """S1A-5b — the governed cross-catalog plan, as the FROZEN dict a decision row stores.
+
+    The sibling of ``recipe_planning_lens.fold_frozen_binding_plan`` (the single-source class) and
+    deliberately the SAME shape where the two overlap — ``plan_kind``, ``read_set``,
+    ``role_bindings``, ``grain_refs``, ``output_grain`` — so one loader reads both and
+    ``activation_policy`` needs no second vocabulary.
+
+    Two things differ, and both are the point:
+
+    * **every read-set entry is FULLY QUALIFIED** (``source::schema.table.column``). A single-source
+      plan stores bare refs and one plan-wide ``catalog_source`` every entry inherits; a
+      cross-catalog plan has no single catalog to inherit from, so an entry that did not name its
+      own would be attributed to whichever catalog the plan happened to mention — measuring the
+      authority of columns that do not exist and calling the answer an execution floor. This is the
+      dialect ``semantic_option_decision._governed_read_set_pairs`` parses STRICTLY, so a spelling
+      that is not canonical is refused at load rather than silently mis-attributed;
+    * **``catalog_sources``, ``ordered_path``, ``physical_plan_id`` and the bridge realization
+      dependencies ride along**: the envelope's own record of which catalogs the plan spans, in
+      what order, over which governed hops. A single-source plan has nothing to say there.
+
+    ``None`` when the idea carries no plan envelope — an option with no governed plan has no
+    governed plan to freeze, and an empty dict would read as one that authorizes nothing.
+
+    Raises:
+        ValueError: a ``derives_pairs`` ref with fewer than three dotted components. The planner's
+            read sets are COLUMN-level; a table-level ref would mis-split (``"transactions.acct"``
+            → ``schema="transactions", table="acct"`` with the column silently lost) into a
+            well-formed qualified ref naming a different object. That is an upstream defect, and it
+            must name itself rather than be attributed.
+    """
+    env = idea.plan_envelope
+    if env is None:
+        return None
+    for _catalog, ref in idea.derives_pairs:
+        if len(ref.split(".")) < 3:
+            raise ValueError(
+                f"governed read-set ref {ref!r} has fewer than three dotted components: the "
+                f"planner's read sets are column-level (schema.table.column), and a table-level "
+                f"ref reaching this fold would mis-split into a qualified ref naming a different "
+                f"object")
+    return {
+        "plan_kind": "governed_cross_catalog",
+        "catalog_sources": sorted(set(env.catalog_sources)),
+        "read_set": sorted(normalize_ref(catalog, *ref.split(".")[-3:])
+                           for catalog, ref in idea.derives_pairs),
+        "role_bindings": {b.role: normalize_ref(b.ref[0], *b.ref[1].split(".")[-3:])
+                          for b in idea.input_role_bindings if b.ref},
+        "grain_refs": [[catalog, ref] for catalog, ref in idea.grain_refs],
+        "ordered_path": list(env.ordered_path),
+        "output_grain": env.target_entity or "",
+        "physical_plan_id": env.physical_plan_id,
+        "bridge_realization_dependencies": [dict(d) for d in env.bridge_realization_dependencies],
+    }
 
 
 def _option_from(entry: _PlannedRequestV1, *, evidence: _FrozenEvidenceV1, compile_ctx,
@@ -826,6 +886,7 @@ __all__ = [
     "DefinitionGovernanceStateV1",
     "GovernedOptionV1",
     "ReasonContextV1",
+    "fold_governed_binding_plan",
     "governed_options_from_requests",
     "governed_requests_for_scope",
 ]

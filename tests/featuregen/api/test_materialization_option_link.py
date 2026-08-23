@@ -77,8 +77,12 @@ def work_items(db):
     return [_seed_work_item(db, "total_debit_amount_30d", "b4a")]
 
 
-def _freeze_option(db, recipe_id: str, *, key: str) -> tuple[str, str]:
-    """One REAL ``semantic_option_decision`` row, through the real writers."""
+def _freeze_option(db, recipe_id: str, *, key: str, uoa: str | None = None) -> tuple[str, str]:
+    """One REAL ``semantic_option_decision`` row, through the real writers.
+
+    ``uoa`` freezes the unit of analysis the human had confirmed when the card was served — the
+    fact B5's intent re-read is about. ``None`` (the default every other case here uses) is the
+    honest absence: the confirmation is optional by design and absence never blocks."""
     definition = v2_recipe_by_id(recipe_id)
     assert definition is not None
     request = planning_request_from_recipe(definition)
@@ -101,7 +105,7 @@ def _freeze_option(db, recipe_id: str, *, key: str) -> tuple[str, str]:
                       "window": None})
     idea = FeatureIdea(name=recipe_id, description="", derives_from=[], aggregation=None,
                        grain_table=None, source_definition_id=recipe_id)
-    facts = decision_facts_for_candidate(candidate, idea, None, "ctx")
+    facts = decision_facts_for_candidate(candidate, idea, None, "ctx", uoa_entity=uoa)
     db.execute("INSERT INTO contract_intent "
                "(intent_id,hypothesis,intake_mode,redacted_hypothesis) "
                "VALUES (%s,'h','hypothesis','h') ON CONFLICT DO NOTHING", (f"intent-{key}",))
@@ -212,6 +216,92 @@ def test_an_allowed_option_mints_a_request_carrying_its_provenance(
     assert stored[2]["activation"]["allowed"] is True
     assert stored[2]["activation"]["blockers"] == []
     assert route._MATERIALIZATION_ACTION == "execute_materialization"
+
+
+# ── B5: the route re-reads the option's own INTENT ───────────────────────────────────────────────
+
+
+def _later_uoa_confirmation(db, *, intent_id: str, key: str, uoa: str) -> None:
+    """A LATER generation under the SAME intent that confirmed a DIFFERENT unit of analysis.
+
+    Appended directly, with an explicit ``recorded_at``, for one reason: the column defaults to
+    ``now()`` — the TRANSACTION timestamp — so two rows written inside one test tie on it, and
+    ``_latest_confirmed_uoa``'s tiebreak is a ULID whose sub-millisecond half is random. A control
+    resting on that coin flip would be flaky rather than discriminating. The row is otherwise an
+    ordinary append to the same append-only table, and it is read back by the real query. A
+    revision is UNIQUE per (intent, generation run), so the later generation gets its own run."""
+    import json
+
+    db.execute("INSERT INTO feature_generation_run (generation_run_id,intent_id,actor) "
+               "VALUES (%s,%s,'{}'::jsonb) ON CONFLICT DO NOTHING",
+               (f"genrun-{key}", intent_id))
+    db.execute("INSERT INTO contract_considered_revision (considered_revision_id,intent_id,"
+               "generation_run_id,considered_json,considered_content_hash,"
+               "canonicalization_version) VALUES (%s,%s,%s,'{}'::jsonb,%s,'test-v1')",
+               (f"rev-{key}", intent_id, f"genrun-{key}", f"hash-{key}"))
+    db.execute(
+        "INSERT INTO semantic_option_decision (decision_id, considered_revision_id, option_id, "
+        " generation_run_id, source_definition_id, generation_source, computation_kind, "
+        " planning_request_hash, binding_state, readiness, dataset_story, recorded_at) "
+        "VALUES (%s,%s,%s,%s,%s,'recipe','deterministic_formula','prh','bound','FORMULA_BLOCKED',"
+        " %s, now() + interval '1 hour')",
+        (f"sod-{key}", f"rev-{key}", f"opt-{key}", f"genrun-{key}", REVIEWED,
+         json.dumps({"confirmed_uoa_entity": uoa})))
+
+
+def test_a_confirmed_UOA_that_has_NOT_moved_no_longer_drifts_the_option(
+        client, admin_headers, db, work_items):
+    """**B5 — a live bug, fixed.** ``_require_the_option_allows_materialization`` called
+    ``assemble_current_activation_state`` with no ``intent_id``, and that assembler's UOA re-read
+    treats a missing intent as unverifiable: ``uoa_now = frozen_uoa is None``. So EVERY option
+    whose card was served under a confirmed unit of analysis was permanently
+    ``ACTIVATION_STATE_DRIFTED`` on this ladder — not because anything had drifted, but because
+    the route never asked which intent to compare against. The fix resolves the intent from the
+    cited revision (``contract_considered_revision.intent_id``) and passes it.
+
+    ``ACTIVATION_STATE_DRIFTED`` is emitted by two rules and deduplicated by code, so the
+    assertion is only a discriminator while the OTHER one is clear: the policy-pin rule is, and
+    this test proves it rather than assuming it — the facts producer writes the live authority
+    matrix hash into the frozen pins, so ``policy_revisions_current`` is true on this row."""
+    revision_id, option_id = _freeze_option(db, REVIEWED, key="uoa-same", uoa="account")
+    response = _post(client, admin_headers, work_items,
+                     considered_revision_id=revision_id, option_id=option_id)
+
+    assert response.status_code == 409, response.text          # other rungs still block it
+    codes = {b["code"] for b in response.json()["detail"]["blockers"]}
+    assert R.ACTIVATION_STATE_DRIFTED not in codes, codes
+    # the other producer of that code really is clear, so its absence measures the UOA re-read
+    from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
+    from featuregen.overlay.upload.semantic_option_decision import load_frozen_option_facts
+    frozen = load_frozen_option_facts(db, considered_revision_id=revision_id,
+                                      option_id=option_id)
+    assert f"authority_matrix_hash:{authority_matrix_hash()}" in frozen.policy_revision_pins
+    assert frozen.confirmed_uoa_entity == "account"
+
+
+def test_a_confirmed_UOA_that_GENUINELY_moved_still_drifts_the_option(
+        client, admin_headers, db, work_items):
+    """The control, and the half that must never be lost: the human re-confirmed a DIFFERENT unit
+    of analysis after this card was served, so the card answers a question nobody is asking
+    anymore. Same fixture as above except for the later confirmation."""
+    revision_id, option_id = _freeze_option(db, REVIEWED, key="uoa-moved", uoa="account")
+    _later_uoa_confirmation(db, intent_id="intent-uoa-moved", key="uoa-later", uoa="customer")
+
+    response = _post(client, admin_headers, work_items,
+                     considered_revision_id=revision_id, option_id=option_id)
+    assert response.status_code == 409, response.text
+    codes = {b["code"] for b in response.json()["detail"]["blockers"]}
+    assert R.ACTIVATION_STATE_DRIFTED in codes, codes
+
+
+def test_the_route_resolves_the_intent_from_the_revision_it_was_given(db):
+    """The lookup itself, against the real table. ``None`` for a revision nobody recorded — the
+    honest answer, and the one the assembler already fails closed on."""
+    from featuregen.api.routes.materialization_runs import _intent_of_revision
+
+    revision_id, _option_id = _freeze_option(db, REVIEWED, key="intent-lookup")
+    assert _intent_of_revision(db, considered_revision_id=revision_id) == "intent-intent-lookup"
+    assert _intent_of_revision(db, considered_revision_id="rev-nobody") is None
 
 
 # ── the legacy path, and the half-key ────────────────────────────────────────────────────────────

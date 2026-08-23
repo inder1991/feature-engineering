@@ -454,6 +454,30 @@ def _contract_minted_from(
     return row[0] if row is not None else None
 
 
+def _intent_of_revision(
+    conn: psycopg.Connection, *, considered_revision_id: str,
+) -> str | None:
+    """The INTENT the cited considered revision belongs to — B5's missing half.
+
+    ``assemble_current_activation_state``'s UOA re-read compares the option's frozen
+    ``confirmed_uoa_entity`` against the intent's LATEST confirmed one, and it needs the intent to
+    do it. With no intent it fails closed (``uoa_now = frozen_uoa is None``), which is right in the
+    abstract and wrong here: this route always HAS an intent — every considered revision carries
+    one — it simply was not asking. The consequence was that every option served under a confirmed
+    unit of analysis was permanently ``ACTIVATION_STATE_DRIFTED`` on the materialization ladder,
+    with the refusal telling the operator to regenerate into exactly the same state.
+
+    ``None`` is still a real answer, for a revision id naming no row, and the assembler's
+    fail-closed arm is still the right one for it. It is not reached from this route's happy path:
+    ``load_frozen_option_facts`` has already proved the decision row exists, and the decision row's
+    revision is this one.
+    """
+    row = conn.execute(
+        "SELECT intent_id FROM contract_considered_revision WHERE considered_revision_id = %s",
+        (considered_revision_id,)).fetchone()
+    return row[0] if row is not None else None
+
+
 def _require_the_option_allows_materialization(
     conn: psycopg.Connection, body: MaterializationRunIn, identity: IdentityEnvelope,
 ) -> dict[str, Any]:
@@ -528,6 +552,12 @@ def _require_the_option_allows_materialization(
                    f"option that was actually served, because that row IS the approval")
     current = assemble_current_activation_state(
         conn, frozen=frozen, snapshot_id=frozen.snapshot_id or None,
+        # B5 — the intent the option was served under. Without it the UOA re-read has nothing to
+        # compare against and fails closed, which made every option carrying a confirmed unit of
+        # analysis permanently ACTIVATION_STATE_DRIFTED on this ladder (:func:`_intent_of_revision`
+        # says why in full).
+        intent_id=_intent_of_revision(
+            conn, considered_revision_id=body.considered_revision_id),
         contract_id=_contract_minted_from(
             conn, considered_revision_id=body.considered_revision_id, option_id=body.option_id))
     decision = activation_decision(

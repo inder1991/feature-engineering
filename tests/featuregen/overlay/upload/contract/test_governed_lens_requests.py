@@ -422,6 +422,21 @@ def test_intent_origin_through_the_same_builder(db, monkeypatch):
 
 
 def test_authority_is_gated_on_the_pin_conflict_state(db, monkeypatch):
+    """S1A-5b (ruling): the lens and the durable write's C2 floors now apply ONE rule —
+    ``field_resolution.pin_authority``. The pins here are REAL-SHAPED rather than idealised, and
+    that is the whole correction.
+
+    ``concept`` is the only field either side reads, and ``field_policies._CONCEPT`` is a
+    RECOMMENDATION-tier policy, so ``resolve_field_authority`` short-circuits on the influence
+    ceiling before it selects a load-bearing value: EVERY concept pin in the system — a
+    human-confirmed one included — comes back ``load_bearing=False`` with
+    ``conflict_state='influence_not_operational'``, never ``'resolved'``. The verbatim D4 clause
+    this lens used to apply (``conflict_state == 'resolved' and load_bearing``) was therefore INERT
+    against real data: it read ``absent`` for genuinely human-confirmed bindings, and its old
+    fixture only passed because it stubbed pins the resolver cannot produce.
+
+    What survives is the half that is real: a pin the resolver calls a CONFLICT lends no authority.
+    ``test_governed_authority_floors`` holds the mirror-image regression pin over live evidence."""
     _two_catalogs(db)
     recipe = v2_recipe_by_id(RECIPE_ID)
     real = lens.current_resolution_pins
@@ -435,19 +450,47 @@ def test_authority_is_gated_on_the_pin_conflict_state(db, monkeypatch):
             conflicted = ref.endswith("account_id")
             out[(ref, "concept")] = ResolutionPinV1(
                 value="account_id" if conflicted else "event_timestamp",
-                producer="human", strength="confirmed", evidence_id=f"ev-{ref}",
-                conflict_state="conflict" if conflicted else "resolved", load_bearing=True)
+                # a genuine conflict blanks the winner — there is no winning view to attribute
+                producer="" if conflicted else "human",
+                strength="" if conflicted else "confirmed",
+                evidence_id=f"ev-{ref}",
+                # the REAL shapes: the resolver's conflict verdict, and the advisory-tier
+                # short-circuit every uncontested concept pin actually carries
+                conflict_state="conflict" if conflicted else "influence_not_operational",
+                load_bearing=False)
         return out
 
     assert real is not _pins
     monkeypatch.setattr(lens, "current_resolution_pins", _pins)
     (option,) = _options(db, [_plannable_request(recipe)])[0]
     by_role = {b.role: b for b in option.idea.input_role_bindings}
-    assert by_role["account"].authority == "absent"          # conflicted → never load-bearing
+    assert by_role["account"].authority == "absent"          # a disputed field lends nothing
+    # ...and the human confirmation is honoured despite NEITHER D4 clause holding
     assert by_role["event_ts"].authority == "human/confirmed"
     assert by_role["event_ts"].evidence_ids == (
         f"ev-{by_role['event_ts'].ref[0]}::public.transactions.event_ts",)
     assert by_role["event_ts"].confirmation_required is False
+
+
+def test_the_lens_and_the_activation_floors_share_ONE_authority_law(db):
+    """The anti-drift pin for the ruling: there is one function, and both sides call it.
+
+    Asserted by IDENTITY rather than by behaviour, because two copies that agree today are exactly
+    the failure mode this collapse exists to prevent — they agree until the day one of them is
+    corrected."""
+    from featuregen.overlay.upload import field_resolution, semantic_option_decision
+
+    del db
+    assert lens.pin_authority is field_resolution.pin_authority
+    assert not hasattr(semantic_option_decision, "_pin_authority")
+    # the projection itself, over the two pin shapes real data actually produces
+    assert field_resolution.pin_authority(None) == "absent"
+    advisory = field_resolution.ResolutionPinV1(
+        value="account_identifier", producer="human", strength="confirmed", evidence_id="ev",
+        conflict_state="influence_not_operational", load_bearing=False)
+    assert field_resolution.pin_authority(advisory) == "human/confirmed"
+    assert field_resolution.pin_authority(
+        dataclasses.replace(advisory, conflict_state="conflict")) == "absent"
 
 
 # ── 4. the batched enrichment ────────────────────────────────────────────────────────────────

@@ -580,6 +580,48 @@ class ResolutionPinV1:
     load_bearing: bool
 
 
+def pin_authority(pin: ResolutionPinV1 | None) -> str:
+    """THE authority a bound operand may claim from its CURRENT resolution pin — one law, one home.
+
+    The WINNING evidence's ``producer/strength``, and ``absent`` when there is no pin, no winning
+    evidence, or the resolver's verdict is a CONFLICT — two contradictory views it refuses to choose
+    between. A field whose meaning is actively disputed has no authority to lend, and it must not
+    underwrite an authoring or an execution floor.
+
+    ▲ **This deliberately does NOT gate on ``load_bearing`` / ``conflict_state == "resolved"``**, the
+    way the verbatim D4 clause did. Every caller reads exactly ONE field — ``concept`` — and
+    ``field_policies._CONCEPT`` is a RECOMMENDATION-tier policy (``influence_max=
+    InfluenceTier.RECOMMENDATION``). :func:`resolve_field_authority` short-circuits on that ceiling
+    BEFORE it ever selects a load-bearing value, so EVERY concept pin in the system — a
+    human-confirmed one included — comes back as::
+
+        ResolutionPinV1(producer='human', strength='confirmed',
+                        conflict_state='influence_not_operational', load_bearing=False)
+
+    Gating on either clause would therefore read ``absent`` for every column in every catalog: the
+    authoring and execution floors would become permanently unmeetable, and the serving lens would
+    report ``absent`` for genuinely human-confirmed pins. Not a stricter platform, an inoperable one.
+    For an advisory-tier field the load-bearing question is simply not the right one:
+    ``AUTHORITY_MATRIX`` is the gate that decides what a concept's producer/strength may authorize,
+    and it already refuses ``llm/proposed`` at every rung and ``source/declared`` at execution.
+
+    The conflict gate is the half that IS real, and it is belt-and-braces rather than new behaviour:
+    on a genuine concept conflict the resolver already blanks ``producer``/``strength`` (there is no
+    winning view), so such a pin read ``absent`` before this too. Stating the rule explicitly means
+    the safety no longer depends on that incidental blanking.
+
+    **It lives HERE, beside :class:`ResolutionPinV1` itself, because there is exactly one answer to
+    "what does this pin authorize".** ``semantic_option_decision._authority_floors`` (the durable
+    write's C2 floors) and ``contract/governed_lens`` (the serving lens's binding authorities) both
+    consume it. They used to carry two different rules — the floors' accepted gate and the lens's
+    verbatim D4 — which meant one option could be told its operand had ``human/confirmed`` authority
+    at the floor and ``absent`` on the card it was served from. S1A-5b collapsed them into this.
+    """
+    if pin is None or not pin.producer or pin.conflict_state == "conflict":
+        return "absent"
+    return f"{pin.producer}/{pin.strength}"
+
+
 def _strength_rank(strength: str) -> int:
     return {"proposed": 0, "supported": 1, "attested": 2, "confirmed": 3}.get(strength, -1)
 

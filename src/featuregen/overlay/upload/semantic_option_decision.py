@@ -146,6 +146,129 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
     }
 
 
+def decision_facts_for_governed_option(conn, option, *, context_hash: str,
+                                       uoa_entity: str | None = None,
+                                       spine_ref: str | None = None) -> dict:
+    """S1A-5b — ONE governed cross-catalog option's frozen facts, KEY-FOR-KEY with
+    :func:`decision_facts_for_candidate`.
+
+    The key set is a CONTRACT, not a convention: ``persist_option_decisions`` maps these keys onto
+    migration 1063/1066's columns positionally, so a producer that spelled one key differently
+    would write the wrong column or raise. ``test_the_governed_facts_carry_EXACTLY_the_candidate_
+    contracts_keys`` asserts the two dicts against each other rather than against a literal.
+
+    What this producer adds over the candidate one, and why:
+
+    * **``source_definition_id`` is the CANONICAL definition id — never the variant id (V11).** The
+      persisted column feeds ``v2_recipe_by_id`` and ``_formula_schema_supported`` at every durable
+      write; a ``gvar_…`` there resolves to no recipe, so the option would be review-blocked forever
+      with nothing naming why. That is exactly why
+      :class:`~featuregen.overlay.upload.contract.governed_identity.GovernedVariantIdentityV1` keeps
+      canonical id and variant identity as SEPARATE fields, and why the variant identity rides the
+      evidence record instead.
+    * **origin purity (R14).** Only a ``recipe_v2`` request asks the expectation registry; every
+      other origin gets an honest ``False`` having read nothing.
+    * **the ``evidence.governed_plan`` block.** The variant identity, the physical plan content
+      hash, the parameter binding hash, the origin, the review gaps and the policy revisions the
+      governance read returned — the audit a governed cross-catalog decision must carry and that
+      no single-source candidate has.
+    * **``dataset_story.operand_authorities`` is keyed by the QUALIFIED logical ref**, where the
+      candidate producer keys by the bare ``object_ref``. A bare ref is ambiguous across catalogs:
+      two catalogs' ``public.accounts.account_id`` are two objects with two authorities, and one
+      bare key would silently keep only one of them.
+
+    ``binding_plan`` and ``binding_plan_hash`` are computed ONCE and handed to both the column and
+    the manifest, so :func:`_verified_plan`'s seal check holds by construction — the same property
+    B1 gave the candidate path, reached the same way.
+    """
+    from dataclasses import asdict
+
+    from featuregen.overlay.upload.concept_operand_classes import OPERAND_CLASS_MAP_VERSION
+    from featuregen.overlay.upload.contract.governed_lens import fold_governed_binding_plan
+    from featuregen.overlay.upload.field_resolution import canonical_hash
+    from featuregen.overlay.upload.object_ref import normalize_ref
+    from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
+    from featuregen.overlay.upload.typed_gauntlet import TYPED_GAUNTLET_VERSION
+
+    del conn        # nothing here reads the store; the parameter keeps the producers' one shape
+    idea, request, identity = option.idea, option.request, option.identity
+    binding_plan = fold_governed_binding_plan(idea)
+    binding_plan_hash = canonical_hash(binding_plan) if binding_plan else ""
+    bound = [b for b in idea.input_role_bindings if b.ref]
+    return {
+        "source_definition_id": identity.canonical_definition_id,
+        "generation_source": ("recipe" if request.origin == "recipe_v2" else "llm_intent"),
+        "computation_kind": request.computation_kind,
+        "planning_request_hash": identity.planning_request_hash,
+        "parameter_values": [[name, repr(value)] for name, value in request.parameter_values],
+        # The governed builder only ever returns an option for a SELECTED RESOLVED contract plan
+        # (anything else is an evidence-bearing rejection that never reaches this producer), and
+        # every required operand of such a plan is bound. There is no unbound governed option to
+        # describe, so the state is not re-derived from a weaker signal.
+        "binding_state": "bound",
+        # The governed path has no per-role confirmation funnel: authority is MEASURED from the
+        # resolution pins (`_role_bindings`) and re-measured at the durable write by C2's floors,
+        # which is the drift rule this empty list hands over to.
+        "confirmation_required_roles": [],
+        "readiness": option.readiness.state,
+        "review_current": option.governance.review_current,
+        "recipe_revision_hash": request.source_content_hash,
+        "validation_status": idea.validation_status,
+        "outstanding_requirement_codes": sorted(
+            {req.code for req in idea.requirements} | set(option.unmapped_requirement_codes)),
+        "has_reviewed_formula_expectation": (
+            has_reviewed_formula_expectation(identity.canonical_definition_id)
+            if request.origin == "recipe_v2" else False),
+        "formula_expectation_revision": "",   # pinned when the formula seam mints one (Phase E)
+        "plan_envelope_present": binding_plan is not None,
+        "binding_plan": binding_plan,
+        "binding_plan_hash": binding_plan_hash,
+        "dataset_story": {
+            "output_grain": request.output_grain,
+            "confirmed_uoa_entity": uoa_entity,
+            "confirmed_spine_ref": spine_ref,
+            "readiness_blockers": list(option.readiness.blockers),
+            "operand_authorities": {
+                normalize_ref(b.ref[0], *b.ref[1].split(".")[-3:]): b.authority for b in bound},
+        },
+        "policy_revision_pins": {"authority_matrix_hash": authority_matrix_hash()},
+        "observation_id": None,
+        "context_hash": context_hash,
+        "evidence": {
+            "planning_request": asdict(request),
+            "verdicts": [],
+            "eligibility_audit": [
+                {"role": b.role, "catalog_source": b.ref[0], "object_ref": b.ref[1],
+                 "authority": b.authority, "evidence_ids": list(b.evidence_ids)}
+                for b in bound],
+            "validation": {"status": idea.validation_status, "refusals": [],
+                           "requirements": [asdict(r) for r in idea.requirements],
+                           "families": []},
+            "governed_plan": {
+                "physical_plan_id": idea.plan_envelope.physical_plan_id
+                if idea.plan_envelope is not None else "",
+                "ordered_path": list(idea.plan_envelope.ordered_path)
+                if idea.plan_envelope is not None else [],
+                "governed_variant_id": identity.governed_variant_id,
+                "physical_plan_content_hash": identity.physical_plan_content_hash,
+                "parameter_binding_hash": identity.parameter_binding_hash,
+                "definition_origin": identity.definition_origin,
+                "review_missing_roles": list(option.governance.review_missing_roles),
+                "policy_revision_ids": list(option.governance.policy_revision_ids)},
+        },
+        # Mirrors `_decision_manifest` EXACTLY — same keys, same imports, same one-hash rule.
+        "decision_manifest": {
+            "semantic_context_hash": context_hash,
+            "authority_matrix_hash": authority_matrix_hash(),
+            "typed_gauntlet_version": TYPED_GAUNTLET_VERSION,
+            "operand_class_map_version": OPERAND_CLASS_MAP_VERSION,
+            "planning_request_hash": identity.planning_request_hash,
+            "binding_plan_hash": binding_plan_hash,
+            "recipe_revision_hash": request.source_content_hash,
+        },
+    }
+
+
 def _candidate_validation(candidate):
     from featuregen.overlay.upload.typed_gauntlet import validate_candidate
 
@@ -562,59 +685,33 @@ def _requirements_closed(conn, contract_id: str | None,
         return False
 
 
-def _pin_authority(pin) -> str:
-    """The authority a bound operand may claim from its CURRENT resolution pin.
-
-    The WINNING evidence's ``producer/strength``, and ``absent`` when there is no pin, no winning
-    evidence, or the resolver's verdict is a CONFLICT — two contradictory views it refuses to
-    choose between. A field whose meaning is actively disputed has no authority to lend, and it
-    must not underwrite an authoring or an execution floor.
-
-    ▲ **This deliberately does NOT gate on ``load_bearing`` / ``conflict_state == "resolved"``**,
-    the way ``contract/governed_lens._authority`` (D4) does on the serving side. The floors read
-    exactly ONE field — ``concept`` — and ``field_policies._CONCEPT`` is a RECOMMENDATION-tier
-    policy (``influence_max=InfluenceTier.RECOMMENDATION``). ``resolve_field_authority``
-    short-circuits on that ceiling BEFORE it ever selects a load-bearing value, so EVERY concept
-    pin in the system — a human-confirmed one included — comes back as::
-
-        ResolutionPinV1(producer='human', strength='confirmed',
-                        conflict_state='influence_not_operational', load_bearing=False)
-
-    Gating on either clause would therefore read ``absent`` for every column in every catalog, and
-    the authoring and execution floors would become permanently unmeetable — not a stricter
-    platform, an inoperable one. For an advisory-tier field the load-bearing question is simply
-    not the right one: ``AUTHORITY_MATRIX`` is the gate that decides what a concept's
-    producer/strength may authorize, and it already refuses ``llm/proposed`` at every rung and
-    ``source/declared`` at execution.
-
-    The conflict gate is the half that IS real, and it is belt-and-braces rather than new
-    behaviour: on a genuine concept conflict the resolver already blanks ``producer``/``strength``
-    (there is no winning view), so such a pin read ``absent`` before this too. Stating the rule
-    explicitly means the safety no longer depends on that incidental blanking.
-    """
-    if pin is None or not pin.producer or pin.conflict_state == "conflict":
-        return "absent"
-    return f"{pin.producer}/{pin.strength}"
-
-
 def _authority_floors(conn, logical_refs: list[str]) -> tuple[bool, bool]:
     """C2's two floors over an already-qualified set of logical refs: ``(authoring, execution)``.
 
     ONE batched resolver read (C1's read-only pins — the same law generation served from), one
-    authority per ref through :func:`_pin_authority`, and one ``clears`` fold per floor. The set is
-    authorized as a WHOLE or not at all: a materialization reads every column in its read set, so
-    one operand short of the floor is the whole plan short of it.
+    authority per ref through ``field_resolution.pin_authority``, and one ``clears`` fold per floor.
+    The set is authorized as a WHOLE or not at all: a materialization reads every column in its read
+    set, so one operand short of the floor is the whole plan short of it.
+
+    ``pin_authority`` is IMPORTED, never re-stated: S1A-5b promoted it beside
+    :class:`ResolutionPinV1` so the durable write's floors and the serving lens
+    (``contract/governed_lens``) apply ONE rule to one pin. They previously carried two — the
+    accepted conflict-gate here, the verbatim D4 clause there — which meant one option could be
+    told its operand had ``human/confirmed`` authority at the floor and ``absent`` on the card.
 
     An empty ref list clears nothing — ``all()`` over nothing is vacuously true, and a floor that
     passed because it measured no columns would be the most dangerous answer this function could
     give. The CALLER decides whether an empty measurement counts as evaluated at all.
     """
-    from featuregen.overlay.upload.field_resolution import current_resolution_pins
+    from featuregen.overlay.upload.field_resolution import (
+        current_resolution_pins,
+        pin_authority,
+    )
     from featuregen.overlay.upload.semantic_eligibility import clears
 
     refs = list(dict.fromkeys(logical_refs))
     pins = current_resolution_pins(conn, logical_refs=refs, fields=("concept",))
-    authorities = [_pin_authority(pins.get((logical, "concept"))) for logical in refs]
+    authorities = [pin_authority(pins.get((logical, "concept"))) for logical in refs]
     return (bool(authorities) and all(clears(a, "authoring") for a in authorities),
             bool(authorities) and all(clears(a, "execution_at_governed") for a in authorities))
 
@@ -674,9 +771,9 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
     #
     # S1A-5a: TWO arms, ONE fold. The arms differ only in how a read-set entry is qualified into a
     # logical ref — a governed cross-catalog plan carries each entry's own catalog, a single-source
-    # plan has one the whole read set inherits. Everything after that (the batched pin read, the
-    # `_pin_authority` rule, the two `clears` folds) is `_authority_floors`, shared, so the two
-    # cannot drift into two answers about the same pin. The PAIR arm goes first: where both shapes
+    # plan has one the whole read set inherits. Everything after that (the batched pin read,
+    # `field_resolution.pin_authority`, the two `clears` folds) is `_authority_floors`, shared, so
+    # the two cannot drift into two answers about the same pin. The PAIR arm goes first: where both
     # are present the per-entry attribution is the precise one, and falling back to a plan-wide
     # catalog is exactly what a cross-catalog plan must never do.
     authoring_now = False
@@ -792,6 +889,7 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
 __all__ = ["GOVERNED_CROSS_CATALOG", "OPTION_DECISION_INTEGRITY_CODE",
            "OPTION_DECISION_INTEGRITY_NEXT_STEP", "OptionDecisionIntegrityError",
            "assemble_current_activation_state", "decision_facts_for_candidate",
+           "decision_facts_for_governed_option",
            "frozen_binding_plan", "has_reviewed_formula_expectation",
            "load_frozen_option_facts", "load_option_decision_record",
            "persist_option_decisions"]
