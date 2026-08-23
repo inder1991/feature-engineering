@@ -345,8 +345,18 @@ def retry_run_authoring(run_id: str, body: RetryAuthoringIn, conn: _Conn,
     approval, the ceiling, the tombstones and the money guard all belong to
     `request_draft_for_candidate` — the same function `POST /considered-revisions/.../formula-drafts`
     calls — and its typed refusals are re-raised here with the statuses that route already answers
-    with, so a person cannot get two different answers to one question by arriving through two
-    doors.
+    with.
+
+    ▲ **ONE KNOWN DIVERGENCE FROM THAT OTHER DOOR, STATED RATHER THAN CLAIMED AWAY.** This route
+    adds a PRE-FLIGHT the legacy door does not have: `retry_availability` refuses
+    `COST_AUTHORIZATION_EXHAUSTED` before the seam is called. The legacy door mints and CONSUMES
+    the coupon, because 1105 enforces spend per physical call at the DISPATCH seam and not at
+    request time — so a draft bought there against a spent ceiling dies at its first provider call
+    with the one-use approval already burnt. The divergence is deliberate and it runs in the
+    conservative direction: refusing protects the coupon, and the two doors agree on every other
+    refusal. It closes when the exhaustion check moves into the shared request seam (queued with
+    the substrate session, whose file this is); the correct behaviour is this one, so the gate
+    below does not soften in the meantime.
 
     THE ORDER OF THE GATES, and why each is where it is:
 

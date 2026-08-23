@@ -310,6 +310,122 @@ def test_an_EXHAUSTED_CEILING_refuses_in_the_spend_guards_own_word(client, conn)
     assert response.json()["detail"]["code"] == "COST_AUTHORIZATION_EXHAUSTED"
 
 
+def test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO(client, conn):
+    """▲ THE DRIFT-KILLER for the one query this projection COPIES.
+
+    `runs.projection.retry_availability` reads the ceiling a retry would ride with a query that is
+    byte-identical to `formula_draft_service.request_draft_for_candidate`'s — including its
+    preferences: only the AUTHORIZATION's expiry filters, the coupon's own uses and expiry do not,
+    and `ORDER BY e.approved_at DESC` breaks the tie. Copies do not stay identical on their own, and
+    nothing else in the suite notices a divergence: two approvals for one identity is the smallest
+    arrangement where the preference ORDER decides the answer, so it is the arrangement that
+    defends it. Flip the copy's DESC to ASC and this dies; every other test stays green.
+
+    The extraction of the shared read belongs to the substrate session (`formula_draft_service` is
+    not this session's to edit); until it lands, this test is what stands between the two copies.
+    """
+    from featuregen.overlay.upload.llm_spend import remaining_spend, reserve_spend, settle_spend
+
+    chain = _seed(conn, run_id="rty-two")
+    draft_id = _attempt(client, conn, chain)
+
+    # TWO approvals for one identity, differing only in the amount confirmed — so each mints its own
+    # spend authorization and its own coupon, which is what makes the pick a real choice.
+    older = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                        json={**_CEILING, "max_cost": "25.00"}, headers=_GOVERNANCE).json()
+    newer = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                        json={**_CEILING, "max_cost": "9.00"}, headers=_GOVERNANCE).json()
+    assert older["spend_authorization_id"] != newer["spend_authorization_id"]
+    # The older one is aged back a day and then spent to the last call: a ceiling that authorizes
+    # nothing any more, which is exactly what a wrong pick would report on.
+    conn.execute(
+        "UPDATE formula_draft_regeneration_exception "
+        "SET approved_at = approved_at - interval '1 day' WHERE exception_id = %s",
+        (older["exception_id"],))
+    now = conn.execute("SELECT now()").fetchone()[0]
+    settle_spend(conn, reserve_spend(
+        conn, spend_authorization_id=older["spend_authorization_id"], calls=45, tokens=250_000,
+        cost="25.00", now=now), actual_calls=45, actual_tokens=250_000, actual_cost="25.00")
+
+    # THE ARRANGEMENT, asserted rather than assumed — a test whose premise silently stopped holding
+    # would pass for the wrong reason for ever.
+    assert remaining_spend(conn, older["spend_authorization_id"], now=now).calls == 0
+    assert remaining_spend(conn, newer["spend_authorization_id"], now=now).calls > 0
+
+    # THE PAGE picks the NEWER ceiling, so it offers the retry...
+    row = _row(client, "rty-two", draft_id)
+    assert row["retryable"] is True, row["retry_blockers"]
+    assert row["retry_blockers"] == []
+
+    # ...and THE SEAM agrees, which is the half a page-only assertion could never catch: a
+    # projection reading one ceiling while the mint rides another is two answers to one question.
+    response = client.post(RETRY.format(run="rty-two"), json={"formula_draft_id": draft_id},
+                           headers=_hdr())
+    assert response.status_code == 202, response.text
+    assert conn.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_authoring_plan "
+        "WHERE formula_draft_id = %s",
+        (response.json()["formula_draft_id"],)).fetchone() == (newer["spend_authorization_id"],), \
+        "the draft rides the ceiling the page believed in, not the spent one"
+
+
+def test_a_RACE_LOST_AT_THE_SEAM_IS_A_REFUSAL_NOT_A_REPORTED_PURCHASE(client, conn, monkeypatch):
+    """The TOCTOU loser: the page's gate said yes, and somebody else's mint landed in between.
+
+    1107's partial index then refuses this INSERT, `request_draft` returns the row that won WITHOUT
+    consuming any coupon, and reporting that as a new attempt would describe a purchase that never
+    happened. Unreachable through the front door — the projection's own live-row blocker catches
+    every non-race case — so the concurrent winner is simulated by minting one from inside the seam.
+    """
+    import featuregen.overlay.upload.formula_draft_service as service
+
+    chain = _seed(conn, run_id="rty-race")
+    draft_id = _attempt(client, conn, chain)
+    client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                json=_CEILING, headers=_GOVERNANCE)
+    real = service.request_draft_for_candidate
+
+    def _loses_the_race(conn, **kwargs):
+        # Somebody else's retry, committed between this route's read and its write. It takes the
+        # identity slot AND the one coupon — which is why the second call below neither refuses as
+        # not-an-answer nor mints: it simply loses.
+        real(conn, **{**kwargs, "formula_draft_id": "fd-concurrent-winner"})
+        return real(conn, **kwargs)
+
+    monkeypatch.setattr(service, "request_draft_for_candidate", _loses_the_race)
+
+    response = client.post(RETRY.format(run="rty-race"), json={"formula_draft_id": draft_id},
+                           headers=_hdr())
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "RETRY_ATTEMPT_ALREADY_LIVE"
+    assert response.json()["detail"]["formula_draft_id"] == "fd-concurrent-winner"
+    assert conn.execute("SELECT COUNT(*) FROM formula_draft").fetchone() == (2,), \
+        "the failure and the winner — this gesture reported a refusal and minted nothing of its own"
+
+
+def test_a_DATABASE_WITHOUT_THE_GOVERNED_RETRY_SUBSTRATE_DEGRADES_INSTEAD_OF_500ing(client, conn):
+    """`pin_exists`'s rule, proved for 1103/1105. The live ledger stands at 1099, so this is the
+    deployment the code will actually meet first: reading the approval or ceiling store there raises
+    `UndefinedTable` out of a read-only projection and takes the WHOLE run page down for one failed
+    draft. The stores are dropped inside the test transaction, which rolls back."""
+    chain = _seed(conn, run_id="rty-pre")
+    draft_id = _attempt(client, conn, chain)
+    conn.execute("DROP TABLE formula_draft_regeneration_exception, "
+                 "llm_spend_authorization_revision CASCADE")
+
+    row = _row(client, "rty-pre", draft_id)
+    assert row["retryable"] is False
+    assert [b["code"] for b in row["retry_blockers"]] == ["RETRY_SUBSTRATE_ABSENT"]
+    assert "migrations" in row["retry_blockers"][0]["detail"], \
+        "the remedy is an operator's, and the sentence has to say so"
+
+    response = client.post(RETRY.format(run="rty-pre"), json={"formula_draft_id": draft_id},
+                           headers=_hdr())
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "RETRY_SUBSTRATE_ABSENT"
+
+
 def test_an_APPROVAL_CEILING_THAT_IS_NOT_A_POSITIVE_AMOUNT_is_a_422_not_a_500(client, conn):
     """The approval this gesture rides carries the same string-into-`numeric` field, and it had the
     same raw-500 hole: refused now at the one declaration both approval bodies share."""

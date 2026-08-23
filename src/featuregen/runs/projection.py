@@ -646,6 +646,19 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
         # offering a retry over a spent one sends a person into `SpendExhausted` at the dispatch
         # seam. With no approved ceiling the service mints its bounded development envelope, so
         # there is nothing here to be exhausted and nothing to report.
+        #
+        # ▲ **THIS IS A COPY, AND IT IS NAMED AS ONE.** The original is
+        # `formula_draft_service.request_draft_for_candidate`'s approved-ceiling read (the
+        # `SELECT llm_spend_authorization_id ...` inside its `spend_authorization_id is None`
+        # branch). Byte-identical DELIBERATELY, preferences included: only the AUTHORIZATION's
+        # expiry filters here, the coupon's own uses and expiry do not, and `approved_at DESC`
+        # breaks the tie — a projection that "improved" any of those would report a ceiling the
+        # mint does not use, which is the two-answers-by-route defect this whole surface is built
+        # to avoid. Extracting the shared read is the SUBSTRATE session's (this session may not
+        # edit that file); until it lands, the copy is defended by
+        # `tests/featuregen/api/test_feature_run_retry.py::
+        # test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO`, which is the only test in
+        # the suite that dies if these two drift. Change one, change the other, and run that test.
         approved = conn.execute(
             "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception e "
             "  JOIN llm_spend_authorization_revision a "

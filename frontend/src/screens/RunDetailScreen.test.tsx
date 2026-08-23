@@ -714,6 +714,29 @@ it('never lands a retry answer under a run the screen has since moved to', async
   expect(screen.queryByText('d0')).toBeNull()
 })
 
+// ▲ AND THE RETRY ERROR BRANCH, the twin of the prepare one. Deleting its guard leaves every other
+// test green: a refusal about the PREVIOUS run's attempt would paint an alert here, and the reader
+// has no way to tell that the sentence is about a draft this run does not have.
+it('never paints a retry refusal that belongs to a run the screen has left', async () => {
+  getFeatureRunDetail.mockResolvedValue(detailWith(OFFERED))
+  let refuse: (e: unknown) => void = () => {}
+  retryRunAuthoring.mockImplementation(
+    () => new Promise((_, reject) => { refuse = reject }) as never)
+  const { rerender } = render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('d0')).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('button', { name: /Retry attempt d0/ }))
+
+  getFeatureRunDetail.mockResolvedValue({ ...DETAIL, generation_run_id: 'grun_other' })
+  rerender(<RunDetailScreen runId="grun_other" />)
+  await waitFor(() => expect(getFeatureRunDetail).toHaveBeenCalledWith('grun_other'))
+
+  refuse(new api.ApiError(409, 'a live attempt already holds this identity', null,
+    'RETRY_ATTEMPT_ALREADY_LIVE', { code: 'RETRY_ATTEMPT_ALREADY_LIVE' }))
+
+  await waitFor(() => expect(screen.getByText('d1')).toBeInTheDocument())
+  expect(screen.queryByRole('alert')).toBeNull()
+})
+
 // ── the stage cell, when a stage has BOTH a reason and a count (carried from Task 4) ─────────────
 it('separates a stage’s reason code from its count instead of running them together', async () => {
   getFeatureRunDetail.mockResolvedValue({
