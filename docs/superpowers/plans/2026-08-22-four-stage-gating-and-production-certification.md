@@ -3123,8 +3123,13 @@ premises withdrawn on evidence.
 * The ordinal count filters seven columns behind a single-column index — perf nit at current
   row counts; an index on the binding fields (or `exact_formula_identity_hash` — same owed
   migration) when convenient.
-* `retirement_scope.__all__` omits `approve_regeneration_exception` and `covering_tombstones`
-  while still listing the deprecated `tombstone_covering`.
+* ~~`retirement_scope.__all__` stale~~ — CLOSED at `e2d9819f`, together with the two Task 7
+  review items (2026-08-24, same commit): the **dead-ticket guard** at the request seam
+  (`DraftCeilingExhausted` → `AuthoringRefused(COST_AUTHORIZATION_EXHAUSTED)`, refusing BEFORE
+  the coupon is consumed; expired-authorization falls through to the dev envelope, pinned) and
+  the **ONE ceiling locator** `approved_ceiling_for` in `retirement_scope.py` (byte-stable
+  semantics, three callers; run-spine projection switches when my branch reaches its tree —
+  until then its byte-identical copy + coupling test stands).
 * From the round-5 ledger (reviewer's file:line record is the source of truth): the
   201-with-"budget in effect" message over a dead coupon; the spend-preference query's missing
   expiry/exhaustion filters and the refuses-vs-substitutes posture (flagged for the
