@@ -76,6 +76,19 @@ def generation_on(monkeypatch):
     monkeypatch.setenv("FEATUREGEN_GENERATION_V2_ENABLED", "1")
 
 
+@pytest.fixture
+def sandbox_switches_off(monkeypatch):
+    """BOTH switches `EXECUTE_SANDBOX`'s only entrance rides, explicitly OFF.
+
+    Default-OFF is what every test and dev deployment actually is, but a test that asserts the
+    DEFAULT must not INHERIT it from whatever the developer's shell exports: with either flag set
+    outside the process the assertion would invert on that one machine and nowhere else. Deleting
+    them states the deployment the test is describing.
+    """
+    monkeypatch.delenv("FEATUREGEN_MATERIALIZE_ENABLED", raising=False)
+    monkeypatch.delenv("FEATUREGEN_VERIFICATION_V2_ENABLED", raising=False)
+
+
 def _rail(detail):
     return {s["stage"]: s for s in detail["rail"]}
 
@@ -90,7 +103,7 @@ def test_rail_mapping_is_total_over_1090s_check():
     assert set(_AUTHOR_SEVERITY) == set(RAIL_FROM_DRAFT_STATE.values())
 
 
-def test_detail_shows_sockets_and_two_axes(db, generation_on):
+def test_detail_shows_sockets_and_two_axes(db, generation_on, sandbox_switches_off):
     _seed_retired_ready_draft(db, "rd-a")
     _drop_the_pin(db)
     out = run_detail(db, _ADMIN, "rd-a")
@@ -106,13 +119,19 @@ def test_detail_shows_sockets_and_two_axes(db, generation_on):
     # asks for — the code is what tells an operator which person and which remedy. Asserting the
     # states only lets a socket carry the wrong reason (TRAIN_MODEL is an unbuilt SUBSYSTEM, not a
     # missing worker) and still pass.
+    #
+    # THREE of these five are now DERIVED, and this map is the mutation check: reverting to the old
+    # static tuple restores `WORKER_NOT_IMPLEMENTED` for EXECUTE_SANDBOX (whose §9.0 lane exists)
+    # and `STATE_MACHINE_NOT_BUILT` for the production pair (whose machines 1113/1114 built), and
+    # this assertion fails on all three. The two that remain literal are literal because they are
+    # still TRUE: no sandbox publication worker and no training subsystem exist to derive from.
     _sockets = ("EXECUTE_SANDBOX", "PUBLISH_SANDBOX", "MATERIALIZE_PRODUCTION",
                 "PUBLISH_PRODUCTION", "TRAIN_MODEL")
     assert {s: by_stage[s]["reason_code"] for s in _sockets} == {
-        "EXECUTE_SANDBOX": "WORKER_NOT_IMPLEMENTED",
+        "EXECUTE_SANDBOX": "MATERIALIZATION_DISABLED",
         "PUBLISH_SANDBOX": "WORKER_NOT_IMPLEMENTED",
-        "MATERIALIZE_PRODUCTION": "STATE_MACHINE_NOT_BUILT",
-        "PUBLISH_PRODUCTION": "STATE_MACHINE_NOT_BUILT",
+        "MATERIALIZE_PRODUCTION": "ACTION_UNAVAILABLE",
+        "PUBLISH_PRODUCTION": "ACTION_UNAVAILABLE",
         "TRAIN_MODEL": "SUBSYSTEM_NOT_BUILT"}
     # The rail is these NINE stages and no others. Every other assertion here indexes `by_stage` by
     # name, so an extra stage — a lane the UI would render with nothing behind it — survives them
@@ -123,7 +142,7 @@ def test_detail_shows_sockets_and_two_axes(db, generation_on):
     assert len(out["rail"]) == 9
 
 
-def test_preview_is_not_started_once_the_pin_exists(db, generation_on):
+def test_preview_is_not_started_once_the_pin_exists(db, generation_on, sandbox_switches_off):
     """The other half of the DERIVED availability rule (spec §7 [R3.1]).
 
     Without this, a `pin_exists` that always answered False — a hardcoded UNAVAILABLE — would pass
@@ -155,6 +174,70 @@ def test_preview_unavailable_while_generation_is_switched_off(db, monkeypatch):
     _seed_retired_ready_draft(db, "rd-off")
     assert _rail(run_detail(db, _ADMIN, "rd-off"))["GENERATE_PREVIEW"] == {
         "stage": "GENERATE_PREVIEW", "state": "UNAVAILABLE", "reason_code": "GENERATION_DISABLED"}
+
+
+def test_execute_sandbox_names_the_lane_switch_once_the_surface_is_on(db, sandbox_switches_off,
+                                                                     monkeypatch):
+    """The SECOND half of `EXECUTE_SANDBOX`'s fold, and the only test that can pin its precedence.
+
+    The stage's only entrance is `POST /feature-execution/verifications`, and two independent
+    switches shut it: the router-level `materialization_enabled` (which 404s every path on that
+    surface) and the lane's own `verification_enabled` (default OFF, the switch the worker tick
+    reads before it will process a single request).
+
+    Both answers are UNAVAILABLE, so the state cannot tell them apart — and they send an operator
+    to DIFFERENT deployment switches. A fold that named only one of them would have half the
+    deployments told to flip a flag that changes nothing.
+    """
+    monkeypatch.setenv("FEATUREGEN_MATERIALIZE_ENABLED", "1")
+    _seed_retired_ready_draft(db, "rd-vs")
+    assert _rail(run_detail(db, _ADMIN, "rd-vs"))["EXECUTE_SANDBOX"] == {
+        "stage": "EXECUTE_SANDBOX", "state": "UNAVAILABLE",
+        "reason_code": "VERIFICATION_DISABLED"}
+
+
+def test_execute_sandbox_is_not_started_once_both_switches_are_on(db, monkeypatch):
+    """The falsifier for the whole derivation: without it, a hardcoded UNAVAILABLE passes.
+
+    NOT_STARTED is the honest answer here even though this deployment has no execution substrate
+    configured (`verification_lane._EXECUTOR is None`). That absence is not unavailability: the
+    entrance ACCEPTS the request, the worker claims it, and the attempt ends FAILED with the
+    posture named. An attempt with an outcome is a stage that ran — spec §7 [R3.1] forbids
+    NOT_STARTED over an entrance that REFUSES, and this entrance does not refuse.
+    """
+    monkeypatch.setenv("FEATUREGEN_MATERIALIZE_ENABLED", "1")
+    monkeypatch.setenv("FEATUREGEN_VERIFICATION_V2_ENABLED", "1")
+    _seed_retired_ready_draft(db, "rd-vo")
+    by_stage = _rail(run_detail(db, _ADMIN, "rd-vo"))
+    assert by_stage["EXECUTE_SANDBOX"] == {"stage": "EXECUTE_SANDBOX", "state": "NOT_STARTED",
+                                           "reason_code": None}
+    # The production pair does NOT move with a deployment switch — it moves with the ACTION POLICY,
+    # and no environment variable reaches that. A derivation that read the switches for all three
+    # would open production here, which is precisely §0.1.0's prohibition.
+    assert by_stage["MATERIALIZE_PRODUCTION"]["reason_code"] == "ACTION_UNAVAILABLE"
+    assert by_stage["PUBLISH_PRODUCTION"]["reason_code"] == "ACTION_UNAVAILABLE"
+
+
+def test_production_sockets_read_the_action_policy_not_a_stored_string(db, sandbox_switches_off,
+                                                                      monkeypatch):
+    """The production pair's availability is ASKED of `action_available`, never remembered.
+
+    A stored `ACTION_UNAVAILABLE` reads identically today and becomes a lie on the day §21.0's
+    production governance lands — the same class of stale label this task deleted three of. Moving
+    the policy's answer must move the rail, so the policy is moved here and the rail is read.
+    """
+    monkeypatch.setattr("featuregen.runs.projection.action_available", lambda action: True)
+    _seed_retired_ready_draft(db, "rd-pa")
+    by_stage = _rail(run_detail(db, _ADMIN, "rd-pa"))
+    for stage in ("MATERIALIZE_PRODUCTION", "PUBLISH_PRODUCTION"):
+        assert by_stage[stage] == {"stage": stage, "state": "NOT_STARTED", "reason_code": None}
+    # The two acts are asked SEPARATELY — one call per action, with that action's own name. A
+    # derivation that asked once and reused the answer would report both on one act's policy.
+    asked: list[str] = []
+    monkeypatch.setattr("featuregen.runs.projection.action_available",
+                        lambda action: asked.append(str(action)) or False)
+    run_detail(db, _ADMIN, "rd-pa")
+    assert asked == ["MATERIALIZE_PRODUCTION", "PUBLISH_PRODUCTION"]
 
 
 def test_milestones_and_identity_are_derived_from_evidence(db):
