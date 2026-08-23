@@ -504,3 +504,99 @@ def request_draft_for_candidate(
         formula_draft_id=draft_id, created=created, strategy=decision.strategy,
         warnings=tuple(decision.warnings), config_hash=config_hash, candidate=candidate,
         action_decision_revision_id=decision_id)
+
+
+class RegenerationNotApprovable(Exception):
+    """The target cannot take a regeneration exception — `kind` is closed: `unknown_draft`
+    (404-shaped), `deterministic_lane` (409 — Option 2: free by construction, nothing to
+    approve), `not_a_formula` (409 — the candidate resolves to no formula at all)."""
+
+    def __init__(self, kind: str, detail: str) -> None:
+        super().__init__(detail)
+        self.kind = kind
+        self.detail = detail
+
+
+def approve_regeneration_for_draft(
+    conn, *, formula_draft_id: str, actor_subject: str, max_calls: int, max_tokens: int,
+    max_cost: str, currency: str, pricing_version: str, expires_at: str, max_uses: int = 1,
+) -> tuple[str, str, bool]:
+    """Task 6's approval act, with every binding derived SERVER-SIDE from the target draft.
+
+    The exception authorizes the identity a re-request would mint TODAY — the candidate's frozen
+    facts under the CURRENT strategy resolution and CURRENT provider contract — because that is
+    the identity `request_draft` will check. The three bindings come from that derivation, never
+    from a request body: a caller supplying its own target identity would be approving a
+    regeneration of something other than what the retry will actually attempt.
+
+    Cost-confirmed (§11.2): the NOT NULL spend authorization is minted here from the approver's
+    ceilings, expiry through `canonical_approval_expiry` (the replay lesson), and the exception's
+    own idempotency means a replayed approval is one coupon, not a stack.
+
+    Returns ``(exception_id, spend_authorization_id, created)``.
+    """
+    from featuregen.overlay.upload.llm_spend import (
+        authorize_spend,
+        canonical_approval_expiry,
+    )
+    from featuregen.overlay.upload.retirement_scope import approve_regeneration_exception
+
+    target = conn.execute(
+        "SELECT considered_revision_id, option_id FROM formula_draft "
+        "WHERE formula_draft_id = %s", (formula_draft_id,)).fetchone()
+    if target is None:
+        raise RegenerationNotApprovable(
+            "unknown_draft", f"no draft {formula_draft_id!r}: an approval regenerates a recorded "
+                             f"attempt, and there is nothing recorded here")
+
+    candidate = frozen_candidate(conn, target[0], target[1])
+    assembled = assemble_strategy_facts(
+        conn, considered_revision_id=candidate.considered_revision_id, option_id=target[1],
+        idea=candidate.idea, catalog_snapshot_hash=candidate.catalog_snapshot_hash)
+    decision = resolve_formula_strategy(assembled.facts)
+
+    if decision.strategy is FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT:
+        raise RegenerationNotApprovable(
+            "deterministic_lane",
+            "this candidate resolves to the reviewed deterministic lane, whose retries are FREE "
+            "BY CONSTRUCTION (owner ruling, Option 2): re-request the draft — no approval "
+            "exists to give, and none is needed")
+    if decision.strategy is not FormulaStrategy.LLM_AUTHORED:
+        raise RegenerationNotApprovable(
+            "not_a_formula",
+            "this candidate resolves to no formula at all, so there is no regeneration to "
+            "approve")
+
+    provider_contract = current_author_contract_hash()
+    config_hash = jcs_sha256({
+        "identity_version": 2,
+        "formula_strategy": str(decision.strategy),
+        "strategy_identity_hash": decision.strategy_identity_hash,
+        "provider_contract_hash": provider_contract,
+    })
+    from featuregen.overlay.upload.formula_draft_store import formula_identity
+
+    target_identity = formula_identity(
+        considered_revision_id=candidate.considered_revision_id, option_id=target[1],
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        authoring_config_hash=config_hash,
+        definition_revision=candidate.definition_revision)
+
+    expires = canonical_approval_expiry(conn, expires_at)
+    spend_authorization_id = authorize_spend(
+        conn, action="AUTHOR_FORMULA", actor_subject=actor_subject,
+        job_identity=f"regeneration:{target_identity}",
+        member_identities=[target_identity],
+        provider_contract_hash=provider_contract,
+        max_calls=max_calls, max_tokens=max_tokens, currency=currency, max_cost=max_cost,
+        pricing_version=pricing_version, expires_at=expires)
+    exception_id, created = approve_regeneration_exception(
+        conn, target_formula_identity_hash=target_identity,
+        provider_contract_hash=provider_contract,
+        strategy_identity_hash=decision.strategy_identity_hash,
+        actor_subject=actor_subject, llm_spend_authorization_id=spend_authorization_id,
+        expires_at=expires, max_uses=max_uses)
+    log("featuregen.regeneration.approved", exception_id=exception_id,
+        formula_draft_id=formula_draft_id, created=created)
+    return exception_id, spend_authorization_id, created

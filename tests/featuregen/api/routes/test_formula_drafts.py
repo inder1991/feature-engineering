@@ -537,3 +537,106 @@ def test_A_RETIRED_CANDIDATE_IS_REFUSED_BY_THE_DECISION_before_the_money_guard(
         "SELECT allowed FROM action_decision_revision WHERE action = 'AUTHOR_FORMULA' "
         "ORDER BY decided_at DESC LIMIT 1").fetchone()
     assert refused == (False,)
+
+
+# ══ Stage I Task 6 — Option 2: deterministic retries are FREE; LLM retries are APPROVED ═════════
+_CEILING = {"max_calls": 45, "max_tokens": 250_000, "max_cost": "25.00", "currency": "USD",
+            "pricing_version": "regen@1", "expires_at": "2026-12-31T09:00:00Z"}
+
+
+def _first_draft(client, conn, headers, *, revision: str) -> str:
+    _revision(conn, revision_id=revision, snapshot_id=f"snap-{revision}")
+    response = client.post(DRAFT_PATH.format(rev=revision, opt="opt-a"), headers=headers)
+    assert response.status_code == 202, response.text
+    return response.headers["X-Formula-Draft-Id"]
+
+
+def _fail(conn, draft_id: str) -> None:
+    conn.execute(
+        "UPDATE formula_draft SET state = 'FAILED', failure_reason = 'boom' "
+        "WHERE formula_draft_id = %s", (draft_id,))
+
+
+def test_an_LLM_FAILURE_still_refuses_without_an_approval_and_the_APPROVAL_unlocks_it(
+        client, conn, engineer_headers):
+    """The whole retry chain, end to end: FAILED → 409 by name → a governance approval (bindings
+    derived server-side, cost-confirmed) → the re-request mints, consuming the exception exactly
+    once — and a THIRD request needs a fresh approval, because max_uses=1 means one."""
+    draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6")
+    _fail(conn, draft_id)
+
+    refused = client.post(DRAFT_PATH.format(rev="crev-t6", opt="opt-a"),
+                          headers=engineer_headers)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "FORMULA_DRAFT_NOT_AN_ANSWER"
+
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+    assert approved.json()["created"] is True
+
+    retried = client.post(DRAFT_PATH.format(rev="crev-t6", opt="opt-a"),
+                          headers=engineer_headers)
+    assert retried.status_code == 202, retried.text
+    assert retried.json()["created"] is True
+    burned = conn.execute(
+        "SELECT uses_consumed, max_uses FROM formula_draft_regeneration_exception "
+        "WHERE exception_id = %s", (approved.json()["exception_id"],)).fetchone()
+    assert burned == (1, 1), "consumed exactly once, by the mint it authorized"
+
+    _fail(conn, retried.headers["X-Formula-Draft-Id"])
+    third = client.post(DRAFT_PATH.format(rev="crev-t6", opt="opt-a"),
+                        headers=engineer_headers)
+    assert third.status_code == 409, "one approval is ONE budget — spent means spent"
+
+
+def test_a_REPLAYED_APPROVAL_is_one_coupon_not_a_stack(client, conn, engineer_headers):
+    draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6r")
+    _fail(conn, draft_id)
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+
+    first = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                        json=_CEILING, headers=governance)
+    replay = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                         json={**_CEILING, "expires_at": "2026-12-31T17:00:00Z"},
+                         headers=governance)
+    assert first.json()["exception_id"] == replay.json()["exception_id"]
+    assert replay.json()["created"] is False, \
+        "same UTC day, same ceilings: the same approval — canonical_approval_expiry at work"
+
+
+def test_the_DETERMINISTIC_LANE_has_nothing_to_approve(client, conn, engineer_headers,
+                                                       monkeypatch):
+    """Option 2 made the 1103/1105 unrepresentability the DESIGN: the approval surface refuses a
+    deterministic candidate by name, pointing at the free re-request."""
+    from featuregen.overlay.upload import formula_strategy_facts as fsf
+
+    draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6d")
+    _fail(conn, draft_id)
+
+    from featuregen.overlay.upload.formula_strategy import (
+        FormulaStrategy,
+        FormulaStrategyDecisionV1,
+    )
+    import featuregen.overlay.upload.formula_draft_service as service
+
+    monkeypatch.setattr(
+        service, "resolve_formula_strategy",
+        lambda facts: FormulaStrategyDecisionV1(
+            strategy=FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT, blockers=(), warnings=(),
+            strategy_identity_hash="sih-det"))
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    response = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "DETERMINISTIC_RETRY_IS_FREE"
+
+
+def test_approving_a_regeneration_is_a_GOVERNANCE_act_not_an_engineer_click(
+        client, conn, engineer_headers):
+    draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6p")
+    _fail(conn, draft_id)
+    response = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=engineer_headers)
+    assert response.status_code == 403, response.text

@@ -510,3 +510,83 @@ def test_the_LOCK_LIVES_ACROSS_THE_MUTATION_ON_AN_AUTOCOMMIT_CONNECTION(db, _dsn
             cleanup.execute("DELETE FROM formula_draft WHERE formula_draft_id = %s", ("fd-auto",))
             cleanup.execute("ALTER TABLE formula_draft ENABLE TRIGGER "
                             "formula_draft_no_identity_edit")
+
+
+# ══ Stage I Task 6 — Option 2: the deterministic lane's retries are FREE BY CONSTRUCTION ════════
+def _failed_draft(db, draft_id: str) -> str:
+    """A FAILED occupant AT THE IDENTITY a re-request will compute — seeded with the store's own
+    `formula_identity` over the same fields, or the gates under test would never even see it.
+    FAILED carries its reason IN the insert (`formula_draft_failure_reason_belongs_to_failed`)."""
+    from featuregen.overlay.upload.formula_draft_store import formula_identity
+
+    identity = formula_identity(
+        considered_revision_id="crev-r", option_id=f"opt-{draft_id}",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", authoring_config_hash="h3",
+        definition_revision="")
+    db.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES (%s,'crev-r',%s,'h1','h2','h3','',%s,'FAILED','renderer crash',"
+        "'user:ops','t')",
+        (draft_id, f"opt-{draft_id}", identity))
+    return identity
+
+
+def _request_again(db, *, draft_id: str, option_id: str, identity: str,
+                   provider_contract_hash=None, strategy_identity_hash=None):
+    from featuregen.overlay.upload.formula_draft_store import request_draft
+
+    return request_draft(
+        db, formula_draft_id=draft_id, considered_revision_id="crev-r", option_id=option_id,
+        planning_request_hash="h1", catalog_snapshot_hash="h2", authoring_config_hash="h3",
+        definition_revision="", requested_by="user:ops", requested_at="2026-08-23T00:00:00Z",
+        provider_contract_hash=provider_contract_hash,
+        strategy_identity_hash=strategy_identity_hash)
+
+
+def test_a_FAILED_DETERMINISTIC_draft_re_requests_FREE_no_exception_no_spend(db):
+    """The owner's Option 2 ruling (spec R4.2 gap 3): a reviewed-blueprint attempt carries no
+    provider contract, calls no provider and spends nothing — so the re-spend gate does not
+    apply, and a fresh row mints with ZERO exception rows and ZERO spend rows."""
+    identity = _failed_draft(db, "fd-det")
+
+    minted, created = _request_again(
+        db, draft_id="fd-det-retry", option_id="opt-fd-det", identity=identity)
+
+    assert (minted, created) == ("fd-det-retry", True)
+    assert db.execute(
+        "SELECT COUNT(*) FROM formula_draft_regeneration_exception").fetchone() == (0,)
+    assert db.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision").fetchone() == (0,)
+    history = db.execute(
+        "SELECT COUNT(*) FROM formula_draft WHERE formula_identity_hash = %s", (identity,)
+    ).fetchone()
+    assert history == (2,), "the failed row stays as history beside the fresh attempt"
+
+
+def test_a_TOMBSTONE_refuses_the_deterministic_lane_too_withdrawal_is_not_a_cost(db):
+    """The precedence pin the ruling demands: tombstones refuse FIRST, both lanes — the free
+    path frees the WALLET check, never the WITHDRAWAL check."""
+    from featuregen.overlay.upload.formula_draft_store import DraftRetired
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _failed_draft(db, "fd-det-ret")
+    record_tombstone(db, formula_draft_id="fd-det-ret",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+
+    with pytest.raises(DraftRetired):
+        _request_again(db, draft_id="fd-det-ret-retry", option_id="opt-fd-det-ret",
+                       identity="ident-fd-det-ret")
+
+
+def test_an_LLM_FAILURE_without_an_exception_is_UNCHANGED_still_not_an_answer(db):
+    from featuregen.overlay.upload.formula_draft_store import DraftNotAnAnswer
+
+    _failed_draft(db, "fd-llm")
+    with pytest.raises(DraftNotAnAnswer):
+        _request_again(db, draft_id="fd-llm-retry", option_id="opt-fd-llm",
+                       identity="ident-fd-llm",
+                       provider_contract_hash="sha256:contract",
+                       strategy_identity_hash="sih-llm")

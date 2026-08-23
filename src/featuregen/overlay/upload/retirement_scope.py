@@ -267,3 +267,51 @@ def consume_exception(conn, exception_id: str) -> bool:
         " WHERE exception_id = %s AND uses_consumed < max_uses RETURNING exception_id",
         (exception_id,)).fetchone()
     return row is not None
+
+
+def approve_regeneration_exception(
+    conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
+    strategy_identity_hash: str, actor_subject: str, llm_spend_authorization_id: str,
+    expires_at: str, max_uses: int = 1,
+) -> tuple[str, bool]:
+    """Record one approved regeneration — Stage I Task 6's creation act, LLM-lane-only by the
+    owner's Option 2 ruling (deterministic retries are free by construction and need none).
+
+    Idempotent on content: the exception id is the hash of everything it binds, so a replayed
+    approval is ONE exception with ONE ``max_uses`` budget — never a stack of fresh coupons.
+    ``tombstone_id`` is derived HERE, not accepted: if a tombstone covers the target, the
+    exception must name it (1103's CHECK makes the pairing structural), and a caller choosing
+    which tombstone it overrides would be choosing what it is exempt from.
+    """
+    from featuregen.canonical import jcs_sha256
+
+    covering = conn.execute(
+        "SELECT tombstone_id FROM formula_draft_retirement_tombstone "
+        "WHERE exact_formula_identity_hash = %s OR retirement_scope_key = ("
+        "  SELECT retirement_scope_key FROM formula_draft_authoring_identity i"
+        "  JOIN formula_draft d ON d.formula_draft_id = i.formula_draft_id"
+        "  WHERE d.formula_identity_hash = %s LIMIT 1) "
+        "ORDER BY tombstone_id DESC LIMIT 1",
+        (target_formula_identity_hash, target_formula_identity_hash)).fetchone()
+    tombstone_id = None if covering is None else covering[0]
+
+    exception_id = "exc-" + jcs_sha256({
+        "target_formula_identity_hash": target_formula_identity_hash,
+        "provider_contract_hash": provider_contract_hash,
+        "strategy_identity_hash": strategy_identity_hash,
+        "actor_subject": actor_subject,
+        "llm_spend_authorization_id": llm_spend_authorization_id,
+        "expires_at": str(expires_at),
+        "max_uses": max_uses,
+        "tombstone_id": tombstone_id,
+    })[:32]
+    inserted = conn.execute(
+        "INSERT INTO formula_draft_regeneration_exception (exception_id, tombstone_id, "
+        "target_formula_identity_hash, provider_contract_hash, strategy_identity_hash, "
+        "llm_spend_authorization_id, actor_subject, overrides_tombstone, max_uses, expires_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (exception_id) DO NOTHING RETURNING exception_id",
+        (exception_id, tombstone_id, target_formula_identity_hash, provider_contract_hash,
+         strategy_identity_hash, llm_spend_authorization_id, actor_subject,
+         tombstone_id is not None, max_uses, expires_at)).fetchone()
+    return exception_id, inserted is not None

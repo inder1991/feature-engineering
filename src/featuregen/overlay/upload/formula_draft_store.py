@@ -417,7 +417,10 @@ def _request_draft_locked(
             conn, target_formula_identity_hash=identity,
             provider_contract_hash=provider_contract_hash,
             strategy_identity_hash=strategy_identity_hash,
-            now=now or _now(conn))
+            # ▲ The DB's clock when the caller passed none — this line was `_now(conn)`, a
+            # helper that never existed in this module: a NameError masked because every prior
+            # caller passed `now` explicitly. Found by Task 6's store-level tests.
+            now=now if now is not None else conn.execute("SELECT now()").fetchone()[0])
 
     tombstone = tombstone_covering(
         conn, scope_key=scope_key, formula_identity_hash=identity)
@@ -443,7 +446,16 @@ def _request_draft_locked(
             live = conn.execute(
                 "SELECT 1 FROM formula_draft WHERE formula_identity_hash = %s "
                 "AND state NOT IN ('FAILED', 'CANCELLED')", (identity,)).fetchone()
-            if live is None:
+            if live is None and provider_contract_hash is not None:
+                # ▲ THE LLM LANE ONLY. Owner ruling 2026-08-23 (Option 2, spec R4.2 gap 3 at the
+                # run-spine's 9a613bfa): DETERMINISTIC retries are FREE BY CONSTRUCTION — a
+                # reviewed-blueprint attempt carries NO provider contract (1104's CHECK), calls
+                # no provider and spends nothing, so the re-spend this gate exists to guard
+                # cannot occur and the gate does not apply. It minted a fresh row with no
+                # exception and no spend — which the constraints made UNREPRESENTABLE to approve
+                # anyway (1103 contract NOT NULL + 1105 spend NOT NULL): the ruling turns that
+                # unrepresentability from a trap into the design. Tombstones still refuse FIRST,
+                # both lanes — withdrawal is a decision, not a cost.
                 raise DraftNotAnAnswer(
                     f"formula identity {identity} belongs to draft {failed[0]}, which is "
                     f"{failed[1]}. That is not an answer this platform bought — it is a failure it "

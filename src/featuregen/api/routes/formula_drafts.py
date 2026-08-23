@@ -273,6 +273,70 @@ def request_formula_method_override(
     }
 
 
+class RegenerationApprovalIn(BaseModel):
+    """The approver's cost confirmation — everything else is DERIVED from the target draft."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_calls: int = Field(gt=0)
+    max_tokens: int = Field(gt=0)
+    max_cost: str = Field(min_length=1)
+    currency: str = Field(min_length=3, max_length=3)
+    pricing_version: str = Field(min_length=1)
+    expires_at: str = Field(min_length=1)
+    max_uses: int = Field(default=1, ge=1, le=10)
+
+
+@router.post(
+    "/formula-drafts/{formula_draft_id}/regeneration-exceptions", status_code=201,
+    dependencies=[Depends(require_permission("governance:confirm"))])
+def approve_regeneration(
+    formula_draft_id: str, body: RegenerationApprovalIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """§11.1's approval surface, LLM-lane-only by the owner's Option 2 ruling.
+
+    A GOVERNANCE act (`governance:confirm` — the recipe-review primitive), because approving a
+    re-spend after a recorded failure is somebody taking responsibility for buying the answer
+    again. The three bindings — target identity, provider contract, strategy — are derived
+    server-side from the target draft's candidate under the CURRENT resolution; the body carries
+    only the cost confirmation. One-time-consumption semantics are 1103's, consumed only by the
+    transaction that mints the replacement.
+    """
+    from featuregen.overlay.upload.formula_draft_service import (
+        RegenerationNotApprovable,
+        approve_regeneration_for_draft,
+    )
+
+    try:
+        exception_id, spend_authorization_id, created = approve_regeneration_for_draft(
+            conn, formula_draft_id=formula_draft_id, actor_subject=identity.subject,
+            max_calls=body.max_calls, max_tokens=body.max_tokens, max_cost=body.max_cost,
+            currency=body.currency, pricing_version=body.pricing_version,
+            expires_at=body.expires_at, max_uses=body.max_uses)
+    except RegenerationNotApprovable as exc:
+        raise HTTPException(
+            status_code=404 if exc.kind == "unknown_draft" else 409,
+            detail={"code": {"deterministic_lane": "DETERMINISTIC_RETRY_IS_FREE",
+                             "not_a_formula": "NOT_A_FORMULA"}.get(exc.kind, exc.kind),
+                    "detail": exc.detail}) from exc
+    except CandidateUnavailable as exc:
+        raise HTTPException(
+            status_code={"unknown_revision": 404,
+                         "option_not_in_revision": 422}.get(exc.kind, 409),
+            detail=exc.detail) from exc
+
+    counters.incr("featuregen.regeneration.approved" if created
+                  else "featuregen.regeneration.deduplicated")
+    return {
+        "exception_id": exception_id,
+        "spend_authorization_id": spend_authorization_id,
+        "created": created,
+        "detail": ("the regeneration is approved and cost-confirmed; re-request the draft and "
+                   "the exception is consumed by the mint it authorizes" if created else
+                   "this exact approval already exists; its one budget is the one in effect"),
+    }
+
+
 @router.get("/formula-drafts/{formula_draft_id}",
             dependencies=[Depends(require_permission("feature:generate"))])
 def formula_draft_status(formula_draft_id: str, conn: _Conn) -> dict[str, Any]:
