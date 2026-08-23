@@ -38,6 +38,8 @@ from featuregen.runtime.observability import counters, log
 from featuregen.runtime.outbox import OutboxMessage, insert_outbox_message_checked
 
 __all__ = [
+    "AUTHORING_ENVIRONMENT",
+    "AuthoringRefused",
     "CandidateUnavailable",
     "DraftRequestedV1",
     "FORMULA_DRAFT_HANDLER",
@@ -47,9 +49,93 @@ __all__ = [
     "NotAnAnswerAtRequest",
     "RetiredAtRequest",
     "StrategyRefused",
+    "authoring_evidence_pins",
+    "candidate_governance_blockers",
     "frozen_candidate",
     "request_draft_for_candidate",
 ]
+
+#: AUTHOR_FORMULA's authorization environment. Authoring runs in the CONTROL PLANE — there is no
+#: serving environment for a draft, and inventing one would let an environment-scoped rule match
+#: a claim nothing deploys. A namespace, not a claim; stated so nobody "fixes" it to an env id.
+AUTHORING_ENVIRONMENT = "control-plane"
+
+
+def authoring_evidence_pins(
+    *, retirement_scope_key: str, catalog_snapshot_hash: str, strategy_identity_hash: str,
+) -> dict[str, str]:
+    """The pins an AUTHOR_FORMULA decision is taken against — ONE definition (Stage I Task 5).
+
+    ▲ The service's decide and the worker's recheck must build these from the SAME function, or
+    the two dictionaries drift apart the first time either changes and the drift check fires on
+    healthy drafts — which teaches people to delete it (the generation lane's own words). The
+    three pins are the candidate's facts hash (the retirement scope key — §0.1.4's authoring
+    subject), the frozen catalog the model is given, and the evidence that chose the method.
+    """
+    return {
+        "retirement_scope_key": retirement_scope_key,
+        "catalog_snapshot_hash": catalog_snapshot_hash,
+        "strategy_identity_hash": strategy_identity_hash,
+    }
+
+
+def candidate_governance_blockers(
+    conn, *, candidate: "FrozenCandidateV1", option_id: str, strategy,
+    strategy_identity_hash: str, provider_contract_hash: str | None, config_hash: str,
+    scope_key: str,
+) -> tuple[str, ...]:
+    """The candidate-level refusal FACTS — the ONE composition the plan preview and the
+    AUTHOR_FORMULA decision both consult (§8.3 applied to reads: the first cut computed these in
+    `member_authoring_plans` and never showed them to the decision, which made the gate
+    ceremonial — the Task 5 review's 4a).
+
+    * a retirement tombstone covering the candidate → ``FORMULA_DRAFT_RETIRED``;
+    * identity V2 active, a READY legacy V1 draft on this scope, LLM strategy, and no valid
+      regeneration exception → ``LEGACY_REGENERATION_NOT_APPROVED``.
+    """
+    from featuregen.overlay.upload.formula_draft_store import formula_identity
+    from featuregen.overlay.upload.formula_strategy import FormulaStrategy as _FS
+    from featuregen.overlay.upload.retirement_scope import (
+        tombstone_covering,
+        valid_exception_for,
+    )
+
+    blockers: list[str] = []
+    identity_hash = formula_identity(
+        considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        authoring_config_hash=config_hash,
+        definition_revision=candidate.definition_revision)
+    if tombstone_covering(conn, scope_key=scope_key,
+                          formula_identity_hash=identity_hash) is not None:
+        blockers.append("FORMULA_DRAFT_RETIRED")
+
+    if strategy is _FS.LLM_AUTHORED:
+        legacy_ready = conn.execute(
+            "SELECT 1 FROM formula_draft_authoring_identity i "
+            "  JOIN formula_draft d ON d.formula_draft_id = i.formula_draft_id "
+            " WHERE i.identity_version = 1 AND i.retirement_scope_key = %s "
+            "   AND d.state = 'READY' LIMIT 1", (scope_key,)).fetchone()
+        if legacy_ready is not None:
+            exception = valid_exception_for(
+                conn, target_formula_identity_hash=identity_hash,
+                provider_contract_hash=provider_contract_hash,
+                strategy_identity_hash=strategy_identity_hash,
+                now=conn.execute("SELECT now()").fetchone()[0])
+            if exception is None:
+                blockers.append("LEGACY_REGENERATION_NOT_APPROVED")
+    return tuple(blockers)
+
+
+class AuthoringRefused(Exception):
+    """The AUTHOR_FORMULA decision refused — a typed, member-level answer both callers map
+    (route → 409 with the blockers; coordinator → member BLOCKED), never a 500."""
+
+    def __init__(self, blockers: tuple[str, ...]) -> None:
+        super().__init__(", ".join(blockers))
+        self.blockers = blockers
+
 
 #: The lane this work travels on — moved here WITH the producer so the one string keeps living
 #: beside the code that writes it; the route re-exports both names unchanged.
@@ -124,6 +210,52 @@ class DraftRequestedV1:
     warnings: tuple[str, ...]
     config_hash: str
     candidate: FrozenCandidateV1
+    #: Task 5: the request-time AUTHOR_FORMULA decision this draft was admitted under.
+    action_decision_revision_id: str = ""
+
+
+#: The development envelope's ceilings — BOUNDED, visible, and replaced by a real approval
+#: surface when production opens (§21). ▲ Sized from the PER-DRAFT worst case, not one
+#: structured call (the Task 5 review's C-1: an authoring run is up to 8 author turns × 5
+#: physical attempts each, plus the critic's own 5-attempt envelope — 45 calls — and
+#: AUTHOR_TOKEN_BUDGET alone is 200k, so a 200k ceiling left the critic literally zero and one
+#: repair anywhere exhausted mid-draft into a FALSE technical_failure plus a false
+#: security-audit signal). Both ceilings raised TOGETHER, since per-call reservation is
+#: max_tokens/max_calls and raising one alone reshapes what a single call may reserve.
+_DEV_ENVELOPE_MAX_CALLS = 45          # 8 author turns × 5 + critic envelope of 5
+_DEV_ENVELOPE_MAX_TOKENS = 250_000    # AUTHOR_TOKEN_BUDGET (200k) + critic allowance (50k)
+_DEV_ENVELOPE_MAX_COST = "25.00"
+
+
+def _development_spend_envelope(
+    conn, *, actor_subject: str, config_hash: str, provider_contract_hash: str | None,
+) -> str:
+    """Mint the bounded development ceiling for ONE draft identity — Task 5 AC3's chosen posture.
+
+    Scoped to the draft's CONFIG (so a re-request of the same draft reuses the same ceiling
+    rather than stacking fresh ones) and expiring on a DAY boundary two days out — the expiry is
+    inside `authorize_spend`'s idempotency identity, so a within-the-day re-request is the SAME
+    authorization and a next-day one is a new bounded envelope, never an unbounded accumulation
+    within a working session.
+    """
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+
+    # ▲ UTC midnight, EXPLICITLY: a bare date cast to timestamptz lands at SESSION-tz midnight
+    # (probed at Asia/Dubai by the Task 5 review), which made "the day boundary" drift with
+    # whoever's session applied it. With expiry now inside authorize_spend's idempotency
+    # identity, a within-the-day re-request is genuinely ONE authorization and the next UTC day
+    # genuinely mints a fresh bounded envelope — the renewal the first cut only claimed.
+    expires = conn.execute(
+        "SELECT ((((now() AT TIME ZONE 'utc')::date + 2)::timestamp) "
+        "AT TIME ZONE 'utc')::text").fetchone()[0]
+    return authorize_spend(
+        conn, action="AUTHOR_FORMULA", actor_subject=actor_subject,
+        job_identity=f"draft-dev-envelope:{config_hash}",
+        member_identities=[config_hash],
+        provider_contract_hash=provider_contract_hash or "none",
+        max_calls=_DEV_ENVELOPE_MAX_CALLS, max_tokens=_DEV_ENVELOPE_MAX_TOKENS,
+        currency="USD", max_cost=_DEV_ENVELOPE_MAX_COST,
+        pricing_version="development", expires_at=expires)
 
 
 def frozen_candidate(conn, revision_id: str, option_id: str) -> FrozenCandidateV1:
@@ -172,6 +304,7 @@ def frozen_candidate(conn, revision_id: str, option_id: str) -> FrozenCandidateV
 def request_draft_for_candidate(
     conn, *, revision_id: str, option_id: str, formula_draft_id: str, requested_by: str,
     now: str, spend_authorization_id: str | None = None,
+    mint_development_envelope: bool = True,
 ) -> DraftRequestedV1:
     """Record a formula-draft request and enqueue its work — the ONE write composition.
 
@@ -214,6 +347,70 @@ def request_draft_for_candidate(
         config_payload["provider_contract_hash"] = provider_contract
     config_hash = jcs_sha256(config_payload)
 
+    # ▲ STAGE I TASK 5 — the per-draft AUTHOR_FORMULA decision, IN this one transaction. The
+    # subject is the CANDIDATE (§0.1.4): its five facts ARE the retirement scope key, so the
+    # authorization's resource is that key — one tuple, three uses. Placed BEFORE the
+    # money-guarded INSERT: a refused decision spends nothing and writes nothing but itself.
+    from featuregen.materialize.action_authorization import ActionV1, authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+    from featuregen.overlay.upload.retirement_scope import retirement_scope_key
+
+    scope_key = retirement_scope_key(
+        considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        definition_revision=candidate.definition_revision)
+    authorization = authorize_action(
+        conn, action=ActionV1.AUTHOR_FORMULA, resource_identity_hash=scope_key,
+        actor_subject=requested_by, environment_id=AUTHORING_ENVIRONMENT)
+    # ▲ The decision receives the candidate's REAL facts (Task 5 review 4a) — the same builder
+    # the plan preview reads — so the §5 fold is what refuses a retired or unapproved-legacy
+    # candidate here, BEFORE the money guard and before any queue row. A gate that cannot refuse
+    # is ceremonial; this one is not, and its refusal test authors nothing.
+    member_blockers = candidate_governance_blockers(
+        conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
+        strategy_identity_hash=decision.strategy_identity_hash,
+        provider_contract_hash=provider_contract, config_hash=config_hash,
+        scope_key=scope_key)
+    decision_id, authoring_decision = decide(
+        conn,
+        ActionRequestV1(
+            action=ActionV1.AUTHOR_FORMULA, resource_identity_hash=scope_key,
+            member_names=(option_id,),
+            member_blockers={option_id: member_blockers} if member_blockers else {},
+            member_warnings={option_id: tuple(decision.warnings)} if decision.warnings else {},
+            evidence_pins=authoring_evidence_pins(
+                retirement_scope_key=scope_key,
+                catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+                strategy_identity_hash=decision.strategy_identity_hash)),
+        authorization_id=authorization.authorization_id)
+    if not authoring_decision.allowed:
+        refused = tuple(dict.fromkeys(
+            tuple(authoring_decision.blockers)
+            + tuple(code for verdict in authoring_decision.per_member
+                    for code in verdict.blockers)))
+        raise AuthoringRefused(refused)
+
+    # ▲ SPEND IS MANDATORY ON EVERY PATH THAT CAN REACH THE LLM LANE (Task 5 AC3). The chosen
+    # posture is ROUTE-MINTS-DEV-ENVELOPE (§0.1.0): with no caller-supplied ceiling, the server
+    # mints a BOUNDED development envelope — spend stays an enforced, reserved-per-call act at
+    # the dispatch seam instead of an absent one, and the surface keeps working under the
+    # development policy ("permission is broad and SERVER-owned"). Production opening replaces
+    # this with a real approval surface (§21's release-readiness list). The alternative —
+    # route-dies — would 409 every "Draft formula" click until an approval UI exists, which
+    # punishes the user for a surface nobody has built.
+    if decision.strategy is FormulaStrategy.LLM_AUTHORED and spend_authorization_id is None:
+        if not mint_development_envelope:
+            # ▲ THE JOB PATH REFUSES, NEVER SUBSTITUTES (Task 5 review 4b): a coordinator member
+            # reaches here with None exactly when the job's cost-confirmed ceiling EXPIRED — and
+            # quietly swapping in a $25 dev envelope would replace the ceiling a person
+            # confirmed with one nobody did. §11.2's posture: refuse by name; re-confirming the
+            # cost is the remedy, and it is the user's.
+            raise AuthoringRefused(("COST_AUTHORIZATION_MISSING",))
+        spend_authorization_id = _development_spend_envelope(
+            conn, actor_subject=requested_by, config_hash=config_hash,
+            provider_contract_hash=provider_contract)
+
     try:
         draft_id, created = request_draft(
             conn,
@@ -245,8 +442,8 @@ def request_draft_for_candidate(
             "formula_strategy, strategy_identity_hash, recipe_id, recipe_revision_hash, "
             "expectation_ref, expectation_generation, reviewed_blueprint_revision, "
             "reviewed_blueprint_hash, provider_contract_hash, method_override_revision_id, "
-            "llm_spend_authorization_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "llm_spend_authorization_id, action_decision_revision_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (draft_id, facts.candidate_origin, str(decision.strategy),
              decision.strategy_identity_hash, facts.recipe_id, facts.recipe_revision_hash,
              facts.expectation_ref if facts.recipe_id else None,
@@ -260,24 +457,20 @@ def request_draft_for_candidate(
              # called: a reviewed plan spends nothing, and pinning a ceiling to it would claim a
              # purchase that cannot happen.
              (spend_authorization_id
-              if decision.strategy is FormulaStrategy.LLM_AUTHORED else None)))
+              if decision.strategy is FormulaStrategy.LLM_AUTHORED else None),
+             # Task 5 AC4 — durable where the worker re-reads: the request-time decision id,
+             # rechecked at act time exactly as the generation lane rechecks its own.
+             decision_id))
 
         # ▲ AND THE IDENTITY COMPANION — version 2, explicitly. Its composite FK to
         # (formula_draft_id, authoring_config_hash) is what makes "this companion describes that
-        # draft" a constraint rather than a hope.
-        from featuregen.overlay.upload.retirement_scope import retirement_scope_key
-
+        # draft" a constraint rather than a hope. The scope key is the SAME hoisted value the
+        # authorization named — one tuple, three uses, computed once.
         conn.execute(
             "INSERT INTO formula_draft_authoring_identity (formula_draft_id, identity_version, "
             "retirement_scope_key, config_payload_json, config_hash) "
             "VALUES (%s, 2, %s, %s::jsonb, %s)",
-            (draft_id,
-             retirement_scope_key(
-                 considered_revision_id=candidate.considered_revision_id, option_id=option_id,
-                 planning_request_hash=candidate.planning_request_hash,
-                 catalog_snapshot_hash=candidate.catalog_snapshot_hash,
-                 definition_revision=candidate.definition_revision),
-             json.dumps(config_payload, sort_keys=True), config_hash))
+            (draft_id, scope_key, json.dumps(config_payload, sort_keys=True), config_hash))
 
         # Enqueued ONLY for a genuinely new draft. Re-enqueuing an existing one would put a second
         # job on the lane for work already in flight or already finished.
@@ -295,4 +488,5 @@ def request_draft_for_candidate(
         considered_revision_id=revision_id, option_id=option_id, created=created)
     return DraftRequestedV1(
         formula_draft_id=draft_id, created=created, strategy=decision.strategy,
-        warnings=tuple(decision.warnings), config_hash=config_hash, candidate=candidate)
+        warnings=tuple(decision.warnings), config_hash=config_hash, candidate=candidate,
+        action_decision_revision_id=decision_id)

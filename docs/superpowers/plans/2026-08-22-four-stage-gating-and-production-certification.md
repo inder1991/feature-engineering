@@ -634,12 +634,19 @@ code_generation_job_action
 
 **Every worker claims ONE action stage and revalidates that stage's own authorization and decision.**
 
-▲ **And there is a live bypass to close in the same change.** `POST
-/considered-revisions/{id}/options/{id}/formula-drafts` (`formula_drafts.py:117`) creates a draft and
-an outbox message with **no action authorization, no decision and no spend authorization** — the
-worker then trusts `formula_draft.requested_by` (`formula_draft_worker.py:239`). Direct formula
-drafting is `AUTHOR_FORMULA`; it must bind all three **before the outbox row is written**, on the same
-before-the-queue discipline as retirement (§11.1.1) and spend (§11.2).
+▲ **CLOSED — Stage I Task 5 (2026-08-23).** This row used to read: the drafts route creates a
+draft and an outbox message with no action authorization, no decision and no spend authorization.
+All three now bind in `request_draft_for_candidate`'s one transaction, BEFORE the outbox row:
+`authorize_action(AUTHOR_FORMULA, resource=retirement_scope_key)` under the `control-plane`
+authoring environment · `decide()` carrying the candidate's REAL facts (the tombstone and
+legacy-regeneration blockers from `candidate_governance_blockers`, plus the resolver's warnings)
+so the §5 fold is what refuses a retired candidate · and spend as a MANDATORY ceiling — the HTTP
+path's posture is ROUTE-MINTS-DEV-ENVELOPE (bounded: 45 calls sized from the per-draft worst
+case of 8 author turns × 5 attempts + the critic's 5 · 250k tokens · $25 · UTC-day-boundary
+expiry, with expiry inside `authorize_spend`'s idempotency identity so renewal is real), while
+the JOB path REFUSES on an absent ceiling rather than substituting one nobody confirmed. The
+worker's second look rechecks the plan row's decision (`ACTION_DECISION_MISSING` /
+`ACTION_DECISION_DRIFTED`).
 
 ### ▲ 0.1.4 `AUTHOR_FORMULA`'s subject is a CANDIDATE, not a selection — R8
 
@@ -3116,6 +3123,9 @@ still follow step order.**
 | 1114 | **parent §12.1** | `recipe_compiler_eval_attempt` + the compiler certificate record | 9 |
 | 1115 | **run-spine spec §6/§13 (foundation)** | `feature_run_identity` (composite-FK chain, write-once) + `feature_run_profile` + `feature_run_state` + the three additive UNIQUE chain indexes on `contract_generation_input` / `contract_considered_revision` / `catalog_metadata_snapshot` | foundation |
 | 1116 | **run-spine spec §9 (foundation)** | simple FKs: `formula_draft.considered_revision_id` and `feature_selection_revision.considered_revision_id` → `contract_considered_revision` (live-measured 0 orphans) | foundation |
+| 1117 | **run-spine** | reserved, currently unused (Stage I expects zero migrations) | — |
+| 1118 | **parent §12** | ▲ **DONE** — the compiler certification programme: `recipe_compiler_evaluation_contract` (NO provider hashes, structurally) + `recipe_compiler_eval_case` (ONE governed revision; tolerances CONSTRAINED EMPTY) + `recipe_compiler_eval_attempt` (honesty CHECKs) | 9 |
+| 1119 | **Stage I Task 5** | ▲ **DONE** — `formula_draft_authoring_plan.action_decision_revision_id` (nullable expand; the GATE is not nullable — the worker refuses NULL on a governed plan row). ▲ **A NEW FILE, not an edit to 1104**: the §20.1 cutover may apply 1104 live at any moment, and an edited applied migration breaks the checksum ledger. ▲ **DEPLOY NOTE: 1104 and 1119 must apply in the SAME cutover** — a plan row written under 1104-without-1119 is permanently `ACTION_DECISION_MISSING` (the plan table is append-only; unbackfillable) and its BLOCKED draft holds the identity slot | 5 (Stage I) |
 
 ▲ **Ordering note (run-spine foundation).** 1115/1116 may APPLY before 1104–1114 exist: the two
 blocks are mutually independent (1115/1116's FKs reach only ≤1024 tables; nothing in 1100–1114
