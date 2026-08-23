@@ -189,3 +189,77 @@ def test_AN_ABANDONED_REQUEST_IS_RECONCILED_but_a_released_one_is_left_alone(db)
     assert judged == (dead,)
     assert _status(db, dead)[0] == "FAILED"
     assert _status(db, released)[0] == "CLAIMED"
+
+
+# ══ THE READ PATH — v2-first, found orphaned by the run-spine session's mapping ═════════════════
+def test_THE_GET_READS_THE_V2_REQUEST_the_lane_actually_writes(db):
+    """§9.0's rewrite left GET /verifications selecting `verification_attempt` — a table the v2
+    lane never writes — so the workspace's poll 404'd on every v2 request for ever. The read is
+    now v2-first: the request row, server-owned stage words, and the SANDBOX OUTPUT REVISION
+    under the key the screen renders, with the v1 mechanics as honest nulls."""
+    from featuregen.api.routes.feature_execution import verification_result
+
+    rid = _requested(db, request_id="vfr-read", artifact="art-vl-read")
+    body = verification_result(rid, db)
+    assert body["request_id"] == rid
+    assert body["status"] == "REQUESTED"
+    assert body["stage_label"] == "Queued — the durable worker will execute it"
+    assert (body["attempt"], body["staging_path"], body["verified_output"]) == (None, None, None)
+
+    advance_verification(db, rid, VerificationStatusV1.CLAIMED)
+    advance_verification(db, rid, VerificationStatusV1.RUNNING)
+    db.execute(
+        "INSERT INTO sandbox_output_revision (output_revision_id, request_id, "
+        "sealed_artifact_id, environment_id, output_manifest_hash, row_count) "
+        "VALUES ('sor-read', %s, 'art-vl-read', %s, 'sha256:m', 42)", (rid, ENV))
+    advance_verification(db, rid, VerificationStatusV1.PASSED, execution_hash="sor-read")
+    body = verification_result(rid, db)
+    assert body["terminal"] is True
+    assert body["verified_output"] == {
+        "revision_id": "sor-read", "output_manifest_hash": "sha256:m", "row_count": 42}
+
+
+def test_PUBLISH_SANDBOX_finally_SEES_a_v2_verification(db):
+    """`evaluate_publish_sandbox` joined only the dead v1 tables, so a v2-lane verification could
+    never satisfy publication. The v2 branch: a PASSED request's content-addressed output IS the
+    exact output — no staging path exists or is needed — and a non-PASSED request still refuses."""
+    from featuregen.materialize.evaluate_execution import evaluate_publish_sandbox
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+    from featuregen.overlay.upload.verification_store import StalenessV1
+
+    rid = _requested(db, request_id="vfr-pub", artifact="art-vl-pub")
+    advance_verification(db, rid, VerificationStatusV1.CLAIMED)
+    advance_verification(db, rid, VerificationStatusV1.RUNNING)
+    db.execute(
+        "INSERT INTO sandbox_output_revision (output_revision_id, request_id, "
+        "sealed_artifact_id, environment_id, output_manifest_hash, row_count) "
+        "VALUES ('sor-pub', %s, 'art-vl-pub', %s, 'sha256:m', 5)", (rid, ENV))
+    advance_verification(db, rid, VerificationStatusV1.PASSED, execution_hash="sor-pub")
+
+    verdict = evaluate_publish_sandbox(
+        db, verified_output_revision_id="sor-pub", staging_path=None,
+        staleness=StalenessV1.NEITHER, publication_permitted=True,
+        capability_attestation="cap-1", activation_blockers=())
+    assert R.VERIFICATION_NOT_CURRENT not in verdict.blockers
+
+    # A NON-passed v2 request's output must still refuse — PASSED is the currency.
+    rid2 = _requested(db, request_id="vfr-pub2", artifact="art-vl-pub2")
+    advance_verification(db, rid2, VerificationStatusV1.CLAIMED)
+    advance_verification(db, rid2, VerificationStatusV1.RUNNING)
+    advance_verification(db, rid2, VerificationStatusV1.FAILED, failure_reason="boom")
+    db.execute(
+        "INSERT INTO sandbox_output_revision (output_revision_id, request_id, "
+        "sealed_artifact_id, environment_id, output_manifest_hash, row_count) "
+        "VALUES ('sor-pub2', %s, 'art-vl-pub2', %s, 'sha256:m2', 5)", (rid2, ENV))
+    verdict = evaluate_publish_sandbox(
+        db, verified_output_revision_id="sor-pub2", staging_path=None,
+        staleness=StalenessV1.NEITHER, publication_permitted=True,
+        capability_attestation="cap-1", activation_blockers=())
+    assert R.VERIFICATION_NOT_CURRENT in verdict.blockers
+
+    # And a LEGACY id with no staging path keeps the old hard refusal — nothing loosened.
+    with pytest.raises(ValueError, match="no staging path"):
+        evaluate_publish_sandbox(
+            db, verified_output_revision_id="vor-legacy", staging_path=None,
+            staleness=StalenessV1.NEITHER, publication_permitted=True,
+            capability_attestation="cap-1", activation_blockers=())

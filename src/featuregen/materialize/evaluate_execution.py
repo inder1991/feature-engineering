@@ -132,7 +132,7 @@ def evaluate_publish_sandbox(
     conn: DbConn,
     *,
     verified_output_revision_id: str,
-    staging_path: str,
+    staging_path: str | None,
     staleness: StalenessV1,
     publication_permitted: bool,
     capability_attestation: str,
@@ -160,27 +160,46 @@ def evaluate_publish_sandbox(
         raise ValueError(
             "evaluate_publish_sandbox was called with no verified output: publication rests on a "
             "verification, and one naming none rests on nothing")
-    if not staging_path.strip():
-        raise ValueError(
-            "evaluate_publish_sandbox was called with no staging path: §0.3 asks for THE EXACT "
-            "staged output, and two verification attempts deliberately do not share a path")
 
     blockers = list(carried_blockers(tuple(activation_blockers)))
 
-    row = conn.execute(
-        "SELECT v.retention_state, a.staging_path FROM verified_output_revision v "
-        "JOIN verification_attempt a ON a.execution_hash = v.execution_hash "
-        "WHERE v.revision_id = %s", (verified_output_revision_id,)).fetchone()
-    if row is None or row[0] not in ("live", "marked_orphan") or row[1] != staging_path:
-        # ONE code for three shapes of the same fact: there is no current passing verification over
-        # this exact staged output. Splitting them would name where the caller's belief diverged
-        # from the record, which is a debugging question rather than a governed one.
-        blockers.append(R.VERIFICATION_NOT_CURRENT)
-    elif staleness is not StalenessV1.CURRENT:
-        # STALE and NEITHER both refuse, for different reasons the code's own text carries: a stale
-        # verification vouches for an artifact whose meaning moved, an unverifiable one never
-        # vouched for anything on content.
-        blockers.append(R.VERIFICATION_NOT_CURRENT)
+    # ▲ THE V2 CHAIN FIRST — §9.0's lane writes `verification_request` + `sandbox_output_revision`,
+    # and until this branch existed, PUBLISH_SANDBOX could never see a v2 verification at all: the
+    # join below reads `verification_attempt`, which nothing writes any more (found by the
+    # run-spine session mapping the frozen SHA). For a v2 output the EXACTNESS is the content
+    # address itself — `output_revision_id` IS the measured rows, so "the exact staged output"
+    # needs no path — and currency is the request's PASSED state; a supersession/staleness
+    # machinery for v2 outputs arrives with the execution substrate (step 0b), and until it can
+    # measure anything there is nothing for it to say.
+    v2 = conn.execute(
+        "SELECT r.status FROM sandbox_output_revision o "
+        "JOIN verification_request r ON r.request_id = o.request_id "
+        "WHERE o.output_revision_id = %s", (verified_output_revision_id,)).fetchone()
+    if v2 is not None:
+        if v2[0] != "PASSED":
+            blockers.append(R.VERIFICATION_NOT_CURRENT)
+    else:
+        # The LEGACY chain: attempt + staged path + three-way staleness, exactly as before.
+        if staging_path is None or not staging_path.strip():
+            raise ValueError(
+                "evaluate_publish_sandbox was called with no staging path: §0.3 asks for THE "
+                "EXACT staged output, and two verification attempts deliberately do not share a "
+                "path (a v2 content-addressed output needs none — but this id matches no v2 "
+                "output)")
+        row = conn.execute(
+            "SELECT v.retention_state, a.staging_path FROM verified_output_revision v "
+            "JOIN verification_attempt a ON a.execution_hash = v.execution_hash "
+            "WHERE v.revision_id = %s", (verified_output_revision_id,)).fetchone()
+        if row is None or row[0] not in ("live", "marked_orphan") or row[1] != staging_path:
+            # ONE code for three shapes of the same fact: there is no current passing verification
+            # over this exact staged output. Splitting them would name where the caller's belief
+            # diverged from the record, which is a debugging question rather than a governed one.
+            blockers.append(R.VERIFICATION_NOT_CURRENT)
+        elif staleness is not StalenessV1.CURRENT:
+            # STALE and NEITHER both refuse, for different reasons the code's own text carries: a
+            # stale verification vouches for an artifact whose meaning moved, an unverifiable one
+            # never vouched for anything on content.
+            blockers.append(R.VERIFICATION_NOT_CURRENT)
 
     if not publication_permitted:
         blockers.append(R.EXECUTION_AUTHORITY_UNMET)

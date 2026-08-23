@@ -4416,22 +4416,32 @@ export interface VerifiedOutputSummary {
   retention_state: string
 }
 
+// §9.0: verifications are DURABLE REQUESTS a worker executes. The v2 shape leads — status,
+// server-owned stage words, findings — while the legacy attempt fields survive as nullable for
+// rows that predate the lane. `verified_output` in the v2 shape is the SANDBOX OUTPUT REVISION:
+// content-addressed, the thing publication binds to; `staging_path` is a v1 mechanism and is an
+// honest null on v2 rows.
 export interface VerificationResult {
-  execution_hash: string
+  request_id?: string | null
+  execution_hash: string | null
   sealed_artifact_id: string
-  attempt: number
-  staging_path: string
-  started_at: string
+  status?: string
+  stage_label?: string
+  terminal?: boolean
+  findings?: { code: string; reason?: string }[]
+  failure_reason?: string | null
+  attempt: number | null
+  staging_path: string | null
+  started_at?: string
   // null is the ORDINARY answer while a worker is still running — never an error, and never a
   // fabricated pending output.
   verified_output: VerifiedOutputSummary | null
 }
 
 export interface VerificationRequested {
-  execution_hash: string
+  request_id: string
+  created: boolean
   sealed_artifact_id: string
-  attempt: number
-  staging_path: string
   detail: string
 }
 
@@ -4477,24 +4487,27 @@ export function getArtifactCode(artifactId: string): Promise<ArtifactCode> {
   return request(`/feature-execution/${encodeURIComponent(artifactId)}/code`)
 }
 
+// ▲ The body matches the REWRITTEN route exactly (extra="forbid"): the authorization and the
+// environment are properties OF THE ARTIFACT, recorded at sealing — the server refuses a client
+// that supplies them, so this type cannot offer them.
 export function requestVerification(body: {
   sealed_artifact_id: string
-  generation_authorization_revision_id: string
   check_set_hash: string
   inventory_observation_id: string
-  environment_id: string
   attempt: number
 }): Promise<VerificationRequested> {
   return post('/feature-execution/verifications', body)
 }
 
-export function getVerificationResult(executionHash: string): Promise<VerificationResult> {
-  return request(`/feature-execution/verifications/${encodeURIComponent(executionHash)}`)
+// Accepts a v2 request id (the POST's answer) or a legacy execution hash.
+export function getVerificationResult(verificationId: string): Promise<VerificationResult> {
+  return request(`/feature-execution/verifications/${encodeURIComponent(verificationId)}`)
 }
 
 export function requestPublication(body: {
   verified_output_revision_id: string
-  staging_path: string
+  // Required for a legacy attempt's output; a v2 content-addressed output needs none.
+  staging_path?: string | null
   sealed_artifact_id: string
   environment_id: string
   logical_group_name: string

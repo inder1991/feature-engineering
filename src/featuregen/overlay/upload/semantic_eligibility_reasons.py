@@ -146,6 +146,7 @@ CATALOG_SNAPSHOT_NOT_FROZEN = "CATALOG_SNAPSHOT_NOT_FROZEN"
 LEGACY_CONFIG_UNPROVEN = "LEGACY_CONFIG_UNPROVEN"
 FORMULA_DRAFT_RETIRED = "FORMULA_DRAFT_RETIRED"
 LEGACY_REGENERATION_NOT_APPROVED = "LEGACY_REGENERATION_NOT_APPROVED"
+FORMULA_DRAFT_NOT_AN_ANSWER = "FORMULA_DRAFT_NOT_AN_ANSWER"
 
 #: code -> product family. A code absent from this table cannot ship — the pin test enforces.
 REASON_FAMILIES: dict[str, str] = {
@@ -229,6 +230,7 @@ REASON_FAMILIES: dict[str, str] = {
     LEGACY_CONFIG_UNPROVEN: "structurally_unsuitable",
     FORMULA_DRAFT_RETIRED: "undecided",
     LEGACY_REGENERATION_NOT_APPROVED: "undecided",
+    FORMULA_DRAFT_NOT_AN_ANSWER: "undecided",
 }
 
 #: UI/primary precedence: hard structural truths first, then authority, then setup/checks —

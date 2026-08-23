@@ -32,6 +32,8 @@ does not run materialization at all.
 """
 from __future__ import annotations
 
+import json
+
 from typing import Annotated, Any
 
 import psycopg
@@ -77,7 +79,6 @@ from featuregen.overlay.upload.verification_revisions import VerificationExecuti
 from featuregen.overlay.upload.verification_store import (
     StagingPathCollision,
     StalenessV1,
-    record_verification_attempt,
 )
 from featuregen.runtime.observability import counters, log
 
@@ -422,21 +423,66 @@ def request_verification(
     }
 
 
-@router.get("/feature-execution/verifications/{execution_hash}",
-            dependencies=[Depends(require_feature_read)])
-def verification_result(execution_hash: str, conn: _Conn) -> dict[str, Any]:
-    """What became of one verification — and its THREE-WAY staleness, never a boolean.
+#: The words the card shows per v2 status — SERVER-owned, one sentence per state.
+_VERIFICATION_STAGE_WORDS: dict[str, str] = {
+    "REQUESTED": "Queued — the durable worker will execute it",
+    "CLAIMED": "Claimed by a worker",
+    "RUNNING": "Executing in the sandbox",
+    "PASSED": "Verified",
+    "REFUSED": "Cannot be verified — the findings say why",
+    "FAILED": "The platform could not finish — not a verdict about the artifact",
+    "CANCELLED": "Cancelled",
+}
 
-    ``label`` is ``current`` / ``stale`` / ``unverifiable``, computed by
-    :func:`~featuregen.overlay.upload.verification_store.label_for` so the workspace and every other
-    surface use one word for one state. ``unverifiable`` is the honest answer for an ``UNPINNED``
-    output: nothing was pinned, so no content comparison can say whether its inputs moved.
+
+@router.get("/feature-execution/verifications/{verification_id}",
+            dependencies=[Depends(require_feature_read)])
+def verification_result(verification_id: str, conn: _Conn) -> dict[str, Any]:
+    """What became of one verification — v2 REQUEST id first, legacy execution hash as fallback.
+
+    ▲ The §9.0 rewrite made the POST return a ``request_id`` and moved execution to the durable
+    worker — which left THIS read still SELECTing `verification_attempt`, a table the v2 lane
+    never writes, so the workspace's poll 404'd on every v2 request for ever (found by the
+    run-spine session mapping the frozen SHA). The v2 shape leads; the legacy attempt read
+    survives unchanged for rows that predate the lane. ``verified_output`` in the v2 shape is the
+    SANDBOX OUTPUT REVISION — content-addressed, the thing publication binds to — presented under
+    the key the screen already renders, with the v1-only fields as honest nulls.
     """
+    request = conn.execute(
+        "SELECT sealed_artifact_id, environment_id, status, findings, failure_reason "
+        "FROM verification_request WHERE request_id = %s", (verification_id,)).fetchone()
+    if request is not None:
+        output = conn.execute(
+            "SELECT output_revision_id, output_manifest_hash, row_count "
+            "FROM sandbox_output_revision WHERE request_id = %s", (verification_id,)).fetchone()
+        findings = request[3] if isinstance(request[3], list) else json.loads(request[3] or "[]")
+        return {
+            "request_id": verification_id,
+            "sealed_artifact_id": request[0],
+            "environment_id": request[1],
+            "status": request[2],
+            "stage_label": _VERIFICATION_STAGE_WORDS.get(request[2], request[2]),
+            "terminal": request[2] in ("PASSED", "REFUSED", "FAILED", "CANCELLED"),
+            "findings": findings,
+            "failure_reason": request[4],
+            # v1-only mechanics, honestly absent — the v2 lane's exactness is the content
+            # address below, not a staging path.
+            "execution_hash": None,
+            "attempt": None,
+            "staging_path": None,
+            "verified_output": None if output is None else {
+                "revision_id": output[0],
+                "output_manifest_hash": output[1],
+                "row_count": output[2],
+            },
+        }
+
+    execution_hash = verification_id
     attempt = conn.execute(
         "SELECT sealed_artifact_id, attempt, staging_path, started_at FROM verification_attempt "
         "WHERE execution_hash = %s", (execution_hash,)).fetchone()
     if attempt is None:
-        raise HTTPException(status_code=404, detail="verification attempt not found")
+        raise HTTPException(status_code=404, detail="verification not found")
 
     output = conn.execute(
         "SELECT revision_id, input_observation_strength, reads_enforced, retention_state "
@@ -470,7 +516,9 @@ class PublicationRequestIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     verified_output_revision_id: str = Field(min_length=1)
-    staging_path: str = Field(min_length=1)
+    #: REQUIRED for a legacy attempt's output; a v2 sandbox output revision is content-addressed
+    #: and needs none — the evaluator refuses a missing path exactly when the id is legacy.
+    staging_path: str | None = Field(default=None)
     sealed_artifact_id: str = Field(min_length=1)
     environment_id: str = Field(min_length=1)
     logical_group_name: str = Field(min_length=1)
@@ -493,12 +541,17 @@ def request_publication(
     nowhere to record "the swap may or may not have landed" if it died mid-call.
     """
     staleness = _staleness_of(conn, body.verified_output_revision_id)
-    verdict = evaluate_publish_sandbox(
-        conn, verified_output_revision_id=body.verified_output_revision_id,
-        staging_path=body.staging_path, staleness=staleness,
-        publication_permitted=_may_publish(identity),
-        capability_attestation=body.capability_attestation,
-        activation_blockers=())   # explicit-empty is a claim — §8.1; see verify_eligibility
+    try:
+        verdict = evaluate_publish_sandbox(
+            conn, verified_output_revision_id=body.verified_output_revision_id,
+            staging_path=body.staging_path, staleness=staleness,
+            publication_permitted=_may_publish(identity),
+            capability_attestation=body.capability_attestation,
+            activation_blockers=())   # explicit-empty is a claim — §8.1; see verify_eligibility
+    except ValueError as exc:
+        # A legacy output id with no staging path — the body is what is wrong, and naming which
+        # half is the difference between a caller fixing it and guessing.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not verdict.allowed:
         raise HTTPException(
             status_code=409,

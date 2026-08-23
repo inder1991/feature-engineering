@@ -100,6 +100,7 @@ def _plan_formulas(conn, job: CodeGenJobV1) -> None:
     from featuregen.overlay.upload.formula_draft_service import (
         CandidateUnavailable,
         NotAFormulaCandidate,
+        NotAnAnswerAtRequest,
         RetiredAtRequest,
         StrategyRefused,
         request_draft_for_candidate,
@@ -124,6 +125,11 @@ def _plan_formulas(conn, job: CodeGenJobV1) -> None:
         except RetiredAtRequest:
             update_member(conn, job.job_id, member.position, state=MemberStateV1.BLOCKED,
                           blockers=["FORMULA_DRAFT_RETIRED"])
+        except NotAnAnswerAtRequest:
+            # A member whose previous attempt FAILED: blocked by name, never a whole-job
+            # "coordinator crash" — re-buying is an approved act (§11.1.2).
+            update_member(conn, job.job_id, member.position, state=MemberStateV1.BLOCKED,
+                          blockers=["FORMULA_DRAFT_NOT_AN_ANSWER"])
         except NotAFormulaCandidate as exc:
             update_member(conn, job.job_id, member.position, state=MemberStateV1.BLOCKED,
                           blockers=[exc.code])

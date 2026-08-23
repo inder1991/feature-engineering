@@ -21,7 +21,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from featuregen.canonical import jcs_sha256
-from featuregen.overlay.upload.formula_draft_store import DraftRetired, request_draft
+from featuregen.overlay.upload.formula_draft_store import (
+    DraftNotAnAnswer,
+    DraftRetired,
+    request_draft,
+)
 from featuregen.overlay.upload.formula_strategy import (
     FormulaStrategy,
     resolve_formula_strategy,
@@ -40,6 +44,7 @@ __all__ = [
     "FORMULA_DRAFT_TOPIC",
     "FrozenCandidateV1",
     "NotAFormulaCandidate",
+    "NotAnAnswerAtRequest",
     "RetiredAtRequest",
     "StrategyRefused",
     "frozen_candidate",
@@ -92,6 +97,13 @@ class StrategyRefused(Exception):
         super().__init__(", ".join(blockers))
         self.strategy = strategy
         self.blockers = blockers
+
+
+class NotAnAnswerAtRequest(Exception):
+    """The identity's existing draft records a FAILURE, not a formula (§11.1.2) — re-buying the
+    answer is an approved regeneration, never an automatic re-spend. The store raised this as
+    control flow; uncaught it was a 500 on the route and a whole-job "coordinator crash" — found
+    by the run-spine session's mapping."""
 
 
 class RetiredAtRequest(Exception):
@@ -219,6 +231,8 @@ def request_draft_for_candidate(
             now=now)
     except DraftRetired as exc:
         raise RetiredAtRequest(str(exc), candidate=candidate, config_hash=config_hash) from exc
+    except DraftNotAnAnswer as exc:
+        raise NotAnAnswerAtRequest(str(exc)) from exc
 
     if created:
         # ▲ THE PLAN, PERSISTED IN THE SAME TRANSACTION AS THE DRAFT AND ITS QUEUE MESSAGE. The

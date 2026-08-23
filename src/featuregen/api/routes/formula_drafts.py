@@ -44,6 +44,7 @@ from featuregen.overlay.upload.formula_draft_service import (
     CandidateUnavailable,
     FormulaStrategy,
     NotAFormulaCandidate,
+    NotAnAnswerAtRequest,
     RetiredAtRequest,
     StrategyRefused,
     request_draft_for_candidate,
@@ -113,6 +114,15 @@ def request_formula_draft(
             "formula_strategy": str(exc.strategy),
             "blockers": list(exc.blockers),
             "detail": "the authoring strategy could not be resolved for this candidate"}) from exc
+    except NotAnAnswerAtRequest as exc:
+        # 409 — the identity's draft is a recorded FAILURE, and buying the answer again is an
+        # approved act (§11.1.2), not a retry button. This used to escape as a 500.
+        raise HTTPException(status_code=409, detail={
+            "code": "FORMULA_DRAFT_NOT_AN_ANSWER",
+            "message": str(exc),
+            "remedy": ("the previous attempt at this exact formula failed; re-authoring spends "
+                       "again, so it needs an approved, cost-confirmed regeneration exception"),
+        }) from exc
     except RetiredAtRequest as exc:
         # ▲ 409, NOT a 500 — the identity belongs to a RETIRED draft. 409 rather than 422: the
         # request is well-formed and would have been valid yesterday; what conflicts is the state
