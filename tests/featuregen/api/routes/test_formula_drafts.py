@@ -765,7 +765,7 @@ def test_HALF_NAMED_COVERAGE_refuses_the_same_way_on_both_routes(client, conn,
 
     refused = client.post(DRAFT_PATH.format(rev="crev-half", opt="opt-a"),
                           headers=engineer_headers)
-    assert refused.status_code == 409, "and the STORE refuses — one answer, both routes"
+    assert refused.status_code == 409, "and the DECISION path refuses — one answer, both routes"
     assert refused.json()["detail"]["code"] == "FORMULA_DRAFT_RETIRED"
 
 

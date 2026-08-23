@@ -365,7 +365,6 @@ def request_draft(
         covering_tombstones,
         retirement_scope_key,
         scope_locked,
-        tombstone_covering,
         valid_exception_for,
     )
 
@@ -395,7 +394,6 @@ def request_draft(
             strategy_identity_hash=strategy_identity_hash, now=now,
             consume_exception=consume_exception,
             covering_tombstones=covering_tombstones,
-            tombstone_covering=tombstone_covering,
             valid_exception_for=valid_exception_for)
 
 
@@ -404,7 +402,7 @@ def _request_draft_locked(
     option_id: str, planning_request_hash: str, catalog_snapshot_hash: str,
     authoring_config_hash: str, definition_revision: str, requested_by: str, requested_at: str,
     provider_contract_hash, strategy_identity_hash, now,
-    consume_exception, covering_tombstones, tombstone_covering, valid_exception_for,
+    consume_exception, covering_tombstones, valid_exception_for,
 ) -> tuple[str, bool]:
     """The request itself, with the retirement scope's lock already held."""
     # ── WHO MUST PRESENT AN EXCEPTION, decided BEFORE anything is spent or written ──────────────

@@ -319,10 +319,11 @@ def approve_regeneration_exception(
     from featuregen.canonical import jcs_sha256
 
     # ▲ UNDER THE SCOPE LOCK (round-4 delta probe): the ordinal read, the covering-set read and
-    # the coupon INSERTs serialize on the SAME advisory lock the minting transaction holds — so
-    # an approval can never race the consume that exhausts its predecessor into computing a
-    # stale ordinal, and two concurrent identical approvals converge on one coupon twice over
-    # (the lock, and the content-addressed ON CONFLICT beneath it).
+    # the coupon INSERTs serialize on the SAME advisory lock the minting transaction holds. The
+    # lock is not the whole argument — under REPEATABLE READ the snapshot may predate it — the
+    # argument that carries is that the exhausted-count is MONOTONE: an undercount reproduces a
+    # prior generation's identity and collapses under ON CONFLICT (created=False) instead of
+    # stacking a coupon; concurrent identical approvals converge the same way.
     with scope_locked(conn, scope_key):
         return _approve_locked(
             conn, target_formula_identity_hash=target_formula_identity_hash,
@@ -361,11 +362,20 @@ def _approve_locked(
         # own identity: a replay while a coupon is still live is that same coupon (count
         # unchanged), and an approval after exhaustion is a fresh one — which is what the
         # governance actor clicking approve again is asking for.
+        # ▲ ROUND-5 C1: the count scopes to the EXACT binding — every field the identity
+        # folds. Counting at (identity, tombstone) alone let a sibling binding's exhaustion
+        # bump THIS binding's ordinal, so a plain replay of a still-live approval minted an
+        # extra live coupon: two paid regenerations from one governance decision.
         exhausted_before = conn.execute(
             "SELECT COUNT(*) FROM formula_draft_regeneration_exception "
             "WHERE target_formula_identity_hash = %s "
-            "  AND tombstone_id IS NOT DISTINCT FROM %s AND uses_consumed >= max_uses",
-            (target_formula_identity_hash, tombstone_id)).fetchone()[0]
+            "  AND tombstone_id IS NOT DISTINCT FROM %s AND uses_consumed >= max_uses "
+            "  AND provider_contract_hash = %s AND strategy_identity_hash = %s "
+            "  AND actor_subject = %s AND llm_spend_authorization_id = %s "
+            "  AND expires_at = %s AND max_uses = %s",
+            (target_formula_identity_hash, tombstone_id, provider_contract_hash,
+             strategy_identity_hash, actor_subject, llm_spend_authorization_id,
+             expires_at, max_uses)).fetchone()[0]
         exception_id = "exc-" + jcs_sha256({
             "target_formula_identity_hash": target_formula_identity_hash,
             "provider_contract_hash": provider_contract_hash,

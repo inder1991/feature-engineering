@@ -772,8 +772,10 @@ def _override_minted(db, tag: str) -> tuple[str, str]:
 def test_an_EXACT_withdrawal_of_the_override_draft_STOPS_it_mid_ladder(db):
     """Round-3's blocking probe: the candidate-first pick let the OLD broad tombstone (which the
     coupon names) MASK a fresh EXACT_DRAFT withdrawal of the mint itself — the fence advanced a
-    freshly-withdrawn draft. The rule now: an exact withdrawal at the mint's identity ALWAYS
-    refuses — it necessarily post-dates the coupon, so no approval can have weighed it."""
+    freshly-withdrawn draft. The ONE LAW carries this now: every covering withdrawal must be
+    individually NAMED by a consumed coupon, and this fresh exact withdrawal is named by none —
+    so the fence refuses. (NOT because exact withdrawals post-date coupons — NB-1's governed
+    exact override disproves that — but because THIS one is un-named.)"""
     from featuregen.overlay.upload.formula_draft_store import (
         DraftRetired,
         DraftStateV1,
@@ -1052,3 +1054,58 @@ def test_ORDINAL_EDGES_no_stacking_while_live_and_no_resurrection_after_newer(db
         "SELECT COUNT(*) FROM formula_draft_regeneration_exception "
         "WHERE target_formula_identity_hash = %s", (identity,)).fetchone()
     assert total == (2,), "two generations, never a third from replays"
+
+
+def test_C1_a_SIBLING_bindings_exhaustion_never_bumps_THIS_bindings_ordinal(db):
+    """Round-5 C1, the probe verbatim: two admins approve the same regeneration (two bindings
+    differing only in actor), the mint consumes ONE coupon, and a plain replay of the OTHER
+    admin's still-live approval must be THAT coupon — created False, no third row. The ordinal
+    counts exhaustion per EXACT binding; a sibling binding's spent coupon is not this
+    binding's history, and one governance decision never becomes two paid regenerations."""
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        approve_regeneration_exception,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-sib")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-sib",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-sib",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+
+    def _approve(actor):
+        return approve_regeneration_exception(
+            db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+            strategy_identity_hash="sih-llm", actor_subject=actor,
+            llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z",
+            scope_key=scope)
+
+    (first,), created_first = _approve("user:admin-one")
+    (second,), created_second = _approve("user:admin-two")
+    assert created_first is True and created_second is True and first != second
+
+    minted, _ = _request_again(db, draft_id="fd-sib-retry", option_id="opt-fd-sib",
+                               provider_contract_hash="sha256:llm",
+                               strategy_identity_hash="sih-llm")
+    assert minted is not None
+
+    consumed = {row[0] for row in db.execute(
+        "SELECT exception_id FROM formula_draft_regeneration_exception "
+        "WHERE target_formula_identity_hash = %s AND uses_consumed >= max_uses",
+        (identity,)).fetchall()}
+    survivors = {first, second} - consumed
+    assert len(survivors) == 1, "the mint consumed one binding's coupon, not both"
+    live_actor = "user:admin-one" if first in survivors else "user:admin-two"
+
+    (replayed,), created_replay = _approve(live_actor)
+    assert created_replay is False, "a replay of a still-live approval mints NOTHING"
+    assert replayed in survivors, "the replay IS the live coupon"
+    total = db.execute(
+        "SELECT COUNT(*) FROM formula_draft_regeneration_exception "
+        "WHERE target_formula_identity_hash = %s", (identity,)).fetchone()
+    assert total == (2,), "no third row — one decision, one paid regeneration per binding"
