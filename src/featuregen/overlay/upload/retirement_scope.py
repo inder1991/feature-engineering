@@ -272,28 +272,31 @@ def consume_exception(conn, exception_id: str) -> bool:
 def approve_regeneration_exception(
     conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
     strategy_identity_hash: str, actor_subject: str, llm_spend_authorization_id: str,
-    expires_at: str, max_uses: int = 1,
+    expires_at: str, max_uses: int = 1, scope_key: str | None = None,
 ) -> tuple[str, bool]:
     """Record one approved regeneration — Stage I Task 6's creation act, LLM-lane-only by the
     owner's Option 2 ruling (deterministic retries are free by construction and need none).
 
     Idempotent on content: the exception id is the hash of everything it binds, so a replayed
     approval is ONE exception with ONE ``max_uses`` budget — never a stack of fresh coupons.
-    ``tombstone_id`` is derived HERE, not accepted: if a tombstone covers the target, the
-    exception must name it (1103's CHECK makes the pairing structural), and a caller choosing
-    which tombstone it overrides would be choosing what it is exempt from.
+    ``tombstone_id`` is derived HERE through :func:`tombstone_covering` — the ONE reader, so the
+    writer's answer to "which withdrawal does this override" is the same answer the request gate
+    will compute, candidate-wide precedence included (the Task 6 review found the first cut with
+    its own query: opaque-id ordering, reversed precedence, and a scope-key subquery that
+    required the target row to exist — three ways to bind the wrong tombstone or none). A caller
+    choosing its own tombstone would be choosing what it is exempt from; note 1103's CHECK
+    enforces the pairing SHAPE (`overrides_tombstone` ⇔ a tombstone named), not coverage
+    correctness — coverage correctness is exactly what routing through the one reader buys.
     """
     from featuregen.canonical import jcs_sha256
 
-    covering = conn.execute(
-        "SELECT tombstone_id FROM formula_draft_retirement_tombstone "
-        "WHERE exact_formula_identity_hash = %s OR retirement_scope_key = ("
-        "  SELECT retirement_scope_key FROM formula_draft_authoring_identity i"
-        "  JOIN formula_draft d ON d.formula_draft_id = i.formula_draft_id"
-        "  WHERE d.formula_identity_hash = %s LIMIT 1) "
-        "ORDER BY tombstone_id DESC LIMIT 1",
-        (target_formula_identity_hash, target_formula_identity_hash)).fetchone()
-    tombstone_id = None if covering is None else covering[0]
+    if scope_key is None:
+        raise ValueError("approve_regeneration_exception needs the candidate's scope key: the "
+                         "covering-tombstone derivation must not depend on any draft row "
+                         "existing at the target identity")
+    covering = tombstone_covering(
+        conn, scope_key=scope_key, formula_identity_hash=target_formula_identity_hash)
+    tombstone_id = None if covering is None else covering.tombstone_id
 
     exception_id = "exc-" + jcs_sha256({
         "target_formula_identity_hash": target_formula_identity_hash,

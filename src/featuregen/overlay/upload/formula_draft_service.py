@@ -52,6 +52,7 @@ __all__ = [
     "PER_DRAFT_CALL_ENVELOPE",
     "authoring_evidence_pins",
     "candidate_governance_blockers",
+    "current_authoring_config",
     "frozen_candidate",
     "request_draft_for_candidate",
 ]
@@ -127,6 +128,24 @@ def candidate_governance_blockers(
             if exception is None:
                 blockers.append("LEGACY_REGENERATION_NOT_APPROVED")
     return tuple(blockers)
+
+
+def current_authoring_config(strategy_decision) -> tuple[str | None, dict[str, Any], str]:
+    """The identity-V2 configuration for THIS strategy decision — the ONE composition
+    (§8.3, whose sentence this file quotes and, until the Task 6 review, violated in two other
+    places). Returns ``(provider_contract_hash, config_payload, config_hash)``: LLM drafts fold
+    the FROZEN provider contract (where prompt identity actually lives); reviewed drafts fold
+    none, because no provider would be called."""
+    provider_contract = (current_author_contract_hash()
+                         if strategy_decision.strategy is FormulaStrategy.LLM_AUTHORED else None)
+    config_payload: dict[str, Any] = {
+        "identity_version": 2,
+        "formula_strategy": str(strategy_decision.strategy),
+        "strategy_identity_hash": strategy_decision.strategy_identity_hash,
+    }
+    if provider_contract is not None:
+        config_payload["provider_contract_hash"] = provider_contract
+    return provider_contract, config_payload, jcs_sha256(config_payload)
 
 
 class AuthoringRefused(Exception):
@@ -350,16 +369,7 @@ def request_draft_for_candidate(
     # since it shipped. Safe to correct ONLY because 1103 moved retirement off the identity hash
     # first. LLM drafts fold the FROZEN provider contract (where prompt identity actually lives);
     # reviewed drafts fold none, because no provider would be called.
-    provider_contract = (current_author_contract_hash()
-                         if decision.strategy is FormulaStrategy.LLM_AUTHORED else None)
-    config_payload: dict[str, Any] = {
-        "identity_version": 2,
-        "formula_strategy": str(decision.strategy),
-        "strategy_identity_hash": decision.strategy_identity_hash,
-    }
-    if provider_contract is not None:
-        config_payload["provider_contract_hash"] = provider_contract
-    config_hash = jcs_sha256(config_payload)
+    provider_contract, config_payload, config_hash = current_authoring_config(decision)
 
     # ▲ STAGE I TASK 5 — the per-draft AUTHOR_FORMULA decision, IN this one transaction. The
     # subject is the CANDIDATE (§0.1.4): its five facts ARE the retirement scope key, so the
@@ -567,13 +577,7 @@ def approve_regeneration_for_draft(
             "this candidate resolves to no formula at all, so there is no regeneration to "
             "approve")
 
-    provider_contract = current_author_contract_hash()
-    config_hash = jcs_sha256({
-        "identity_version": 2,
-        "formula_strategy": str(decision.strategy),
-        "strategy_identity_hash": decision.strategy_identity_hash,
-        "provider_contract_hash": provider_contract,
-    })
+    provider_contract, _config_payload, config_hash = current_authoring_config(decision)
     from featuregen.overlay.upload.formula_draft_store import formula_identity
 
     target_identity = formula_identity(
@@ -591,12 +595,21 @@ def approve_regeneration_for_draft(
         provider_contract_hash=provider_contract,
         max_calls=max_calls, max_tokens=max_tokens, currency=currency, max_cost=max_cost,
         pricing_version=pricing_version, expires_at=expires)
+    from featuregen.overlay.upload.retirement_scope import retirement_scope_key
+
     exception_id, created = approve_regeneration_exception(
         conn, target_formula_identity_hash=target_identity,
         provider_contract_hash=provider_contract,
         strategy_identity_hash=decision.strategy_identity_hash,
         actor_subject=actor_subject, llm_spend_authorization_id=spend_authorization_id,
-        expires_at=expires, max_uses=max_uses)
+        expires_at=expires, max_uses=max_uses,
+        # The candidate's OWN scope key — the derivation must not depend on any draft row
+        # existing at the target identity (review item 3c).
+        scope_key=retirement_scope_key(
+            considered_revision_id=candidate.considered_revision_id, option_id=target[1],
+            planning_request_hash=candidate.planning_request_hash,
+            catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+            definition_revision=candidate.definition_revision))
     log("featuregen.regeneration.approved", exception_id=exception_id,
         formula_draft_id=formula_draft_id, created=created)
     return exception_id, spend_authorization_id, created

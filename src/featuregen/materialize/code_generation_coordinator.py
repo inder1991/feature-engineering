@@ -512,23 +512,16 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
         # consults (`candidate_governance_blockers` — Task 5 review 4a): the plan previews
         # exactly what the decision will refuse, because they read the same composition. The
         # first cut computed these inline here and never showed them to the decision.
-        provider_contract = (current_author_contract_hash()
-                            if decision.strategy is FormulaStrategy.LLM_AUTHORED else None)
-        config_payload: dict[str, Any] = {
-            "identity_version": 2,
-            "formula_strategy": str(decision.strategy),
-            "strategy_identity_hash": decision.strategy_identity_hash,
-        }
-        if provider_contract is not None:
-            config_payload["provider_contract_hash"] = provider_contract
         from featuregen.overlay.upload.formula_draft_service import (
             candidate_governance_blockers,
+            current_authoring_config,
         )
 
+        provider_contract, _payload, config_hash = current_authoring_config(decision)
         blockers.extend(candidate_governance_blockers(
             conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
             strategy_identity_hash=decision.strategy_identity_hash,
-            provider_contract_hash=provider_contract, config_hash=jcs_sha256(config_payload),
+            provider_contract_hash=provider_contract, config_hash=config_hash,
             scope_key=retirement_scope_key(
                 considered_revision_id=candidate.considered_revision_id, option_id=option_id,
                 planning_request_hash=candidate.planning_request_hash,

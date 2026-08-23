@@ -610,16 +610,15 @@ def test_the_DETERMINISTIC_LANE_has_nothing_to_approve(client, conn, engineer_he
                                                        monkeypatch):
     """Option 2 made the 1103/1105 unrepresentability the DESIGN: the approval surface refuses a
     deterministic candidate by name, pointing at the free re-request."""
-    from featuregen.overlay.upload import formula_strategy_facts as fsf
 
     draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6d")
     _fail(conn, draft_id)
 
+    import featuregen.overlay.upload.formula_draft_service as service
     from featuregen.overlay.upload.formula_strategy import (
         FormulaStrategy,
         FormulaStrategyDecisionV1,
     )
-    import featuregen.overlay.upload.formula_draft_service as service
 
     monkeypatch.setattr(
         service, "resolve_formula_strategy",

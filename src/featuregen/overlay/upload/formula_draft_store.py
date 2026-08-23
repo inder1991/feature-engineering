@@ -425,13 +425,28 @@ def _request_draft_locked(
     tombstone = tombstone_covering(
         conn, scope_key=scope_key, formula_identity_hash=identity)
     if tombstone is not None:
+        if exception_id is not None:
+            # ▲ THE OVERRIDE MUST NAME THE WITHDRAWAL (Task 6 review, item 3): an exception that
+            # predates the tombstone — or was written when no tombstone covered the target —
+            # carries tombstone_id NULL, and letting it unlock a later withdrawal would override
+            # a decision nobody weighed it against, with no audit linkage. Overriding a
+            # withdrawal is an act about THAT withdrawal.
+            names = conn.execute(
+                "SELECT tombstone_id FROM formula_draft_regeneration_exception "
+                "WHERE exception_id = %s", (exception_id,)).fetchone()
+            if names is None or names[0] != tombstone.tombstone_id:
+                exception_id = None
         if exception_id is None:
             raise DraftRetired(
                 f"formula identity {identity} is withdrawn by tombstone "
                 f"{tombstone.tombstone_id} at scope {tombstone.scope} ({tombstone.reason})"
                 f"{'' if tombstone.replacement_draft_id is None else f', replaced by {tombstone.replacement_draft_id}'}"
-                f". A new draft id does not change the identity — either use the replacement, or "
-                f"obtain an approved regeneration exception for this exact identity")
+                f". A new draft id does not change the identity — "
+                + ("use the replacement, or change an identity-bearing input: the reviewed lane "
+                   "needs no exception and none exists to obtain — this identity is WITHDRAWN"
+                   if provider_contract_hash is None else
+                   "either use the replacement, or obtain an approved regeneration exception "
+                   "naming this withdrawal"))
     else:
         # ▲ A TERMINAL FAILURE holds no slot (migration 1107) but still gates the re-spend. The
         # bounded re-attempt §11.1.2 permits is bounded BY THE EXCEPTION's max_uses — `formula_draft`

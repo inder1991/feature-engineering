@@ -533,7 +533,7 @@ def _failed_draft(db, draft_id: str) -> str:
     return identity
 
 
-def _request_again(db, *, draft_id: str, option_id: str, identity: str,
+def _request_again(db, *, draft_id: str, option_id: str,
                    provider_contract_hash=None, strategy_identity_hash=None):
     from featuregen.overlay.upload.formula_draft_store import request_draft
 
@@ -552,7 +552,7 @@ def test_a_FAILED_DETERMINISTIC_draft_re_requests_FREE_no_exception_no_spend(db)
     identity = _failed_draft(db, "fd-det")
 
     minted, created = _request_again(
-        db, draft_id="fd-det-retry", option_id="opt-fd-det", identity=identity)
+        db, draft_id="fd-det-retry", option_id="opt-fd-det")
 
     assert (minted, created) == ("fd-det-retry", True)
     assert db.execute(
@@ -577,8 +577,7 @@ def test_a_TOMBSTONE_refuses_the_deterministic_lane_too_withdrawal_is_not_a_cost
                      reason="superseded", retired_by="user:owner")
 
     with pytest.raises(DraftRetired):
-        _request_again(db, draft_id="fd-det-ret-retry", option_id="opt-fd-det-ret",
-                       identity="ident-fd-det-ret")
+        _request_again(db, draft_id="fd-det-ret-retry", option_id="opt-fd-det-ret")
 
 
 def test_an_LLM_FAILURE_without_an_exception_is_UNCHANGED_still_not_an_answer(db):
@@ -587,6 +586,44 @@ def test_an_LLM_FAILURE_without_an_exception_is_UNCHANGED_still_not_an_answer(db
     _failed_draft(db, "fd-llm")
     with pytest.raises(DraftNotAnAnswer):
         _request_again(db, draft_id="fd-llm-retry", option_id="opt-fd-llm",
-                       identity="ident-fd-llm",
                        provider_contract_hash="sha256:contract",
+                       strategy_identity_hash="sih-llm")
+
+
+def test_an_exception_that_does_not_NAME_the_withdrawal_cannot_override_it(db):
+    """Task 6 review item 3: a coupon minted BEFORE the tombstone (tombstone_id NULL) must not
+    unlock a LATER withdrawal — overriding a withdrawal is an act about THAT withdrawal, and an
+    approval nobody weighed against it carries no audit linkage. The retry refuses as retired."""
+    from featuregen.overlay.upload.formula_draft_store import DraftRetired, formula_identity
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        approve_regeneration_exception,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-prearm")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-prearm",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-prearm",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    # The coupon, minted while NO tombstone covers the target → tombstone_id NULL.
+    approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z",
+        scope_key=scope)
+    # The withdrawal lands AFTERWARDS.
+    record_tombstone(db, formula_draft_id="fd-prearm",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+
+    with pytest.raises(DraftRetired):
+        _request_again(db, draft_id="fd-prearm-retry", option_id="opt-fd-prearm",
+                       provider_contract_hash="sha256:llm",
                        strategy_identity_hash="sih-llm")

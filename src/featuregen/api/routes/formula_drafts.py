@@ -230,12 +230,11 @@ def request_formula_method_override(
     an expiry — the strategy resolver then consumes it as an input fact on the NEXT draft
     request, which mints a NEW draft identity (child D2): nothing re-labels the refused one.
     """
+    from featuregen.overlay.upload.llm_spend import canonical_approval_expiry
     from featuregen.overlay.upload.method_override import (
         OverrideRefusalUnverified,
         request_method_override,
     )
-
-    from featuregen.overlay.upload.llm_spend import canonical_approval_expiry
 
     # Day-floored for the same replay reason as spend approvals: a replayed override request
     # computing a fresh now()+N would otherwise mint a new revision per replay, quietly
@@ -317,7 +316,8 @@ def approve_regeneration(
         raise HTTPException(
             status_code=404 if exc.kind == "unknown_draft" else 409,
             detail={"code": {"deterministic_lane": "DETERMINISTIC_RETRY_IS_FREE",
-                             "not_a_formula": "NOT_A_FORMULA"}.get(exc.kind, exc.kind),
+                             "not_a_formula": "NOT_A_FORMULA",
+                             "unknown_draft": "UNKNOWN_DRAFT"}.get(exc.kind, exc.kind.upper()),
                     "detail": exc.detail}) from exc
     except CandidateUnavailable as exc:
         raise HTTPException(
