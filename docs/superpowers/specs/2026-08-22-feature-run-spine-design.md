@@ -754,16 +754,16 @@ All opened at the code baseline; ® = verified in the revision-2 review or re-ve
 | run minted per recommendation generation · `fgr_` second prefix | `contract.py:790` · `gate1.py:733` |
 | many runs per intent | `1021:17` |
 | ® child plan's mutable job lifecycle | child §3.5 (migration 1109): `code_generation_job` status, member states, events, per-action state |
-| ® a FAILED draft cannot re-enqueue | `formula_draft_store.py:306` (`created=False`, enqueue only on create) + `formula_draft_identity` UNIQUE (1090) |
+| ~~a FAILED draft cannot re-enqueue~~ **SUPERSEDED by 1107 + R4.2**: the money-guard index covers only answers (`WHERE state NOT IN ('FAILED','CANCELLED')`); retry is governed per R4.2 (LLM: exception+spend; deterministic: free, Option 2 ruling) | `1107_money_guard_covers_only_answers.sql` |
 | ® scope children mutable after the parent, id-only hash | `scope_records.py:422` · `confirmed_scope_use_case` (0974, ON DELETE CASCADE) |
 | ® the runner applies any missing file, checksum-ledgered | `migrations.py:288` |
 | ® dev stubs carry `authenticated=False` | `deps.py:95` |
 | ® `contract_generation_input` chain target | 1024: PK `generation_run_id`, NOT NULL `intent_id` + `confirmed_scope_id` |
 | ® the sealing pattern to copy | 1006: DEFERRABLE INITIALLY DEFERRED item FK, items-first, write-once triggers, `item_count` |
 | fork cannot mint new selections · build-set identity excludes the formula · latest-wins resolve | `1072:97` · `1092:56,66` · `restore_formula_v3.py:90` |
-| authoring idempotent on identity; config hash a constant | 1090 · `_authoring_config_hash` |
+| authoring idempotent on identity; ~~config hash a constant~~ **the constant-hash function was DELETED** — identity V2 is composed once in `formula_draft_service.py` (`{identity_version, formula_strategy, strategy_identity_hash, provider_contract_hash iff LLM}`) | 1090 · 1103/1109 companions |
 | authoring subject is a candidate | parent §0.1.4 / §0.1.1 |
-| sandbox lane absent · publication settled only by tests | parent §9.0 · `publication_attempt_store.py:183` callers · `feature_execution.py:424` |
+| ~~sandbox lane absent~~ **the §9.0 verification worker EXISTS** (executor seam awaits step 0b — posture-named FAILED, never a fake pass); publication read path repaired at `2a03a77b`; the PUBLISH_SANDBOX worker remains absent | `verification_lane.py` · 1110 |
 | `publication_attempt` bare text ids | `1081:32` — live row count **unmeasured** |
 | six role bundles · tenant on the envelope | `permissions.py` · `envelopes.py:26` |
 | migrations 1100–1114 reserved; 1113/1114 = compiler evaluation | parent §17 allocation table (line numbers shift with the plan's in-flight edits — cite the section) |
@@ -877,7 +877,7 @@ Availability stays DERIVED; three stored reason codes are now false and must der
 
 | Stage | Truth at `e5c4f581` |
 |---|---|
-| `EXECUTE_SANDBOX` | worker EXISTS (§9.0 lane); still honestly UNAVAILABLE for two derivable reasons — the deployment switch is off, and the executor substrate (step 0b) is absent (`_EXECUTOR is None` → posture-named FAILED, never a fake pass). Derive switch-first like `_generate_preview_stage`; never `WORKER_NOT_IMPLEMENTED` |
+| `EXECUTE_SANDBOX` | worker EXISTS (§9.0 lane); still honestly UNAVAILABLE, derived from TWO INDEPENDENT SWITCHES surface-first (`FEATUREGEN_MATERIALIZE_ENABLED` gates the whole route surface at the router; `FEATUREGEN_VERIFICATION_V2_ENABLED` gates the lane) — shipped as `MATERIALIZATION_DISABLED` then `VERIFICATION_DISABLED` then `NOT_STARTED` (Task 1, deviation upheld). `_EXECUTOR is None` is deliberately unread: its absence surfaces as a posture-named FAILED attempt, not unavailability. Never `WORKER_NOT_IMPLEMENTED` |
 | `MATERIALIZE_PRODUCTION` / `PUBLISH_PRODUCTION` | state machines BUILT (1113/1114) behind `action_available()` — the true reason is `ACTION_UNAVAILABLE` under §0.1.0, derivable |
 | `PUBLISH_SANDBOX` | still genuinely `WORKER_NOT_IMPLEMENTED` — and its READ path repair (the substrate's `2a03a77b`) is the lane's own affair |
 | `TRAIN_MODEL` | unchanged — `SUBSYSTEM_NOT_BUILT` |
