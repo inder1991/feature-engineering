@@ -307,7 +307,7 @@ def approve_regeneration(
     )
 
     try:
-        exception_id, spend_authorization_id, created = approve_regeneration_for_draft(
+        exception_ids, spend_authorization_id, created = approve_regeneration_for_draft(
             conn, formula_draft_id=formula_draft_id, actor_subject=identity.subject,
             max_calls=body.max_calls, max_tokens=body.max_tokens, max_cost=body.max_cost,
             currency=body.currency, pricing_version=body.pricing_version,
@@ -328,7 +328,11 @@ def approve_regeneration(
     counters.incr("featuregen.regeneration.approved" if created
                   else "featuregen.regeneration.deduplicated")
     return {
-        "exception_id": exception_id,
+        # ▲ ONE approval act binds the FULL covering set (round-4's one law) — one exception per
+        # covering withdrawal, or the single plain-retry row when nothing covers. The first id
+        # is kept under the old key for existing readers.
+        "exception_ids": list(exception_ids),
+        "exception_id": exception_ids[0],
         "spend_authorization_id": spend_authorization_id,
         "created": created,
         "detail": ("the regeneration is approved and cost-confirmed; re-request the draft and "

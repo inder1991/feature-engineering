@@ -488,7 +488,7 @@ def test_EVERY_DRAFT_IS_DECIDED_AND_CEILINGED_in_its_one_transaction(client, con
 def test_the_dev_envelope_is_ONE_ceiling_per_draft_config_not_one_per_click(client, conn,
                                                                             engineer_headers):
     _revision(conn, revision_id="crev-t5b", snapshot_id="snap-t5b")
-    first = client.post(DRAFT_PATH.format(rev="crev-t5b", opt="opt-a"), headers=engineer_headers)
+    client.post(DRAFT_PATH.format(rev="crev-t5b", opt="opt-a"), headers=engineer_headers)
     second = client.post(DRAFT_PATH.format(rev="crev-t5b", opt="opt-a"), headers=engineer_headers)
     assert second.json()["created"] is False
     count = conn.execute(
@@ -678,3 +678,92 @@ def test_a_NAMING_COUPON_turns_RETIRED_into_an_OVERRIDDEN_warning_one_answer_bot
     assert minted.status_code == 202, minted.text
     assert "RETIREMENT_OVERRIDDEN" in minted.json()["strategy_warnings"], \
         "the withdrawal's override is DISPLAYED, never silent — one answer, both routes"
+
+
+def test_HALF_NAMED_COVERAGE_refuses_the_same_way_on_both_routes(client, conn,
+                                                                 engineer_headers):
+    """Round-4 NB-2's agreement half: both kinds cover, only the broad one has a coupon — the
+    preview says RETIRED and the request 409s, one answer by construction (both read the same
+    covering-set + coupons)."""
+
+    from featuregen.overlay.upload.formula_draft_service import (
+        candidate_governance_blockers,
+        current_authoring_config,
+        frozen_candidate,
+    )
+    from featuregen.overlay.upload.formula_draft_store import formula_identity
+    from featuregen.overlay.upload.formula_strategy import resolve_formula_strategy
+    from featuregen.overlay.upload.formula_strategy_facts import assemble_strategy_facts
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    _revision(conn, revision_id="crev-half", snapshot_id="snap-half")
+    candidate = frozen_candidate(conn, "crev-half", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-half', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-half', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    broad = record_tombstone(conn, formula_draft_id="fd-half",
+                             scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                             reason="superseded", retired_by="user:owner")
+    assembled = assemble_strategy_facts(
+        conn, considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        idea=candidate.idea, catalog_snapshot_hash=candidate.catalog_snapshot_hash)
+    decision = resolve_formula_strategy(assembled.facts)
+    contract, _payload, config_hash = current_authoring_config(decision)
+    identity = formula_identity(
+        considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        authoring_config_hash=config_hash,
+        definition_revision=candidate.definition_revision)
+    # An EXACT withdrawal of the CURRENT target identity, with NO coupon of its own.
+    conn.execute(
+        "INSERT INTO formula_draft_retirement_tombstone (tombstone_id, scope, "
+        "retirement_scope_key, exact_formula_identity_hash, coverage_identity_hash, "
+        "formula_draft_id, reason, retired_by) VALUES ('tmb-half-exact', 'EXACT_DRAFT', %s, "
+        "%s, %s, 'fd-half', 'this exact one is wrong', 'user:owner')",
+        (retirement_scope_key(
+            considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+            planning_request_hash=candidate.planning_request_hash,
+            catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+            definition_revision=candidate.definition_revision),
+         identity, "cov-half-exact"))
+    # A coupon naming ONLY the broad withdrawal.
+    spend = authorize_spend(
+        conn, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-half",
+        member_identities=[identity], provider_contract_hash=contract, max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    conn.execute(
+        "INSERT INTO formula_draft_regeneration_exception (exception_id, tombstone_id, "
+        "target_formula_identity_hash, provider_contract_hash, strategy_identity_hash, "
+        "llm_spend_authorization_id, actor_subject, overrides_tombstone, max_uses, expires_at) "
+        "VALUES ('exc-half-broad', %s, %s, %s, %s, %s, 'user:owner', true, 1, "
+        "'2026-12-31T00:00:00Z')",
+        (broad.tombstone_id, identity, contract, decision.strategy_identity_hash, spend))
+
+    scope = retirement_scope_key(
+        considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        definition_revision=candidate.definition_revision)
+    blockers, warnings = candidate_governance_blockers(
+        conn, candidate=candidate, option_id="opt-a", strategy=decision.strategy,
+        strategy_identity_hash=decision.strategy_identity_hash,
+        provider_contract_hash=contract, config_hash=config_hash, scope_key=scope)
+    assert "FORMULA_DRAFT_RETIRED" in blockers, "the PREVIEW refuses"
+    assert "RETIREMENT_OVERRIDDEN" not in warnings
+
+    refused = client.post(DRAFT_PATH.format(rev="crev-half", opt="opt-a"),
+                          headers=engineer_headers)
+    assert refused.status_code == 409, "and the STORE refuses — one answer, both routes"
+    assert refused.json()["detail"]["code"] == "FORMULA_DRAFT_RETIRED"

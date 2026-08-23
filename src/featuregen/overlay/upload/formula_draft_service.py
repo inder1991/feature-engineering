@@ -85,7 +85,7 @@ def candidate_governance_blockers(
     conn, *, candidate: FrozenCandidateV1, option_id: str, strategy,
     strategy_identity_hash: str, provider_contract_hash: str | None, config_hash: str,
     scope_key: str,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """The candidate-level refusal FACTS — the ONE composition the plan preview and the
     AUTHOR_FORMULA decision both consult (§8.3 applied to reads: the first cut computed these in
     `member_authoring_plans` and never showed them to the decision, which made the gate
@@ -104,7 +104,7 @@ def candidate_governance_blockers(
     from featuregen.overlay.upload.formula_draft_store import formula_identity
     from featuregen.overlay.upload.formula_strategy import FormulaStrategy as _FS
     from featuregen.overlay.upload.retirement_scope import (
-        tombstone_covering,
+        covering_tombstones,
         valid_exception_for,
     )
 
@@ -116,16 +116,23 @@ def candidate_governance_blockers(
         authoring_config_hash=config_hash,
         definition_revision=candidate.definition_revision)
     warnings: list[str] = []
-    covering = tombstone_covering(conn, scope_key=scope_key,
-                                  formula_identity_hash=identity_hash)
-    if covering is not None:
-        override = valid_exception_for(
-            conn, target_formula_identity_hash=identity_hash,
-            provider_contract_hash=provider_contract_hash,
-            strategy_identity_hash=strategy_identity_hash,
-            covering_tombstone_id=covering.tombstone_id,
-            now=conn.execute("SELECT now()").fetchone()[0]) if provider_contract_hash else None
-        if override is not None:
+    # ▲ THE ONE LAW's preview (round-4): the SAME covering-set + coupon read the store gates on —
+    # RETIRED iff some covering withdrawal lacks a valid naming coupon, RETIREMENT_OVERRIDDEN
+    # iff every one is named. One answer, both routes, by construction rather than by parallel
+    # derivations agreeing.
+    covering_set = covering_tombstones(conn, scope_key=scope_key,
+                                       formula_identity_hash=identity_hash)
+    if covering_set:
+        preview_now = conn.execute("SELECT now()").fetchone()[0]
+        all_named = provider_contract_hash is not None and all(
+            valid_exception_for(
+                conn, target_formula_identity_hash=identity_hash,
+                provider_contract_hash=provider_contract_hash,
+                strategy_identity_hash=strategy_identity_hash,
+                covering_tombstone_id=withdrawal.tombstone_id,
+                now=preview_now) is not None
+            for withdrawal in covering_set)
+        if all_named:
             warnings.append("RETIREMENT_OVERRIDDEN")
         else:
             blockers.append("FORMULA_DRAFT_RETIRED")
@@ -137,13 +144,19 @@ def candidate_governance_blockers(
             " WHERE i.identity_version = 1 AND i.retirement_scope_key = %s "
             "   AND d.state = 'READY' LIMIT 1", (scope_key,)).fetchone()
         if legacy_ready is not None:
-            exception = valid_exception_for(
-                conn, target_formula_identity_hash=identity_hash,
-                provider_contract_hash=provider_contract_hash,
-                strategy_identity_hash=strategy_identity_hash,
-                covering_tombstone_id=None if covering is None else covering.tombstone_id,
-                now=conn.execute("SELECT now()").fetchone()[0])
-            if exception is None:
+            # Under the one law: with withdrawals covering, "is a re-buy approved" IS "is every
+            # covering withdrawal named" — the same coupons answer both; with nothing covering,
+            # the plain retry coupon (tombstone_id NULL) is the approval.
+            if covering_set:
+                approved = "RETIREMENT_OVERRIDDEN" in warnings
+            else:
+                approved = valid_exception_for(
+                    conn, target_formula_identity_hash=identity_hash,
+                    provider_contract_hash=provider_contract_hash,
+                    strategy_identity_hash=strategy_identity_hash,
+                    covering_tombstone_id=None,
+                    now=conn.execute("SELECT now()").fetchone()[0]) is not None
+            if not approved:
                 blockers.append("LEGACY_REGENERATION_NOT_APPROVED")
     return tuple(blockers), tuple(warnings)
 
@@ -531,9 +544,11 @@ def request_draft_for_candidate(
         considered_revision_id=revision_id, option_id=option_id, created=created)
     return DraftRequestedV1(
         formula_draft_id=draft_id, created=created, strategy=decision.strategy,
-        # The FULL warning set — the resolver's route announcements AND the governance facts
-        # (RETIREMENT_OVERRIDDEN et al.): a warning computed and dropped is worse than none (D3).
-        warnings=member_warnings, config_hash=config_hash, candidate=candidate,
+        # ▲ The FOLDED warning set — what the DECISION persisted after the §5 disposition fold,
+        # not the raw pre-fold union (round-4: the durable record is the truth, and returning a
+        # different set is the two-answers divergence inverted).
+        warnings=tuple(authoring_decision.warnings), config_hash=config_hash,
+        candidate=candidate,
         action_decision_revision_id=decision_id)
 
 
@@ -551,7 +566,7 @@ class RegenerationNotApprovable(Exception):
 def approve_regeneration_for_draft(
     conn, *, formula_draft_id: str, actor_subject: str, max_calls: int, max_tokens: int,
     max_cost: str, currency: str, pricing_version: str, expires_at: str, max_uses: int = 1,
-) -> tuple[str, str, bool]:
+) -> tuple[tuple[str, ...], str, bool]:
     """Task 6's approval act, with every binding derived SERVER-SIDE from the target draft.
 
     The exception authorizes the identity a re-request would mint TODAY — the candidate's frozen
@@ -618,7 +633,7 @@ def approve_regeneration_for_draft(
         pricing_version=pricing_version, expires_at=expires)
     from featuregen.overlay.upload.retirement_scope import retirement_scope_key
 
-    exception_id, created = approve_regeneration_exception(
+    exception_ids, created = approve_regeneration_exception(
         conn, target_formula_identity_hash=target_identity,
         provider_contract_hash=provider_contract,
         strategy_identity_hash=decision.strategy_identity_hash,
@@ -631,6 +646,6 @@ def approve_regeneration_for_draft(
             planning_request_hash=candidate.planning_request_hash,
             catalog_snapshot_hash=candidate.catalog_snapshot_hash,
             definition_revision=candidate.definition_revision))
-    log("featuregen.regeneration.approved", exception_id=exception_id,
+    log("featuregen.regeneration.approved", exception_ids=list(exception_ids),
         formula_draft_id=formula_draft_id, created=created)
-    return exception_id, spend_authorization_id, created
+    return exception_ids, spend_authorization_id, created

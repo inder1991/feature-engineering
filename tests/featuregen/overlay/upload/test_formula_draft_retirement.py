@@ -788,7 +788,7 @@ def test_an_EXACT_withdrawal_of_the_override_draft_STOPS_it_mid_ladder(db):
     record_tombstone(db, formula_draft_id=minted, scope=RetirementScope.EXACT_DRAFT,
                      reason="wrong after all", retired_by="user:owner")
 
-    with pytest.raises(DraftRetired, match="withdrawn EXACTLY"):
+    with pytest.raises(DraftRetired, match="no consumed regeneration exception names"):
         advance(db, minted, DraftStateV1.CRITIC_REVIEW)
 
 
@@ -849,3 +849,118 @@ def test_the_REQUEST_gate_shares_the_masking_fix(db):
     with pytest.raises(DraftRetired):
         _request_again(db, draft_id="fd-mask-retry", option_id="opt-fd-mask",
                        provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+
+
+def test_NB1_a_governed_override_of_an_EXACT_withdrawal_completes(db):
+    """Round-4's NB-1: under round 3, this journey minted (coupon consumed, spend reserved) and
+    died at the first advance — dead on arrival with no exit. Under the ONE LAW the coupon names
+    the exact withdrawal and the ladder runs to READY."""
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        approve_regeneration_exception,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-nb1")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-nb1",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    # The withdrawal is EXACT — the default scope an operator reaches for.
+    record_tombstone(db, formula_draft_id="fd-nb1", scope=RetirementScope.EXACT_DRAFT,
+                     reason="bad numbers", retired_by="user:owner")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-nb1",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    ids, created = approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
+    assert created and len(ids) == 1, "one covering withdrawal, one binding"
+
+    minted, was_created = _request_again(
+        db, draft_id="fd-nb1-retry", option_id="opt-fd-nb1",
+        provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+    assert was_created is True
+
+    for to in (DraftStateV1.AUTHORING, DraftStateV1.CRITIC_REVIEW, DraftStateV1.VALIDATING,
+               DraftStateV1.ADMISSION):
+        advance(db, minted, to)
+    final = advance(db, minted, DraftStateV1.READY, formula_content_hash="sha256:f-nb1",
+                    formula_json={"formula_schema_version": 3})
+    assert final is DraftStateV1.READY
+
+
+def test_NB2_both_kinds_cover_ONE_approval_binds_both_and_the_ladder_runs(db):
+    """Round-4's NB-2: both scopes covering was unmintable by construction (the writer picked
+    one; the gate demanded the other). One approval act now binds BOTH; the mint consumes BOTH;
+    the ladder runs to READY."""
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        approve_regeneration_exception,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-nb2")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-nb2",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    record_tombstone(db, formula_draft_id="fd-nb2",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    record_tombstone(db, formula_draft_id="fd-nb2", scope=RetirementScope.EXACT_DRAFT,
+                     reason="and this exact one is wrong", retired_by="user:owner")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-nb2",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    ids, _ = approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
+    assert len(ids) == 2, "one binding PER covering withdrawal, in one act"
+
+    minted, was_created = _request_again(
+        db, draft_id="fd-nb2-retry", option_id="opt-fd-nb2",
+        provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+    assert was_created is True
+    consumed = db.execute(
+        "SELECT COUNT(*) FROM formula_draft_regeneration_exception "
+        "WHERE target_formula_identity_hash = %s AND uses_consumed = 1", (identity,)).fetchone()
+    assert consumed == (2,), "the mint consumed BOTH coupons"
+
+    for to in (DraftStateV1.AUTHORING, DraftStateV1.CRITIC_REVIEW, DraftStateV1.VALIDATING,
+               DraftStateV1.ADMISSION):
+        advance(db, minted, to)
+    assert advance(db, minted, DraftStateV1.READY, formula_content_hash="sha256:f-nb2",
+                   formula_json={"formula_schema_version": 3}) is DraftStateV1.READY
+
+
+def test_the_fence_refusal_carries_the_REPLACEMENT_POINTER(db):
+    """Round-4 NB-3's fence half: the refusal names the actual un-named withdrawal INCLUDING its
+    replacement pointer — the thing the operator usually actually needs."""
+    from featuregen.overlay.upload.formula_draft_store import (
+        DraftRetired,
+        DraftStateV1,
+        advance,
+    )
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    minted, _identity = _override_minted(db, "ptr")
+    advance(db, minted, DraftStateV1.AUTHORING)
+    # A replacement-bearing EXACT withdrawal lands mid-ladder.
+    other = _draft(db, "fd-ptr-replacement", state="BLOCKED")
+    record_tombstone(db, formula_draft_id=minted, scope=RetirementScope.EXACT_DRAFT,
+                     reason="superseded mid-flight", retired_by="user:owner",
+                     replacement_draft_id=other)
+
+    with pytest.raises(DraftRetired, match="use fd-ptr-replacement"):
+        advance(db, minted, DraftStateV1.CRITIC_REVIEW)
