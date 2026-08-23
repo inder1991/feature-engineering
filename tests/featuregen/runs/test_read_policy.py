@@ -20,6 +20,9 @@ def test_admin_sees_everything():
 def test_owner_predicate_covers_identity_and_pre_spine_actor():
     frag, params = visibility_where(_env("priya", "feature_engineer"))
     assert "fri.owner_subject" in frag and "fgr.actor" in frag
+    # Pinned exactly: consumer queries splice this verbatim, so a reworded fragment that still
+    # mentions both owner sources could change which rows match.
+    assert frag == "COALESCE(fri.owner_subject, fgr.actor->>'subject') = %s"
     assert params == ["priya"]
 
 

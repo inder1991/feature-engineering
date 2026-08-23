@@ -20,8 +20,15 @@ def is_platform_admin(identity: IdentityEnvelope) -> bool:
 def visibility_where(identity: IdentityEnvelope) -> tuple[str, list]:
     """The SQL fragment (and its params) restricting a run query to what `identity` may see.
 
-    The fragment is a standalone boolean expression the caller ANDs into its WHERE clause, and its
-    params go first, in the caller's parameter order."""
+    The fragment is a standalone boolean expression the caller ANDs into its WHERE clause. Its
+    params bind positionally AT THE POINT THE FRAGMENT IS SPLICED into the SQL — the caller appends
+    them in splice order, wherever that is: `WHERE {frag} AND ...` binds `(*params, ...)`, while
+    `WHERE fgr.generation_run_id = %s AND {frag}` binds `(run_id, *params)`. Getting that order
+    wrong does not raise; it silently matches nothing.
+
+    Invariant: if this fragment ever becomes compound, parenthesize it. Comparison binds tighter
+    than OR/NOT, so today's single equality needs none — the invariant, not the punctuation, is
+    the durable protection."""
     if is_platform_admin(identity):
         return "TRUE", []
     # ONE comparison: a V1 run's owner is the immutable identity row; a pre-spine run falls back
