@@ -201,3 +201,18 @@ def test_A_RESERVATION_CANNOT_BE_EDITED_OR_DELETED(db):
     with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
         db.execute("UPDATE llm_spend_reservation SET expires_at = now() "
                    "WHERE reservation_id = %s", (reservation,))
+
+
+def test_a_DIFFERENT_VALIDITY_WINDOW_is_a_DIFFERENT_approval(db):
+    """Task 5 review C-2: expiry is INSIDE the idempotency identity. Outside it, every ceiling
+    was a LIFETIME budget per (actor, subject, contract) — once expired, a re-mint returned the
+    same expired row for ever and the subject became permanently unauthorable."""
+    common = dict(action="AUTHOR_FORMULA", actor_subject="user:sam", job_identity="job-c2",
+                  member_identities=["m"], provider_contract_hash="sha256:c", max_calls=5,
+                  max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1")
+    first = authorize_spend(db, **common, expires_at="2026-12-01T00:00:00Z")
+    same = authorize_spend(db, **common, expires_at="2026-12-01T00:00:00Z")
+    renewed = authorize_spend(db, **common, expires_at="2026-12-02T00:00:00Z")
+
+    assert first == same, "the identical approval is ONE row"
+    assert renewed != first, "a new validity window is a NEW bounded approval — the renewal"

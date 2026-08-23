@@ -73,6 +73,13 @@ function NavIcon({ children }: { children: ReactElement | ReactElement[] }) {
 }
 
 const ICONS: Record<Route, ReactElement> = {
+  'code-generation': (
+    <NavIcon>
+      {/* code brackets — the generation workspace */}
+      <path d="M6 4 3 8l3 4" />
+      <path d="M10 4l3 4-3 4" />
+    </NavIcon>
+  ),
   overview: (
     <NavIcon>
       <circle cx="8" cy="8" r="6.25" />

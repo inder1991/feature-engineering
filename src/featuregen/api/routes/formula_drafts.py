@@ -41,6 +41,7 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.formula_draft_service import (
     FORMULA_DRAFT_HANDLER,
     FORMULA_DRAFT_TOPIC,
+    AuthoringRefused,
     CandidateUnavailable,
     FormulaStrategy,
     NotAFormulaCandidate,
@@ -114,6 +115,12 @@ def request_formula_draft(
             "formula_strategy": str(exc.strategy),
             "blockers": list(exc.blockers),
             "detail": "the authoring strategy could not be resolved for this candidate"}) from exc
+    except AuthoringRefused as exc:
+        # The AUTHOR_FORMULA decision refused — typed, with the service's blockers (Task 5 AC2).
+        raise HTTPException(status_code=409, detail={
+            "code": exc.blockers[0] if exc.blockers else "AUTHORING_REFUSED",
+            "blockers": list(exc.blockers),
+            "detail": "the authoring decision refused; nothing was recorded or spent"}) from exc
     except NotAnAnswerAtRequest as exc:
         # 409 — the identity's draft is a recorded FAILURE, and buying the answer again is an
         # approved act (§11.1.2), not a retry button. This used to escape as a 500.

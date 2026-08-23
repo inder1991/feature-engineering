@@ -26,12 +26,13 @@ NEW job identity created by an explicit user act — never a silent drop of a se
 from __future__ import annotations
 
 import traceback
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.overlay.upload.code_generation_job_store import (
     CodeGenJobV1,
-    CodeGenMemberV1,
     JobStatusV1,
     MemberStateV1,
     advance_job,
@@ -42,6 +43,9 @@ from featuregen.overlay.upload.code_generation_job_store import (
     record_job_action,
     release_job,
     update_member,
+)
+from featuregen.overlay.upload.formula_draft_service import (
+    PER_DRAFT_CALL_ENVELOPE as CALL_ENVELOPE_PER_LLM_MEMBER,
 )
 from featuregen.runtime.observability import counters, log
 
@@ -98,6 +102,7 @@ def _drive(conn, job: CodeGenJobV1) -> None:
 # ── stage: request every member's draft through the ONE composition ─────────────────────────────
 def _plan_formulas(conn, job: CodeGenJobV1) -> None:
     from featuregen.overlay.upload.formula_draft_service import (
+        AuthoringRefused,
         CandidateUnavailable,
         NotAFormulaCandidate,
         NotAnAnswerAtRequest,
@@ -121,10 +126,17 @@ def _plan_formulas(conn, job: CodeGenJobV1) -> None:
             result = request_draft_for_candidate(
                 conn, revision_id=member.considered_revision_id, option_id=member.option_id,
                 formula_draft_id=mint_id("fd"), requested_by=job.requested_by, now=_now(conn),
-                spend_authorization_id=spend_authorization_id)
+                spend_authorization_id=spend_authorization_id,
+                # 4b: the job's ceiling was cost-CONFIRMED at the write; its absence here means
+                # it expired — refuse (COST_AUTHORIZATION_MISSING), never substitute a dev
+                # envelope for what a person approved.
+                mint_development_envelope=False)
         except RetiredAtRequest:
             update_member(conn, job.job_id, member.position, state=MemberStateV1.BLOCKED,
                           blockers=["FORMULA_DRAFT_RETIRED"])
+        except AuthoringRefused as exc:
+            update_member(conn, job.job_id, member.position, state=MemberStateV1.BLOCKED,
+                          blockers=list(exc.blockers) or ["AUTHORING_REFUSED"])
         except NotAnAnswerAtRequest:
             # A member whose previous attempt FAILED: blocked by name, never a whole-job
             # "coordinator crash" — re-buying is an approved act (§11.1.2).
@@ -380,3 +392,240 @@ def _watch_generation(conn, job: CodeGenJobV1) -> None:
                                      "failure_reason": request.failure_reason})
     else:
         release_job(conn, job.job_id)   # still compiling — the lease expiry paces the next look
+
+
+# ══ Stage I Task 4's seam — job creation as a CALLABLE SERVICE, the route as its adapter ════════
+# The run→job trigger bridge (run-spine Stage I) invokes job creation from a worker, where an
+# HTTP body and an HTTPException have no meaning — so the composition lives HERE, typed end to
+# end, and `api/routes/code_generation_jobs.py` maps the refusals to statuses exactly as the
+# drafts route maps the draft service's.
+
+@dataclass(frozen=True, slots=True)
+class CodeGenJobRequestV1:
+    """One explicit request, transport-free — what the route's body decodes to and what the
+    run-spine trigger constructs directly."""
+
+    considered_revision_id: str
+    target_reading_revision_id: str
+    selection_revision_ids: tuple[str, ...]
+    environment_id: str
+    logical_group_name: str
+    declaration: Mapping[str, Any]
+    execution_parameters: Mapping[str, Any]
+    #: (max_calls, max_tokens, max_cost, currency, pricing_version, expires_at) or None.
+    spend_approval: Mapping[str, Any] | None = None
+
+
+class SelectionUnavailable(Exception):
+    """A selection the request names cannot anchor a build — `kind` is closed:
+    `unknown_selection` (404-shaped) or `wrong_considered_revision` (409-shaped)."""
+
+    def __init__(self, kind: str, detail: str) -> None:
+        super().__init__(detail)
+        self.kind = kind
+        self.detail = detail
+
+
+class CodeGenRequestInvalid(ValueError):
+    """The request itself is malformed (undecodable declaration, missing execution parameter) —
+    422-shaped: the body is what is wrong, and the message names which part."""
+
+
+class CodeGenMembersRefused(Exception):
+    """Members the platform refuses BEFORE any spend — a costed job containing one would be a
+    quote for a purchase nobody can make (plan §5a item 1)."""
+
+    def __init__(self, refused: list[dict[str, Any]]) -> None:
+        super().__init__(refused[0]["blockers"][0] if refused and refused[0]["blockers"] else "")
+        self.refused = refused
+
+
+class SpendApprovalRequired(Exception):
+    """LLM members exist and no cost confirmation came with the request (§11.2)."""
+
+    def __init__(self, llm_members: int, estimated_provider_calls: int) -> None:
+        super().__init__("COST_AUTHORIZATION_MISSING")
+        self.llm_members = llm_members
+        self.estimated_provider_calls = estimated_provider_calls
+
+
+#: The authoring call envelope per LLM member — THE one per-draft bound (see the import at the
+#: top of this module), so the quote, the write and the dev envelope can never disagree again
+#: (Task 5 re-review, carried finding 1).
+
+
+def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str, Any]]:
+    """Resolve each selection's frozen candidate and authoring strategy — READ-ONLY.
+
+    Raises `SelectionUnavailable` for a selection that cannot anchor the build, and lets the
+    draft service's `CandidateUnavailable` propagate for a candidate the frozen revision cannot
+    resolve — both typed; the route maps them.
+
+    Refusals that must land BEFORE costing (plan §5a item 1): a retirement tombstone covering the
+    candidate (`FORMULA_DRAFT_RETIRED`), and a READY legacy V1 draft with no approved regeneration
+    (`LEGACY_REGENERATION_NOT_APPROVED` — under identity V2 a re-author would mint a DIFFERENT
+    identity, so the money guard alone cannot see that the answer was already bought once).
+    """
+    from featuregen.canonical import jcs_sha256
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.formula_strategy import (
+        FormulaStrategy,
+        resolve_formula_strategy,
+    )
+    from featuregen.overlay.upload.formula_strategy_facts import (
+        assemble_strategy_facts,
+        current_author_contract_hash,
+    )
+    from featuregen.overlay.upload.retirement_scope import retirement_scope_key
+
+    plans: list[dict[str, Any]] = []
+    for position, selection_revision_id in enumerate(request.selection_revision_ids):
+        row = conn.execute(
+            "SELECT considered_revision_id, option_id FROM feature_selection_revision "
+            "WHERE revision_id = %s", (selection_revision_id,)).fetchone()
+        if row is None:
+            raise SelectionUnavailable(
+                "unknown_selection",
+                f"no selection {selection_revision_id!r}: a build is a build of "
+                f"selections, and this one does not exist")
+        if row[0] != request.considered_revision_id:
+            raise SelectionUnavailable(
+                "wrong_considered_revision",
+                f"selection {selection_revision_id!r} belongs to considered revision "
+                f"{row[0]!r}, not {request.considered_revision_id!r}: one build reads one "
+                f"frozen considered set")
+        option_id = row[1]
+
+        candidate = frozen_candidate(conn, request.considered_revision_id, option_id)
+
+        assembled = assemble_strategy_facts(
+            conn, considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+            idea=candidate.idea, catalog_snapshot_hash=candidate.catalog_snapshot_hash)
+        decision = resolve_formula_strategy(assembled.facts)
+
+        blockers = list(decision.blockers)
+        warnings = list(decision.warnings)
+        if decision.strategy in (FormulaStrategy.NON_FORMULA, FormulaStrategy.MODEL_WORKFLOW):
+            blockers = blockers or ["CONCEPTUAL_PATTERN_NOT_AUTHORABLE"]
+
+        # ▲ The candidate-level refusal facts, from the ONE builder the write path's DECISION also
+        # consults (`candidate_governance_blockers` — Task 5 review 4a): the plan previews
+        # exactly what the decision will refuse, because they read the same composition. The
+        # first cut computed these inline here and never showed them to the decision.
+        provider_contract = (current_author_contract_hash()
+                            if decision.strategy is FormulaStrategy.LLM_AUTHORED else None)
+        config_payload: dict[str, Any] = {
+            "identity_version": 2,
+            "formula_strategy": str(decision.strategy),
+            "strategy_identity_hash": decision.strategy_identity_hash,
+        }
+        if provider_contract is not None:
+            config_payload["provider_contract_hash"] = provider_contract
+        from featuregen.overlay.upload.formula_draft_service import (
+            candidate_governance_blockers,
+        )
+
+        blockers.extend(candidate_governance_blockers(
+            conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
+            strategy_identity_hash=decision.strategy_identity_hash,
+            provider_contract_hash=provider_contract, config_hash=jcs_sha256(config_payload),
+            scope_key=retirement_scope_key(
+                considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+                planning_request_hash=candidate.planning_request_hash,
+                catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+                definition_revision=candidate.definition_revision)))
+
+        plans.append({
+            "position": position,
+            "selection_revision_id": selection_revision_id,
+            "considered_revision_id": candidate.considered_revision_id,
+            "option_id": option_id,
+            "formula_strategy": str(decision.strategy),
+            "blockers": blockers,
+            "warnings": warnings,
+        })
+    return plans
+
+
+def request_code_generation_job(
+    conn, request: CodeGenJobRequestV1, *, actor_subject: str,
+) -> tuple[str, bool]:
+    """THE explicit write/spend act, callable from any owner of a connection — everything durable
+    in one transaction; the worker's coordinator drives the rest. Returns ``(job_id, created)``.
+
+    Raises `CodeGenRequestInvalid` / `SelectionUnavailable` / `CodeGenMembersRefused` /
+    `SpendApprovalRequired` — all typed, none knowing what HTTP is.
+    """
+    from featuregen.aggregates.ids import mint_id
+    from featuregen.materialize.build_set_declaration import (
+        declaration_identity,
+        decode_declaration,
+    )
+    from featuregen.overlay.upload.code_generation_job_store import (
+        JobMemberSpecV1,
+        create_job,
+    )
+    from featuregen.overlay.upload.formula_strategy import FormulaStrategy
+    from featuregen.overlay.upload.formula_strategy_facts import current_author_contract_hash
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+
+    try:
+        declaration = decode_declaration(dict(request.declaration))
+    except (ValueError, TypeError) as exc:
+        raise CodeGenRequestInvalid(str(exc)) from exc
+    for required in ("engine_id", "physical_type_policy", "empty_values"):
+        if required not in request.execution_parameters:
+            raise CodeGenRequestInvalid(
+                f"execution_parameters is missing {required!r} — each decides how the build "
+                f"runs, and a defaulted one would decide it on the caller's behalf")
+
+    plans = member_authoring_plans(conn, request)
+    refused = [p for p in plans if p["blockers"]]
+    if refused:
+        raise CodeGenMembersRefused(refused)
+
+    llm_members = [p for p in plans
+                   if p["formula_strategy"] == str(FormulaStrategy.LLM_AUTHORED)]
+    if llm_members and request.spend_approval is None:
+        raise SpendApprovalRequired(
+            len(llm_members), len(llm_members) * CALL_ENVELOPE_PER_LLM_MEMBER)
+
+    identity_payload = declaration_identity(declaration)
+    from featuregen.overlay.upload.code_generation_job_store import job_content_identity
+
+    job_identity = job_content_identity(
+        considered_revision_id=request.considered_revision_id,
+        target_reading_revision_id=request.target_reading_revision_id,
+        environment_id=request.environment_id,
+        logical_group_name=request.logical_group_name,
+        selection_revision_ids=list(request.selection_revision_ids),
+        declaration_identity=identity_payload,
+        execution_parameters=dict(request.execution_parameters))
+
+    if llm_members and request.spend_approval is not None:
+        approval = request.spend_approval
+        authorize_spend(
+            conn, action="AUTHOR_FORMULA", actor_subject=actor_subject,
+            job_identity=job_identity,
+            member_identities=[p["selection_revision_id"] for p in llm_members],
+            provider_contract_hash=current_author_contract_hash(),
+            max_calls=approval["max_calls"], max_tokens=approval["max_tokens"],
+            currency=approval["currency"], max_cost=approval["max_cost"],
+            pricing_version=approval["pricing_version"], expires_at=approval["expires_at"])
+
+    return create_job(
+        conn, job_id=mint_id("cgj"),
+        considered_revision_id=request.considered_revision_id,
+        target_reading_revision_id=request.target_reading_revision_id,
+        environment_id=request.environment_id,
+        logical_group_name=request.logical_group_name,
+        declaration=dict(request.declaration), declaration_identity=identity_payload,
+        execution_parameters=dict(request.execution_parameters),
+        members=tuple(
+            JobMemberSpecV1(
+                position=p["position"],
+                selection_revision_id=p["selection_revision_id"],
+                considered_revision_id=p["considered_revision_id"],
+                option_id=p["option_id"], formula_strategy=p["formula_strategy"],
+                strategy_warnings=tuple(p["warnings"])) for p in plans),
+        requested_by=actor_subject, requested_at=_now(conn))

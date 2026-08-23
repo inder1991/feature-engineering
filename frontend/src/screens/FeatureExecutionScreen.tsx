@@ -86,7 +86,9 @@ function BlockerList({ blockers }: { blockers: ExecutionBlocker[] }) {
 export function FeatureExecutionScreen(props: Props) {
   const {
     artifactId, environmentId, logicalGroupName, inventoryObservationId,
-    generationAuthorizationRevisionId, checkSetHash, goal, targetMode, targetRef,
+    // generationAuthorizationRevisionId stays in Props for the call sites; the POST no longer
+    // sends it (the server reads it off the artifact), so it is deliberately not destructured.
+    checkSetHash, goal, targetMode, targetRef,
   } = props
 
   const [code, setCode] = useState<ArtifactCode | null>(null)

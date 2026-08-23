@@ -1,4 +1,4 @@
-# The Feature Run Spine — design, revision 3.1
+# The Feature Run Spine — design, revision 4
 
 **Date** 2026-08-23 · **Code baseline** `feature/asset-detail-reapply` @ `302b8e9a` · **Plan
 baseline** the four-stage gating plan at revision five (§0.1.0 included) and the recipe-to-code
@@ -131,6 +131,11 @@ The domain stores own their lifecycles: `formula_draft.state`, `generation_reque
 
 ### 4.1 The child plan's `code_generation_job` is dissolved **[R3 — P0-1]**
 
+> ▲ **SUPERSEDED by Revision 4 (Option B, owner ruling 2026-08-23 — see the final
+> section).** The job aggregate was implemented and ratified while this section's premise
+> (documentation-only) still held; the owner ruled it STANDS as the domain journey store. The
+> text below is retained as the historical design record only.
+
 The authoritative child plan (§3.5, migration 1109) still defines `code_generation_job` with a
 mutable `status`, mutable member states, its own `code_generation_job_event`, per-action
 `code_generation_job_action.state`, and a preview coordinator progressing
@@ -207,7 +212,7 @@ GET   /action-attempts/{id} · /action-attempts/{id}/events
 
 POST  /feature-runs/{run_id}/actions/{action}/plan          read-only preflight
 POST  /feature-runs/{run_id}/actions/{action}/start
-POST  /feature-runs/{run_id}/actions/{action}/retry         -- NOT offered for AUTHOR_FORMULA (§8)
+POST  /feature-runs/{run_id}/actions/{action}/retry         -- AUTHOR_FORMULA: Rev-4 gates (final section)
 POST  /feature-runs/{run_id}/actions/{action}/re-execute    -- after SUCCEEDED (§8 semantics)
 POST  /feature-runs/{run_id}/archive
 ```
@@ -485,6 +490,8 @@ immutable evidence; eligibility is derived at read time from retirement/superses
 
 ## 7. Vocabulary: six governed actions, and a rail that shows more **[R3 — P0-10]**
 
+> ▲ Revision 4 corrects three socket reason codes below — see the final section.
+
 **`ActionV1` — the executable-action and authorization vocabulary — is exactly the parent plan's
 six:** `AUTHOR_FORMULA · GENERATE_PREVIEW · EXECUTE_SANDBOX · PUBLISH_SANDBOX ·
 MATERIALIZE_PRODUCTION · PUBLISH_PRODUCTION`. Revision 2 put `TRAIN_MODEL` in the same vocabulary
@@ -533,6 +540,9 @@ domain store carries a state that means it.
 ---
 
 ## 8. Re-execution is stage-specific — and authoring has no retry **[R3 — P0-6]**
+
+> ▲ **The no-retry rows below are SUPERSEDED** — the Reconciliation addendum blessed
+> retry-after-terminal under two gates, and Revision 4 (final section) carries the operative text.
 
 | Action | The truthful act |
 |---|---|
@@ -676,6 +686,9 @@ current-state view, not a fabricated timeline (§6.6)**.
 
 ## 13. Increments and their gates
 
+> ▲ **The actionable gates below are SUPERSEDED by Revision 4's re-scope (final section)** —
+> the invocation-rewrite gate died with Option B, and the substrate closed most others.
+
 ### Foundation — read-only projection: **conditional GO**, conditions folded
 
 * `feature_run_identity` **without fork columns** (§6.1) · `feature_run_profile` ·
@@ -802,3 +815,90 @@ now possible, any run-detail fold must separate ATTEMPT HISTORY from the current
   ratchets to NOT NULL in 1100b; the worker refuses a missing decision at act time regardless.
 * Migration numbering: substrate holds 1100–1114 (1107/1108/1109 now taken); run-spine holds
   1115–1117.
+
+
+---
+
+## Revision 4 — the Option B ruling and the Stage I re-scope (owner, 2026-08-23)
+
+Ruled at frozen SHA `e5c4f581` after three verified interface maps. This section is OPERATIVE and
+supersedes §4.1 wholly, §8's authoring rows, §13's actionable gates, and three §7 socket labels.
+
+### R4.1 The job aggregate STANDS — Option B
+
+`code_generation_job` (+`_member`, `_event`, `_action`; migration 1111, store, coordinator, route,
+worker tick, frontend screen) was implemented under the child plan's authority while this spec's
+dissolution obligation sat unexecuted, and the reconciliation ratified it. The owner ruled:
+
+> **The job is a DOMAIN JOURNEY AGGREGATE — the same standing as `formula_draft` and
+> `generation_request`. The spine derives from it, links to it, and triggers through it. Nothing
+> named `feature_run_action_invocation` is ever built.**
+
+The §2/§4 principles survive intact and are RE-AFFIRMED against the job: one lifecycle authority
+per act (the job is now the only coordinator — the invocation was never built, so there are not
+two); status derived at read time wherever the spine renders it; immutable evidence linked, never
+copied. §4's "no spine lease, no spine reconciler" holds unchanged. `feature_run_state` remains a
+shipped, writerless table — reserved for future spine-owned mutations; the job store owns the
+journey's idempotency and lifecycle.
+
+The run→job bridge needs no new identity: `code_generation_job` carries `considered_revision_id`,
+and `contract_considered_revision.generation_run_id` is NOT NULL — the same §9 bridge every other
+domain store uses.
+
+### R4.2 Retry-after-terminal — the operative §8 rows
+
+| Action | The truthful act |
+|---|---|
+| `AUTHOR_FORMULA` | **Reuse existing formula** — a READ; never an attempt |
+| `AUTHOR_FORMULA` | **Retry after FAILED/CANCELLED — OFFERED**, admissible only when BOTH gates hold: a regeneration exception bound to the exact formula identity (1103; one-time consumption; carries its own NOT NULL spend authorization) AND spend enforced per physical call at the audited seam (1105). Typed refusals: `DraftRetired` / `DraftNotAnAnswer` / `SpendExhausted` |
+| `AUTHOR_FORMULA` | "Request another opinion" on a LIVE draft — still deferred (identity must move; a live draft's slot is held) |
+
+Three unreachability gaps stand between the blessing and a working button, and they are Stage I
+work: (1) no production writer of `formula_draft_regeneration_exception` exists — an
+exception-creation act (owner/admin, cost-confirmed) must be built; (2) `DraftNotAnAnswer` is
+uncaught by both `request_draft_for_candidate` callers — the route 500s and the coordinator marks
+the whole job FAILED; both must catch it and answer with the retry affordance; (3) the
+deterministic lane cannot be covered by an exception at all (1103's `provider_contract_hash` NOT
+NULL + 1105's spend NOT NULL make it unrepresentable) — a FAILED reviewed-lane draft is
+permanently stuck at its identity. (3) needs an OWNER RULING: bless a deterministic-retry shape
+(e.g. nullable provider contract on the exception for zero-spend retries) or declare
+reviewed-lane failures terminal-by-design.
+
+### R4.3 Socket corrections (§7)
+
+Availability stays DERIVED; three stored reason codes are now false and must derive instead:
+
+| Stage | Truth at `e5c4f581` |
+|---|---|
+| `EXECUTE_SANDBOX` | worker EXISTS (§9.0 lane); still honestly UNAVAILABLE for two derivable reasons — the deployment switch is off, and the executor substrate (step 0b) is absent (`_EXECUTOR is None` → posture-named FAILED, never a fake pass). Derive switch-first like `_generate_preview_stage`; never `WORKER_NOT_IMPLEMENTED` |
+| `MATERIALIZE_PRODUCTION` / `PUBLISH_PRODUCTION` | state machines BUILT (1113/1114) behind `action_available()` — the true reason is `ACTION_UNAVAILABLE` under §0.1.0, derivable |
+| `PUBLISH_SANDBOX` | still genuinely `WORKER_NOT_IMPLEMENTED` — and its READ path repair (the substrate's `2a03a77b`) is the lane's own affair |
+| `TRAIN_MODEL` | unchanged — `SUBSYSTEM_NOT_BUILT` |
+
+### R4.4 The Stage I re-scope — what the revised plan builds
+
+`AUTHOR_FORMULA` is the one action with no authorization, no decision, and no evidence assembler
+anywhere (the coordinator records `PERFORMED` with NULLs, deliberately deferring per-candidate
+governance to this increment). Stage I therefore is:
+
+1. **Projection honesty** (run-spine files only): derived socket reasons per R4.3; the
+   history-vs-current split (1107 makes multiple drafts per identity real — attempt history and
+   the current per-subject result are two readings, §6.7's axes applied to drafts); plus the
+   still-parked BIND_SELECTIONS accumulating count and the switch-precedence test.
+2. **The run→job trigger bridge**: the run detail's start gesture mints/attaches a
+   code-generation job scoped to the run's candidates, through the existing coordinator — the
+   server resolves everything from the run; the §11 read/trigger policy applies; PRE_SPINE runs
+   are not actionable (`PRE_SPINE_NOT_ACTIONABLE`).
+3. **AUTHOR_FORMULA governance closed at the service seam** (`request_draft_for_candidate`):
+   per-draft `authorize_action` + `decide` (an authoring evidence-pin assembler must be built —
+   none exists) + the spend authorization already threaded on the job path made MANDATORY there,
+   and the ungoverned direct route (`formula_drafts.py` — parent §0.1.3's named bypass, still
+   open, still ceiling-less) becomes an adapter or dies. Ownership of these files is coordinated
+   with the substrate session before execution.
+4. **The retry chain** per R4.2's three gaps, including the owner ruling request for (3).
+5. **Corrections carried**: `§15`'s two stale fact rows; migration numbering (1117 free, 1118
+   taken — Stage I expects ZERO new migrations; Stage II re-reserves).
+
+Everything else in the frozen NO-GO plan (`2026-08-23-run-spine-actionable-stage1.md`) that
+described invocation tables, CAS-minted headers, or migration 1117 content is dead; that document
+remains banner-frozen as the historical record.

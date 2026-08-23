@@ -78,7 +78,9 @@ def test_THE_PLAN_WRITES_NOTHING(client, conn, enabled, engineer_headers):
     assert plan["members"][0]["formula_strategy"] == "LLM_AUTHORED"
     assert plan["llm_members"] == 1
     assert plan["spend_approval_required"] is True
-    assert plan["estimated_provider_calls"] == 5, "1 call + 2 retries + 2 repairs, quoted"
+    assert plan["estimated_provider_calls"] == 45, \
+        "the PER-DRAFT bound (8 author turns × 5 attempts + critic's 5) — the ONE constant the " \
+        "quote, the ceiling and the dev envelope all import (re-review carried finding 1)"
     assert plan["spend_approval"] is None, "READS an approval; never creates one"
     # ▲ Nothing durable: no job, no decision revision, no spend ceiling — `ask`, not `decide`.
     for table in ("code_generation_job", "action_decision_revision",
@@ -252,3 +254,34 @@ def test_a_READY_LEGACY_V1_DRAFT_refuses_costing_until_a_regeneration_is_approve
 
     cleared = client.post(PLAN, json=body, headers=engineer_headers).json()
     assert "LEGACY_REGENERATION_NOT_APPROVED" not in cleared["members"][0]["blockers"]
+
+
+def test_THE_WRITE_ROUTE_maps_a_bad_selection_like_the_plan_route(client, conn, enabled,
+                                                                  engineer_headers):
+    """Task 5 review item 1: SelectionUnavailable escaped the WRITE route as a 500 while the
+    plan route answered 404/409 — same refusals, same statuses, BOTH routes."""
+    body = {**_seed(conn, tag="wmap"), "spend_approval": _APPROVAL}
+
+    unknown = client.post(JOBS, json={**body, "selection_revision_ids": ["sel-absent"]},
+                          headers=engineer_headers)
+    assert unknown.status_code == 404, unknown.text
+
+    # A selection anchored to a DIFFERENT considered revision (minimal second revision — the
+    # shared fixture's fixed intent/run ids cannot seed twice in one test).
+    conn.execute(
+        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
+        "VALUES ('int-wmap2','h','hypothesis') ON CONFLICT DO NOTHING")
+    conn.execute(
+        "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
+        "generation_run_id, considered_json, considered_content_hash, "
+        "canonicalization_version) VALUES ('crev-wmap2','int-wmap2','run-wmap2','{}'::jsonb,"
+        "'sha256:c','contract-considered-v3')")
+    conn.execute(
+        "INSERT INTO feature_selection_revision (revision_id, target_reading_revision_id, "
+        "considered_revision_id, option_id, decision_id, planning_request_hash, "
+        "binding_plan_hash, content_hash) VALUES ('sel-wmap2','trr-wmap','crev-wmap2','opt-a',"
+        "'dec-wmap2','sha256:a','sha256:b','ch-wmap2')")
+    crossed = client.post(JOBS, json={**body, "selection_revision_ids": ["sel-wmap2"]},
+                          headers=engineer_headers)
+    assert crossed.status_code == 409, crossed.text
+    assert "one build reads one" in crossed.json()["detail"]
