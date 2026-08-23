@@ -403,13 +403,29 @@ def _variant_identity_for(request: FeaturePlanningRequestV1, plan: BindingPlanV1
     ``planner.fingerprint.contract_input_hash`` takes ``(ctx, plan, template)`` — the read columns
     it hashes live on the compiler context — so this helper takes the run's ``compile_ctx`` and
     projects the request's own probe as the template. Both are the run's, never re-derived."""
+    return _governed_variant_identity(
+        request,
+        physical_plan_content_hash=plan_content_hash(
+            compile_ctx, plan, planning_probe(request)),
+        parameter_binding_hash=_parameter_binding_hash(request))
+
+
+def plan_content_hash(compile_ctx, plan: BindingPlanV1, template) -> str:
+    """THE ``physical_plan_content_hash`` rule, for any lane that holds a compiled plan.
+
+    The compiled plan's ``contract_input_hash`` — the full 64-hex digest of the inputs the verdict
+    consumed — when the plan actually compiled, and the untruncated ``full_physical_plan_hash``
+    otherwise. Never the truncated ``bp_…`` display id, which is the trap
+    :func:`_governed_variant_identity` refuses: a well-formed string that mints a well-formed but
+    WRONG variant id.
+
+    ``template`` is whatever ``contract_input_hash`` reads a recipe's identity from — the telemetry
+    lane projects the request's own ``planning_probe``; gate1's live lane holds the real
+    ``Template`` the planner compiled. Shared so a resolved row means the same thing in both."""
     compiled = (plan.path_resolution_status is PathResolutionStatus.source_to_target_resolved
                 and plan.contract_resolution_status is not ContractResolutionStatus.not_compiled)
-    content_hash = (contract_input_hash(compile_ctx, plan, planning_probe(request)) if compiled
-                    else full_physical_plan_hash(plan))
-    return _governed_variant_identity(
-        request, physical_plan_content_hash=content_hash,
-        parameter_binding_hash=_parameter_binding_hash(request))
+    return (contract_input_hash(compile_ctx, plan, template) if compiled
+            else full_physical_plan_hash(plan))
 
 
 # ── governance + display ──────────────────────────────────────────────────────────────────────
@@ -781,6 +797,24 @@ def _unmet_hop_demand(hop: UnmetHopV1) -> dict:
             "near_side_key_refs": list(hop.near_side_key_refs)}
 
 
+def resolution_evidence(plan: BindingPlanV1) -> dict:
+    """The RESOLVED counterpart of :func:`rejection_evidence`, from the SELECTED plan.
+
+    Same keys, same ``_plan_facts`` derivation, so a caller writing an observation row never
+    branches on the outcome to find out whether a field exists. Two of them are empty BY RULING
+    rather than by accident:
+
+    * ``reason_codes`` — a resolved row records no refusal. The plan's own observed codes stay on
+      the plan; a reason code standing beside ``resolution_status = resolved`` reads as a refusal
+      that somehow resolved.
+    * ``unmet_hops`` — nothing dead-ended, so there is no demand to file. A resolved run is not
+      somebody's missing crossing, and filing one would report demand for work nobody needs.
+    """
+    facts = _plan_facts(plan)
+    facts["reason_codes"] = []
+    return {"reason": "", **facts, "unmet_hops": []}
+
+
 def rejection_evidence(result: BindingPlanningResultV1 | None) -> dict:
     """THE evidence half of a refusal — the headline reason, the best plan's own facts, its ordered
     path segments and its unmet hops — with NO request-identity fields on it at all.
@@ -1096,5 +1130,7 @@ __all__ = [
     "fold_governed_binding_plan",
     "governed_options_from_requests",
     "governed_requests_for_scope",
+    "plan_content_hash",
     "rejection_evidence",
+    "resolution_evidence",
 ]

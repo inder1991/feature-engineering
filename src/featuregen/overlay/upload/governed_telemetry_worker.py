@@ -382,6 +382,35 @@ def _safe_parameter_binding_hash(request: FeaturePlanningRequestV1) -> str:
         return ""
 
 
+def observation_plan_columns(facts: dict, *, envelope=None, fallback_anchor: str = "") -> dict:
+    """The observation row's PLAN-SHAPED columns, projected from ONE ``_plan_facts`` mapping.
+
+    Extracted because there are now THREE writers of these six columns and they must agree: this
+    module's resolved and refused rows, and gate1's LIVE lane, which holds the identical facts (the
+    lens's ``resolution_evidence`` / ``rejection_evidence`` both carry ``_plan_facts`` under these
+    names) and no ``GovernedOptionV1`` to build a row from. A ledger whose ``hop_count`` means fan-in
+    hops on one row and path segments on another cannot be grouped, and the divergence is invisible
+    on any seed whose catalogs happen to sort in path order.
+
+    What is NOT here is what genuinely differs per lane and must not be faked: the variant identity,
+    the readiness fold and the authority floor all need bindings the template lane never produces.
+
+    ``fallback_anchor`` is the run's own anchor catalog, used only when the facts name none (a
+    planner failure): leaving the column blank would drop that row out of every per-anchor rollup.
+    """
+    return {
+        "selected_physical_plan_id": (str(facts.get("physical_plan_id") or "")
+                                      or (envelope.physical_plan_id if envelope is not None
+                                          else "")),
+        "contract_id": str(facts.get("contract_id") or "") or None,
+        "anchor_catalog_source": (str(facts.get("anchor_catalog_source") or "")
+                                  or fallback_anchor),
+        "participating_catalogs": list(facts.get("participating_catalogs") or ()),
+        "hop_count": int(facts.get("hop_count") or 0),
+        "bridge_count": int(facts.get("bridge_count") or 0),
+    }
+
+
 def _resolved_row(option: GovernedOptionV1, *, common: dict, corroborated: bool,
                   divergence: list[dict]) -> dict:
     """A resolved request's row.
@@ -391,8 +420,6 @@ def _resolved_row(option: GovernedOptionV1, *, common: dict, corroborated: bool,
     one thing across the whole table. They used to be re-derived here from the idea and its
     envelope, which read the anchor off a SORTED read set (right only while the anchor happened to
     sort first) and counted path segments instead of fan-in hops."""
-    facts = option.plan_facts
-    envelope = option.idea.plan_envelope
     return {
         **common,
         "definition_origin": option.identity.definition_origin,
@@ -402,19 +429,12 @@ def _resolved_row(option: GovernedOptionV1, *, common: dict, corroborated: bool,
         "planning_request_hash": option.identity.planning_request_hash,
         "parameter_binding_hash": option.identity.parameter_binding_hash,
         "physical_plan_content_hash": option.identity.physical_plan_content_hash,
-        "selected_physical_plan_id": (facts.get("physical_plan_id")
-                                      or (envelope.physical_plan_id if envelope is not None
-                                          else "")),
-        "contract_id": str(facts.get("contract_id") or "") or None,
+        **observation_plan_columns(option.plan_facts, envelope=option.idea.plan_envelope),
         "primary_objective": option.request.primary_objective,
-        "anchor_catalog_source": str(facts.get("anchor_catalog_source") or ""),
         "resolution_status": "resolved",
         # A resolved row records no refusal. The plan's own observed codes stay on the plan; a
         # reason code beside `resolution_status = resolved` would read as a refusal that resolved.
         "reason_codes": [],
-        "participating_catalogs": list(facts.get("participating_catalogs") or ()),
-        "hop_count": int(facts.get("hop_count") or 0),
-        "bridge_count": int(facts.get("bridge_count") or 0),
         "authority_floor_status": _authority_floor_status(option),
         "readiness": option.readiness.state,
         "intent_corroborated": corroborated,
@@ -442,16 +462,10 @@ def _rejected_row(request: FeaturePlanningRequestV1, rejection: dict, *, common:
         "planning_request_hash": planning_request_hash(request),
         "parameter_binding_hash": _safe_parameter_binding_hash(request),
         "physical_plan_content_hash": UNRESOLVED_PLAN_CONTENT_HASH,
-        "selected_physical_plan_id": str(rejection.get("physical_plan_id") or ""),
-        "contract_id": str(rejection.get("contract_id") or "") or None,
+        **observation_plan_columns(rejection, fallback_anchor=fallback_anchor),
         "primary_objective": request.primary_objective,
-        "anchor_catalog_source": (str(rejection.get("anchor_catalog_source") or "")
-                                  or fallback_anchor),
         "resolution_status": reason,
         "reason_codes": list(rejection.get("reason_codes") or ([reason] if reason else [])),
-        "participating_catalogs": list(rejection.get("participating_catalogs") or ()),
-        "hop_count": int(rejection.get("hop_count") or 0),
-        "bridge_count": int(rejection.get("bridge_count") or 0),
         # Nothing was bound, so nothing was measured. "unmet" would claim a measurement that never
         # happened; "" would be indistinguishable from a column nobody filled.
         "authority_floor_status": "unevaluated",
@@ -780,5 +794,6 @@ __all__: list[str] = [
     "UNRESOLVED_PLAN_CONTENT_HASH",
     "contract_level_demands",
     "demands_for_rejection",
+    "observation_plan_columns",
     "run_governed_telemetry_once",
 ]

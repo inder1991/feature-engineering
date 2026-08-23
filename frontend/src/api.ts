@@ -881,17 +881,17 @@ export function bulkRejectEntityBridges(
 //   * `distinct_runs`    — how many generation runs hit it. Shown BESIDE the intents so a retry
 //     storm is visible as a retry storm rather than read as demand.
 //
-// `live_observations` / `telemetry_observations` split the same demand rows by which lane recorded
+// `live_demand_rows` / `telemetry_demand_rows` split the same demand rows by which lane recorded
 // them: `live` is the request path's own planning, `telemetry` is the off-request replan. They are
 // not two demands; they are two observers of the same platform.
 export interface BridgeDemandCounts {
   demand_rows: number
   distinct_intents: number
   distinct_runs: number
-  live_observations: number
-  telemetry_observations: number
-  recent_observations: number
-  historical_observations: number
+  live_demand_rows: number
+  telemetry_demand_rows: number
+  recent_demand_rows: number
+  historical_demand_rows: number
 }
 
 // Where an engineer would BUILD it: the catalog and table the demand is positioned in.

@@ -120,8 +120,8 @@ def test_a_seeded_demand_surfaces_with_its_nested_position_row(client, conn):
     assert group["demand_rows"] == 2
     # two runs of two intents — the retry-gaming denominators the panel shows beside the count
     assert (group["distinct_intents"], group["distinct_runs"]) == (2, 2)
-    assert (group["live_observations"], group["telemetry_observations"]) == (1, 1)
-    assert group["recent_observations"] == 2 and group["historical_observations"] == 0
+    assert (group["live_demand_rows"], group["telemetry_demand_rows"]) == (1, 1)
+    assert group["recent_demand_rows"] == 2 and group["historical_demand_rows"] == 0
     # ONE shape: flat, catalog-qualified refs — the far realizer, then the near-side anchor
     assert group["suggested_endpoints"] == ["rev::public.accounts.account_id",
                                             "ops::public.transactions.account_id"]
@@ -163,6 +163,23 @@ def test_capacity_demand_lands_in_the_planner_capacity_queue(client, conn):
     assert group["demand_rows"] == 1
 
 
+def test_a_bounded_out_capacity_row_still_renders_its_realizer_endpoints(client, conn):
+    """The OTHER capacity verdict, and the half the reduced identity does NOT take away.
+
+    ``bounded_out_max_bridges`` reached a specific crossing it could not spend a bridge on, so its
+    reject carries a fully populated hop — and the store keeps both JSONB evidence columns even
+    while zeroing the hop COLUMNS. The realizer endpoint therefore still renders (it is qualified by
+    its own far catalog); the near-side ref does not, because a capacity row's ``position_catalog``
+    is blank by that same ruling and a catalog-less ref is not an endpoint. Pinning both halves so
+    the reduced identity cannot quietly start eating the evidence too."""
+    _seed(conn, "bounded_bridges", demands=[_hop(verdict="bounded_out_max_bridges")])
+    (group,) = client.get("/governance/bridge-demand",
+                          headers=ADMIN).json()["queues"]["planner_capacity"]
+    assert (group["relationship_id"], group["from_entity"]) == ("", "")   # identity reduced
+    assert group["suggested_endpoints"] == ["rev::public.accounts.account_id"]   # evidence kept
+    assert group["nested"][0]["position_catalog"] == ""
+
+
 def test_the_resolution_summary_rides_along(client, conn):
     _seed(conn, "resolved_one", resolution_status="resolved",
           physical_plan_content_hash="c" * 64)
@@ -200,8 +217,12 @@ def test_an_unusable_cursor_is_a_client_error_not_a_500(client):
 
 
 @pytest.mark.parametrize("limit", [0, 101])
-def test_the_limit_is_clamped_by_the_route(client, limit):
-    """A read this wide is a governance surface, not a bulk export: the bound is the route's, so no
-    caller can ask the aggregate for an unbounded page."""
+def test_an_out_of_range_limit_is_refused_rather_than_silently_clamped(client, limit):
+    """A read this wide is a governance surface, not a bulk export: the bound is the ROUTE's, so no
+    caller can ask the aggregate for an unbounded page.
+
+    Refused (422), not clamped: silently serving 100 to a caller who asked for 500 would hand them
+    a page they would read as complete. The name says refused because that is what happens — the
+    behaviour is the bound, the wording is the honesty."""
     response = client.get(f"/governance/bridge-demand?limit={limit}", headers=ADMIN)
     assert response.status_code == 422

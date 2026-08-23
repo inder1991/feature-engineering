@@ -27,10 +27,10 @@ function counts(over: Partial<api.BridgeDemandCounts> = {}): api.BridgeDemandCou
     demand_rows: 1,
     distinct_intents: 1,
     distinct_runs: 1,
-    live_observations: 1,
-    telemetry_observations: 0,
-    recent_observations: 1,
-    historical_observations: 0,
+    live_demand_rows: 1,
+    telemetry_demand_rows: 0,
+    recent_demand_rows: 1,
+    historical_demand_rows: 0,
     ...over,
   }
 }
@@ -86,8 +86,8 @@ it('renders a bridge-demand crossing with its counts, mode and endpoints', async
     queues: {
       bridge_demand: [group({
         ...counts({ demand_rows: 5, distinct_intents: 2, distinct_runs: 5,
-                    live_observations: 3, telemetry_observations: 2,
-                    recent_observations: 4, historical_observations: 1 }),
+                    live_demand_rows: 3, telemetry_demand_rows: 2,
+                    recent_demand_rows: 4, historical_demand_rows: 1 }),
       })],
       realization_gap: [],
       planner_capacity: [],
@@ -110,6 +110,21 @@ it('renders a bridge-demand crossing with its counts, mode and endpoints', async
   const position = within(row).getByTestId('bd-position')
   expect(position).toHaveTextContent('ops · public.transactions')
   expect(position).toHaveTextContent('1 attempt, 1 question')
+})
+
+it('points at the entity-bridge queue without claiming what is in it', async () => {
+  // The copy used to end "Nothing here has been proposed yet." — a SERVER FACT this panel never
+  // read, and one that can be false: a PROPOSED-but-unconfirmed bridge never reaches
+  // `entity_bridge_edge`, so a demand row coexists happily with a live proposal in the queue
+  // above. Tell the reviewer where to look; do not tell them what is there.
+  await renderPanel(payload({
+    queues: { bridge_demand: [group()], realization_gap: [], planner_capacity: [] },
+  }))
+  const next = screen.getByTestId('bd-next-bridge_demand')
+  expect(next).toHaveTextContent(
+    'A bridge for these endpoints is proposed by catalog ingestion from declared join evidence. '
+    + 'If one has been proposed, it appears in the entity-bridge decisions above.')
+  expect(next.textContent).not.toMatch(/nothing here has been proposed/i)
 })
 
 it('never frames a demand row as a failure', async () => {

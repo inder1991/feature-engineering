@@ -14,6 +14,8 @@ integration tests now assert the stronger fact, that there is nothing left for i
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from psycopg.rows import dict_row
 from tests.featuregen.overlay.upload.planner.test_plan import (
@@ -65,7 +67,18 @@ def test_helper_surfaces_resolved_governed_plan_as_option(db):
     ideas, rejections, evidence = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
-    assert len(ideas) == 1 and not rejections and not evidence
+    assert len(ideas) == 1 and not rejections
+    # ONE evidence entry per PLANNED recipe, resolved included — the store's invariant is a row per
+    # request whatever it did, and a lane that reported only its failures would contribute a
+    # pure-failure denominator to a resolution rate shared with the telemetry lane.
+    assert len(evidence) == 1
+    assert evidence[0]["recipe_id"] == "t_roll"
+    assert evidence[0]["resolution_status"] == "resolved"
+    assert evidence[0]["reason_codes"] == [] and evidence[0]["unmet_hops"] == []
+    # a resolved row carries a REAL plan hash, never the unresolved sentinel
+    content_hash = evidence[0]["physical_plan_content_hash"]
+    assert len(content_hash) == 64 and content_hash == content_hash.lower()
+    assert evidence[0]["anchor_catalog_source"]
     idea = ideas[0]
     assert idea.origin == "governed_planner"
     assert idea.path_authority == "governed_cross_catalog"
@@ -284,13 +297,56 @@ def test_a_live_governed_rejection_leaves_an_observation_and_its_bridge_demand(d
     assert demand["near_side_key_refs"] == ["public.transactions.account_id"]
 
 
-def test_a_resolved_live_run_records_nothing(db):
-    """The control. Same lane, same code path, a run that RESOLVED — no observation, no demand.
-    A ledger that filed a row here would report demand for a crossing nobody is missing."""
+def test_a_resolved_live_run_records_a_resolved_row_and_no_demand(db):
+    """The store's invariant on this lane: EVERY governed planning request leaves a row, whatever
+    it did — and a resolved one files no demand, because nothing is missing.
+
+    This used to assert that a resolved run recorded NOTHING, which quietly made this lane a
+    failures-only writer. ``resolution_summary`` divides resolved rows by all rows across both
+    lanes, so a refusals-only lane reports 0% forever (never a measurement) and drags the shared
+    platform number down by exactly the planning it did successfully — which the bridge-demand
+    panel then shows a human as its headline denominator."""
     _cross_seed(db)
     _, cs = _live_build(db, generation_run_id=RUN_ID, templates=(_txn_template(),))
     assert [f.name for s in cs.alternatives for f in s.features] == ["t_roll"]
-    assert _observations(db) == [] and _demands(db) == []
+
+    (observation,) = _observations(db)
+    assert observation["observation_mode"] == "live"
+    assert observation["resolution_status"] == "resolved"
+    assert observation["canonical_definition_id"] == "t_roll"
+    # a REAL plan hash, not the unresolved sentinel — there IS a plan, and the two lanes must agree
+    # about what a resolved row looks like
+    assert observation["physical_plan_content_hash"] != "unresolved"
+    assert len(observation["physical_plan_content_hash"]) == 64
+    assert observation["selected_physical_plan_id"].startswith("bp_")
+    assert observation["contract_id"]
+    assert observation["anchor_catalog_source"] in {"ops", "rev"}
+    assert observation["participating_catalogs"]
+    # a resolved row records no refusal: a reason code here would read as a refusal that resolved
+    assert observation["reason_codes"] == []
+    # ...and nothing is missing, so nobody's demand was filed
+    assert _demands(db) == []
+
+
+def test_the_resolution_rate_over_a_mixed_live_run_is_the_real_one(db):
+    """The defect this closes, measured end to end: one run, one resolved recipe and one refused,
+    and the summary the panel renders reports 50% rather than 0%."""
+    from featuregen.overlay.upload.governed_observation_store import resolution_summary
+
+    refusing = _unsanctioned_bridge_seeds(db)                 # dead-ends: `ops` is the only source
+    resolving = replace(_txn_template(), id="t_ok")           # `rev` serves this one intra-catalog
+    _live_build(db, generation_run_id=RUN_ID, templates=(refusing, resolving))
+
+    by_status = {row["canonical_definition_id"]: row["resolution_status"]
+                 for row in _observations(db)}
+    assert by_status == {"t_roll": "unsanctioned_bridge", "t_ok": "resolved"}
+    # exactly one demand, from the refusal — the resolved recipe files none
+    assert [row["verdict"] for row in _demands(db)] == ["unsanctioned_bridge"]
+
+    summary = resolution_summary(db)
+    assert summary["totals"] == {"observations": 2, "resolved": 1, "resolution_rate": 0.5}
+    (origin,) = summary["by_origin"]
+    assert (origin["definition_origin"], origin["resolution_rate"]) == ("recipe_v2", 0.5)
 
 
 @pytest.mark.parametrize("run_id", [None, "grun_never_minted"])

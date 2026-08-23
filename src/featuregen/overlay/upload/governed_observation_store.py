@@ -359,21 +359,23 @@ _BASE_CTE = (
 #: is what ``count(*)`` over ``base`` actually counts: ONE observation carrying an unmet hop AND a
 #: contract-level realization gap files TWO demand rows, by S1B-3's co-occurrence ruling. Calling
 #: that "2 observations" would double-count the run that produced it and inflate every queue that
-#: reports it. The distinct counts beside it are the honest denominators — and the ``live_``,
-#: ``telemetry_``, ``recent_`` and ``historical_`` splits are all splits OF the demand rows.
+#: reports it. The mode and recency splits carry the SAME noun for the same reason — they are
+#: splits OF the demand rows, and `live_observations` beside `demand_rows` would reinstate the
+#: very confusion the rename removes. Only `distinct_intents` / `distinct_runs` count something
+#: else, and they say so in their names.
 _COUNTS = (
     " count(*) AS demand_rows,"
     " count(DISTINCT intent_id) AS distinct_intents,"
     " count(DISTINCT generation_run_id) AS distinct_runs,"
-    " count(*) FILTER (WHERE observation_mode = 'live') AS live_observations,"
-    " count(*) FILTER (WHERE observation_mode = 'telemetry') AS telemetry_observations,"
+    " count(*) FILTER (WHERE observation_mode = 'live') AS live_demand_rows,"
+    " count(*) FILTER (WHERE observation_mode = 'telemetry') AS telemetry_demand_rows,"
     " count(*) FILTER (WHERE recorded_at >= %s - make_interval(days => %s))"
-    "     AS recent_observations,"
+    "     AS recent_demand_rows,"
     " count(*) FILTER (WHERE recorded_at < %s - make_interval(days => %s))"
-    "     AS historical_observations")
+    "     AS historical_demand_rows")
 
-_COUNT_KEYS = ("demand_rows", "distinct_intents", "distinct_runs", "live_observations",
-               "telemetry_observations", "recent_observations", "historical_observations")
+_COUNT_KEYS = ("demand_rows", "distinct_intents", "distinct_runs", "live_demand_rows",
+               "telemetry_demand_rows", "recent_demand_rows", "historical_demand_rows")
 
 
 def observation_queues(conn: DbConn, *, limit: int = 100, cursor: str | None = None,

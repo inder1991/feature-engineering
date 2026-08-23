@@ -54,9 +54,13 @@ const QUEUES: Array<{ name: QueueName } & QueueCopy> = [
     about: 'Governed planning could not cross between catalogs here. Another catalog '
       + 'demonstrably performs this join, so a sanctioned bridge between the endpoints below '
       + 'would let these roll-ups complete.',
+    // NOT "nothing here has been proposed yet" — that asserted a server fact this panel never
+    // read, and it can be FALSE: a PROPOSED-but-unconfirmed bridge never reaches
+    // `entity_bridge_edge`, so a demand row happily coexists with a live proposal sitting in the
+    // queue above. The honest sentence tells the reviewer where to look instead of telling them
+    // what is there.
     next: 'A bridge for these endpoints is proposed by catalog ingestion from declared join '
-      + 'evidence, and is confirmed in the entity-bridge decisions above. Nothing here has been '
-      + 'proposed yet.',
+      + 'evidence. If one has been proposed, it appears in the entity-bridge decisions above.',
     empty: 'No bridge demand recorded yet — rows appear when governed cross-catalog planning '
       + 'cannot complete a roll-up.',
   },
@@ -98,11 +102,11 @@ function crossingLabel(group: BridgeDemandGroup): string {
 
 // Which lane RECORDED these rows, said in words rather than left as a code. Both lanes observe the
 // same platform, so a row seen by both is not two demands.
-function modeLabel(group: { live_observations: number; telemetry_observations: number }): string {
+function modeLabel(group: { live_demand_rows: number; telemetry_demand_rows: number }): string {
   const seen: string[] = []
-  if (group.live_observations > 0) seen.push(`${group.live_observations} live`)
-  if (group.telemetry_observations > 0) {
-    seen.push(`${group.telemetry_observations} telemetry`)
+  if (group.live_demand_rows > 0) seen.push(`${group.live_demand_rows} live`)
+  if (group.telemetry_demand_rows > 0) {
+    seen.push(`${group.telemetry_demand_rows} telemetry`)
   }
   return seen.length > 0 ? `Recorded by: ${seen.join(', ')}` : 'Recorded by: not attributed'
 }
@@ -142,8 +146,8 @@ function DemandGroup({ group, queue }: { group: BridgeDemandGroup; queue: QueueN
         {plural(group.distinct_runs, 'run', 'runs')}
       </p>
       <p className="hint bd-mode" data-testid="bd-mode">
-        {modeLabel(group)} · {group.recent_observations} in the last 7 days,{' '}
-        {group.historical_observations} older
+        {modeLabel(group)} · {group.recent_demand_rows} in the last 7 days,{' '}
+        {group.historical_demand_rows} older
       </p>
       <Endpoints refs={group.suggested_endpoints} />
       {group.nested.length > 0 && (

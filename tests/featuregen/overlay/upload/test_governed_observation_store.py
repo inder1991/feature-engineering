@@ -714,10 +714,10 @@ def test_rollup_splits_recent_from_historical_and_counts_per_mode(conn) -> None:
                        recorded_at=now - timedelta(days=30))
     group = observation_queues(conn)["queues"]["bridge_demand"][0]
     assert group["demand_rows"] == 2
-    assert group["recent_observations"] == 1
-    assert group["historical_observations"] == 1
-    assert group["live_observations"] == 1
-    assert group["telemetry_observations"] == 1
+    assert group["recent_demand_rows"] == 1
+    assert group["historical_demand_rows"] == 1
+    assert group["live_demand_rows"] == 1
+    assert group["telemetry_demand_rows"] == 1
     assert group["suggested_endpoints"], "realizers + near-side key refs, sampled"
     assert len(group["suggested_endpoints"]) <= 5
 
