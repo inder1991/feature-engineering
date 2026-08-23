@@ -860,9 +860,16 @@ uncaught by both `request_draft_for_candidate` callers — the route 500s and th
 the whole job FAILED; both must catch it and answer with the retry affordance; (3) the
 deterministic lane cannot be covered by an exception at all (1103's `provider_contract_hash` NOT
 NULL + 1105's spend NOT NULL make it unrepresentable) — a FAILED reviewed-lane draft is
-permanently stuck at its identity. (3) needs an OWNER RULING: bless a deterministic-retry shape
-(e.g. nullable provider contract on the exception for zero-spend retries) or declare
-reviewed-lane failures terminal-by-design.
+permanently stuck at its identity. (3) RULED (owner,
+2026-08-23, Option 2): **deterministic-lane retries are free by construction.** The exception
+mechanism gates SPEND — its own wording is "re-authoring spends again" — and the reviewed lane
+provably spends nothing (1104's CHECK forbids a provider contract on REVIEWED; 1118's
+certification programme asserts zero provider dispatch by CHECK). A FAILED/CANCELLED
+reviewed-lane draft may therefore be re-requested WITHOUT an exception; worker-time needs no
+approval. Tombstones (deliberate withdrawal) still refuse BOTH lanes — governance keeps its teeth
+exactly where a human decided something. The honest concession, recorded: "every retry is an
+approved act" narrows to "every retry THAT SPENDS is an approved act." The regeneration-exception
+surface (gap 1) is accordingly LLM-lane-only.
 
 ### R4.3 Socket corrections (§7)
 
