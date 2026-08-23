@@ -12,8 +12,9 @@
 > guard purpose-independent; idempotency compares the stored request_content_hash over the FULL
 > server-resolved request (409 IDEMPOTENCY_CONFLICT); 1106's decision identity must cover the
 > whole payload and a read-only preflight must exist; spend reserves at AuditingClient.call
-> (the physical seam), settles after egress, reconciles expired reservations against dispatch
-> outcomes; PRE_SPINE runs are not actionable. Substrate remediation (1104–1106) precedes any
+> (the physical seam; retry and repair budgets are INDEPENDENT — 1+2+2 = 5 physical calls per
+> structured call is the envelope bound, llm.py:415-470, and a mixed retry-plus-repair test is
+> owed), settles after egress, reconciles expired reservations against dispatch outcomes; PRE_SPINE runs are not actionable. Substrate remediation (1104–1106) precedes any
 > plan revision.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
