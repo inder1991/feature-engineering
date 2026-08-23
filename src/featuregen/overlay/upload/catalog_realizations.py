@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.concepts import concept
@@ -121,6 +122,33 @@ def key_entity(conn, catalog_source: str, column_object_ref: str) -> str | None:
         "SELECT concept FROM graph_node WHERE catalog_source = %s AND object_ref = %s AND kind = 'column'",
         (catalog_source, column_object_ref)).fetchone()
     return _entity_of_concept(row[0]) if row is not None else None
+
+
+def key_entities_for(conn, refs: Sequence[tuple[str, str]],
+                     ) -> dict[tuple[str, str], str | None]:
+    """:func:`key_entity` for MANY ``(catalog_source, column_object_ref)`` refs in ONE query.
+
+    Semantically identical per ref — the same governed reading (the column's concept, then that
+    concept's ``entity_link``); ``graph_node.entity`` is never consulted, here or there. EVERY
+    requested ref is a key of the returned mapping, ``None`` where the column is absent or its
+    concept links no entity, so an absent key can never be misread as "not asked".
+
+    Exists because the governed option builder needs the key entity of every plan's grain ref at
+    once: the per-ref reader would issue one query per option, which is the N+1 that batching
+    forbids. Deterministic and read-only, like every other reader in this module."""
+    wanted = list(dict.fromkeys((str(catalog), str(ref)) for catalog, ref in refs))
+    out: dict[tuple[str, str], str | None] = dict.fromkeys(wanted)
+    if not wanted:
+        return out
+    rows = conn.execute(
+        "SELECT n.catalog_source, n.object_ref, n.concept FROM graph_node n "
+        "JOIN unnest(%s::text[], %s::text[]) AS w(catalog_source, object_ref) "
+        "  ON n.catalog_source = w.catalog_source AND n.object_ref = w.object_ref "
+        "WHERE n.kind = 'column'",
+        ([catalog for catalog, _ref in wanted], [ref for _catalog, ref in wanted])).fetchall()
+    for catalog_source, object_ref, concept_name in rows:
+        out[(catalog_source, object_ref)] = _entity_of_concept(concept_name)
+    return out
 
 
 CONCEPT_REGISTRY_FOR_REALIZATION = "concepts@1"   # a version tag for the concept vocabulary

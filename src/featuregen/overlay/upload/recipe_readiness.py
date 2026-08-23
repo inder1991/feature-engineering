@@ -96,6 +96,48 @@ def fold_readiness(inputs: ReadinessInputsV1) -> RecipeReadinessV1:
     return RecipeReadinessV1("MATERIALIZATION_READY")
 
 
+@dataclass(frozen=True, slots=True)
+class _DeclaredGovernance:
+    """The two governance answers the fold needs, for a caller that reads them off a DEFINITION.
+
+    Structurally identical to the origin-neutral state the governed lens carries
+    (``DefinitionGovernanceStateV1``), and deliberately NOT that type: ``recipe_readiness`` is a
+    pure fold that must not import the lens (the lens imports it), so the shared contract is
+    duck-typed — ``retired`` and ``reviewed_expectation``, nothing else."""
+
+    retired: bool
+    reviewed_expectation: bool
+
+
+def fold_request_readiness(request, governance, *, temporal_blockers: tuple[str, ...] = (),
+                           binding_blockers: tuple[str, ...] = (),
+                           governed_policy_blockers: tuple[str, ...] = (),
+                           ) -> RecipeReadinessV1:
+    """S1A-4b — the fold over ONE origin-neutral planning REQUEST plus the governance state its
+    origin resolved, so a recipe-origin and an LLM-intent option are answered by the same ladder.
+
+    ``request`` supplies only its ``computation_kind``; ``governance`` supplies ``retired`` and
+    ``reviewed_expectation`` — both duck-typed, so this stays the pure fold every other reader
+    already trusts. The three remaining inputs are the SAME honest constants
+    :func:`fold_definition_readiness` documents: ``grammar_verdict="ok"`` (no proposal exists
+    until authoring runs), ``gold_validated=False`` and ``engine_verdict=None`` (no gate has run),
+    which rests a clean request at ``FORMULA_AUTHORABLE``.
+
+    Whatever blockers the caller passes are MEASUREMENTS it made — passed through verbatim, per
+    BR-7. Nothing here measures anything itself.
+    """
+    return fold_readiness(ReadinessInputsV1(
+        computation_kind=request.computation_kind,
+        retired=bool(governance.retired),
+        temporal_blockers=tuple(temporal_blockers),
+        binding_blockers=tuple(binding_blockers),
+        reviewed_expectation=bool(governance.reviewed_expectation),
+        grammar_verdict="ok",
+        gold_validated=False,
+        engine_verdict=None,
+        governed_policy_blockers=tuple(governed_policy_blockers)))
+
+
 def fold_definition_readiness(definition, *, temporal_blockers: tuple[str, ...] = (),
                               binding_blockers: tuple[str, ...] = (),
                               governed_policy_blockers: tuple[str, ...] = (),
@@ -121,23 +163,25 @@ def fold_definition_readiness(definition, *, temporal_blockers: tuple[str, ...] 
 
     Whatever the caller passes in ``temporal_blockers`` / ``binding_blockers`` /
     ``governed_policy_blockers`` is a measurement it made — passed through verbatim, per BR-7.
+
+    S1A-4b: the fold itself now lives in :func:`fold_request_readiness`, which this function
+    DELEGATES to after reading the two governance answers off the definition. One ladder, two
+    entry points — a definition and a planning request can no longer be folded differently.
     """
     from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
         has_reviewed_expectation,
     )
 
     formula = definition.formula
-    return fold_readiness(ReadinessInputsV1(
-        computation_kind=definition.computation_kind,
-        retired=definition.readiness == "RETIRED",
-        temporal_blockers=tuple(temporal_blockers),
-        binding_blockers=tuple(binding_blockers),
-        reviewed_expectation=(formula is not None
-                              and has_reviewed_expectation(formula.expectation_ref)),
-        grammar_verdict="ok",
-        gold_validated=False,
-        engine_verdict=None,
-        governed_policy_blockers=tuple(governed_policy_blockers)))
+    return fold_request_readiness(
+        definition,
+        _DeclaredGovernance(
+            retired=definition.readiness == "RETIRED",
+            reviewed_expectation=(formula is not None
+                                  and has_reviewed_expectation(formula.expectation_ref))),
+        temporal_blockers=temporal_blockers,
+        binding_blockers=binding_blockers,
+        governed_policy_blockers=governed_policy_blockers)
 
 
 def exceeds_fold(authored: str, folded: str) -> bool:
