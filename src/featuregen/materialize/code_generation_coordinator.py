@@ -603,6 +603,8 @@ def request_code_generation_job(
         execution_parameters=dict(request.execution_parameters))
 
     if llm_members and request.spend_approval is not None:
+        from featuregen.overlay.upload.llm_spend import canonical_approval_expiry
+
         approval = request.spend_approval
         authorize_spend(
             conn, action="AUTHOR_FORMULA", actor_subject=actor_subject,
@@ -611,7 +613,11 @@ def request_code_generation_job(
             provider_contract_hash=current_author_contract_hash(),
             max_calls=approval["max_calls"], max_tokens=approval["max_tokens"],
             currency=approval["currency"], max_cost=approval["max_cost"],
-            pricing_version=approval["pricing_version"], expires_at=approval["expires_at"])
+            pricing_version=approval["pricing_version"],
+            # ▲ FLOORED to UTC-day granularity so a browser REPLAY of the same confirm (each
+            # minting a fresh now()+24h) is the SAME approval — not a new unspent ceiling the
+            # latest-first reader would silently adopt (Task 4 follow-up finding).
+            expires_at=canonical_approval_expiry(conn, approval["expires_at"]))
 
     return create_job(
         conn, job_id=mint_id("cgj"),
