@@ -7,10 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.catalog_realizations import object_grain, table_of
-from featuregen.overlay.upload.need_metadata import (
-    RESOLVED_NEED_METADATA,
-    ResolvedNeedMetadataV1,
-)
+from featuregen.overlay.upload.need_metadata import RESOLVED_NEED_METADATA
 from featuregen.overlay.upload.planner.contracts import (
     MAX_CANDIDATE_COLUMNS_PER_NEED_PER_CATALOG,
     BindingQuality,
@@ -59,9 +56,8 @@ def discover_ingredient_candidates(conn, template: Template, catalog_source: str
     # `recipe_grounding_context` enumerates Template's fields dynamically
     # (`_TEMPLATE_FIELDS = frozenset(field.name for field in fields(Template))`), so a new field
     # would move every legacy template's canonical hash and invalidate sealed identities.
-    resolved: dict[str, ResolvedNeedMetadataV1] = (
-        {} if metadata_resolution_mode == "request_contract"
-        else {r.role: r for r in RESOLVED_NEED_METADATA.get(template.id, ())})
+    resolved = ({} if metadata_resolution_mode == "request_contract"
+                else {r.role: r for r in RESOLVED_NEED_METADATA.get(template.id, ())})
     out: dict[str, tuple[IngredientCandidateV1, ...]] = {}
     truncated = False
     total = 0

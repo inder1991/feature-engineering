@@ -217,23 +217,33 @@ _POISON = ResolvedNeedMetadataV1(
     temporal_role_source="explicit_recipe")
 
 
-def _direction_catalog(db, source: str) -> None:
-    """The smallest catalog that yields a candidate for `direction`, the ONE need role the legacy
-    `inflow_outflow_ratio` template and the V2 recipe of the same id share."""
+def _inflow_outflow_catalog(db, source: str) -> None:
+    """One TRANSACTION-grain table binding all four `inflow_outflow_ratio` operands, so the recipe
+    can plan end-to-end. `direction` is the ONE need role the legacy template and the V2 recipe of
+    the same id share — the role the collision shadows."""
     catalog = [
         (CanonicalRow(source, "postings", "txn_id", "integer", is_grain=True,
                       entity="Transaction"), "transaction_id"),
+        (CanonicalRow(source, "postings", "account_id", "integer",
+                      entity="Account"), "account_id"),
+        (CanonicalRow(source, "postings", "amount", "numeric", currency="USD"), "monetary_flow"),
         (CanonicalRow(source, "postings", "dr_cr", "text"), "debit_credit_indicator"),
+        (CanonicalRow(source, "postings", "event_ts", "timestamp"), "event_timestamp"),
     ]
     build_graph(db, source, [r for r, _ in catalog],
                 concepts={content_hash(r): c for r, c in catalog})
+    db.execute(
+        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, "
+        "head_seq) VALUES (%s, %s, 'r', 1) "
+        "ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
+        (source, _NOW, _NOW))
 
 
 def test_probe_operand_metadata_is_never_shadowed_by_the_legacy_registry(db, monkeypatch):
     """106 V2 ids collide with legacy template ids. In request_contract mode the resolved-need
     registry must not override a probe's own declared operand metadata; in legacy mode the same
     poisoned entry MUST still be consumed (existing behavior preserved)."""
-    _direction_catalog(db, "core")
+    _inflow_outflow_catalog(db, "core")
     # RESOLVED_NEED_METADATA is a MappingProxyType (immutable), and `candidates` binds the name at
     # import — so the poison goes on the CONSUMER's module attribute, not via setitem.
     monkeypatch.setattr(candidates_module, "RESOLVED_NEED_METADATA",
@@ -264,6 +274,39 @@ def test_probe_operand_metadata_is_never_shadowed_by_the_legacy_registry(db, mon
     assert {c.required_grains for c in poisoned} == {("__sentinel_grain__",)}
     assert {c.join_role for c in poisoned} == {"source_entity_key"}
     assert {c.temporal_role for c in poisoned} == {"as_of_time"}
+
+
+def test_plan_planning_request_asks_for_request_contract_mode(db, monkeypatch):
+    """The SEAM, not the switch: the two tests above drive `discover_ingredient_candidates` and
+    `plan_bindings` directly, so deleting the `metadata_resolution_mode="request_contract"`
+    argument from `plan_planning_request` would leave them green. This test plans a COLLIDING
+    recipe through the request entry itself with the registry poisoned, and the control leg below
+    is exactly what that deletion would produce — so the argument is pinned by construction.
+
+    (The three older `plan_planning_request` tests plan `customer_activity_recency`, whose id
+    collides with no legacy template, which is why they are structurally blind to the mode.)"""
+    _inflow_outflow_catalog(db, "core")
+    monkeypatch.setattr(candidates_module, "RESOLVED_NEED_METADATA",
+                        dict(RESOLVED_NEED_METADATA) | {_COLLIDING_ID: (_POISON,)})
+    request = planning_request_from_recipe(v2_recipe_by_id(_COLLIDING_ID))
+    scope = resolve_catalog_scope(db, roles=(), target_entity="account", now=_NOW)
+
+    result = plan_planning_request(db, request=request, target_entity="account",
+                                   scope=scope, roles=(), now=_NOW)
+    # the UNSHADOWED outcome: `direction` binds on its own declared transaction grain, so the
+    # recipe resolves even though the registry entry it collides with says otherwise.
+    assert result.result_status is PlanResolutionStatus.resolved
+    selected = next(p for p in result.candidate_plans
+                    if p.physical_plan_id == result.selected_plan_id)
+    assert "public.postings.dr_cr" in {b.bound_object_ref for b in selected.ingredient_bindings}
+
+    # The control — byte-for-byte what `plan_planning_request` would do without the argument.
+    # The sentinel grain rejects `direction`, the required need goes unbound, and the recipe no
+    # longer resolves: the assertion above is NOT satisfiable under the default mode.
+    without_the_argument = plan_bindings(
+        db, template=planning_probe(request), target_entity="account", scope=scope,
+        roles=(), now=_NOW)
+    assert without_the_argument.result_status is not PlanResolutionStatus.resolved
 
 
 def test_plan_bindings_rejects_an_unknown_resolution_mode():

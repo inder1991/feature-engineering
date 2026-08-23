@@ -157,10 +157,35 @@ _CONTRACTS_FILE = "src/featuregen/overlay/upload/planner/contracts.py"
 # That is the intended end state — the allow-list shrinks as each correction becomes the baseline
 # rather than accumulating forever. Escalate anything that appears here without a matching,
 # owner-directed reason.
+#
+# S1A-2, THE IDENTITY-NEUTRAL REGISTRY BYPASS (cross-catalog Stage 1). `RESOLVED_NEED_METADATA` is
+# keyed on `template.id`, and 106 ids in the legacy template corpus COLLIDE with V2 recipe ids — so
+# a probe projected from a V2 recipe silently inherits the same-named legacy template's resolved
+# needs, overriding its own declared grains/roles (measured: 37 of the 317 V2 recipes). The fix adds
+# a keyword-only `metadata_resolution_mode` to the two functions that read that registry:
+#
+#   `METADATA_RESOLUTION_MODES`      — the new closed pair ("legacy_registry", "request_contract").
+#   `plan_bindings`                  — validates the mode, then threads it to discovery.
+#   `discover_ingredient_candidates` — "request_contract" skips the id-keyed registry read.
+#
+# This is NOT a shadow-engine perturbation, and specifically not the single-source perturbation
+# design §12 forbids: the parameter DEFAULTS to "legacy_registry", under which `resolved` is the
+# identical comprehension over the identical mapping, so every pre-existing caller
+# (contract/gate1, contract/governed_plan, planner/shadow) is byte-for-byte unchanged — a property
+# proof 2 (RUNTIME) below measures directly and still passes. Only `plan_planning_request`, the
+# origin-neutral request seam, asks for the new mode. The discriminator had to be an ARGUMENT
+# rather than a `Template` field because `recipe_grounding_context` enumerates Template's fields
+# dynamically, so a new field would move every legacy template's canonical hash.
 _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
         "_hop_evidence", "CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN", "CompilerContext",
         "build_compiler_context",
+    }),
+    "src/featuregen/overlay/upload/planner/plan.py": frozenset({
+        "METADATA_RESOLUTION_MODES", "plan_bindings",
+    }),
+    "src/featuregen/overlay/upload/planner/candidates.py": frozenset({
+        "discover_ingredient_candidates",
     }),
 }
 
