@@ -490,6 +490,30 @@ def test_a_rejection_carries_the_best_plans_own_facts(db):
                for segment in rejection["evidence"] for value in segment.values())
 
 
+def test_a_resolved_option_carries_the_same_plan_facts_a_rejection_does(db):
+    """ONE derivation, both outcomes. A ledger whose ``anchor_catalog_source`` or ``hop_count``
+    means one thing for a resolved row and another for a refused one cannot be grouped — and the
+    divergence is invisible on any seed whose catalogs happen to sort in path order."""
+    _two_catalogs(db)
+    recipe = v2_recipe_by_id(RECIPE_ID)
+    options, _rejections = _options(db, [_plannable_request(recipe)])
+    facts = options[0].plan_facts
+
+    # the anchor is where the path STARTS, which is neither the sorted read set's first entry nor
+    # a parse of the envelope's display path
+    assert facts["anchor_catalog_source"] == "ops"
+    assert facts["participating_catalogs"] == ["ops", "rev"]
+    assert facts["hop_count"] == 1 and facts["bridge_count"] == 1
+    assert facts["physical_plan_id"] == options[0].idea.physical_plan_id
+    assert [segment["segment_kind"] for segment in facts["evidence"]] == [
+        "direct_catalog", "semantic_rollup", "governed_bridge"]
+
+    # …and the SAME keys the refused leg carries, so a consumer never branches on the outcome
+    shipped = governed_requests_for_scope(db, eligible_recipe_ids=frozenset({RECIPE_ID}))
+    _options_none, rejections = _options(db, shipped)
+    assert set(facts) <= set(rejections[0])
+
+
 def test_a_planner_failure_rejection_still_carries_the_plan_level_keys(db):
     """The fail-soft rejection (a planner exception) has no plan at all. It must still answer the
     same keys — blank — so a consumer never has to branch on which rejection shape it holds."""

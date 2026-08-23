@@ -20,14 +20,18 @@ from __future__ import annotations
 import dataclasses
 from datetime import UTC, datetime
 
+from tests.featuregen.overlay.upload._bridge_fixtures import seed_verified_bridge
 from tests.featuregen.overlay.upload.contract.test_governed_lens_requests import (
     RECIPE_ID,
+    _freshness,
     _intent_request,
     _no_bridge_far_realizer,
+    _seed,
     _two_catalogs,
 )
 
 import featuregen.overlay.upload.governed_telemetry_worker as worker_module
+from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.gate1 import persist_intent
 from featuregen.overlay.upload.contract.intake import submit_intent
 from featuregen.overlay.upload.feature_metadata_snapshot import ensure_generation_run
@@ -38,6 +42,8 @@ from featuregen.overlay.upload.feature_planning_contracts import (
 from featuregen.overlay.upload.governed_observation_store import (
     claim_telemetry_work,
     enqueue_governed_telemetry,
+    record_bridge_demand,
+    record_planning_observations,
 )
 from featuregen.overlay.upload.governed_scope_material import (
     frozen_telemetry_inputs,
@@ -46,12 +52,23 @@ from featuregen.overlay.upload.governed_scope_material import (
 )
 from featuregen.overlay.upload.governed_telemetry_worker import (
     MAX_REQUESTS_PER_ITEM,
+    PAYLOAD_UNREADABLE,
+    REALIZATION_ATTACHED,
+    REALIZATION_EXISTS_UNATTACHED,
+    REALIZATION_NONE,
     STALE_REGISTRY,
     UNRESOLVED_PLAN_CONTENT_HASH,
     contract_level_demands,
+    demands_for_rejection,
     run_governed_telemetry_once,
 )
-from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+from featuregen.overlay.upload.planner.contracts import (
+    READ_SCOPE_POLICY_VERSION as _POLICY_VERSION,
+)
+from featuregen.overlay.upload.planner.contracts import (
+    ROLE_RESOLUTION_VERSION as _ROLE_VERSION,
+)
+from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES, v2_recipe_by_id
 
 _NOW = datetime(2026, 7, 14, tzinfo=UTC)
 _OWNER = "telemetry-worker-1"
@@ -174,8 +191,14 @@ def test_one_item_records_both_outcomes_and_the_g3_realization_gap(db):
     assert {row["observation_mode"] for row in rows} == {"telemetry"}
     assert {row["intent_id"] for row in rows} == {intent.intent_id}
     assert {row["metadata_snapshot_id"] for row in rows} == {"snap_s1b3"}
-    assert all(row["catalog_scope_material"]["authorized_catalog_sources"] == ["ops", "rev"]
-               for row in rows)
+    # the scope the RUN saw, and — because the lens resolves its own live scope when it plans —
+    # whether the REPLAN saw the same one. Matched here: nothing moved between the two.
+    assert all(row["catalog_scope_material"] == {
+        "frozen": {"authorized_catalog_sources": ["ops", "rev"],
+                   "target_entity": "account",
+                   "read_scope_policy_version": _POLICY_VERSION,
+                   "role_resolution_version": _ROLE_VERSION},
+        "replan_matched": True} for row in rows)
     assert len({row["compiler_input_fingerprint"] for row in rows}) == 1
 
     # ── the RESOLVED row (the intent origin)
@@ -188,6 +211,10 @@ def test_one_item_records_both_outcomes_and_the_g3_realization_gap(db):
     assert resolved["participating_catalogs"] == ["ops", "rev"]
     assert resolved["bridge_count"] == 1
     assert resolved["readiness"] == "CONCEPTUAL_ONLY"
+    # ONE derivation for both outcomes: the resolved row's anchor and hop count are the SAME
+    # plan facts the refused row carries, not a re-derivation off the idea's sorted read set.
+    assert resolved["anchor_catalog_source"] == "ops"
+    assert resolved["hop_count"] == 1
     # every concept pin in this platform reads `absent` (a RECOMMENDATION-tier policy), so the
     # authoring floor is honestly UNMET rather than silently assumed
     assert resolved["authority_floor_status"] == "unmet"
@@ -210,6 +237,11 @@ def test_one_item_records_both_outcomes_and_the_g3_realization_gap(db):
     assert rejected["physical_plan_content_hash"] == UNRESOLVED_PLAN_CONTENT_HASH
     assert rejected["governed_variant_id"].startswith("gvar_")
     assert rejected["governed_variant_id"] != resolved["governed_variant_id"]
+    # THE cross-outcome pin: both rows describe the same physical path, so both must name the same
+    # anchor and the same fan-in hop count. This is what a per-anchor rollup groups on, and it is
+    # exactly what two separate derivations used to get wrong in a way no seed could show.
+    assert rejected["anchor_catalog_source"] == resolved["anchor_catalog_source"]
+    assert rejected["hop_count"] == resolved["hop_count"]
 
     # ── the SECOND demand source: a realization gap filed from plan-level fields alone
     demands = _demands(db, rejected["observation_id"])
@@ -227,7 +259,9 @@ def test_one_item_records_both_outcomes_and_the_g3_realization_gap(db):
                                     "from_catalog_source": "ops",
                                     "from_key_ref": "public.transactions.account_id",
                                     "to_key_ref": "public.accounts.account_id",
-                                    "realization_state": "no_executable_revision"}]
+                                    # asked of the store, not inferred from the empty attachment:
+                                    # nothing has been built for this bridge yet
+                                    "realization_state": REALIZATION_NONE}]
     assert demand["recipe_revision_hash"] == planning_request_from_recipe(
         v2_recipe_by_id(RECIPE_ID)).source_content_hash
     assert summary["demands"] == 1
@@ -287,6 +321,222 @@ def test_a_refusal_that_is_nobodys_missing_crossing_files_no_demand(db):
     assert contract_level_demands(
         {"reason_codes": ["additivity_source_conflict"], "evidence": []},
         recipe_revision_hash="rev-hash") == []
+
+
+def _inverted_names(db) -> None:
+    """``_two_catalogs``, with the two catalogs renamed so the PATH ANCHOR sorts LAST.
+
+    ``zeta`` holds the transaction-grain table the path starts from; ``alpha`` holds the
+    account-grain landing table. Every assertion about an anchor is vacuous on the normal seed,
+    where the anchor (``ops``) happens to sort before the landing catalog (``rev``) — a resolved
+    row could be reading the alphabetically-first entry of a SORTED read set and look correct.
+    Here those two answers are different strings."""
+    _seed(db, "zeta", [
+        (CanonicalRow("zeta", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("zeta", "transactions", "account_id", "integer"), "account_id"),
+        (CanonicalRow("zeta", "transactions", "event_ts", "timestamp"), "event_timestamp"),
+    ])
+    _seed(db, "alpha", [
+        (CanonicalRow("alpha", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    seed_verified_bridge(db, "bfk_s1b3_inverted", entity="account", left_source="zeta",
+                         left_ref="public.transactions.account_id", right_source="alpha",
+                         right_ref="public.accounts.account_id")
+    _freshness(db, "zeta", "alpha")
+
+
+def test_the_resolved_rows_anchor_is_the_path_start_not_the_first_sorted_catalog(db):
+    """The Critical pin, on a seed where the two answers cannot coincide: the resolved row must
+    name ``zeta`` (where the path STARTS), not ``alpha`` (the first entry of the sorted read
+    set)."""
+    _inverted_names(db)
+    intent, run_id = _lineage(db)
+    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
+    _enqueue(db, run_id=run_id, intent=intent, intent_requests=[request])
+
+    summary = run_governed_telemetry_once(db, owner=_OWNER, now=_NOW)
+    assert summary["resolved"] == 1
+    row = _by_id(_observations(db, run_id), request.source_definition_id)
+    assert row["anchor_catalog_source"] == "zeta"
+    # the plan's OWN order, which is path order — so the anchor leads it. Sorted, this list would
+    # start with `alpha`, which is exactly the wrong answer the old derivation gave.
+    assert row["participating_catalogs"] == ["zeta", "alpha"]
+    assert row["participating_catalogs"][0] == row["anchor_catalog_source"]
+    assert row["hop_count"] == 1 and row["bridge_count"] == 1
+
+
+def _bridge_segment(**overrides) -> dict:
+    segment = {"segment_kind": "governed_bridge", "catalog_source": "rev",
+               "from_entity": "transaction", "to_entity": "account",
+               "relationship_id": "", "relationship_version": "", "bridge_fact_key": "bfk_s1a4b",
+               "realization_ref": "", "cardinality": "",
+               "bridge_from_catalog_source": "ops",
+               "bridge_from_object_ref": "public.transactions.account_id",
+               "bridge_to_catalog_source": "rev",
+               "bridge_to_object_ref": "public.accounts.account_id",
+               "has_realization_revision": False}
+    return {**segment, **overrides}
+
+
+def test_a_rejection_carrying_both_sources_files_into_both_queues(db):
+    """The co-occurrence case, and the RULING it pins: the two demand sources are NOT deduplicated
+    against each other.
+
+    A rejection can carry a contract headline (``_rejection_reason`` prefers the SELECTED plan's
+    contract refusal) while other candidates in the same run dead-ended carrying real hops. Those
+    are two different pieces of work for two different people — sanction a crossing
+    (``bridge_demand``) versus build/attach a realization for one that IS sanctioned
+    (``realization_gap``) — so both rows land, in both queues."""
+    _two_catalogs(db)
+    intent, run_id = _lineage(db)
+    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
+    rejection = {
+        "reason": "physical_cardinality_unavailable",
+        "reason_codes": ["physical_cardinality_unavailable", "unsanctioned_bridge"],
+        "anchor_catalog_source": "ops",
+        "evidence": [_bridge_segment()],
+        "unmet_hops": [{"relationship_id": "transaction_to_account",
+                        "relationship_version": "1.0.0", "from_entity": "transaction",
+                        "to_entity": "account", "position_catalog": "ops",
+                        "position_table_ref": "public.transactions", "hop_index": 0,
+                        "verdict": "unsanctioned_bridge", "realizers": [],
+                        "near_side_key_refs": ["public.transactions.account_id"]}],
+    }
+    demands = demands_for_rejection(db, request, rejection)
+    assert [d["verdict"] for d in demands] == ["unsanctioned_bridge", "missing_realization"]
+
+    (observation_id,) = record_planning_observations(
+        db, generation_run_id=run_id, intent_id=intent.intent_id, observation_mode="telemetry",
+        rows=[{"definition_origin": "llm_intent",
+               "canonical_definition_id": request.source_definition_id,
+               "governed_variant_id": "gvar_cooccurrence", "planning_request_hash": "h",
+               "target_entity": "account", "resolution_status": "physical_cardinality_unavailable",
+               "anchor_catalog_source": "ops"}])
+    record_bridge_demand(db, observation_id=observation_id, rejections=demands)
+    filed = _demands(db, observation_id)
+    assert {row["demand_queue"] for row in filed} == {"bridge_demand", "realization_gap"}
+    assert len(filed) == 2
+
+
+# ── the realization state: "build one" is not the same work item as "wire up the one you have" ──
+
+
+def test_an_unrealized_bridge_reports_that_no_revision_exists(db):
+    _two_catalogs(db)
+    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
+    demands = demands_for_rejection(db, request, {
+        "reason_codes": ["physical_cardinality_unavailable"], "anchor_catalog_source": "ops",
+        "evidence": [_bridge_segment()]})
+    assert demands[0]["realizers"][0]["realization_state"] == REALIZATION_NONE
+
+
+def test_an_existing_but_unattached_realization_is_a_different_work_item(db, monkeypatch):
+    """``bridge_realization_revision is None`` says only that the planner did not ATTACH one —
+    and the planner never attaches (``attach_executable_bridge_realizations`` has zero callers).
+    Asking the store the separate question is what stops a "go build this bridge" ticket being
+    filed for a bridge somebody already built."""
+    _two_catalogs(db)
+    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.bridge_store.executable_bridge_realizations",
+        lambda conn, **kwargs: ("a-current-executable-realization",))
+    demands = demands_for_rejection(db, request, {
+        "reason_codes": ["physical_cardinality_unavailable"], "anchor_catalog_source": "ops",
+        "evidence": [_bridge_segment()]})
+    assert len(demands) == 1
+    assert demands[0]["realizers"][0]["realization_state"] == REALIZATION_EXISTS_UNATTACHED
+
+
+def test_an_attached_realization_files_no_demand_at_all(db):
+    """Nothing is missing on a segment whose realization the plan already carries."""
+    _two_catalogs(db)
+    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
+    assert demands_for_rejection(db, request, {
+        "reason_codes": ["physical_cardinality_unavailable"], "anchor_catalog_source": "ops",
+        "evidence": [_bridge_segment(has_realization_revision=True)]}) == []
+    assert contract_level_demands(
+        {"reason_codes": ["physical_cardinality_unavailable"],
+         "evidence": [_bridge_segment(has_realization_revision=True)]},
+        recipe_revision_hash="rev-hash",
+        realization_states={"bfk_s1a4b": REALIZATION_ATTACHED}) == []
+
+
+# ── the replan's own scope, recorded rather than assumed ──────────────────────────────────────
+
+
+def test_a_scope_that_moved_between_the_enqueue_and_the_replan_is_recorded(db):
+    """The lens resolves its OWN live scope when it plans, so a replan can silently run against a
+    different authorization than the run did. Asking again costs one read and makes the mismatch
+    countable instead of invisible — and the differing material rides beside the frozen one."""
+    _two_catalogs(db)
+    intent, run_id = _lineage(db)
+    _enqueue(db, run_id=run_id, intent=intent, recipe_ids=[RECIPE_ID])
+
+    # a third catalog lands AFTER the work item was frozen — exactly the production case
+    _seed(db, "late", [
+        (CanonicalRow("late", "accounts", "account_id", "integer", is_grain=True), "account_id")])
+    _freshness(db, "ops", "rev", "late")
+
+    run_governed_telemetry_once(db, owner=_OWNER, now=_NOW)
+    material = _by_id(_observations(db, run_id), RECIPE_ID)["catalog_scope_material"]
+    assert material["replan_matched"] is False
+    assert material["frozen"]["authorized_catalog_sources"] == ["ops", "rev"]
+    assert material["replan"]["authorized_catalog_sources"] == ["late", "ops", "rev"]
+
+
+def test_a_scope_read_that_fails_is_recorded_as_unknown_never_as_matched(db, monkeypatch):
+    _two_catalogs(db)
+    intent, run_id = _lineage(db)
+    _enqueue(db, run_id=run_id, intent=intent, recipe_ids=[RECIPE_ID])
+
+    def _boom(conn, **kwargs):
+        raise RuntimeError("the scope read fell over")
+
+    monkeypatch.setattr(worker_module, "governed_scope_material", _boom)
+    run_governed_telemetry_once(db, owner=_OWNER, now=_NOW)
+    material = _by_id(_observations(db, run_id), RECIPE_ID)["catalog_scope_material"]
+    assert material["replan_matched"] is None                  # not True, and not False
+    assert material["frozen"]["authorized_catalog_sources"] == ["ops", "rev"]
+
+
+# ── the frozen payload's round trip, proven rather than promised ──────────────────────────────
+
+
+def test_a_payload_that_does_not_round_trip_is_recorded_never_planned(db, monkeypatch):
+    """The freeze's contract is that a payload rebuilds to the SAME request. A lossy rebuild would
+    otherwise be planned, observed and reported as though it were the request the run proposed."""
+    _two_catalogs(db)
+    intent, run_id = _lineage(db)
+    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
+    _enqueue(db, run_id=run_id, intent=intent, intent_requests=[request])
+
+    lossy = dataclasses.replace(request, primary_objective=request.primary_objective)
+    monkeypatch.setattr(
+        worker_module, "planning_request_from_frozen",
+        lambda payload: dataclasses.replace(lossy, parameter_values=(("window", 7),)))
+    planned: list = []
+    monkeypatch.setattr(worker_module, "governed_options_from_requests",
+                        lambda conn, **kw: (planned.extend(kw["requests"]), ([], []))[1])
+
+    summary = run_governed_telemetry_once(db, owner=_OWNER, now=_NOW)
+    assert summary["stale"] == 1 and planned == []
+    row = _by_id(_observations(db, run_id), request.source_definition_id)
+    assert row["resolution_status"] == PAYLOAD_UNREADABLE
+
+
+def test_every_v2_parameter_value_is_a_scalar(db):
+    """Why the reconstruction does not need to re-tuple ``parameter_values``: JSON would return a
+    non-scalar as a list and move the hash. Every authored ``allowed_values`` entry in the registry
+    is a scalar, and an ``llm_intent`` request carries no parameters at all — so the hazard is
+    structurally absent rather than merely unobserved. If a recipe ever authors a list-valued
+    parameter, this fails BEFORE the round trip can silently drift."""
+    offenders = [(recipe.recipe_id, parameter.name, value)
+                 for recipe in V2_RECIPES
+                 for parameter in recipe.parameters
+                 for value in parameter.allowed_values
+                 if not isinstance(value, str | int | float | bool) and value is not None]
+    assert offenders == []
 
 
 # ── 3. the registry moving under a work item ──────────────────────────────────────────────────

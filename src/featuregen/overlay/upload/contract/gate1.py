@@ -1229,6 +1229,11 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
     # (a lineage mismatch, a missing run) must not leave the request's transaction unusable.
     if telemetry_enabled and engine_served and target_entity is not None and snap_run_id:
         try:
+            # Imported HERE rather than at module scope, matching this module's own convention for
+            # its heavier collaborators (the engine, the projection, the decision facts): a
+            # deployment with the flag off never imports the telemetry stack at all, and gate1 —
+            # which the store's own migrations sit downstream of — keeps its import graph free of
+            # the observation store.
             from featuregen.overlay.upload.governed_observation_store import (
                 enqueue_governed_telemetry,
             )

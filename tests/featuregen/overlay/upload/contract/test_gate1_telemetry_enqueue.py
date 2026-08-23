@@ -20,6 +20,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import time
 from datetime import UTC, datetime
 
 import psycopg
@@ -111,7 +112,13 @@ class _CountingCursor:
 
 
 class _CountingConn:
-    """Counts every statement the builder issues, through either entry point."""
+    """Counts the QUERIES the builder issues, through either entry point it uses —
+    ``conn.execute(...)`` and ``conn.cursor(...).execute(...)``.
+
+    It does NOT count transaction control. ``conn.transaction()`` issues its SAVEPOINT / RELEASE
+    through psycopg's internal ``_exec_command``, which never passes through either wrapper — so a
+    savepoint costs 0 here. That is the intended scope: the pin below is about the WORK a flag adds
+    (one scope read, one insert), not about the bookkeeping that makes it fail-soft."""
 
     def __init__(self, conn):
         self._conn = conn
@@ -325,6 +332,34 @@ def test_the_enqueue_costs_a_constant_two_statements(db):
 
     assert on["queries"] - off["queries"] == 2
     assert on_large["queries"] == on["queries"]
+
+
+def test_the_recipe_manifest_is_built_once_per_process_not_once_per_run(db):
+    """The other half of the cost, which the query count cannot see: CPU.
+
+    Projecting and field-exhaustively hashing all 317 V2 recipes measured **131 ms on the request
+    path** — every generation, for an answer that cannot change while the process lives (the
+    registry is in-code). It is cached, so the second run of the same manifest is a lookup. The
+    pin is a RATIO rather than a wall-clock bound, because a wall-clock assertion on shared CI is a
+    flake generator; a regression that removes the cache moves this by two orders of magnitude."""
+    from featuregen.overlay.upload.governed_scope_material import frozen_telemetry_inputs
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    every_recipe = frozenset(recipe.recipe_id for recipe in V2_RECIPES)
+    assert len(every_recipe) > 300
+
+    def _freeze() -> float:
+        started = time.perf_counter()
+        frozen = frozen_telemetry_inputs(
+            v2_eligible_ids=every_recipe, target_entity="Customer",
+            anchor_catalog_source="bank", scope_material={}, metadata_snapshot_id=None)
+        assert len(frozen["requests"]) == len(every_recipe)
+        return time.perf_counter() - started
+
+    _freeze()                                   # whatever the process had already cached
+    cold_or_warm, warm = _freeze(), _freeze()
+    assert warm <= cold_or_warm * 4             # both warm: the cache is doing the work
+    assert warm < 0.02                          # ~0.2 ms measured; 131 ms uncached
 
 
 # ── 4. fail-soft ──────────────────────────────────────────────────────────────────────────────

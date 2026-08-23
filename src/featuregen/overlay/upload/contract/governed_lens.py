@@ -72,7 +72,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from featuregen.overlay.upload.catalog_realizations import key_entities_for, table_of
@@ -187,6 +187,14 @@ class GovernedOptionV1:
     # `FeatureIdea` has no field for these: a reason code with no closed requirement builder is a
     # fact about THIS option's evidence, carried here so it is visible instead of discarded.
     unmapped_requirement_codes: tuple[str, ...]
+    # S1B-3: the SELECTED plan's own facts, from the SAME `_plan_facts` derivation a rejection
+    # carries. Deliberately shared rather than re-derived per outcome: a ledger that answers
+    # "which catalog anchored this?" or "how many fan-in hops?" differently depending on whether
+    # the request resolved is a ledger whose columns mean two things. The `FeatureIdea` and its
+    # envelope cannot supply them honestly — the envelope's `ordered_path` is a display string and
+    # `derives_pairs` is a SORTED read set, whose first entry is the alphabetically-first catalog
+    # rather than the anchor. Defaulted so no other constructor moves.
+    plan_facts: dict = field(default_factory=dict)
 
 
 _NEUTRAL_GOVERNANCE = DefinitionGovernanceStateV1(
@@ -708,12 +716,28 @@ def _segment_evidence(plan: BindingPlanV1) -> list[dict]:
 
 
 def _plan_facts(plan: BindingPlanV1 | None) -> dict:
-    """The best plan's own facts under the names ``governed_planning_observation`` spells them.
+    """A plan's own facts under the names ``governed_planning_observation`` spells them.
+
+    **THE one derivation, for BOTH outcomes** — a rejection's best plan (:func:`_best_plan`) and a
+    resolved option's selected plan (``GovernedOptionV1.plan_facts``). Sharing it is the point: a
+    ledger whose ``anchor_catalog_source`` or ``hop_count`` means one thing for a resolved row and
+    another for a refused one cannot be grouped, and the divergence would be invisible on any seed
+    whose catalogs happen to sort in path order.
+
+    ``anchor_catalog_source`` is ``plan.catalog_source`` — where the path STARTS. Neither
+    ``derives_pairs`` (a sorted read set) nor the envelope's ``ordered_path`` (a display string)
+    is that fact; the first is alphabetical and the second is parsed prose.
+
+    ``hop_count`` is the number of AGGREGATION hops the contract compiled — the count a demand
+    queue means by "hops". The path segment count includes the direct-catalog anchor and the
+    bridges, and is not it.
+
+    ``participating_catalogs`` is the plan's own tuple, i.e. PATH order (the anchor leads), not
+    sorted. Sorting would throw away the traversal for a tidiness no consumer asked for, and a
+    reader can still compare two lists as sets.
 
     All-blank when there is no plan (a planner failure, an empty candidate set), so a consumer
-    never branches on which rejection shape it is holding. ``hop_count`` is the number of
-    AGGREGATION hops the contract compiled, which is the count a demand queue means by "hops"; the
-    path segment count includes the direct-catalog anchor and is not it."""
+    never branches on which shape it is holding."""
     if plan is None:
         return {"physical_plan_id": "", "contract_id": "", "anchor_catalog_source": "",
                 "participating_catalogs": [], "hop_count": 0, "bridge_count": 0,
@@ -1041,7 +1065,8 @@ def _option_from(entry: _PlannedRequestV1, *, evidence: _FrozenEvidenceV1, compi
     return GovernedOptionV1(
         idea=idea, request=request, identity=identity, governance=governance,
         readiness=readiness, display_name=display_name,
-        business_definition=business_definition, unmapped_requirement_codes=unmapped)
+        business_definition=business_definition, unmapped_requirement_codes=unmapped,
+        plan_facts=_plan_facts(plan))
 
 
 __all__ = [

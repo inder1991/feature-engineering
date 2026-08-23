@@ -71,6 +71,7 @@ from featuregen.overlay.upload.governed_observation_store import (
 )
 from featuregen.overlay.upload.governed_scope_material import (
     FROZEN_INPUTS_VERSION,
+    governed_scope_material,
     planning_request_from_frozen,
 )
 from featuregen.overlay.upload.planner.contracts import ReasonCode
@@ -101,6 +102,13 @@ UNRESOLVED_PLAN_CONTENT_HASH = "unresolved"
 #: an ADAPTER-level outcome can be recorded honestly instead of dressed as one.
 STALE_REGISTRY = "stale_registry"
 
+#: The same refusal for a PAYLOAD-carried request (an LLM intent): its bytes did not reconstruct
+#: into a request that hashes to what was frozen. Spelled differently from ``stale_registry``
+#: because the remedy is different — nobody's registry moved, this run's own frozen bytes and the
+#: reconstruction disagree, which is a defect in the freeze/thaw pair and not a fact about the
+#: catalog.
+PAYLOAD_UNREADABLE = "payload_unreadable"
+
 _MODE = "telemetry"
 _MAX_ERROR = 2000
 
@@ -110,8 +118,13 @@ _REJECTION_LEVEL_CAPACITY = (ReasonCode.bounded_out_max_frontier_states.value,)
 
 #: R21: the closed window vocabulary a hypothesis may spell. Nothing here parses free text for
 #: meaning — it finds a number followed by a unit, and refuses to guess at anything else.
-_WINDOW_MENTION = re.compile(r"(\d+)\s*[-\s]?\s*(days?|d|months?|m)\b", re.IGNORECASE)
-_UNIT_DAYS = {"d": 1, "day": 1, "days": 1, "m": 30, "month": 30, "months": 30}
+#:
+#: A bare ``m`` is deliberately NOT a month: "a $30m book" would otherwise imply a 900-day window
+#: and file a divergence against a hypothesis that named no window at all. A bare ``d`` is kept
+#: (``30d`` is how this platform's own parameter values are spelled), and ``\b`` on BOTH sides
+#: stops ``30days`` inside a longer token from matching.
+_WINDOW_MENTION = re.compile(r"\b(\d+)\s*[-\s]?\s*(days?|d|months?)\b", re.IGNORECASE)
+_UNIT_DAYS = {"d": 1, "day": 1, "days": 1, "month": 30, "months": 30}
 
 
 class _LeaseLost(Exception):
@@ -206,7 +219,8 @@ def _process_item(conn: DbConn, item: dict, *, now: datetime | None) -> dict:
                          for rejection in rejections}
     common = {
         "target_entity": target_entity,
-        "catalog_scope_material": dict(frozen.get("catalog_scope_material") or {}),
+        "catalog_scope_material": _scope_material_record(
+            conn, frozen=frozen, roles=roles, target_entity=target_entity),
         "metadata_snapshot_id": frozen.get("metadata_snapshot_id"),
         "compiler_input_fingerprint": _compiler_input_fingerprint(frozen),
     }
@@ -216,9 +230,12 @@ def _process_item(conn: DbConn, item: dict, *, now: datetime | None) -> dict:
     rows: list[dict] = []
     demands_per_row: list[list[dict]] = []
     counts = {"resolved": 0, "rejected": 0, "stale": 0}
+    # One realization lookup per DISTINCT bridge fact key per ITEM, shared across every rejection.
+    realization_cache: dict[str, str] = {}
+    frozen_anchor = str(frozen.get("anchor_catalog_source") or "")
     for entry in restored:
         if entry.request is None:
-            rows.append(_unplanned_row(entry, common=common))
+            rows.append(_unplanned_row(entry, common=common, anchor_catalog_source=frozen_anchor))
             demands_per_row.append([])
             counts["stale"] += 1
             continue
@@ -243,8 +260,10 @@ def _process_item(conn: DbConn, item: dict, *, now: datetime | None) -> dict:
                          "rejection", entry.request.source_definition_id)
             rejection = {"reason": ReasonCode.planner_internal_error.value}
         rows.append(_rejected_row(entry.request, rejection, common=common,
-                                  corroborated=corroborated, divergence=divergence))
-        demands_per_row.append(_demands_for(entry.request, rejection))
+                                  corroborated=corroborated, divergence=divergence,
+                                  fallback_anchor=frozen_anchor))
+        demands_per_row.append(demands_for_rejection(conn, entry.request, rejection,
+                                                     realization_cache=realization_cache))
         counts["rejected"] += 1
 
     observation_ids = record_planning_observations(
@@ -287,15 +306,35 @@ def _restore(frozen: dict) -> tuple[list[_Restored], int]:
 
 
 def _restore_one(ref: dict) -> _Restored:
+    """Rebuild one reference, and PROVE the rebuild by hash before letting it near the planner.
+
+    A recipe is re-derived from the registry and refused on drift (:func:`_restore_recipe`). A
+    payload-carried request is reconstructed and its ``planning_request_hash`` re-checked against
+    the frozen one — the check the freeze's contract promises. A lossy round trip is not a
+    theoretical worry: JSON has no tuples, so any value the reconstruction failed to re-tuple
+    would produce a request that hashes differently and would then be planned, observed and
+    reported as though it were the request this run actually proposed. Recorded, never planned.
+    """
     origin = str(ref.get("origin") or "")
     if origin == DEFINITION_ORIGIN_RECIPE_V2:
         return _restore_recipe(ref)
     payload = ref.get("payload")
+    definition_id = ref.get("canonical_definition_id")
     if not payload:
         logger.warning("governed telemetry: %s-origin ref %s carries no payload and cannot be "
-                       "reconstructed", origin, ref.get("canonical_definition_id"))
-        return _Restored(ref=ref, request=None, status=STALE_REGISTRY)
-    return _Restored(ref=ref, request=planning_request_from_frozen(payload))
+                       "reconstructed", origin, definition_id)
+        return _Restored(ref=ref, request=None, status=PAYLOAD_UNREADABLE)
+    try:
+        request = planning_request_from_frozen(payload)
+    except Exception:
+        logger.warning("governed telemetry: %s-origin payload %s does not reconstruct into a "
+                       "valid planning request", origin, definition_id, exc_info=True)
+        return _Restored(ref=ref, request=None, status=PAYLOAD_UNREADABLE)
+    if planning_request_hash(request) != str(ref.get("planning_request_hash") or ""):
+        logger.warning("governed telemetry: %s-origin payload %s did not round-trip (rebuilt hash "
+                       "differs from the frozen one); not planned", origin, definition_id)
+        return _Restored(ref=ref, request=None, status=PAYLOAD_UNREADABLE)
+    return _Restored(ref=ref, request=request)
 
 
 def _restore_recipe(ref: dict) -> _Restored:
@@ -344,9 +383,15 @@ def _safe_parameter_binding_hash(request: FeaturePlanningRequestV1) -> str:
 
 def _resolved_row(option: GovernedOptionV1, *, common: dict, corroborated: bool,
                   divergence: list[dict]) -> dict:
+    """A resolved request's row.
+
+    Every plan-shaped column comes from ``option.plan_facts`` — the SAME ``_plan_facts``
+    derivation a rejection carries — so ``anchor_catalog_source`` and ``hop_count`` mean exactly
+    one thing across the whole table. They used to be re-derived here from the idea and its
+    envelope, which read the anchor off a SORTED read set (right only while the anchor happened to
+    sort first) and counted path segments instead of fan-in hops."""
+    facts = option.plan_facts
     envelope = option.idea.plan_envelope
-    kinds = [entry.split(":")[1] if entry.count(":") >= 2 else ""
-             for entry in (envelope.ordered_path if envelope is not None else ())]
     return {
         **common,
         "definition_origin": option.identity.definition_origin,
@@ -356,18 +401,19 @@ def _resolved_row(option: GovernedOptionV1, *, common: dict, corroborated: bool,
         "planning_request_hash": option.identity.planning_request_hash,
         "parameter_binding_hash": option.identity.parameter_binding_hash,
         "physical_plan_content_hash": option.identity.physical_plan_content_hash,
-        "selected_physical_plan_id": envelope.physical_plan_id if envelope is not None else "",
-        "contract_id": (envelope.contract_id if envelope is not None else None) or None,
+        "selected_physical_plan_id": (facts.get("physical_plan_id")
+                                      or (envelope.physical_plan_id if envelope is not None
+                                          else "")),
+        "contract_id": str(facts.get("contract_id") or "") or None,
         "primary_objective": option.request.primary_objective,
-        "anchor_catalog_source": option.idea.derives_pairs[0][0] if option.idea.derives_pairs
-                                 else "",
+        "anchor_catalog_source": str(facts.get("anchor_catalog_source") or ""),
         "resolution_status": "resolved",
+        # A resolved row records no refusal. The plan's own observed codes stay on the plan; a
+        # reason code beside `resolution_status = resolved` would read as a refusal that resolved.
         "reason_codes": [],
-        "participating_catalogs": sorted(envelope.catalog_sources) if envelope is not None else [],
-        # The envelope's ordered path is the only per-segment record an OPTION carries; its
-        # entries are `catalog:segment_kind:key`. A bridge is a crossing, a rollup is a hop.
-        "hop_count": kinds.count("semantic_rollup"),
-        "bridge_count": kinds.count("governed_bridge"),
+        "participating_catalogs": list(facts.get("participating_catalogs") or ()),
+        "hop_count": int(facts.get("hop_count") or 0),
+        "bridge_count": int(facts.get("bridge_count") or 0),
         "authority_floor_status": _authority_floor_status(option),
         "readiness": option.readiness.state,
         "intent_corroborated": corroborated,
@@ -376,7 +422,12 @@ def _resolved_row(option: GovernedOptionV1, *, common: dict, corroborated: bool,
 
 
 def _rejected_row(request: FeaturePlanningRequestV1, rejection: dict, *, common: dict,
-                  corroborated: bool, divergence: list[dict]) -> dict:
+                  corroborated: bool, divergence: list[dict],
+                  fallback_anchor: str = "") -> dict:
+    """A refused request's row. ``fallback_anchor`` is the run's own anchor catalog from the frozen
+    inputs, used when the rejection has no plan to name one (a planner failure): the run's anchor
+    is a fact this item KNOWS, and leaving the column blank would drop that row out of every
+    per-anchor rollup for no reason."""
     reason = str(rejection.get("reason") or "")
     return {
         **common,
@@ -393,7 +444,8 @@ def _rejected_row(request: FeaturePlanningRequestV1, rejection: dict, *, common:
         "selected_physical_plan_id": str(rejection.get("physical_plan_id") or ""),
         "contract_id": str(rejection.get("contract_id") or "") or None,
         "primary_objective": request.primary_objective,
-        "anchor_catalog_source": str(rejection.get("anchor_catalog_source") or ""),
+        "anchor_catalog_source": (str(rejection.get("anchor_catalog_source") or "")
+                                  or fallback_anchor),
         "resolution_status": reason,
         "reason_codes": list(rejection.get("reason_codes") or ([reason] if reason else [])),
         "participating_catalogs": list(rejection.get("participating_catalogs") or ()),
@@ -408,10 +460,10 @@ def _rejected_row(request: FeaturePlanningRequestV1, rejection: dict, *, common:
     }
 
 
-def _unplanned_row(entry: _Restored, *, common: dict) -> dict:
-    """A row for a request that was never planned. It names what the RUN froze — the id and the
-    request hash as they were at enqueue — because that is the fact worth keeping: this run wanted
-    THIS definition and the build no longer has it."""
+def _unplanned_row(entry: _Restored, *, common: dict, anchor_catalog_source: str = "") -> dict:
+    """A row for a request that was never planned. It names what the RUN froze — the id, the
+    request hash and the anchor catalog as they were at enqueue — because that is the fact worth
+    keeping: this run wanted THIS definition and the build no longer has it."""
     ref = entry.ref
     origin = str(ref.get("origin") or DEFINITION_ORIGIN_RECIPE_V2)
     identity = GovernedVariantIdentityV1(
@@ -428,6 +480,7 @@ def _unplanned_row(entry: _Restored, *, common: dict) -> dict:
         "governed_variant_id": identity.governed_variant_id,
         "planning_request_hash": identity.planning_request_hash,
         "physical_plan_content_hash": UNRESOLVED_PLAN_CONTENT_HASH,
+        "anchor_catalog_source": anchor_catalog_source,
         "resolution_status": entry.status or STALE_REGISTRY,
         "authority_floor_status": "unevaluated",
     }
@@ -443,6 +496,35 @@ def _authority_floor_status(option: GovernedOptionV1) -> str:
     if not bindings:
         return "unevaluated"
     return "met" if all(clears(b.authority, "authoring") for b in bindings) else "unmet"
+
+
+def _scope_material_record(conn: DbConn, *, frozen: dict, roles: tuple[str, ...],
+                           target_entity: str) -> dict:
+    """The scope the RUN saw, and whether the REPLAN saw the same one.
+
+    The lens resolves its own live catalog scope when it plans (``resolve_catalog_scope`` inside
+    ``governed_options_from_requests``), so a replan can silently run against a wider or narrower
+    authorization than the run did — and then "same inputs, different answer" would be a claim
+    nobody checked. Asking the same question again here costs ONE read and makes the mismatch
+    COUNTABLE: ``replan_matched`` is on every row, and the differing material is recorded beside
+    the frozen one ONLY when it actually differs, so the common case stays the shape S1B-1
+    specified.
+
+    A read failure records ``replan_matched: null`` — "nobody could ask" is not "they matched".
+    """
+    frozen_material = dict(frozen.get("catalog_scope_material") or {})
+    try:
+        replan = governed_scope_material(conn, roles=roles, target_entity=target_entity)
+    except Exception:
+        logger.warning("governed telemetry: the replan scope could not be read; recorded as "
+                       "unknown rather than matched", exc_info=True)
+        return {"frozen": frozen_material, "replan_matched": None}
+    if replan == frozen_material:
+        return {"frozen": frozen_material, "replan_matched": True}
+    logger.info("governed telemetry: the replan scope differs from the frozen one (%s vs %s)",
+                replan.get("authorized_catalog_sources"),
+                frozen_material.get("authorized_catalog_sources"))
+    return {"frozen": frozen_material, "replan_matched": False, "replan": replan}
 
 
 def _compiler_input_fingerprint(frozen: dict) -> str:
@@ -464,15 +546,88 @@ def _compiler_input_fingerprint(frozen: dict) -> str:
 # ── the two demand sources ────────────────────────────────────────────────────────────────────
 
 
-def _demands_for(request: FeaturePlanningRequestV1, rejection: dict) -> list[dict]:
+def demands_for_rejection(conn: DbConn, request: FeaturePlanningRequestV1, rejection: dict, *,
+                          realization_cache: dict[str, str] | None = None) -> list[dict]:
+    """BOTH demand sources for one rejection, merged with the rejection-level fields the store
+    reads (``recipe_revision_hash``, ``anchor_catalog_source`` — passed explicitly so the store
+    never has to look the anchor up).
+
+    **RULING (S1B-3, on review): the two sources are NOT deduplicated against each other, and a
+    rejection that carries both files both rows.** They answer different questions and land in
+    different queues: an unmet HOP says *the frontier could not cross here at all* (bridge_demand —
+    somebody must sanction a crossing), while a contract-level realization gap says *the crossing
+    is sanctioned and has no executable realization* (realization_gap — somebody must build or
+    attach one). Collapsing them would hide one of two genuinely different pieces of work behind
+    whichever happened to be filed first, and the headline ``reason`` cannot decide between them:
+    ``_rejection``'s precedence prefers the SELECTED plan's contract refusal, so a run can carry a
+    contract headline while other candidates dead-ended carrying real hops. Pinned by
+    ``test_a_rejection_carrying_both_sources_files_into_both_queues``.
+    """
     revision_hash = request.source_content_hash
     anchor = str(rejection.get("anchor_catalog_source") or "")
     hops = [{**hop, "recipe_revision_hash": revision_hash, "anchor_catalog_source": anchor}
             for hop in (rejection.get("unmet_hops") or ())]
-    return [*hops, *contract_level_demands(rejection, recipe_revision_hash=revision_hash)]
+    states = _realization_states(conn, rejection, cache=realization_cache)
+    return [*hops, *contract_level_demands(rejection, recipe_revision_hash=revision_hash,
+                                           realization_states=states)]
 
 
-def contract_level_demands(rejection: dict, *, recipe_revision_hash: str) -> list[dict]:
+#: A governed bridge segment carries no realization revision. Two very different reasons, two very
+#: different work items, and ``bridge_realization_revision is None`` alone cannot tell them apart:
+#: the planner never calls ``assembly.attach_executable_bridge_realizations`` (it has zero callers),
+#: so EVERY segment reads None today — including one whose realization already exists and is
+#: executable. Filing both under one state would put "build a realization" and "wire up the
+#: realization you already have" in the same queue row, addressed to the wrong person half the time.
+REALIZATION_ATTACHED = "attached"
+REALIZATION_EXISTS_UNATTACHED = "revision_exists_unattached"
+REALIZATION_NONE = "no_revision_exists"
+#: Not a state of the bridge — a state of the QUESTION. A revalidation fault must never read as
+#: "nothing exists" (that would file a build ticket for work that may already be done).
+REALIZATION_UNKNOWN = "realization_lookup_failed"
+
+#: The reader's fixed question: is a CURRENT, fully revalidated realization executable right now?
+#: Same purpose/environment the analysis tree asks with (``context_graph``), so telemetry and the
+#: dossier cannot disagree about whether a bridge is executable.
+_REALIZATION_PURPOSE = "analysis"
+_REALIZATION_ENVIRONMENT = "production"
+
+
+def _realization_states(conn: DbConn, rejection: dict, *,
+                        cache: dict[str, str] | None = None) -> dict[str, str]:
+    """``bridge_fact_key -> realization state`` for every governed-bridge segment in the evidence.
+
+    One store read per DISTINCT bridge fact key per item (memoized through ``cache``), inside its
+    own savepoint: ``executable_bridge_realizations`` revalidates, and a revalidation fault would
+    otherwise abort the item's whole transaction — the ``context_graph`` idiom, for the same
+    reason."""
+    from featuregen.overlay.upload.bridge_store import executable_bridge_realizations
+
+    states = cache if cache is not None else {}
+    for segment in rejection.get("evidence") or ():
+        if segment.get("segment_kind") != "governed_bridge":
+            continue
+        key = str(segment.get("bridge_fact_key") or "")
+        if segment.get("has_realization_revision"):
+            states[key] = REALIZATION_ATTACHED
+            continue
+        if key in states or not key:
+            continue
+        try:
+            with conn.transaction():
+                found = executable_bridge_realizations(
+                    conn, purpose=_REALIZATION_PURPOSE, environment=_REALIZATION_ENVIRONMENT,
+                    bridge_fact_key=key)
+        except Exception:       # noqa: BLE001 — a fault must not read as "nothing exists"
+            logger.warning("governed telemetry: realization lookup failed for bridge %s", key,
+                           exc_info=True)
+            states[key] = REALIZATION_UNKNOWN
+            continue
+        states[key] = REALIZATION_EXISTS_UNATTACHED if found else REALIZATION_NONE
+    return states
+
+
+def contract_level_demands(rejection: dict, *, recipe_revision_hash: str,
+                           realization_states: dict[str, str] | None = None) -> list[dict]:
     """The SECOND demand source: refusals that carry no unmet hop at all.
 
     Two of them exist, and they are different shapes:
@@ -489,6 +644,13 @@ def contract_level_demands(rejection: dict, *, recipe_revision_hash: str) -> lis
       genuinely needs work, and naming only the first would under-report a gap while pretending to
       have attributed the refusal to a specific hop it cannot attribute.
 
+      ``realization_states`` (from :func:`_realization_states`) decides WHICH segments file and
+      what the row says the work is: a segment whose realization is already ``attached`` files
+      nothing (nothing is missing), while ``no_revision_exists`` and ``revision_exists_unattached``
+      both file — the state rides in the row so the queue can tell "build one" from "wire up the
+      one you have". An absent key means nobody asked the store; it is recorded as such rather
+      than assumed.
+
     * ``bounded_out_max_frontier_states`` — hop-less by construction (its reject is minted from the
       START state, which realized nothing), so it can NEVER arrive through ``unmet_hops``. Filed
       from rejection-level fields only; the store zeroes a capacity row's hop columns by ruling,
@@ -500,20 +662,27 @@ def contract_level_demands(rejection: dict, *, recipe_revision_hash: str) -> lis
     """
     codes = set(rejection.get("reason_codes") or ())
     anchor = str(rejection.get("anchor_catalog_source") or "")
+    states = realization_states or {}
     demands: list[dict] = []
     if ReasonCode.physical_cardinality_unavailable.value in codes:
-        demands.extend(_realization_gap(segment, recipe_revision_hash=recipe_revision_hash,
-                                        anchor=anchor)
-                       for segment in (rejection.get("evidence") or ())
-                       if segment.get("segment_kind") == "governed_bridge"
-                       and not segment.get("has_realization_revision"))
+        for segment in rejection.get("evidence") or ():
+            if segment.get("segment_kind") != "governed_bridge":
+                continue
+            state = states.get(str(segment.get("bridge_fact_key") or ""),
+                               REALIZATION_UNKNOWN if not segment.get("has_realization_revision")
+                               else REALIZATION_ATTACHED)
+            if state == REALIZATION_ATTACHED:
+                continue        # nothing is missing here; this segment is not somebody's demand
+            demands.append(_realization_gap(segment, recipe_revision_hash=recipe_revision_hash,
+                                            anchor=anchor, realization_state=state))
     demands.extend({"verdict": code, "anchor_catalog_source": anchor,
                     "recipe_revision_hash": recipe_revision_hash}
                    for code in _REJECTION_LEVEL_CAPACITY if code in codes)
     return demands
 
 
-def _realization_gap(segment: dict, *, recipe_revision_hash: str, anchor: str) -> dict:
+def _realization_gap(segment: dict, *, recipe_revision_hash: str, anchor: str,
+                     realization_state: str) -> dict:
     """One unrealized governed bridge, in the flat shape ``record_bridge_demand`` consumes.
 
     The POSITION is the near side — the catalog and table an engineer would build the realization
@@ -543,7 +712,7 @@ def _realization_gap(segment: dict, *, recipe_revision_hash: str, anchor: str) -
                        "from_catalog_source": str(segment.get("bridge_from_catalog_source") or ""),
                        "from_key_ref": near_ref,
                        "to_key_ref": far_ref,
-                       "realization_state": "no_executable_revision"}],
+                       "realization_state": realization_state}],
         "to_endpoint_hint": f"{far_catalog}::{far_ref}" if far_catalog and far_ref else "",
     }
 
@@ -595,8 +764,14 @@ def _param_divergence(request: FeaturePlanningRequestV1, hypothesis: str) -> lis
 
 __all__: list[str] = [
     "MAX_REQUESTS_PER_ITEM",
+    "PAYLOAD_UNREADABLE",
+    "REALIZATION_ATTACHED",
+    "REALIZATION_EXISTS_UNATTACHED",
+    "REALIZATION_NONE",
+    "REALIZATION_UNKNOWN",
     "STALE_REGISTRY",
     "UNRESOLVED_PLAN_CONTENT_HASH",
     "contract_level_demands",
+    "demands_for_rejection",
     "run_governed_telemetry_once",
 ]
