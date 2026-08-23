@@ -898,7 +898,9 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                          templates: Sequence[Template] | None = None,
                          generation_run_id: str | None = None,
                          scope: ConfirmedScope | None = None,
-                         actor_envelope=None) -> ConsideredSet:
+                         actor_envelope=None,
+                         telemetry_enabled: bool = False,
+                         v2_eligible_ids: frozenset[str] | None = None) -> ConsideredSet:
     """The semantic engine's validated alternatives; the anchor is the requester's own definition run
     through the same engine (definition mode only). Every option shown to the human has passed the
     typed gauntlet. Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot
@@ -931,6 +933,15 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
     (default ``ALL_TEMPLATES``) narrows the recipe registry the governed lens plans over (tests inject
     a fixture template); it never affects the single-catalog template lens.
 
+    ``telemetry_enabled`` / ``v2_eligible_ids`` (S1B-3) are the TELEMETRY PRODUCER's two inputs, both
+    resolved by the route (the builder never reads ``FEATUREGEN_INTENT_SHADOW_TELEMETRY``, exactly
+    like the shadow flags beside it). With telemetry on, an engine-served run persists ONE work item
+    carrying its FROZEN inputs — the eligible recipe references, this run's own intent requests, the
+    scope's stable shape, the C0 snapshot id and the redacted hypothesis — and plans NOTHING. The
+    replan happens off the request path in ``governed_telemetry_worker``. The served payload is
+    byte-identical on both sides of the flag and the enqueue costs a constant two statements; both
+    are pinned by ``test_gate1_telemetry_enqueue.py``.
+
     ``generation_run_id`` (Delivery C0 Task 5) — when the caller already minted a run (the scoped route
     reuses its generation run), the C0 metadata snapshot is anchored to it; otherwise, on a REPEATABLE
     READ feature-generation connection, a fresh ``fgr`` run is minted. Either way the snapshot lineage is
@@ -962,6 +973,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
     recipe_candidate_keys_by_recipe_id: dict[str, tuple[str, ...]] = {}
     binding_plan_by_candidate_key: dict[str, dict] = {}
     semantic_decision_facts: dict[str, dict] = {}
+    # S1B-3: the engine arm's own inputs to the telemetry work item. `engine_served` is what gates
+    # the enqueue — telemetry describes what the ONE engine did, and no other arm runs it.
+    engine_served = False
+    engine_intent_requests: tuple = ()
     if catalog_source is not None and scope is not None:
         # SE-7 — the ENFORCED projection: the recipe lens is served from the semantic engine
         # (frozen context → capability binder → eligibility fold → assembly → typed gauntlet),
@@ -1004,6 +1019,11 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                     confirmed_scope_hash=_confirmed_scope_hash(scope),
                     uoa_entity=getattr(scope, "uoa_entity", None))
                 all_candidates.extend(intent_cands)
+                # S1B-3: the typed requests the engine ALREADY built this run. Collected, never
+                # re-derived — an intent exists only in the run that proposed it, so the telemetry
+                # replan carries these bytes rather than dispatching a second provider call. An
+                # intent step that failed fail-soft above leaves the tuple empty, honestly.
+                engine_intent_requests = tuple(c.planning_request for c in intent_cands)
             except Exception:
                 logger.exception("engine intent generation failed "
                                  "(recipe lens serves alone)")
@@ -1068,6 +1088,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
             alternatives.append(FeatureSet(lens="actionable",
                                            features=projection.actionable_ideas))
         rejections.extend(projection.rejections)
+        engine_served = True
         logger.info(
             "engine served: ideas=%d rejections=%d grounded=%s",
             len(projection.ideas), len(projection.rejections),
@@ -1193,6 +1214,44 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
         conn, cs, intent, generation_run_id=generation_run_id, roles=roles,
         semantic_context=semantic_context,
         catalog_source=catalog_source, is_live=is_live)
+    # S1B-3 — the TELEMETRY PRODUCER. Persist ONE work item carrying this run's frozen inputs and
+    # plan NOTHING: the governed replan runs off the request path, against exactly what this run
+    # saw rather than against whatever the catalog looks like when a worker gets round to it.
+    #
+    # It sits HERE, after the C0 snapshot and before the considered-set INSERT, for two reasons a
+    # reader should not have to reconstruct: `snap_id` is the snapshot the set was authored against
+    # and does not EXIST inside the engine arm above (it is minted on this line); and `snap_run_id`
+    # is the run the snapshot helper actually bound to this intent, which is the run 1121's foreign
+    # key and lineage trigger will check against. Using the raw `generation_run_id` here would
+    # queue against a run that may never have been created.
+    #
+    # Fail-soft inside its own savepoint: telemetry is never worth a 500, and a refused work item
+    # (a lineage mismatch, a missing run) must not leave the request's transaction unusable.
+    if telemetry_enabled and engine_served and target_entity is not None and snap_run_id:
+        try:
+            from featuregen.overlay.upload.governed_observation_store import (
+                enqueue_governed_telemetry,
+            )
+            from featuregen.overlay.upload.governed_scope_material import (
+                frozen_telemetry_inputs,
+                governed_scope_material,
+            )
+
+            with conn.transaction():
+                enqueue_governed_telemetry(
+                    conn, generation_run_id=snap_run_id,
+                    intent_id=intent.intent_id,
+                    frozen_inputs=frozen_telemetry_inputs(
+                        v2_eligible_ids=v2_eligible_ids or frozenset(),
+                        intent_requests=engine_intent_requests,
+                        roles=roles, target_entity=target_entity,
+                        anchor_catalog_source=catalog_source,
+                        scope_material=governed_scope_material(
+                            conn, roles=roles, target_entity=target_entity),
+                        metadata_snapshot_id=snap_id,
+                        redacted_hypothesis=intent.redacted_hypothesis))
+        except Exception:
+            logger.exception("governed telemetry enqueue failed (fail-soft)")
     cs = _with_option_ids(cs, snap_run_id or f"legacy:{intent.intent_id}")
     revision_id, considered_hash = _persist_considered_revision(
         conn,

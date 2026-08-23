@@ -871,7 +871,16 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             # The confirmed scope the engine classifies against — with a catalog_source it is
             # what makes the engine's lens run at all.
             scope=scope,
-            actor_envelope=identity)
+            actor_envelope=identity,
+            # S1B-3: the governed telemetry PRODUCER. Read HERE — the same flag the shadow
+            # planner's persistence already reads below, and for the same reason: the builder
+            # stays pure and only acts on the boolean it is handed. Default OFF, so a deployment
+            # that has not opted in queues nothing and pays nothing.
+            telemetry_enabled=os.environ.get("FEATUREGEN_INTENT_SHADOW_TELEMETRY", "0") == "1",
+            # The V2 universe that was actually PLANNED — the same set the disposition lens
+            # reports on, never the legacy template registry. A telemetry item that froze a
+            # different universe would answer a question this run never asked.
+            v2_eligible_ids=disposition_applicability.eligible_ids)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
     except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered

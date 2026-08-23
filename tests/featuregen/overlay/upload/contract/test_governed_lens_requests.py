@@ -439,6 +439,78 @@ def test_a_dead_end_rejection_carries_the_typed_unmet_hops(db):
                         "realizers", "near_side_key_refs"}
 
 
+# ── S1B-3: the rejection's PLAN-LEVEL half (the second demand source's only carrier) ───────────
+
+
+def test_a_rejection_carries_the_best_plans_own_facts(db):
+    """S1B-3: a rejection is the ONLY thing a telemetry consumer gets back for a request that did
+    not resolve, so it must carry the plan-level facts an observation row needs — otherwise every
+    unresolved row records blanks and the programme's whole point (measuring what the platform
+    could NOT do) is unmeasurable.
+
+    The G3 case is the one that proves it: this refusal rides a path that RESOLVED source→target,
+    so it has no unmet hop at all — its entire evidence is the selected plan's own segments."""
+    _two_catalogs(db)
+    shipped = governed_requests_for_scope(db, eligible_recipe_ids=frozenset({RECIPE_ID}))
+    options, rejections = _options(db, shipped)
+    assert options == []
+    rejection = rejections[0]
+
+    # the request this rejection is ABOUT, unambiguously — two parameter variants of one recipe
+    # share both `recipe_id` and `request_hash`, so an adapter needs the request's own identity
+    assert rejection["planning_request_hash"] == planning_request_hash(shipped[0])
+
+    # the best plan's facts, as the ledger's columns spell them
+    assert rejection["anchor_catalog_source"] == "ops"
+    assert rejection["participating_catalogs"] == ["ops", "rev"]
+    assert rejection["bridge_count"] == 1
+    assert rejection["hop_count"] == 1
+    assert rejection["physical_plan_id"].startswith("bp_")
+    assert rejection["contract_id"].startswith("cc_")
+    assert rejection["reason_codes"][0] == ReasonCode.physical_cardinality_unavailable.value
+
+    # the evidence: the segments, JSON-native (no enums, no None) — and the governed bridge with
+    # NO realization revision, which is exactly the realization gap G3 names
+    kinds = [segment["segment_kind"] for segment in rejection["evidence"]]
+    assert kinds == ["direct_catalog", "semantic_rollup", "governed_bridge"]
+    bridge = rejection["evidence"][2]
+    assert bridge["bridge_fact_key"] == "bfk_s1a4b"
+    assert bridge["bridge_from_catalog_source"] == "ops"
+    assert bridge["bridge_from_object_ref"] == "public.transactions.account_id"
+    assert bridge["bridge_to_catalog_source"] == "rev"
+    assert bridge["bridge_to_object_ref"] == "public.accounts.account_id"
+    assert bridge["has_realization_revision"] is False
+    assert bridge["from_entity"] == "transaction" and bridge["to_entity"] == "account"
+    # the semantic hop beside it names the relationship the bridge realizes; the BRIDGE segment
+    # does not (the assembler stamps relationship ids on the rollup, not the crossing) — carried
+    # as the honest empty string rather than invented
+    assert rejection["evidence"][1]["relationship_id"] == "transaction_to_account"
+    assert bridge["relationship_id"] == ""
+    assert all(isinstance(value, str | bool | int)
+               for segment in rejection["evidence"] for value in segment.values())
+
+
+def test_a_planner_failure_rejection_still_carries_the_plan_level_keys(db):
+    """The fail-soft rejection (a planner exception) has no plan at all. It must still answer the
+    same keys — blank — so a consumer never has to branch on which rejection shape it holds."""
+    _two_catalogs(db)
+    shipped = governed_requests_for_scope(db, eligible_recipe_ids=frozenset({RECIPE_ID}))
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("planner exploded")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(lens, "plan_planning_request", _boom)
+        options, rejections = _options(db, shipped)
+    assert options == []
+    assert rejections[0]["reason"] == ReasonCode.planner_internal_error.value
+    assert rejections[0]["participating_catalogs"] == []
+    assert rejections[0]["anchor_catalog_source"] == ""
+    assert rejections[0]["evidence"] == []
+    assert rejections[0]["unmet_hops"] == []
+    assert rejections[0]["planning_request_hash"] == planning_request_hash(shipped[0])
+
+
 def test_the_annotating_fixtures_no_longer_compensate_for_g1():
     """The two fixtures above annotate roles onto the request by hand. After S1A-4c the projection
     reaches the SAME answer on its own, so what they add is now redundant rather than

@@ -587,8 +587,15 @@ def governed_options_from_requests(conn, *, requests: Sequence[FeaturePlanningRe
         except Exception:
             logger.exception("governed planning failed for request %s",
                              request.source_definition_id)
+            # The SAME key set as every other rejection, blank — a consumer must never branch on
+            # which rejection shape it is holding to find out whether a field exists.
             rejections.append({"lens": _LENS, "reason": ReasonCode.planner_internal_error.value,
-                               "recipe_id": request.source_definition_id})
+                               "recipe_id": request.source_definition_id,
+                               "request_hash": request.source_content_hash,
+                               "planning_request_hash": planning_request_hash(request),
+                               **_plan_facts(None),
+                               "reason_codes": [ReasonCode.planner_internal_error.value],
+                               "unmet_hops": []})
             continue
         plan = _selected_resolved_plan(result)
         envelope = plan_envelope_from_result(result) if plan is not None else None
@@ -645,6 +652,87 @@ def _rejection_reason(result: BindingPlanningResultV1) -> str:
     if cross:
         return cross[0].value
     return result.contract_result_status.value
+
+
+def _best_plan(result: BindingPlanningResultV1) -> BindingPlanV1 | None:
+    """The plan a rejection is ABOUT, under the SAME precedence :func:`_rejection_reason` uses.
+
+    Kept as its own function so the reason and the facts beside it can never come from two
+    different plans: the selected contract plan (the one whose contract refused), else the
+    fail-closed source→target REJECT, else the highest-tier candidate, else nothing at all — a
+    result with no candidates, or a planner failure, has no plan to describe."""
+    pid = result.selected_contract_physical_plan_id
+    if pid is not None:
+        selected = next((p for p in result.candidate_plans if p.physical_plan_id == pid), None)
+        if selected is not None:
+            return selected
+    rejected = next((p for p in result.candidate_plans
+                     if p.path_resolution_status
+                     is PathResolutionStatus.source_to_target_rejected), None)
+    if rejected is not None:
+        return rejected
+    return max(result.candidate_plans, key=lambda p: p.bridge_count, default=None)
+
+
+def _segment_evidence(plan: BindingPlanV1) -> list[dict]:
+    """The plan's ordered path segments, JSON-NATIVE — no enums, no ``None``, nothing a jsonb
+    column would have to be taught about.
+
+    This is the ONLY carrier for the contract-level realization demand. A ``physical_cardinality_
+    unavailable`` refusal rides a path that RESOLVED source→target, so it mints no rejected
+    candidate and has no unmet hop — the crossing that needs work is nameable ONLY from the
+    segments the resolved path actually used. ``has_realization_revision`` is the one derived
+    field: it is exactly the question the G3 boundary asks, and a consumer must not have to know
+    that ``bridge_realization_revision is None`` is what "not executable" looks like.
+
+    ``relationship_id`` / ``relationship_version`` are read from the segment and left as the empty
+    string when the assembler did not stamp them (measured: it stamps them on the semantic rollup,
+    not on the governed bridge that realizes it). Nothing here infers one segment's relationship
+    from its neighbour — an inferred crossing identity is a fabricated demand."""
+    return [{
+        "segment_kind": str(segment.segment_kind),
+        "catalog_source": segment.catalog_source or "",
+        "from_entity": segment.from_entity or "",
+        "to_entity": segment.to_entity or "",
+        "relationship_id": segment.relationship_id or "",
+        "relationship_version": segment.relationship_version or "",
+        "bridge_fact_key": segment.bridge_fact_key or "",
+        "realization_ref": segment.realization_ref or "",
+        "cardinality": str(segment.cardinality or ""),
+        "bridge_from_catalog_source": segment.bridge_from_catalog_source or "",
+        "bridge_from_object_ref": segment.bridge_from_object_ref or "",
+        "bridge_to_catalog_source": segment.bridge_to_catalog_source or "",
+        "bridge_to_object_ref": segment.bridge_to_object_ref or "",
+        "has_realization_revision": segment.bridge_realization_revision is not None,
+    } for segment in plan.path_segments]
+
+
+def _plan_facts(plan: BindingPlanV1 | None) -> dict:
+    """The best plan's own facts under the names ``governed_planning_observation`` spells them.
+
+    All-blank when there is no plan (a planner failure, an empty candidate set), so a consumer
+    never branches on which rejection shape it is holding. ``hop_count`` is the number of
+    AGGREGATION hops the contract compiled, which is the count a demand queue means by "hops"; the
+    path segment count includes the direct-catalog anchor and is not it."""
+    if plan is None:
+        return {"physical_plan_id": "", "contract_id": "", "anchor_catalog_source": "",
+                "participating_catalogs": [], "hop_count": 0, "bridge_count": 0,
+                "evidence": [], "reason_codes": []}
+    codes = [*(code.value for code in plan.contract_reason_codes),
+             *(code.value for code in plan.reason_codes)]
+    return {
+        "physical_plan_id": plan.physical_plan_id,
+        "contract_id": plan.contract_id or "",
+        # The catalog the path STARTS from — `plan.catalog_source` — which is what the ledger's
+        # `anchor_catalog_source` means and what S1B-1 asked the adapter to pass explicitly rather
+        # than let the store look up.
+        "anchor_catalog_source": plan.catalog_source or "",
+        "participating_catalogs": list(plan.participating_catalogs),
+        "hop_count": len(plan.hop_aggregations),
+        "bridge_count": plan.bridge_count,
+        "evidence": _segment_evidence(plan),
+        "reason_codes": list(dict.fromkeys(codes)),
+    }
 
 
 def _unmet_hop_demand(hop: UnmetHopV1) -> dict:
@@ -711,10 +799,20 @@ def _rejection(request: FeaturePlanningRequestV1, result: BindingPlanningResultV
             continue
         seen.add(marker)
         unmet.append(demand)
-    return {"lens": _LENS, "reason": _rejection_reason(result),
+    reason = _rejection_reason(result)
+    facts = _plan_facts(_best_plan(result))
+    # The headline leads the codes and is never duplicated inside them: a ledger row's
+    # `reason_codes[0]` is the answer to "why did this refuse?", and the rest is what else the
+    # plan observed on the way.
+    facts["reason_codes"] = [reason, *(c for c in facts["reason_codes"] if c != reason)]
+    return {"lens": _LENS, "reason": reason,
             "recipe_id": request.source_definition_id,
             "request_hash": request.source_content_hash,
-            "evidence": [], "unmet_hops": unmet}
+            # The REQUEST's own identity. `recipe_id` + `request_hash` are both definition-level:
+            # two parameter variants of one recipe agree on BOTH, so neither maps a rejection back
+            # to the request that produced it. This does.
+            "planning_request_hash": planning_request_hash(request),
+            **facts, "unmet_hops": unmet}
 
 
 # ── pass 2: ONE batch, then project ───────────────────────────────────────────────────────────
