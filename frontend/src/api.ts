@@ -4569,6 +4569,10 @@ export interface RunRailStage {
 
 export interface RunAuthoringRow {
   formula_draft_id: string
+  // BOTH halves of the candidate key: an option id is only meaningful inside the revision that
+  // froze it, and one run can hold several considered revisions — so two rows reading `o1` may be
+  // two different candidates with two different current answers.
+  considered_revision_id: string
   option_id: string
   // Two axes, never one field: state/rail_state is the immutable historical outcome, eligibility
   // is derived at read time from the retirement row.
@@ -4576,6 +4580,14 @@ export interface RunAuthoringRow {
   rail_state: string
   eligibility: 'current' | 'withdrawn'
   retirement_reason: string | null
+}
+
+// One candidate's CURRENT answer — an attempt row plus the one thing only the latest attempt can
+// say. `resolved: false` means the platform bought nothing for this candidate: every attempt
+// FAILED or was CANCELLED, and the most recent one is where it stands. The flag rides the current
+// reading alone, so a superseded attempt is never asked a question only the latest one answers.
+export interface RunAuthoringCurrent extends RunAuthoringRow {
+  resolved: boolean
 }
 
 export interface FeatureRunDetail {
@@ -4599,7 +4611,11 @@ export interface FeatureRunDetail {
     // Nothing can write a binding in the foundation, so this is always empty today.
     bind_selections: unknown[]
   }
-  authoring: RunAuthoringRow[]
+  // TWO READINGS of the same drafts, never one list: since migration 1107 a governed retry writes
+  // a second draft against the same formula identity, so a candidate can hold BOTH a failure and
+  // the answer that replaced it. `current` is where each candidate stands now (one row per
+  // candidate); `history` is every attempt, in the order they were requested.
+  authoring: { current: RunAuthoringCurrent[]; history: RunAuthoringRow[] }
   rail: RunRailStage[]
 }
 

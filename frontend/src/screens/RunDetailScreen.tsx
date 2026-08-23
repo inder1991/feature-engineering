@@ -17,12 +17,20 @@
 // authoring table below is the one place both axes are visible, and it renders each row's stored
 // tokens as they are rather than rewriting a withdrawn draft into a failure it never was.
 //
+// **AND TWO READINGS, NEVER ONE LIST** (spec §R4.4.1). Since migration 1107 a governed retry writes
+// a second draft against the same formula identity, so a candidate can hold BOTH a failure and the
+// answer that replaced it. The table renders the whole ATTEMPT HISTORY — nothing is hidden, because
+// what was tried is part of the record — and marks the row that is each candidate's CURRENT answer.
+// The server decides which that is; this screen only says which rows it named, and never folds a
+// second opinion of its own out of the states in the table.
+//
 // **HONEST ABSENCE.** A pre-spine run has no identity record, an unnamed run has no name, and a
 // run with no chosen candidates has no milestones. Each says so; none is filled in.
 import { useEffect, useState } from 'react'
 import {
   ApiError,
   type FeatureRunDetail,
+  type RunAuthoringCurrent,
   type RunAuthoringRow,
   type RunRailStage,
   getFeatureRunDetail,
@@ -127,6 +135,12 @@ export function RunDetailScreen({ runId }: { runId: string }) {
         Loading run…
       </p>
     )
+
+  // WHICH attempt is a candidate's current answer is the SERVER's fold (it alone knows the money
+  // guard's rule and the candidate key); this is only a lookup of the list it sent, by draft id. A
+  // client that re-derived "current" from the states in the table would be a second opinion, and
+  // two folds of one question is how the rail and the table start disagreeing.
+  const currentAnswers = new Map(run.authoring.current.map(row => [row.formula_draft_id, row]))
 
   return (
     <section className="panel" aria-label="Feature run">
@@ -245,14 +259,16 @@ export function RunDetailScreen({ runId }: { runId: string }) {
       </p>
 
       <h3 className="run-section">Authoring</h3>
-      {run.authoring.length === 0 ? (
+      {run.authoring.history.length === 0 ? (
         <p className="hint">No formula drafts are recorded for this run.</p>
       ) : (
         <>
           <p className="hint">
-            Two axes, never one. Outcome is what happened and never changes; eligibility is read
-            now — a succeeded draft can still have been withdrawn, and the stage rail above folds
-            the outcome axis alone.
+            Every attempt, in the order it was requested. Two axes, never one: outcome is what
+            happened and never changes; eligibility is read now — a succeeded draft can still have
+            been withdrawn. And two readings, never one: the row marked as a candidate&rsquo;s
+            current answer is where that candidate stands, while the rest are the attempts that got
+            it there. The stage rail above folds the current answers alone.
           </p>
           <table>
             <thead>
@@ -262,11 +278,16 @@ export function RunDetailScreen({ runId }: { runId: string }) {
                 <th>State</th>
                 <th>Outcome</th>
                 <th>Eligibility</th>
+                <th>Reading</th>
               </tr>
             </thead>
             <tbody>
-              {run.authoring.map(row => (
-                <AuthoringRow key={row.formula_draft_id} row={row} />
+              {run.authoring.history.map(row => (
+                <AuthoringRow
+                  key={row.formula_draft_id}
+                  row={row}
+                  current={currentAnswers.get(row.formula_draft_id)}
+                />
               ))}
             </tbody>
           </table>
@@ -292,11 +313,21 @@ function RailRow({ stage }: { stage: RunRailStage }) {
   )
 }
 
-function AuthoringRow({ row }: { row: RunAuthoringRow }) {
+// One attempt. `current` is the server's row for this draft when this draft IS its candidate's
+// current answer, and undefined when it is an earlier attempt — the distinction the whole §R4.4.1
+// split exists to make, so it is carried as presence/absence rather than as a boolean nobody can
+// trace back to a row.
+function AuthoringRow({ row, current }: { row: RunAuthoringRow; current?: RunAuthoringCurrent }) {
   return (
-    <tr>
+    <tr className={current ? 'attempt-current' : 'attempt-earlier'}>
       <td className="mono">{row.formula_draft_id}</td>
-      <td className="mono">{row.option_id}</td>
+      <td className="mono">
+        {/* The candidate is the PAIR. The option id is what a person chose, so it leads; the
+            considered revision is what makes it a candidate, and two rows reading `o1` under
+            different revisions are not the same candidate. */}
+        <span>{row.option_id}</span>
+        <div className="stage-detail">{row.considered_revision_id}</div>
+      </td>
       <td className="mono">{row.state}</td>
       <td className="mono">{row.rail_state}</td>
       <td>
@@ -308,6 +339,19 @@ function AuthoringRow({ row }: { row: RunAuthoringRow }) {
           </span>
         ) : (
           <span className="badge ok">Current</span>
+        )}
+      </td>
+      <td>
+        {current === undefined ? (
+          // Not a failure and not a demotion: an attempt a later one superseded. It stays on the
+          // record, quietly, because what was tried is part of what happened.
+          <span className="stage-detail">Earlier attempt</span>
+        ) : current.resolved ? (
+          <span className="badge ok">Current answer</span>
+        ) : (
+          // The candidate's latest word, and it bought nothing — every attempt failed or was
+          // cancelled. Saying "current answer" here would report a purchase that never happened.
+          <span className="badge held">Current — no answer bought</span>
         )}
       </td>
     </tr>

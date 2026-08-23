@@ -8231,3 +8231,19 @@ button.stat:hover {
     to { opacity: 1; transform: none; }
   }
 }
+
+/* ---------------------------------------------------------------- run authoring: two readings
+   Appended for RunDetailScreen's attempt history (spec §R4.4.1). Migration 1107 lets a governed
+   retry write a second draft against the same formula identity, so the table shows EVERY attempt
+   and the server names which one is each candidate's current answer. That row is the primary one;
+   the attempts it superseded recede. Weight and ink only — the Reading cell always carries the
+   words ("Current answer" / "Earlier attempt"), so neither colour nor weight ever works alone.
+   Composes the existing table / .badge / .stage-detail vocabulary; nothing above this line is
+   modified. */
+.attempt-current > td {
+  font-weight: 600;
+}
+
+.attempt-earlier > td {
+  color: var(--ink-soft);
+}

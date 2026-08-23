@@ -16,8 +16,14 @@ const getFeatureRunDetail = vi.mocked(api.getFeatureRunDetail)
 
 const RUN_ID = 'grun_01M02SAZQQQQ'
 
-// The brief's payload, verbatim: a run whose only draft SUCCEEDED and was then withdrawn (the
-// §6.7 two-axis case), and a rail carrying one worked stage plus two sockets with their reasons.
+// A run whose only draft SUCCEEDED and was then withdrawn (the §6.7 two-axis case), and a rail
+// carrying one worked stage plus two sockets with their reasons. One attempt, so it is also its
+// candidate's current answer — the shape every run had before 1107 made a second attempt possible.
+const DRAFT_1: api.RunAuthoringRow = {
+  formula_draft_id: 'd1', considered_revision_id: 'c', option_id: 'o1', state: 'READY',
+  rail_state: 'SUCCEEDED', eligibility: 'withdrawn', retirement_reason: 'CANDIDATE_SUPERSEDED',
+}
+
 const DETAIL: api.FeatureRunDetail = {
   generation_run_id: RUN_ID, pre_spine: false, owner_subject: 'priya',
   display_name: null, description: null,
@@ -28,11 +34,7 @@ const DETAIL: api.FeatureRunDetail = {
       { option_id: 'o1', considered_revision_id: 'c', chosen_at: '2026-08-23T00:00:00+00:00' }],
     bind_selections: [],
   },
-  authoring: [{
-    formula_draft_id: 'd1', option_id: 'o1', state: 'READY',
-    rail_state: 'SUCCEEDED', eligibility: 'withdrawn',
-    retirement_reason: 'CANDIDATE_SUPERSEDED',
-  }],
+  authoring: { current: [{ ...DRAFT_1, resolved: true }], history: [DRAFT_1] },
   rail: [
     { stage: 'CHOOSE_CANDIDATES', state: 'SUCCEEDED', reason_code: null },
     { stage: 'GENERATE_PREVIEW', state: 'UNAVAILABLE',
@@ -101,10 +103,66 @@ it('keeps the outcome axis intact on a draft the eligibility axis calls withdraw
   expect(within(draft).getByText('Withdrawn — CANDIDATE_SUPERSEDED')).toBeInTheDocument()
 })
 
+// A candidate retried after a failure — the shape migration 1107 made possible (the money guard
+// covers ANSWERS, so a failed draft stops holding the identity slot and a governed retry can write
+// a second draft against it). Both attempts are real rows; only one is where the candidate stands.
+const ATTEMPT_FAILED: api.RunAuthoringRow = {
+  formula_draft_id: 'd0', considered_revision_id: 'c', option_id: 'o1', state: 'FAILED',
+  rail_state: 'FAILED', eligibility: 'current', retirement_reason: null,
+}
+const ATTEMPT_READY: api.RunAuthoringRow = {
+  ...DRAFT_1, formula_draft_id: 'd2', eligibility: 'current', retirement_reason: null,
+}
+
+it('shows every attempt and marks the one that is the candidate’s current answer', async () => {
+  getFeatureRunDetail.mockResolvedValue({
+    ...DETAIL,
+    authoring: {
+      current: [{ ...ATTEMPT_READY, resolved: true }],
+      history: [ATTEMPT_FAILED, ATTEMPT_READY],
+    },
+  })
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('d2')).toBeInTheDocument())
+
+  // NOTHING IS HIDDEN. The failure that was retried past stays on the record with its own two
+  // axes — a screen that showed only the current answer would erase what the platform actually
+  // did, and the attempt is what an operator quotes when they ask why a retry was approved.
+  const earlier = rowOf('d0')
+  expect(within(earlier).getAllByText('FAILED')).toHaveLength(2)   // state + outcome, both stored
+  expect(within(earlier).getByText('Earlier attempt')).toBeInTheDocument()
+  expect(earlier).toHaveClass('attempt-earlier')
+  expect(within(earlier).queryByText('Current answer')).toBeNull()
+
+  // ...and the record says which of the two is where the candidate STANDS. The server decided
+  // that; this screen renders the row it named and folds no second opinion out of the states.
+  const answer = rowOf('d2')
+  expect(within(answer).getByText('Current answer')).toBeInTheDocument()
+  expect(answer).toHaveClass('attempt-current')
+})
+
+it('never calls the latest attempt an answer when the platform bought nothing', async () => {
+  getFeatureRunDetail.mockResolvedValue({
+    ...DETAIL,
+    authoring: {
+      current: [{ ...ATTEMPT_FAILED, resolved: false }],
+      history: [ATTEMPT_FAILED],
+    },
+  })
+  render(<RunDetailScreen runId={RUN_ID} />)
+
+  // `resolved: false` is the candidate standing on nothing: every attempt failed or was cancelled.
+  // The row is still the current reading — an empty one would read as "never tried".
+  await waitFor(() => expect(screen.getByText(/no answer bought/)).toBeInTheDocument())
+  expect(rowOf('d0')).toHaveClass('attempt-current')
+  expect(screen.queryByText('Current answer')).toBeNull()
+})
+
 it('renders a pre-spine run as an honest gap in the record, not as a failure', async () => {
   getFeatureRunDetail.mockResolvedValue({
     ...DETAIL, pre_spine: true, identity: null, display_name: null, owner_subject: null,
-    intent: null, authoring: [], milestones: { choose_candidates: [], bind_selections: [] },
+    intent: null, authoring: { current: [], history: [] },
+    milestones: { choose_candidates: [], bind_selections: [] },
   })
   render(<RunDetailScreen runId="fgr_legacy01" />)
 

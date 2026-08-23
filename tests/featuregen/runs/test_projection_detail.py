@@ -18,24 +18,29 @@ _DRAFT_STATES = {"REQUESTED", "AUTHORING", "CRITIC_REVIEW", "VALIDATING",
                  "ADMISSION", "READY", "BLOCKED", "FAILED", "CANCELLED"}  # 1090's CHECK, verbatim
 
 
-def _seed_draft(db, considered_revision_id, draft_id, option_id, state):
+def _seed_draft(db, considered_revision_id, draft_id, option_id, state, *,
+                identity=None, at="2026-08-23T00:00:00Z"):
     """One `formula_draft` in `state`, satisfying 1090's state-dependent CHECKs.
 
     Three of them bite: READY must carry a real formula (`{}` is refused explicitly), BLOCKED must
     name at least one blocker, and `failure_reason` must be present for FAILED and absent for
-    everything else. `requested_at` is TEXT in 1090, not timestamptz."""
+    everything else. `requested_at` is TEXT in 1090, not timestamptz.
+
+    `identity` defaults to one per draft — the shape every test wanted while 1090's unique index
+    covered every row. A RETRY seeds two drafts with the SAME identity, which 1107 permits exactly
+    when the earlier one bought nothing (FAILED/CANCELLED are outside its partial index), and `at`
+    is what orders the attempts."""
     db.execute(
         "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
         "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, definition_revision, "
         "formula_identity_hash, state, formula_content_hash, formula_json, blockers, "
         "failure_reason, requested_by, requested_at) "
-        "VALUES (%s, %s, %s, 'p', 'c', 'a', '', %s, %s, %s, %s, %s, %s, 'u1', "
-        "'2026-08-23T00:00:00Z')",
-        (draft_id, considered_revision_id, option_id, f"fih-{draft_id}", state,
+        "VALUES (%s, %s, %s, 'p', 'c', 'a', '', %s, %s, %s, %s, %s, %s, 'u1', %s)",
+        (draft_id, considered_revision_id, option_id, identity or f"fih-{draft_id}", state,
          "fch" if state == "READY" else None,
          Jsonb({"op": "sum"}) if state == "READY" else None,
          Jsonb([{"code": "X"}] if state == "BLOCKED" else []),
-         "boom" if state == "FAILED" else None))
+         "boom" if state == "FAILED" else None, at))
 
 
 def _seed_retired_ready_draft(db, run_id):
@@ -107,7 +112,7 @@ def test_detail_shows_sockets_and_two_axes(db, generation_on, sandbox_switches_o
     _seed_retired_ready_draft(db, "rd-a")
     _drop_the_pin(db)
     out = run_detail(db, _ADMIN, "rd-a")
-    d = out["authoring"][0]
+    d = out["authoring"]["history"][0]
     assert d["rail_state"] == "SUCCEEDED" and d["eligibility"] == "withdrawn"   # two axes, §6.7
     assert d["state"] == "READY" and d["retirement_reason"] == "CANDIDATE_SUPERSEDED"
     by_stage = _rail(out)
@@ -251,6 +256,9 @@ def test_milestones_and_identity_are_derived_from_evidence(db):
     assert empty["milestones"]["choose_candidates"] == []
     assert _rail(empty)["CHOOSE_CANDIDATES"]["state"] == "NOT_STARTED"
     assert _rail(empty)["AUTHOR_FORMULA"]["state"] == "NOT_STARTED"   # no drafts yet
+    # Both readings exist even with nothing to read: a run with no drafts has no attempts AND no
+    # current answer, and the two empty lists say so without the client testing for a missing key.
+    assert empty["authoring"] == {"current": [], "history": []}
     # No `feature_run_identity` row: the chain is seeded but Task 4's writer never ran.
     assert empty["pre_spine"] is True and empty["identity"] is None
     assert empty["intent"] == {"intent_id": c["intent_id"], "hypothesis": "h"}
@@ -300,13 +308,104 @@ def test_author_formula_folds_worst_of_never_alphabetical(db):
     assert _rail(out)["AUTHOR_FORMULA"]["state"] == "IN_PROGRESS"
     # Neither draft was retired: eligibility is the OTHER axis and reports `current` regardless of
     # how bad the outcome axis reads.
-    assert [d["eligibility"] for d in out["authoring"]] == ["current", "current"]
-    assert [d["retirement_reason"] for d in out["authoring"]] == [None, None]
+    assert [d["eligibility"] for d in out["authoring"]["history"]] == ["current", "current"]
+    assert [d["retirement_reason"] for d in out["authoring"]["history"]] == [None, None]
 
     c2 = seed_run_chain(db, run_id="rd-x")
     _seed_draft(db, c2["considered_revision_id"], "rd-x-d1", "o1", "READY")
     _seed_draft(db, c2["considered_revision_id"], "rd-x-d2", "o2", "BLOCKED")
     assert _rail(run_detail(db, _ADMIN, "rd-x"))["AUTHOR_FORMULA"]["state"] == "BLOCKED"
+
+
+def test_a_failed_attempt_is_history_and_the_retry_is_the_current_answer(db):
+    """The 1107 world, read back: many drafts per identity, so ATTEMPT and ANSWER are two readings.
+
+    1090's money guard covered every row, so one identity meant one draft and a fold over "the
+    drafts" and a fold over "the answers" were the same fold. 1107 narrowed the index to
+    `state NOT IN ('FAILED','CANCELLED')` — a failure bought nothing and must not hold the slot —
+    so a governed retry now writes a SECOND row against the same identity and the two folds part
+    company.
+
+    ▲ THE MUTATION THIS KILLS: the rail folding `history` instead of `current` answers FAILED here,
+    which is the run reporting a stage as broken while its actual answer is a formula. The failed
+    attempt is not deleted or rewritten — it is history, and history is the other reading.
+    """
+    c = seed_run_chain(db, run_id="rd-h")
+    _seed_draft(db, c["considered_revision_id"], "rd-h-d1", "o1", "FAILED",
+                identity="rd-h-identity", at="2026-08-23T00:00:01Z")
+    _seed_draft(db, c["considered_revision_id"], "rd-h-d2", "o1", "READY",
+                identity="rd-h-identity", at="2026-08-23T00:00:02Z")
+    out = run_detail(db, _ADMIN, "rd-h")
+
+    assert [(r["formula_draft_id"], r["state"], r["rail_state"])
+            for r in out["authoring"]["history"]] == [
+        ("rd-h-d1", "FAILED", "FAILED"), ("rd-h-d2", "READY", "SUCCEEDED")]
+    # The current answer is the one row that HOLDS the identity slot, and `resolved` says the
+    # platform actually bought something. Both halves of the candidate key ride each row: the
+    # option id alone is not the candidate.
+    assert out["authoring"]["current"] == [{
+        "formula_draft_id": "rd-h-d2", "considered_revision_id": c["considered_revision_id"],
+        "option_id": "o1", "state": "READY", "rail_state": "SUCCEEDED",
+        "eligibility": "current", "retirement_reason": None, "resolved": True}]
+    assert _rail(out)["AUTHOR_FORMULA"]["state"] == "SUCCEEDED"
+    # `resolved` belongs to the CURRENT reading only. Stamping it onto every history row would
+    # invite a reader to ask of a superseded attempt a question only the latest one answers.
+    assert all("resolved" not in r for r in out["authoring"]["history"])
+
+
+def test_a_candidate_whose_every_attempt_bought_nothing_still_has_a_current_reading(db):
+    """No answer is not the same as no attempt (spec §R4.4.1).
+
+    With every draft for a candidate FAILED or CANCELLED, nothing holds the identity slot — and a
+    `current` reading built from slot-holders alone would be EMPTY, which folds the rail to
+    NOT_STARTED and tells a person the platform never tried. It tried twice. The most recent
+    terminal attempt is therefore the current reading, flagged `resolved: False`: this is where the
+    candidate stands, and it stands on nothing bought.
+    """
+    c = seed_run_chain(db, run_id="rd-n")
+    _seed_draft(db, c["considered_revision_id"], "rd-n-d1", "o1", "FAILED",
+                identity="rd-n-identity", at="2026-08-23T00:00:01Z")
+    _seed_draft(db, c["considered_revision_id"], "rd-n-d2", "o1", "CANCELLED",
+                identity="rd-n-identity", at="2026-08-23T00:00:02Z")
+    out = run_detail(db, _ADMIN, "rd-n")
+
+    assert [r["formula_draft_id"] for r in out["authoring"]["history"]] == ["rd-n-d1", "rd-n-d2"]
+    assert [(r["formula_draft_id"], r["state"], r["resolved"])
+            for r in out["authoring"]["current"]] == [("rd-n-d2", "CANCELLED", False)]
+    assert _rail(out)["AUTHOR_FORMULA"]["state"] == "CANCELLED"
+
+
+def test_the_current_reading_is_per_candidate_and_the_rail_folds_only_those(db):
+    """The grouping key is the CANDIDATE — `(considered_revision_id, option_id)` — not the run.
+
+    Two candidates, each retried once. Every naive fold gets this wrong in a different direction: a
+    fold over the whole history answers FAILED (both attempts that failed are still on the record);
+    a fold over the FIRST row per candidate answers FAILED too; a fold that grouped by run alone
+    would report ONE answer for a run that has two candidates and two.
+
+    ▲ THE IDS SORT BACKWARDS on purpose. `requested_at` is the attempt order and the draft id is
+    only the tie-breaker, so these four ids are lexically the REVERSE of the order they were asked
+    for. The old `ORDER BY d.formula_draft_id` then fails twice over: the history reads inside out,
+    and "latest per candidate" picks the two failures — a rail reading FAILED over a run whose
+    candidates are done and in flight.
+    """
+    c = seed_run_chain(db, run_id="rd-g")
+    ccr = c["considered_revision_id"]
+    _seed_draft(db, ccr, "rd-g-z1", "o1", "FAILED", identity="rd-g-i1", at="2026-08-23T00:00:01Z")
+    _seed_draft(db, ccr, "rd-g-y2", "o2", "FAILED", identity="rd-g-i2", at="2026-08-23T00:00:02Z")
+    _seed_draft(db, ccr, "rd-g-b3", "o1", "READY", identity="rd-g-i1", at="2026-08-23T00:00:03Z")
+    _seed_draft(db, ccr, "rd-g-a4", "o2", "REQUESTED", identity="rd-g-i2",
+                at="2026-08-23T00:00:04Z")
+    out = run_detail(db, _ADMIN, "rd-g")
+
+    # History is every attempt in the order they were REQUESTED, interleaved across candidates.
+    assert [r["formula_draft_id"] for r in out["authoring"]["history"]] == [
+        "rd-g-z1", "rd-g-y2", "rd-g-b3", "rd-g-a4"]
+    assert [(r["option_id"], r["formula_draft_id"], r["resolved"])
+            for r in out["authoring"]["current"]] == [
+        ("o1", "rd-g-b3", True), ("o2", "rd-g-a4", True)]
+    # Worst-of over the CURRENT answers: one candidate is done, the other is still being authored.
+    assert _rail(out)["AUTHOR_FORMULA"]["state"] == "IN_PROGRESS"
 
 
 def test_owner_sees_their_own_run(db):

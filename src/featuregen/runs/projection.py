@@ -90,6 +90,12 @@ RAIL_FROM_DRAFT_STATE = {
 #: sorting to an arbitrary place.
 _AUTHOR_SEVERITY = ["BLOCKED", "FAILED", "IN_PROGRESS", "CANCELLED", "SUCCEEDED"]
 
+#: The two draft states 1107's money guard EXCLUDES, spelled the way the index spells them. A draft
+#: in either one BOUGHT NOTHING — it holds no identity slot, and a governed retry (spec §R4.2) may
+#: write another draft against the same identity. Every other state is an ANSWER or a purchase in
+#: flight, and 1107 guarantees at most one of those per identity.
+_BOUGHT_NOTHING = ("FAILED", "CANCELLED")
+
 #: The TWO sockets that are still literal (spec §7): stages whose machinery genuinely does not
 #: exist, each labelled with WHY. Not "not started" — that is reserved for stages that could
 #: actually run.
@@ -205,6 +211,50 @@ def _production_stage(action: ActionV1) -> dict:
     return {"stage": str(action), "state": "NOT_STARTED", "reason_code": None}
 
 
+def _current_by_candidate(history: list[dict]) -> list[dict]:
+    """The CURRENT answer per candidate, folded from the attempt history (spec §R4.4.1).
+
+    THE PREMISE. Migration 1107 narrowed the money guard to `state NOT IN ('FAILED','CANCELLED')`,
+    so one formula identity can now carry many drafts: a failure bought nothing and must not hold
+    the slot for ever. "What happened to this candidate" and "where does this candidate stand" were
+    the same question while one identity meant one row; since 1107 they are two, and answering the
+    second with the first reports a run as broken while its actual answer is a formula.
+
+    THE CANDIDATE, not the identity, is the grouping key — `(considered_revision_id, option_id)`,
+    1090's own subject (parent §0.1.4). An identity also folds the planning request, the snapshot,
+    the authoring configuration and the definition revision, so ONE candidate can legitimately hold
+    several identities: edit the definition and the next draft is a different identity for the same
+    candidate. A person reads the candidate they chose, so that is what is folded.
+
+    THE RULE, in the order the states earn it:
+
+      * an ANSWER (or a purchase in flight) is the current reading — READY, BLOCKED, or any live
+        state. 1107 guarantees at most one per IDENTITY; per candidate the latest one wins, because
+        a second identity for the same candidate is a later question about it;
+      * otherwise the most recent attempt stands, flagged ``resolved=False``. Nothing was bought,
+        and that is exactly what a person needs to see: an empty current reading here would fold
+        the rail to NOT_STARTED and tell them the platform never tried.
+
+    ``resolved`` rides the CURRENT rows only. On a history row it would invite the reader to ask of
+    a superseded attempt a question only the latest one answers.
+
+    Never raises: this is a read-only projection, and a candidate that somehow held two live drafts
+    must still render. `history` arrives in requested order, so "latest" is simply "last seen".
+    """
+    current: dict[tuple[str, str], dict] = {}
+    for row in history:
+        key = (row["considered_revision_id"], row["option_id"])
+        resolved = row["state"] not in _BOUGHT_NOTHING
+        held = current.get(key)
+        # A copy, never the history row itself: `resolved` must not leak back into the other
+        # reading, and the two lists are serialized independently.
+        if held is None or resolved or not held["resolved"]:
+            current[key] = {**row, "resolved": resolved}
+    # Insertion order — candidates in the order their first attempt was requested. Deterministic,
+    # and it matches the order the same candidates appear in the history table above it.
+    return list(current.values())
+
+
 def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     """One run, projected from the stores that already hold the evidence (spec §12).
 
@@ -214,6 +264,10 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
 
     Current state, not a fabricated timeline (spec §6.6): every field is read now, and nothing is
     reconstructed from what a row must once have been.
+
+    `authoring` is TWO READINGS of the same rows (spec §R4.4.1) — `{"current": [...],
+    "history": [...]}` — because since migration 1107 a candidate can hold both a failure and the
+    answer that replaced it. See `_current_by_candidate` for which row is which and why.
 
     `visibility_where`'s params bind AT THE SPLICE POINT, which here is SECOND — after the run id.
     The fragment is parenthesized on splice (its own invariant): today's single comparison binds
@@ -245,30 +299,48 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     # considered revision is what ties one to this run (1090's subject is a candidate, parent
     # §0.1.4). The LEFT JOIN to the retirement is the eligibility axis — an absent row is the
     # honest "still current", not a missing value.
+    #
+    # ORDERED BY `requested_at`, which is the ATTEMPT order — the order a person lived through and
+    # the order `_current_by_candidate` folds. It was `formula_draft_id` while one identity meant
+    # one row and the order carried no meaning; since 1107 it does. The column is TEXT in 1090, so
+    # this is a lexical sort, and it is chronological because every writer stores one spelling of
+    # the database's own clock (`str(SELECT now())`) — a cast to timestamptz would be the wrong
+    # kind of strict here, raising out of a read-only projection on one malformed legacy value.
+    # The draft id tie-breaks, so the order is total and stable rather than the planner's whim.
     drafts = conn.execute(
-        """SELECT d.formula_draft_id, d.option_id, d.state, r.reason
+        """SELECT d.formula_draft_id, d.considered_revision_id, d.option_id, d.state, r.reason
            FROM formula_draft d
            JOIN contract_considered_revision ccr
              ON ccr.considered_revision_id = d.considered_revision_id
            LEFT JOIN formula_draft_retirement r USING (formula_draft_id)
-           WHERE ccr.generation_run_id = %s ORDER BY d.formula_draft_id""",
+           WHERE ccr.generation_run_id = %s
+           ORDER BY d.requested_at, d.formula_draft_id""",
         (run_id,)).fetchall()
     # Two axes, never one field (spec §6.7): `state`/`rail_state` is the immutable historical
     # outcome, `eligibility` is derived at read time. Rewriting a succeeded-then-retired draft to
     # BLOCKED would destroy the history; dropping the retirement would leave an unusable output
     # looking current.
-    authoring = [{
-        "formula_draft_id": fid, "option_id": opt, "state": state,
-        "rail_state": RAIL_FROM_DRAFT_STATE[state],
+    #
+    # BOTH HALVES OF THE CANDIDATE KEY ride each row. The option id alone is not a candidate — it is
+    # only meaningful inside the revision that froze it (1090's own words), and a run can hold
+    # several considered revisions, so two rows reading `o1` may be two different candidates with
+    # two different current answers.
+    history = [{
+        "formula_draft_id": fid, "considered_revision_id": ccr_of, "option_id": opt,
+        "state": state, "rail_state": RAIL_FROM_DRAFT_STATE[state],
         "eligibility": "withdrawn" if reason else "current",
         "retirement_reason": reason,
-    } for fid, opt, state, reason in drafts]
+    } for fid, ccr_of, opt, state, reason in drafts]
+    current = _current_by_candidate(history)
     rail = [
         {"stage": "CHOOSE_CANDIDATES",
          "state": "SUCCEEDED" if choices else "NOT_STARTED", "reason_code": None},
+        # Worst-of over the CURRENT answers, never over the history (spec §R4.4.1). Folding every
+        # attempt lets a failure that has already been retried past shadow the formula that
+        # replaced it — the rail would report a broken stage over a candidate that is done.
         {"stage": "AUTHOR_FORMULA",
-         "state": (min((d["rail_state"] for d in authoring), key=_AUTHOR_SEVERITY.index)
-                   if authoring else "NOT_STARTED"),
+         "state": (min((d["rail_state"] for d in current), key=_AUTHOR_SEVERITY.index)
+                   if current else "NOT_STARTED"),
          "reason_code": None},
         # Nothing can write a binding in the foundation, so this milestone has no evidence to read.
         {"stage": "BIND_SELECTIONS", "state": "NOT_STARTED", "reason_code": None},
@@ -294,6 +366,9 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
             "choose_candidates": [{"option_id": o, "considered_revision_id": c,
                                    "chosen_at": t.isoformat()} for o, c, t in choices],
             "bind_selections": []},
-        "authoring": authoring,
+        # TWO READINGS, both stated (spec §R4.4.1): where each candidate stands now, and every
+        # attempt that got it there. A single list cannot be both — since 1107 a candidate can have
+        # a failure AND an answer, and which one a reader wants depends on the question they asked.
+        "authoring": {"current": current, "history": history},
         "rail": rail,
     }
