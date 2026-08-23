@@ -785,6 +785,18 @@ claim 295 previews — see §0.
 
 ### Step 4 (CHILD) — recipe formula routing
 
+▲ **STATUS 2026-08-23 — 4a is DONE and 4b is WIRED, POSTURE OFF.** The facts assembler
+(`formula_strategy_facts.py`) reads the per-option decision row with the frozen idea as honest
+fallback, probes each registry PER GENERATION (never the union — two of three reviewed recipes are
+Formula V1), normalizes the three origin vocabularies once, and the route resolves BEFORE the draft
+identity exists, persisting `formula_draft_authoring_plan` in the request transaction. The worker
+dispatches by the STORED plan and the reviewed lane's rebuild — derive, verify against the pinned
+bytes, bind, hand `run_authoring_v2_replay` the bound object — is implemented and tested behind an
+injectable context loader. ▲ **What is deliberately NOT on:** the candidate's grounding context is a
+serving-time product nothing persists to draft time, so the resolver routes reviewed candidates to
+the LLM with `REVIEWED_LANE_UNAVAILABLE` recorded. **The successor increment is context persistence
+plus a posture flip — a loader and a flag, never a re-derivation of this routing.**
+
 ▲ **MOVED TO STEP 2: the resolver and the authoring plan** (§3.1, §3.3, migration 1104) — P0-2. What
 remains at step 4 is everything that **reads** that contract: the two lanes, the worker dispatch, and
 the method override. Items 1, 2 and 7 of 4a below are therefore **built in step 2 and merely verified

@@ -81,6 +81,27 @@ three coupled ones — and the coupling was the defect.
 
 ---
 
+## ▲ Revision six — the owner's five-point ruling of 2026-08-23, EXECUTED
+
+Relayed by the run-spine session and implemented in full at the frozen SHA this section is committed
+beside. The five, with where each landed:
+
+| # | Ruling | Landed |
+|---|---|---|
+| 1 | server-owned authoring identity; fix the getattr-on-dict constant | **identity V2 ACTIVE** — the constant is DELETED, not fixed: a corrected copy beside the route's composition would be a second composition of one identity. §11.1.1's order completed: tombstones (1103) → strategy contract (1104, wired) → V1 recorded (1109) → V2 composed of `{identity_version, formula_strategy, strategy_identity_hash, provider_contract_hash iff LLM}`. Safe ONLY because 1103 moved retirement off the identity hash first |
+| 2 | recipe-first strategy resolution before identity, never a constant; deterministic when a reviewed V2 blueprint binds, LLM otherwise **with the reason recorded** | the facts assembler + resolver run in the request route; the plan row persists in the same transaction; the worker dispatches by the STORED plan. ▲ **THE LANE IS NOW ON — the posture-off premise was WRONG**: gate1's engine pass freezes every served recipe candidate's grounding context, per candidate key, into `considered_json["recipe_grounding_context_by_candidate_key"]`, so the worker binds against the SAME bytes the serving run bound with (`grounding_context_from_json` + the frozen-revision loader). Bindability is PER CANDIDATE from the same frozen source at both moments; a gap (legacy revision, ambiguous key, never-bound) routes LLM with `REVIEWED_LANE_UNAVAILABLE` recorded; a genuine bind failure surfaces at the WORKER as `REVIEWED_BLUEPRINT_NOT_EXECUTABLE`, where binding actually runs |
+| 3 | spend reservation at the PHYSICAL seam, bound to `dispatch_ref`, settled after egress, reconciled against `llm_dispatch_outcome`; envelopes sized against 5 | `AuditingClient.call` reserves in the SAME transaction as the dispatch row, refuses exhaustion as `PROVIDER_AUTH_ERROR` (fail closed, zero egress for the refused attempt), settles from provider-reported usage, and the tick's reconciler settles expired reservations FROM THE OUTCOME — `transport_failed` → zero explicitly, anything else → worst case, because assuming an unaccounted call was free buys its tokens twice. The owner's mixed retry+repair test exists |
+| 4 | full decision identity in 1106 | `decision_id` covers the ENTIRE canonical payload (member verdicts included), members are explicit even when clean, `ask()` takes no authorization id (a read-only preflight that writes is not a preflight), and the per-action evidence assembler is one function shared by route and worker |
+| 5 | durable decision FKs on the authoritative rows | migration **1108**: `generation_request.action_decision_revision_id`, NULLABLE deliberately (the running image writes that table — the 1095 lesson), the worker preferring the ROW over the payload. ▲ **The ratchet schedule, stated**: every expand-phase nullable governance column ratchets to NOT NULL in **1100b**, the contract migration, whose entry condition is that no pre-decision image can run — the worker's act-time refusal makes the nullable column a nullable COLUMN, never a nullable GATE, in the meantime |
+
+▲ **And 1107 legitimately un-blocks retry-after-terminal** (coordination with the run-spine spec):
+a terminal draft no longer holds the identity slot, and the re-attempt is gated per draft attempt on
+a regeneration exception bound to the exact identity plus a spend authorization — so the run-spine
+spec's withdrawn `AUTHOR_FORMULA /retry` premise ("retry is a button wired to a no-op") is now
+false, and the act is BLESSED as a revised-Stage-I candidate under exactly those gates.
+
+---
+
 ## ▲ Revision five — two independent reviews, folded
 
 Revision five folds **two** reviews conducted against `3c52a9de`: a second principal-architect pass
@@ -1298,6 +1319,13 @@ path — is the bypass, and it is the one that happens by default if nobody choo
 ## 8. Closing the bypasses
 
 ### 8.1 The empty default is a silent bypass
+
+▲ **CLOSED 2026-08-23.** All three signatures (`generate_v2`, `evaluate_verify`,
+`evaluate_publish_sandbox`) lost the default; the lane threads the carried blockers **from the
+request-time action decision it just rechecked** — one source, the same answer a person was shown;
+every remaining caller states an explicit empty tuple annotated as the claim it is; and a signature
+pin (`test_THE_ACTIVATION_BLOCKERS_HAVE_NO_DEFAULT_anywhere`) names any function that regains a
+default.
 
 ```python
 activation_blockers: Sequence[str] = ()

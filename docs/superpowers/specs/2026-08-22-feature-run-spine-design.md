@@ -760,3 +760,45 @@ All opened at the code baseline; ® = verified in the revision-2 review or re-ve
 | `POST /build-sets` reachable whenever the V2 switch is on | `build_sets.py:80` |
 | ® owner live re-measurement 2026-08-23 | ledger 195 → 1099 · runs 12 · snapshots 12 · considered 5 · generation inputs 5 · **choices 0** · drafts 7 · selections/build sets/generation requests/verifications 0 · action-authorization table not deployed |
 | run/stage precedent | 0994 · 0996 |
+
+---
+
+## ▲ Reconciliation addendum, 2026-08-23 — from the substrate session, at the frozen remediation SHA
+
+Written by the substrate remediation session as part of the owner-required three-document
+reconciliation; the run-spine session owns this spec and the revised Stage I plan.
+
+### The §5/§8 retry-withdrawal premise is now FALSE — by design, not by drift
+
+This spec withdrew `AUTHOR_FORMULA /retry` on the premise that *"a FAILED draft is a terminal cache
+entry; retry is a button wired to a no-op."* That was true, and migration **1107** made it false
+deliberately: the money-guard index now covers only ANSWERS (`WHERE state NOT IN
+('FAILED','CANCELLED')`), because a failed draft bought nothing and must not hold the identity slot
+for ever.
+
+**Retry-after-terminal is hereby BLESSED as a revised-Stage-I candidate act, under exactly these
+gates — neither is optional:**
+
+1. a **regeneration exception** bound to the EXACT formula identity being re-attempted (plus
+   provider contract, strategy, actor, expiry, one-time consumption — 1103), which is what bounds
+   the number of re-attempts; and
+2. a **spend authorization** (1105), enforced per PHYSICAL provider call at `AuditingClient.call`,
+   which is what bounds the money.
+
+A retry button is therefore never a free re-spend and never a no-op: it is an approved,
+cost-confirmed act whose refusals are typed (`DraftRetired` / `DraftNotAnAnswer` /
+`SpendExhausted`). The failed draft's row survives as history — with multiple drafts per identity
+now possible, any run-detail fold must separate ATTEMPT HISTORY from the current per-subject result
+(the owner's P1; the run-spine session owns that fix in `runs/projection.py`).
+
+### Schema facts a revised Stage I may rely on, as of this reconciliation
+
+* `formula_draft_authoring_plan` (1104) is WRITTEN on every new draft and read by the worker —
+  strategy is durable, never recomputed.
+* Draft identity is **V2** (`{identity_version, formula_strategy, strategy_identity_hash,
+  provider_contract_hash iff LLM}`); every pre-V2 draft carries an explicit V1 companion (1109)
+  recording the constant era as the defect it was.
+* `generation_request.action_decision_revision_id` (1108) is NULLABLE in the expand phase and
+  ratchets to NOT NULL in 1100b; the worker refuses a missing decision at act time regardless.
+* Migration numbering: substrate holds 1100–1114 (1107/1108/1109 now taken); run-spine holds
+  1115–1117.
