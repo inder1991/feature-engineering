@@ -116,6 +116,9 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     reconstructed from what a row must once have been.
 
     `visibility_where`'s params bind AT THE SPLICE POINT, which here is SECOND — after the run id.
+    The fragment is parenthesized on splice (its own invariant): today's single comparison binds
+    tighter than the surrounding AND, but a fragment that grows an OR would silently widen this
+    WHERE into "this run OR anything that clause matches" — a visibility hole, not a syntax error.
     """
     frag, params = visibility_where(identity)
     row = conn.execute(
@@ -128,7 +131,7 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
             LEFT JOIN feature_run_identity fri USING (generation_run_id)
             LEFT JOIN feature_run_profile  frp USING (generation_run_id)
             LEFT JOIN contract_intent      ci  ON ci.intent_id = fgr.intent_id
-            WHERE fgr.generation_run_id = %s AND {frag}""",
+            WHERE fgr.generation_run_id = %s AND ({frag})""",
         (run_id, *params)).fetchone()
     if row is None:
         return None

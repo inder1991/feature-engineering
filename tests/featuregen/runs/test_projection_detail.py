@@ -56,7 +56,11 @@ def _drop_the_pin(db):
     test database and the pre-pin branch would otherwise be unreachable. Postgres DDL is
     transactional and the `db` fixture rolls its transaction back, so the table is gone only for
     the remainder of this test. Nothing else in the schema references it (grepped across the
-    migrations), so CASCADE drops only 1101's own objects."""
+    migrations), so CASCADE drops only 1101's own objects — one of which reaches OUTSIDE the table:
+    1101's `build_set_member_formula_pinned_v1` FK on `build_set_member` goes with it, so the DROP
+    takes an ACCESS EXCLUSIVE lock on `build_set_member` too. Harmless while the suite runs
+    serially; under xdist against a SHARED database it would block every concurrent reader of that
+    table until this test's transaction rolls back."""
     db.execute("DROP TABLE selection_formula_binding CASCADE")
 
 
@@ -86,6 +90,25 @@ def test_detail_shows_sockets_and_two_axes(db):
                   "PUBLISH_PRODUCTION", "TRAIN_MODEL", "GENERATE_PREVIEW"):
         assert by_stage[stage]["state"] == "UNAVAILABLE"
     assert by_stage["GENERATE_PREVIEW"]["reason_code"] == "BUILD_SET_DECLARATION_WITHHELD_PRE_PIN"
+    # Every socket's REASON, not just its state: UNAVAILABLE alone is not the honest label the spec
+    # asks for — the code is what tells an operator which person and which remedy. Asserting the
+    # states only lets a socket carry the wrong reason (TRAIN_MODEL is an unbuilt SUBSYSTEM, not a
+    # missing worker) and still pass.
+    _sockets = ("EXECUTE_SANDBOX", "PUBLISH_SANDBOX", "MATERIALIZE_PRODUCTION",
+                "PUBLISH_PRODUCTION", "TRAIN_MODEL")
+    assert {s: by_stage[s]["reason_code"] for s in _sockets} == {
+        "EXECUTE_SANDBOX": "WORKER_NOT_IMPLEMENTED",
+        "PUBLISH_SANDBOX": "WORKER_NOT_IMPLEMENTED",
+        "MATERIALIZE_PRODUCTION": "STATE_MACHINE_NOT_BUILT",
+        "PUBLISH_PRODUCTION": "STATE_MACHINE_NOT_BUILT",
+        "TRAIN_MODEL": "SUBSYSTEM_NOT_BUILT"}
+    # The rail is these NINE stages and no others. Every other assertion here indexes `by_stage` by
+    # name, so an extra stage — a lane the UI would render with nothing behind it — survives them
+    # all. The length check closes the dict's own blind spot: a duplicated stage collapses silently.
+    assert set(by_stage) == {"CHOOSE_CANDIDATES", "AUTHOR_FORMULA", "BIND_SELECTIONS",
+                             "GENERATE_PREVIEW", "EXECUTE_SANDBOX", "PUBLISH_SANDBOX",
+                             "MATERIALIZE_PRODUCTION", "PUBLISH_PRODUCTION", "TRAIN_MODEL"}
+    assert len(out["rail"]) == 9
 
 
 def test_preview_is_not_started_once_the_pin_exists(db):
