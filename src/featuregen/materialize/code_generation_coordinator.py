@@ -466,7 +466,6 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
     (`LEGACY_REGENERATION_NOT_APPROVED` — under identity V2 a re-author would mint a DIFFERENT
     identity, so the money guard alone cannot see that the answer was already bought once).
     """
-    from featuregen.canonical import jcs_sha256
     from featuregen.overlay.upload.formula_draft_service import frozen_candidate
     from featuregen.overlay.upload.formula_strategy import (
         FormulaStrategy,
@@ -474,7 +473,6 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
     )
     from featuregen.overlay.upload.formula_strategy_facts import (
         assemble_strategy_facts,
-        current_author_contract_hash,
     )
     from featuregen.overlay.upload.retirement_scope import retirement_scope_key
 
@@ -512,28 +510,23 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
         # consults (`candidate_governance_blockers` — Task 5 review 4a): the plan previews
         # exactly what the decision will refuse, because they read the same composition. The
         # first cut computed these inline here and never showed them to the decision.
-        provider_contract = (current_author_contract_hash()
-                            if decision.strategy is FormulaStrategy.LLM_AUTHORED else None)
-        config_payload: dict[str, Any] = {
-            "identity_version": 2,
-            "formula_strategy": str(decision.strategy),
-            "strategy_identity_hash": decision.strategy_identity_hash,
-        }
-        if provider_contract is not None:
-            config_payload["provider_contract_hash"] = provider_contract
         from featuregen.overlay.upload.formula_draft_service import (
             candidate_governance_blockers,
+            current_authoring_config,
         )
 
-        blockers.extend(candidate_governance_blockers(
+        provider_contract, _payload, config_hash = current_authoring_config(decision)
+        governance_blockers, governance_warnings = candidate_governance_blockers(
             conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
             strategy_identity_hash=decision.strategy_identity_hash,
-            provider_contract_hash=provider_contract, config_hash=jcs_sha256(config_payload),
+            provider_contract_hash=provider_contract, config_hash=config_hash,
             scope_key=retirement_scope_key(
                 considered_revision_id=candidate.considered_revision_id, option_id=option_id,
                 planning_request_hash=candidate.planning_request_hash,
                 catalog_snapshot_hash=candidate.catalog_snapshot_hash,
-                definition_revision=candidate.definition_revision)))
+                definition_revision=candidate.definition_revision))
+        blockers.extend(governance_blockers)
+        warnings.extend(governance_warnings)
 
         plans.append({
             "position": position,

@@ -3044,6 +3044,51 @@ approved IRs + reviewed datasets, an operator/governance act; zero cases exist),
 execution adapter wiring (step 0b substrate), step 8's residual (rides step 10's cutover — the
 old route's ladder), step 10 (journey tests + legacy deletion), and all operator work.
 
+## ▲ Stage I record (2026-08-23) — Tasks 5 and 6, and the closed §11.1 items
+
+*(Written fresh in the Task 6 fix round: every earlier attempt to record this chained off a
+python-replace whose anchor no-oped silently, so commits f2fbacab, a0bde41e-adjacent and
+2a03a77b each CLAIMED doc rows this file never carried — the Task 6 review caught it, and every
+replace in this file now asserts its anchor.)*
+
+**Task 5 (accepted):** per-draft AUTHOR_FORMULA governance in the one composition —
+`authoring_evidence_pins`, authorize+decide with the candidate's REAL facts
+(`candidate_governance_blockers`), decision durable on the plan row (migration 1119; 1104+1119
+one cutover), worker recheck, spend mandatory (route mints the bounded dev envelope
+`PER_DRAFT_CALL_ENVELOPE = 45`; the job path REFUSES an absent ceiling), approval expiry floored
+to UTC-day INSIDE the spend idempotency identity so a replayed confirm cannot reset a budget.
+
+**Task 6 (owner ruling OPTION 2 — "deterministic-lane retries are FREE BY CONSTRUCTION",
+recorded in the run-spine spec R4.2 gap 3 at their 9a613bfa) — BOTH former §11.1 owed items are
+CLOSED:**
+* *(was: no production surface creates a regeneration exception)* — `POST
+  /formula-drafts/{id}/regeneration-exceptions` under `governance:confirm`: bindings derived
+  server-side from the target's candidate under the CURRENT resolution, THROUGH
+  `tombstone_covering` (the one reader — so the writer's "which withdrawal does this override"
+  is the gate's own answer), NOT NULL spend minted via `canonical_approval_expiry`,
+  content-addressed so a replayed approval is ONE coupon, consumed once by the mint it
+  authorizes. An exception must NAME the covering tombstone — and the naming filter
+  lives INSIDE the locator (round-2 correction: the first cut located the OLDEST coupon and
+  nullified on mismatch, which both prevented pre-arm AND disarmed the legitimate
+  post-withdrawal approval — an old blank coupon shadowed the younger naming one, making the
+  refusal's own remedy unreachable until the blank expired). The advance fence honors a
+  CONSUMED naming coupon, so the override mint can FINISH — proven by the acceptance chain
+  (FAILED → tombstone → approve-naming → mint → advance to READY).
+* *(was: the reviewed-lane exception is unrepresentable, so a FAILED reviewed draft is stuck)* —
+  the unrepresentability IS the design: `request_draft`'s not-an-answer gate is strategy-aware;
+  a reviewed re-attempt (no provider contract, 1104's construction) mints freely with zero
+  exception and zero spend rows. Tombstones refuse FIRST, both lanes. The LLM lane is unchanged,
+  and the approval surface refuses a deterministic candidate by name
+  (`DETERMINISTIC_RETRY_IS_FREE`).
+
+**Still owed (small, non-blocking — from the Task 5/6 reviews):** `_spend_binding_for` fails
+open on legacy rows while governance fails closed (asymmetry to collapse when convenient); no
+terminal-state requirement on the approval target (a coupon can pre-arm against a healthy
+draft — the tombstone-naming rule already prevents pre-disarm); coupons stack when differing
+only in `max_cost`; the deterministic route-refusal test monkeypatches the resolver (no
+end-to-end real-REVIEWED proof yet); the job route's log line lost `llm_members`; the
+`control-plane` authoring-environment note belongs in §0.1.x proper.
+
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`
 **UNAVAILABLE** until production governance exists. **They stay specified and they stop being

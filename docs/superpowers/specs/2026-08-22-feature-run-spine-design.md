@@ -853,11 +853,18 @@ domain store uses.
 | `AUTHOR_FORMULA` | **Retry after FAILED/CANCELLED — OFFERED**, admissible only when BOTH gates hold: a regeneration exception bound to the exact formula identity (1103; one-time consumption; carries its own NOT NULL spend authorization) AND spend enforced per physical call at the audited seam (1105). Typed refusals: `DraftRetired` / `DraftNotAnAnswer` / `SpendExhausted` |
 | `AUTHOR_FORMULA` | "Request another opinion" on a LIVE draft — still deferred (identity must move; a live draft's slot is held) |
 
-Three unreachability gaps stand between the blessing and a working button, and they are Stage I
-work: (1) no production writer of `formula_draft_regeneration_exception` exists — an
-exception-creation act (owner/admin, cost-confirmed) must be built; (2) `DraftNotAnAnswer` is
-uncaught by both `request_draft_for_candidate` callers — the route 500s and the coordinator marks
-the whole job FAILED; both must catch it and answer with the retry affordance; (3) the
+Three unreachability gaps stood between the blessing and a working button. (1) CLOSED (Task 6,
+substrate chain accepted at `b35d3249` after a five-round adversarial loop): the
+exception-creation act exists — POST regeneration-exceptions behind `governance:confirm`. Its
+governing law, which replaced three rounds of precedence patches: **every covering withdrawal
+must be individually NAMED by a valid, then consumed, coupon — at request AND at advance**; the
+writer binds the FULL covering set in one approval act (one coupon per withdrawal, one shared
+spend ceiling) under the same scope lock the mint and the withdrawal hold; the coupon identity
+folds a per-exact-binding regeneration ordinal, so a post-exhaustion re-approval mints a fresh
+generation while replays of a live approval converge on it. (2) CLOSED (same chain):
+`DraftNotAnAnswer` is translated to `NotAnAnswerAtRequest` in the service and caught by BOTH
+callers — the route answers a typed 409, the coordinator blocks the one member by name
+(`FORMULA_DRAFT_NOT_AN_ANSWER`), never the whole job; (3) the
 deterministic lane cannot be covered by an exception at all (1103's `provider_contract_hash` NOT
 NULL + 1105's spend NOT NULL make it unrepresentable) — a FAILED reviewed-lane draft is
 permanently stuck at its identity. (3) RULED (owner,

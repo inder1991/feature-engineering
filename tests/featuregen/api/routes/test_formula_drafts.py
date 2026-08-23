@@ -488,7 +488,7 @@ def test_EVERY_DRAFT_IS_DECIDED_AND_CEILINGED_in_its_one_transaction(client, con
 def test_the_dev_envelope_is_ONE_ceiling_per_draft_config_not_one_per_click(client, conn,
                                                                             engineer_headers):
     _revision(conn, revision_id="crev-t5b", snapshot_id="snap-t5b")
-    first = client.post(DRAFT_PATH.format(rev="crev-t5b", opt="opt-a"), headers=engineer_headers)
+    client.post(DRAFT_PATH.format(rev="crev-t5b", opt="opt-a"), headers=engineer_headers)
     second = client.post(DRAFT_PATH.format(rev="crev-t5b", opt="opt-a"), headers=engineer_headers)
     assert second.json()["created"] is False
     count = conn.execute(
@@ -537,3 +537,275 @@ def test_A_RETIRED_CANDIDATE_IS_REFUSED_BY_THE_DECISION_before_the_money_guard(
         "SELECT allowed FROM action_decision_revision WHERE action = 'AUTHOR_FORMULA' "
         "ORDER BY decided_at DESC LIMIT 1").fetchone()
     assert refused == (False,)
+
+
+# ══ Stage I Task 6 — Option 2: deterministic retries are FREE; LLM retries are APPROVED ═════════
+_CEILING = {"max_calls": 45, "max_tokens": 250_000, "max_cost": "25.00", "currency": "USD",
+            "pricing_version": "regen@1", "expires_at": "2026-12-31T09:00:00Z"}
+
+
+def _first_draft(client, conn, headers, *, revision: str) -> str:
+    _revision(conn, revision_id=revision, snapshot_id=f"snap-{revision}")
+    response = client.post(DRAFT_PATH.format(rev=revision, opt="opt-a"), headers=headers)
+    assert response.status_code == 202, response.text
+    return response.headers["X-Formula-Draft-Id"]
+
+
+def _fail(conn, draft_id: str) -> None:
+    conn.execute(
+        "UPDATE formula_draft SET state = 'FAILED', failure_reason = 'boom' "
+        "WHERE formula_draft_id = %s", (draft_id,))
+
+
+def test_an_LLM_FAILURE_still_refuses_without_an_approval_and_the_APPROVAL_unlocks_it(
+        client, conn, engineer_headers):
+    """The whole retry chain, end to end: FAILED → 409 by name → a governance approval (bindings
+    derived server-side, cost-confirmed) → the re-request mints, consuming the exception exactly
+    once — and a THIRD request needs a fresh approval, because max_uses=1 means one."""
+    draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6")
+    _fail(conn, draft_id)
+
+    refused = client.post(DRAFT_PATH.format(rev="crev-t6", opt="opt-a"),
+                          headers=engineer_headers)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "FORMULA_DRAFT_NOT_AN_ANSWER"
+
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+    assert approved.json()["created"] is True
+
+    retried = client.post(DRAFT_PATH.format(rev="crev-t6", opt="opt-a"),
+                          headers=engineer_headers)
+    assert retried.status_code == 202, retried.text
+    assert retried.json()["created"] is True
+    burned = conn.execute(
+        "SELECT uses_consumed, max_uses FROM formula_draft_regeneration_exception "
+        "WHERE exception_id = %s", (approved.json()["exception_id"],)).fetchone()
+    assert burned == (1, 1), "consumed exactly once, by the mint it authorized"
+
+    _fail(conn, retried.headers["X-Formula-Draft-Id"])
+    third = client.post(DRAFT_PATH.format(rev="crev-t6", opt="opt-a"),
+                        headers=engineer_headers)
+    assert third.status_code == 409, "one approval is ONE budget — spent means spent"
+
+
+def test_a_REPLAYED_APPROVAL_is_one_coupon_not_a_stack(client, conn, engineer_headers):
+    draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6r")
+    _fail(conn, draft_id)
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+
+    first = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                        json=_CEILING, headers=governance)
+    replay = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                         json={**_CEILING, "expires_at": "2026-12-31T17:00:00Z"},
+                         headers=governance)
+    assert first.json()["exception_id"] == replay.json()["exception_id"]
+    assert replay.json()["created"] is False, \
+        "same UTC day, same ceilings: the same approval — canonical_approval_expiry at work"
+
+
+def test_the_DETERMINISTIC_LANE_has_nothing_to_approve(client, conn, engineer_headers,
+                                                       monkeypatch):
+    """Option 2 made the 1103/1105 unrepresentability the DESIGN: the approval surface refuses a
+    deterministic candidate by name, pointing at the free re-request."""
+
+    draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6d")
+    _fail(conn, draft_id)
+
+    import featuregen.overlay.upload.formula_draft_service as service
+    from featuregen.overlay.upload.formula_strategy import (
+        FormulaStrategy,
+        FormulaStrategyDecisionV1,
+    )
+
+    monkeypatch.setattr(
+        service, "resolve_formula_strategy",
+        lambda facts: FormulaStrategyDecisionV1(
+            strategy=FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT, blockers=(), warnings=(),
+            strategy_identity_hash="sih-det"))
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    response = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "DETERMINISTIC_RETRY_IS_FREE"
+
+
+def test_approving_a_regeneration_is_a_GOVERNANCE_act_not_an_engineer_click(
+        client, conn, engineer_headers):
+    draft_id = _first_draft(client, conn, engineer_headers, revision="crev-t6p")
+    _fail(conn, draft_id)
+    response = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=engineer_headers)
+    assert response.status_code == 403, response.text
+
+
+def test_a_NAMING_COUPON_turns_RETIRED_into_an_OVERRIDDEN_warning_one_answer_both_routes(
+        client, conn, engineer_headers):
+    """Round-3 item 2: the preview/decision said RETIRED for exactly the candidate the store
+    mints under a naming coupon — two answers by route. Now the decision consults the SAME
+    locator: with a valid naming coupon the request MINTS (202) and carries the
+    RETIREMENT_OVERRIDDEN warning instead of refusing."""
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _revision(conn, revision_id="crev-ovw", snapshot_id="snap-ovw")
+    candidate = frozen_candidate(conn, "crev-ovw", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-ovw', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-ovw', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    record_tombstone(conn, formula_draft_id="fd-ovw",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+
+    refused = client.post(DRAFT_PATH.format(rev="crev-ovw", opt="opt-a"),
+                          headers=engineer_headers)
+    assert refused.status_code == 409, "without a coupon, RETIRED refuses — through the decision"
+
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post("/formula-drafts/fd-ovw/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+
+    minted = client.post(DRAFT_PATH.format(rev="crev-ovw", opt="opt-a"),
+                         headers=engineer_headers)
+    assert minted.status_code == 202, minted.text
+    assert "RETIREMENT_OVERRIDDEN" in minted.json()["strategy_warnings"], \
+        "the withdrawal's override is DISPLAYED, never silent — one answer, both routes"
+
+
+def test_HALF_NAMED_COVERAGE_refuses_the_same_way_on_both_routes(client, conn,
+                                                                 engineer_headers):
+    """Round-4 NB-2's agreement half: both kinds cover, only the broad one has a coupon — the
+    preview says RETIRED and the request 409s, one answer by construction (both read the same
+    covering-set + coupons)."""
+
+    from featuregen.overlay.upload.formula_draft_service import (
+        candidate_governance_blockers,
+        current_authoring_config,
+        frozen_candidate,
+    )
+    from featuregen.overlay.upload.formula_draft_store import formula_identity
+    from featuregen.overlay.upload.formula_strategy import resolve_formula_strategy
+    from featuregen.overlay.upload.formula_strategy_facts import assemble_strategy_facts
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    _revision(conn, revision_id="crev-half", snapshot_id="snap-half")
+    candidate = frozen_candidate(conn, "crev-half", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-half', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-half', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    broad = record_tombstone(conn, formula_draft_id="fd-half",
+                             scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                             reason="superseded", retired_by="user:owner")
+    assembled = assemble_strategy_facts(
+        conn, considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        idea=candidate.idea, catalog_snapshot_hash=candidate.catalog_snapshot_hash)
+    decision = resolve_formula_strategy(assembled.facts)
+    contract, _payload, config_hash = current_authoring_config(decision)
+    identity = formula_identity(
+        considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        authoring_config_hash=config_hash,
+        definition_revision=candidate.definition_revision)
+    # An EXACT withdrawal of the CURRENT target identity, with NO coupon of its own.
+    conn.execute(
+        "INSERT INTO formula_draft_retirement_tombstone (tombstone_id, scope, "
+        "retirement_scope_key, exact_formula_identity_hash, coverage_identity_hash, "
+        "formula_draft_id, reason, retired_by) VALUES ('tmb-half-exact', 'EXACT_DRAFT', %s, "
+        "%s, %s, 'fd-half', 'this exact one is wrong', 'user:owner')",
+        (retirement_scope_key(
+            considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+            planning_request_hash=candidate.planning_request_hash,
+            catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+            definition_revision=candidate.definition_revision),
+         identity, "cov-half-exact"))
+    # A coupon naming ONLY the broad withdrawal.
+    spend = authorize_spend(
+        conn, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-half",
+        member_identities=[identity], provider_contract_hash=contract, max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    conn.execute(
+        "INSERT INTO formula_draft_regeneration_exception (exception_id, tombstone_id, "
+        "target_formula_identity_hash, provider_contract_hash, strategy_identity_hash, "
+        "llm_spend_authorization_id, actor_subject, overrides_tombstone, max_uses, expires_at) "
+        "VALUES ('exc-half-broad', %s, %s, %s, %s, %s, 'user:owner', true, 1, "
+        "'2026-12-31T00:00:00Z')",
+        (broad.tombstone_id, identity, contract, decision.strategy_identity_hash, spend))
+
+    scope = retirement_scope_key(
+        considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        definition_revision=candidate.definition_revision)
+    blockers, warnings = candidate_governance_blockers(
+        conn, candidate=candidate, option_id="opt-a", strategy=decision.strategy,
+        strategy_identity_hash=decision.strategy_identity_hash,
+        provider_contract_hash=contract, config_hash=config_hash, scope_key=scope)
+    assert "FORMULA_DRAFT_RETIRED" in blockers, "the PREVIEW refuses"
+    assert "RETIREMENT_OVERRIDDEN" not in warnings
+
+    refused = client.post(DRAFT_PATH.format(rev="crev-half", opt="opt-a"),
+                          headers=engineer_headers)
+    assert refused.status_code == 409, "and the DECISION path refuses — one answer, both routes"
+    assert refused.json()["detail"]["code"] == "FORMULA_DRAFT_RETIRED"
+
+
+def test_the_APPROVED_ceiling_is_the_one_enforced_never_a_dev_envelope_over_it(
+        client, conn, engineer_headers):
+    """Round-4 acceptance probe 2: a governed regeneration carries its own cost-confirmed
+    ceiling — the plan row must thread THAT to the dispatch seam, not a server-minted dev
+    envelope that would leave the approved ceiling decorative. And one approval act = ONE spend
+    authorization shared across its bindings — nothing double-reserved."""
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _revision(conn, revision_id="crev-appc", snapshot_id="snap-appc")
+    candidate = frozen_candidate(conn, "crev-appc", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-appc', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-appc', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    record_tombstone(conn, formula_draft_id="fd-appc",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post("/formula-drafts/fd-appc/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+    approval_spend = approved.json()["spend_authorization_id"]
+
+    minted = client.post(DRAFT_PATH.format(rev="crev-appc", opt="opt-a"),
+                         headers=engineer_headers)
+    assert minted.status_code == 202, minted.text
+    plan_spend = conn.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_authoring_plan "
+        "WHERE formula_draft_id = %s", (minted.headers["X-Formula-Draft-Id"],)).fetchone()
+    assert plan_spend == (approval_spend,), \
+        "the plan row carries the APPROVED ceiling — the seam reserves against what was confirmed"
+    envelopes = conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision "
+        "WHERE pricing_version = 'development'").fetchone()
+    assert envelopes == (0,), "no dev envelope was minted over the approval"
