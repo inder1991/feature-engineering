@@ -20,6 +20,8 @@ import { OverviewScreen } from './screens/OverviewScreen'
 import { RecipeReviewScreen } from './screens/RecipeReviewScreen'
 import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
+import { RunDetailScreen } from './screens/RunDetailScreen'
+import { RunsScreen } from './screens/RunsScreen'
 import { AnalysisWorkspaceScreen } from './screens/AnalysisWorkspaceScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { SemanticsPendingScreen } from './screens/SemanticsPendingScreen'
@@ -135,6 +137,16 @@ const ICONS: Record<Route, ReactElement> = {
       <rect x="9.25" y="9.25" width="4" height="4" rx="0.75" />
     </NavIcon>
   ),
+  // A marked list: each run is one record in an append-only log. Distinct from 'review' (bare
+  // rules ending in a decision dot) — every row here is already a fact, not a question.
+  runs: (
+    <NavIcon>
+      <circle cx="3.75" cy="4.25" r="0.9" />
+      <circle cx="3.75" cy="8" r="0.9" />
+      <circle cx="3.75" cy="11.75" r="0.9" />
+      <path d="M6.75 4.25h6.5M6.75 8h6.5M6.75 11.75h4" />
+    </NavIcon>
+  ),
   integrations: (
     // Linked nodes: one instance (top) linking out to its services (below). A connection graph.
     <NavIcon>
@@ -244,6 +256,15 @@ const PAGES: PageHead[] = [
     eyebrow: 'CATALOG · REGISTRY',
     title: 'Feature registry',
     description: 'Browse registered features — open one for its hypothesis, lineage, and consumers.',
+  },
+  {
+    route: 'runs',
+    label: 'Runs',
+    eyebrow: 'CATALOG · RUNS',
+    title: 'Feature runs',
+    description:
+      'Every feature-generation workflow, grouped by hypothesis — open a run to see exactly '
+      + 'what happened, stage by stage, and what its evidence pins.',
   },
   {
     route: 'search',
@@ -465,6 +486,12 @@ export default function App() {
         {route === 'registry' && (
           <RegistryScreen featureId={params.get('id')} navigate={navigate} />
         )}
+        {/* One route, two surfaces: '#/runs' is the grouped list, '#/runs/<id>' one run's record.
+            The id rides the PATH (nav.ts decodes it into run_id), so an absent param is the list —
+            never a detail sheet silently pointed at nothing. */}
+        {route === 'runs' && (params.get('run_id')
+          ? <RunDetailScreen runId={params.get('run_id') ?? ''} />
+          : <RunsScreen navigate={navigate} />)}
         {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
         {route === 'semantics' && (
           <SemanticsPendingScreen initialSource={params.get('source') ?? ''} />
