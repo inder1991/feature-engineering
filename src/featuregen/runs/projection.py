@@ -211,6 +211,90 @@ def _production_stage(action: ActionV1) -> dict:
     return {"stage": str(action), "state": "NOT_STARTED", "reason_code": None}
 
 
+def _bind_selections_milestone(conn, run_id: str, choice_count: int) -> tuple[dict, list[dict]]:
+    """The `BIND_SELECTIONS` milestone — its rail entry AND its evidence — from 1101's pins.
+
+    A binding pins one SELECTION to the formula that will be built for it, and it reaches this run
+    through the choice it pins: binding → selection → considered revision → run. The hop through
+    `feature_selection_revision` is deliberate even though the binding carries a
+    `considered_revision_id` of its own: 1101's composite foreign keys force the two to agree, so
+    the join costs nothing and reads as "whose choice is this" rather than "which revision did the
+    pin copy".
+
+    ▲ THE DENOMINATOR IS THE RUN'S CHOICE COUNT, and it is the only honest one available. Nothing
+    freezes "the selections this run intends to bind" — a `feature_selection_revision` row is
+    written when somebody selects, so counting selections would grow the denominator with the
+    numerator and the milestone would read complete at every moment of a half-done job. Choices are
+    decided earlier, in a store that stands still, so they are what progress is measured against.
+
+    THE STATES, in the order they earn it:
+
+      * nothing bound — NOT_STARTED, and no detail: the state already says it, and "0 of 5 bound"
+        would only repeat the choices milestone rendered beside it;
+      * bound == chosen (and something WAS bound) — SUCCEEDED. `> 0` is not pedantry: without it an
+        untouched run reads `0 == 0` and claims completion for work nobody started;
+      * bound < chosen — IN_PROGRESS, and the detail carries both numbers. Never SUCCEEDED here: a
+        stage reported done while three choices carry no formula sends a person to the next
+        entrance, which is the one that refuses;
+      * anything else — IN_PROGRESS with the COUNT ALONE. That is the world the platform is
+        actually in (`contract_gate1_choice_revision` holds zero live rows), and it also covers a
+        run holding more bindings than choices, which one candidate selected under two target
+        readings produces honestly. A denominator smaller than its numerator has stopped describing
+        the work, so it is not written; and with no denominator there is nothing to be equal to, so
+        the stage cannot claim to be finished.
+
+    PRE-1101 THE MILESTONE CANNOT RUN AT ALL. There is no store a binding could live in, so the
+    entry is UNAVAILABLE with the pin's own reason code — the same string `GENERATE_PREVIEW`
+    answers with, because it is the same absent table seen from a second surface. NOT_STARTED would
+    be the false rail §7 [R3.1] forbids: nothing a person did could ever move it. The probe is also
+    what keeps this read from RAISING: the count query below would throw `UndefinedTable` out of a
+    read-only projection on a database where 1101 has not landed, and `pin.py` exists precisely
+    because such databases are real.
+
+    The pin is probed here rather than shared with `_generate_preview_stage`: that stage answers
+    the switch first and pays no query at all on a deployment that does not run V2 generation, and
+    threading one eager boolean through both would buy a `to_regclass` lookup at the cost of that.
+    """
+    if not pin_exists(conn):
+        return ({"stage": "BIND_SELECTIONS", "state": "UNAVAILABLE",
+                 "reason_code": PRE_PIN_REASON_CODE, "detail": None}, [])
+    # ORDER BY `recorded_at` then `binding_id`: bindings written in one transaction share `now()`,
+    # so the timestamp alone is not a key and the id is what makes the order total. The id is a
+    # content hash, so that tail order carries no meaning — it is stability, not chronology.
+    rows = conn.execute(
+        """SELECT b.binding_id, b.selection_revision_id, b.formula_draft_id,
+                  b.considered_revision_id, b.option_id, b.recorded_at
+           FROM selection_formula_binding b
+           JOIN feature_selection_revision s ON s.revision_id = b.selection_revision_id
+           JOIN contract_considered_revision ccr
+             ON ccr.considered_revision_id = s.considered_revision_id
+           WHERE ccr.generation_run_id = %s
+           ORDER BY b.recorded_at, b.binding_id""", (run_id,)).fetchall()
+    bindings = [{"binding_id": bid, "selection_revision_id": sel, "formula_draft_id": draft,
+                 "considered_revision_id": ccr_of, "option_id": opt,
+                 "recorded_at": at.isoformat()}
+                for bid, sel, draft, ccr_of, opt, at in rows]
+    # ▲ COUNTED IN CANDIDATES, NOT IN ROWS, because the denominator is: 1025's choices are unique
+    # per `(run, considered revision, option)`. 1101's uniqueness is `(selection, draft)`, so one
+    # selection pinned to two drafts — two build sets declared either side of a re-authoring — is
+    # two rows for ONE choice, and counting rows would report two of five choices bound with four
+    # still carrying nothing. The list below keeps both rows; only the numerator folds them.
+    bound = len({(b["considered_revision_id"], b["option_id"]) for b in bindings})
+    if bound == 0:
+        state, detail = "NOT_STARTED", None
+    elif bound == choice_count:
+        state, detail = "SUCCEEDED", f"{bound} of {choice_count} bound"
+    elif bound < choice_count:
+        state, detail = "IN_PROGRESS", f"{bound} of {choice_count} bound — accumulating"
+    else:
+        state, detail = "IN_PROGRESS", f"{bound} bound"
+    # `detail` rides THIS entry only, and every branch of it. A stage with a count to state says the
+    # count; the eight others have nothing to put there, and a null on each of them would be a field
+    # every client must test for and no stage would ever fill.
+    return ({"stage": "BIND_SELECTIONS", "state": state, "reason_code": None,
+             "detail": detail}, bindings)
+
+
 def _current_by_candidate(history: list[dict]) -> list[dict]:
     """The CURRENT answer per candidate, folded from the attempt history (spec §R4.4.1).
 
@@ -332,6 +416,9 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
         "retirement_reason": reason,
     } for fid, ccr_of, opt, state, reason in drafts]
     current = _current_by_candidate(history)
+    # ONE derivation, two surfaces: the rail entry and the milestone's own rows are the same
+    # reading of the same pins, so the count on the rail and the list under it cannot disagree.
+    bind_stage, bindings = _bind_selections_milestone(conn, run_id, len(choices))
     rail = [
         {"stage": "CHOOSE_CANDIDATES",
          "state": "SUCCEEDED" if choices else "NOT_STARTED", "reason_code": None},
@@ -342,8 +429,7 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
          "state": (min((d["rail_state"] for d in current), key=_AUTHOR_SEVERITY.index)
                    if current else "NOT_STARTED"),
          "reason_code": None},
-        # Nothing can write a binding in the foundation, so this milestone has no evidence to read.
-        {"stage": "BIND_SELECTIONS", "state": "NOT_STARTED", "reason_code": None},
+        bind_stage,
         # One helper, one entry: state and reason are decided together, so they cannot disagree.
         _generate_preview_stage(conn),
         # The tail is written out rather than splatted from a table because it is no longer one
@@ -365,7 +451,10 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
         "milestones": {
             "choose_candidates": [{"option_id": o, "considered_revision_id": c,
                                    "chosen_at": t.isoformat()} for o, c, t in choices],
-            "bind_selections": []},
+            # The pins themselves, so a person can see WHICH choices carry a formula rather than
+            # only how many do. Empty both when nothing is bound and when 1101 has not landed —
+            # the rail entry beside it is what tells those two apart.
+            "bind_selections": bindings},
         # TWO READINGS, both stated (spec §R4.4.1): where each candidate stands now, and every
         # attempt that got it there. A single list cannot be both — since 1107 a candidate can have
         # a failure AND an answer, and which one a reader wants depends on the question they asked.

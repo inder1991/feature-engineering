@@ -6,6 +6,7 @@ the caller does.
 """
 import pytest
 from psycopg.types.json import Jsonb
+from tests.featuregen.materialize.crosswalk_fixtures import bind_ready_formula
 from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -53,6 +54,47 @@ def _seed_retired_ready_draft(db, run_id):
     db.execute("INSERT INTO formula_draft_retirement (formula_draft_id, reason, retired_by, "
                "retired_at) VALUES (%s, 'CANDIDATE_SUPERSEDED', 'u1', now())", (f"{run_id}-d1",))
     return c
+
+
+def _seed_choice(db, chain, option_id):
+    """One gate-1 choice on this run's candidate — a row of `BIND_SELECTIONS`'s denominator.
+
+    1025's lineage trigger checks the whole chain in one predicate, `considered_content_hash`
+    included, so the hash is `seed_run_chain`'s own `'cch'` rather than a fresh string: a mismatch
+    raises out of the INSERT instead of writing a row nobody can explain."""
+    db.execute(
+        "INSERT INTO contract_gate1_choice_revision (choice_id, intent_id, generation_run_id, "
+        "considered_revision_id, considered_content_hash, option_id, "
+        "canonical_candidate_identity_hash, actor) "
+        "VALUES (%s, %s, %s, %s, 'cch', %s, %s, %s)",
+        (f"{chain['run_id']}-c-{option_id}", chain["intent_id"], chain["run_id"],
+         chain["considered_revision_id"], option_id, f"cid-{option_id}",
+         Jsonb({"subject": "u1"})))
+
+
+def _seed_binding(db, chain, option_id):
+    """One SELECTION on this run's candidate with a READY formula PINNED to it (migration 1101).
+
+    The binding is what `BIND_SELECTIONS` counts, and it reaches the run through the selection's
+    considered revision — so the selection must name THIS run's revision or the row belongs to
+    another run and the milestone must not see it.
+
+    `bind_ready_formula` is the shipped fixture for the pin itself (it reads the candidate facts
+    back out of the selection, because 1101's composite keys refuse a draft that disagrees with the
+    choice it is pinned to). Only its parents are seeded here: the target reading a selection hangs
+    off, and the selection."""
+    reading_id, selection_id = f"{chain['run_id']}-trr", f"{chain['run_id']}-sel-{option_id}"
+    db.execute(
+        "INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
+        "VALUES (%s, %s, 'exploration', 'h') ON CONFLICT DO NOTHING",
+        (reading_id, chain["intent_id"]))
+    db.execute(
+        "INSERT INTO feature_selection_revision (revision_id, target_reading_revision_id, "
+        "considered_revision_id, option_id, decision_id, planning_request_hash, binding_plan_hash, "
+        "content_hash) VALUES (%s, %s, %s, %s, %s, 'sha256:asked', 'sha256:plan', %s)",
+        (selection_id, reading_id, chain["considered_revision_id"], option_id,
+         f"dec-{selection_id}", f"ch-{selection_id}"))
+    return bind_ready_formula(db, selection_id)
 
 
 def _drop_the_pin(db):
@@ -181,6 +223,27 @@ def test_preview_unavailable_while_generation_is_switched_off(db, monkeypatch):
         "stage": "GENERATE_PREVIEW", "state": "UNAVAILABLE", "reason_code": "GENERATION_DISABLED"}
 
 
+def test_the_switch_answers_before_the_pin_when_BOTH_are_shut(db, monkeypatch):
+    """The PRECEDENCE cell — the one combination in which the two conditions disagree.
+
+    Every other test in this file exercises the fold with at most one condition false, and a fold
+    that answered the pin first would pass all of them: with the switch off and the pin PRESENT it
+    still reaches `GENERATION_DISABLED`, and with the switch on and the pin absent it still reaches
+    the pre-pin code. Only here — switch off AND pin absent — do the two branches give different
+    answers, so this is the only test that can pin the order and kill the branch-swap mutant.
+
+    The order is not a preference. A switched-off deployment does not have this surface AT ALL: the
+    router-level dependency 404s every path on it, so naming the missing pin would send a person to
+    an operator who would apply a migration and watch nothing change. Only where the surface exists
+    does the pin decide.
+    """
+    monkeypatch.delenv("FEATUREGEN_GENERATION_V2_ENABLED", raising=False)
+    _seed_retired_ready_draft(db, "rd-sp")
+    _drop_the_pin(db)
+    assert _rail(run_detail(db, _ADMIN, "rd-sp"))["GENERATE_PREVIEW"] == {
+        "stage": "GENERATE_PREVIEW", "state": "UNAVAILABLE", "reason_code": "GENERATION_DISABLED"}
+
+
 def test_execute_sandbox_names_the_lane_switch_once_the_surface_is_on(db, sandbox_switches_off,
                                                                      monkeypatch):
     """The SECOND half of `EXECUTE_SANDBOX`'s fold, and the only test that can pin its precedence.
@@ -279,6 +342,132 @@ def test_milestones_and_identity_are_derived_from_evidence(db):
     assert isinstance(chosen[0]["chosen_at"], str) and chosen[0]["chosen_at"].startswith("20")
     assert out["milestones"]["bind_selections"] == []       # the 1101 binding, not yet written
     assert _rail(out)["CHOOSE_CANDIDATES"]["state"] == "SUCCEEDED"
+
+
+def _bind_stage(detail):
+    return _rail(detail)["BIND_SELECTIONS"]
+
+
+def test_the_binding_milestone_accumulates_against_the_runs_choices(db):
+    """`BIND_SELECTIONS` counts pins against the run's own choices (spec §7, R4.4's parked debt).
+
+    ▲ THE MUTATION THIS KILLS is the one the stage shipped with: a constant `NOT_STARTED`, which
+    told a person nothing had been bound while two formulas were pinned to their choices. The
+    milestone is evidence-derived like `CHOOSE_CANDIDATES`, and the evidence is 1101's binding.
+
+    ▲ AND IT MUST NOT ROUND UP. Two of five bound is IN_PROGRESS — a fold that answered SUCCEEDED
+    on "any binding at all" would report the stage done with three choices carrying no formula,
+    which is the false rail in the direction that costs the most: the next stage's entrance is the
+    one that then refuses.
+
+    The denominator is the CHOICE count because it is the only frozen-set-free honest one: nothing
+    freezes "the selections this run intends to bind", and a selection revision is written when
+    somebody selects — so counting selections would grow the denominator with the numerator and the
+    milestone would read complete at every moment.
+    """
+    c = seed_run_chain(db, run_id="rd-bs")
+    for n in range(5):
+        _seed_choice(db, c, f"o{n}")
+    _seed_binding(db, c, "o0")
+    _seed_binding(db, c, "o1")
+
+    out = run_detail(db, _ADMIN, "rd-bs")
+    assert _bind_stage(out) == {"stage": "BIND_SELECTIONS", "state": "IN_PROGRESS",
+                                "reason_code": None, "detail": "2 of 5 bound — accumulating"}
+    # The milestone's own evidence, not just a number on the rail: the same list the choices
+    # milestone keeps beside it, so a person can see WHICH choices carry a formula.
+    bound = out["milestones"]["bind_selections"]
+    assert sorted(b["option_id"] for b in bound) == ["o0", "o1"]
+    assert set(bound[0]) == {"binding_id", "selection_revision_id", "formula_draft_id",
+                             "considered_revision_id", "option_id", "recorded_at"}
+    assert bound[0]["considered_revision_id"] == c["considered_revision_id"]
+    # Serialized, never a `datetime` — the projection's output is JSON (the choices milestone's
+    # own rule, and the two lists are read by the same client).
+    assert isinstance(bound[0]["recorded_at"], str) and bound[0]["recorded_at"].startswith("20")
+
+
+def test_the_binding_milestone_succeeds_only_at_parity_and_never_at_zero(db):
+    """SUCCEEDED means every choice carries a formula — and `0 == 0` is not that.
+
+    Two mutants die here. Dropping the `> 0` guard makes an untouched run — no choices, no
+    bindings — read SUCCEEDED, which is a stage claiming completion for work nobody has started.
+    Loosening parity to `>=` is caught by the accumulating test above.
+    """
+    c = seed_run_chain(db, run_id="rd-bp")
+    _seed_choice(db, c, "o1")
+    _seed_choice(db, c, "o2")
+    assert _bind_stage(run_detail(db, _ADMIN, "rd-bp")) == {
+        "stage": "BIND_SELECTIONS", "state": "NOT_STARTED", "reason_code": None, "detail": None}
+
+    _seed_binding(db, c, "o1")
+    _seed_binding(db, c, "o2")
+    assert _bind_stage(run_detail(db, _ADMIN, "rd-bp")) == {
+        "stage": "BIND_SELECTIONS", "state": "SUCCEEDED", "reason_code": None,
+        "detail": "2 of 2 bound"}
+
+    empty = seed_run_chain(db, run_id="rd-bz")
+    assert _bind_stage(run_detail(db, _ADMIN, empty["run_id"]))["state"] == "NOT_STARTED"
+
+
+def test_a_binding_with_no_choice_on_the_record_is_counted_without_a_denominator(db):
+    """The world the platform is ACTUALLY in: `contract_gate1_choice_revision` has zero live rows.
+
+    A denominator of nothing is not a denominator, so "1 of 0 bound" is not written — the count
+    stands alone, and the stage stays IN_PROGRESS because there is no record against which it could
+    honestly claim to be finished. The same branch covers a run holding MORE bindings than choices
+    (one candidate selected under two target readings): a denominator smaller than the numerator
+    has stopped describing the work.
+    """
+    c = seed_run_chain(db, run_id="rd-bd")
+    _seed_binding(db, c, "o1")
+    assert _bind_stage(run_detail(db, _ADMIN, "rd-bd")) == {
+        "stage": "BIND_SELECTIONS", "state": "IN_PROGRESS", "reason_code": None,
+        "detail": "1 bound"}
+
+
+def test_one_choice_pinned_twice_is_one_choice_bound(db):
+    """The numerator is counted in CANDIDATES, because the denominator is (1025's own key).
+
+    1101's uniqueness is `(selection, draft)`, so a selection re-pinned to a second formula — two
+    build sets declared either side of a re-authoring — is two rows for ONE choice. Counting rows
+    would report two of two bound over a run where a person's second choice still carries nothing:
+    a milestone reading COMPLETE with half the work missing, which is the exact failure this task
+    exists to remove, arrived at from the other direction.
+
+    Both pins stay in the evidence list. They are two facts about what was declared, and folding
+    them there would destroy a record; the fold belongs to the count alone.
+    """
+    c = seed_run_chain(db, run_id="rd-bt")
+    _seed_choice(db, c, "o1")
+    _seed_choice(db, c, "o2")
+    _seed_binding(db, c, "o1")
+    bind_ready_formula(db, "rd-bt-sel-o1", draft_id="rd-bt-second-draft")
+
+    out = run_detail(db, _ADMIN, "rd-bt")
+    assert _bind_stage(out) == {"stage": "BIND_SELECTIONS", "state": "IN_PROGRESS",
+                                "reason_code": None, "detail": "1 of 2 bound — accumulating"}
+    assert len(out["milestones"]["bind_selections"]) == 2
+
+
+def test_the_binding_milestone_is_unavailable_before_the_pin_lands(db):
+    """Pre-1101 there is no store a binding could live in, so the milestone cannot RUN.
+
+    NOT_STARTED would be the false rail §7 [R3.1] forbids — nothing a person did could ever move
+    it — and the reason code is the pin's own, the same string `GENERATE_PREVIEW` answers with,
+    because it is the same absent table seen from a second surface.
+
+    ▲ It is also the guard's mutation check. Deleting the pre-pin branch does not merely mislabel
+    the stage: the count query raises `UndefinedTable` out of a read-only projection, and this test
+    (and the socket test, which drops the pin too) fails on the exception rather than the value.
+    """
+    c = seed_run_chain(db, run_id="rd-bnp")
+    _seed_choice(db, c, "o1")
+    _drop_the_pin(db)
+    out = run_detail(db, _ADMIN, "rd-bnp")
+    assert _bind_stage(out) == {"stage": "BIND_SELECTIONS", "state": "UNAVAILABLE",
+                                "reason_code": "BUILD_SET_DECLARATION_WITHHELD_PRE_PIN",
+                                "detail": None}
+    assert out["milestones"]["bind_selections"] == []
 
 
 def test_identity_row_makes_the_run_post_spine(db):
