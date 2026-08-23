@@ -22,9 +22,13 @@ from featuregen.overlay.upload.retirement_scope import (
     valid_exception_for,
 )
 
+#: ▲ Ids are DISTINCTIVE ON PURPOSE. A full-suite run once failed 16 of these tests while the file
+#: alone passed 22/22 — order-dependent, and consistent with a committed row leaked from another
+#: suite colliding on shared ids like "crev-1". Unique prefixes make that collision class
+#: impossible instead of waiting for the seed that reproduces it.
 CANDIDATE = dict(
-    considered_revision_id="crev-1", option_id="opt-a", planning_request_hash="h-asked",
-    catalog_snapshot_hash="h-snap", definition_revision="rev-1")
+    considered_revision_id="crev-retscope", option_id="opt-retscope", planning_request_hash="h-asked-retscope",
+    catalog_snapshot_hash="h-snap-retscope", definition_revision="rev-retscope")
 
 
 @pytest.fixture(autouse=True)
@@ -35,10 +39,10 @@ def _considered_revision_exists(db):
     (the committed-test variant lives in test_formula_draft_retirement.py)."""
     from tests.featuregen.runs._chain import seed_run_chain
 
-    seed_run_chain(db, run_id="rs", considered_revision_id="crev-1")
+    seed_run_chain(db, run_id="rs", considered_revision_id="crev-retscope")
 
 
-def _request(conn, *, draft_id="fd-1", config="cfg-1", **over):
+def _request(conn, *, draft_id="fd-ret-1", config="cfg-1", **over):
     facts = {**CANDIDATE, **over}
     return request_draft(
         conn, formula_draft_id=draft_id, authoring_config_hash=config,
@@ -78,18 +82,18 @@ def test_A_TOMBSTONE_REFUSES_BEFORE_THE_INSERT(db):
     enqueues nothing because it never returns."""
     _request(db)
     record_tombstone(
-        db, formula_draft_id="fd-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
         reason="withdrawn", retired_by="user:ops")
 
     with pytest.raises(DraftRetired, match="withdrawn by tombstone"):
-        _request(db, draft_id="fd-2", config="cfg-2")   # a NEW configuration, same candidate
+        _request(db, draft_id="fd-ret-2", config="cfg-2")   # a NEW configuration, same candidate
 
 
 def test_A_NEW_DRAFT_ID_DOES_NOT_DEFEAT_A_TOMBSTONE(db):
     """The identity is what is withdrawn, not the row. Minting a fresh draft id was the obvious
     workaround, and it is the one this refuses by name."""
     _request(db)
-    record_tombstone(db, formula_draft_id="fd-1", scope=RetirementScope.EXACT_DRAFT,
+    record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
                      reason="withdrawn", retired_by="user:ops")
 
     with pytest.raises(DraftRetired):
@@ -102,22 +106,22 @@ def test_AN_EXACT_RETIREMENT_DOES_NOT_WITHDRAW_THE_CANDIDATE(db):
     exact identity; withdrawing the candidate under every future model and prompt is a stronger act
     that has to be asked for."""
     _request(db)
-    record_tombstone(db, formula_draft_id="fd-1", scope=RetirementScope.EXACT_DRAFT,
+    record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
                      reason="withdrawn", retired_by="user:ops")
 
     # A DIFFERENT configuration of the same candidate is untouched.
-    draft_id, created = _request(db, draft_id="fd-2", config="cfg-2")
-    assert created is True and draft_id == "fd-2"
+    draft_id, created = _request(db, draft_id="fd-ret-2", config="cfg-2")
+    assert created is True and draft_id == "fd-ret-2"
 
 
 def test_A_CANDIDATE_WIDE_RETIREMENT_DOES_WITHDRAW_IT(db):
     _request(db)
     record_tombstone(
-        db, formula_draft_id="fd-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
         reason="withdrawn", retired_by="user:ops")
 
     with pytest.raises(DraftRetired):
-        _request(db, draft_id="fd-2", config="cfg-2")
+        _request(db, draft_id="fd-ret-2", config="cfg-2")
 
 
 def test_BOTH_SCOPES_CAN_COEXIST_for_one_candidate(db):
@@ -125,14 +129,14 @@ def test_BOTH_SCOPES_CAN_COEXIST_for_one_candidate(db):
     consumed the candidate's key, so B could never be retired and a candidate-wide tombstone could
     never follow an exact one."""
     _request(db)
-    _request(db, draft_id="fd-2", config="cfg-2")
+    _request(db, draft_id="fd-ret-2", config="cfg-2")
 
-    record_tombstone(db, formula_draft_id="fd-1", scope=RetirementScope.EXACT_DRAFT,
+    record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
                      reason="a", retired_by="user:ops")
-    record_tombstone(db, formula_draft_id="fd-2", scope=RetirementScope.EXACT_DRAFT,
+    record_tombstone(db, formula_draft_id="fd-ret-2", scope=RetirementScope.EXACT_DRAFT,
                      reason="b", retired_by="user:ops")
     record_tombstone(
-        db, formula_draft_id="fd-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
         reason="c", retired_by="user:ops")
 
     assert db.execute(
@@ -141,9 +145,9 @@ def test_BOTH_SCOPES_CAN_COEXIST_for_one_candidate(db):
 
 def test_RECORDING_THE_SAME_WITHDRAWAL_TWICE_IS_ONE_TOMBSTONE(db):
     _request(db)
-    first = record_tombstone(db, formula_draft_id="fd-1", scope=RetirementScope.EXACT_DRAFT,
+    first = record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
                              reason="withdrawn", retired_by="user:ops")
-    second = record_tombstone(db, formula_draft_id="fd-1", scope=RetirementScope.EXACT_DRAFT,
+    second = record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
                               reason="withdrawn", retired_by="user:ops")
 
     assert first.tombstone_id == second.tombstone_id
@@ -155,10 +159,10 @@ def test_THE_WIDER_WITHDRAWAL_IS_REPORTED_when_both_cover_a_request(db):
     """Reporting the narrower one would understate what was refused, and send somebody to ask for
     the wrong exception."""
     _request(db)
-    record_tombstone(db, formula_draft_id="fd-1", scope=RetirementScope.EXACT_DRAFT,
+    record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
                      reason="exact", retired_by="user:ops")
     record_tombstone(
-        db, formula_draft_id="fd-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
         reason="candidate-wide", retired_by="user:ops")
 
     found = tombstone_covering(
@@ -168,7 +172,7 @@ def test_THE_WIDER_WITHDRAWAL_IS_REPORTED_when_both_cover_a_request(db):
 
 
 # ══ THE EXCEPTION MUST BIND ════════════════════════════════════════════════════════════════════
-def _spend(db, *, authorization_id="sa-1", contract="pc-1"):
+def _spend(db, *, authorization_id="sa-retscope", contract="pc-1"):
     """▲ An exception BINDS its money (1105), so one cannot be written without an authorization.
     Regeneration is an approved, COST-CONFIRMED act — the constraint is what makes that true rather
     than intended."""
@@ -189,10 +193,10 @@ def _exception(db, tombstone_id, *, target, contract="pc-1", strategy="st-1", us
         "INSERT INTO formula_draft_regeneration_exception (exception_id, tombstone_id, "
         "target_formula_identity_hash, provider_contract_hash, strategy_identity_hash, "
         "actor_subject, overrides_tombstone, max_uses, expires_at, llm_spend_authorization_id) "
-        "VALUES ('ex-1', %s, %s, %s, %s, 'user:ops', %s, %s, %s, %s)",
+        "VALUES ('ex-retscope', %s, %s, %s, %s, 'user:ops', %s, %s, %s, %s)",
         (tombstone_id, target, contract, strategy, tombstone_id is not None, uses, expires,
          spend))
-    return "ex-1"
+    return "ex-retscope"
 
 
 @pytest.mark.parametrize("over,why", [
@@ -205,7 +209,7 @@ def test_AN_EXCEPTION_THAT_DOES_NOT_BIND_DOES_NOT_AUTHORIZE(db, over, why):
     regeneration of that candidate, at ANY cost, under ANY configuration, FOR EVER."""
     _request(db)
     tombstone = record_tombstone(
-        db, formula_draft_id="fd-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
         reason="withdrawn", retired_by="user:ops")
     _exception(db, tombstone.tombstone_id, target=_identity(config="cfg-2"), **over)
 
@@ -220,7 +224,7 @@ def test_AN_EXCEPTION_IS_CONSUMED_EXACTLY_ONCE(db):
     somebody clicks."""
     _request(db)
     tombstone = record_tombstone(
-        db, formula_draft_id="fd-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
         reason="withdrawn", retired_by="user:ops")
     exception_id = _exception(db, tombstone.tombstone_id, target=_identity(config="cfg-2"))
 
@@ -233,19 +237,19 @@ def test_A_BOUND_EXCEPTION_LETS_THE_REGENERATION_THROUGH_ONCE(db):
     tombstone before any exception was loaded, so the override column had no code path at all."""
     _request(db)
     tombstone = record_tombstone(
-        db, formula_draft_id="fd-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
         reason="withdrawn", retired_by="user:ops")
     _exception(db, tombstone.tombstone_id, target=_identity(config="cfg-2"))
 
     draft_id, created = _request(
-        db, draft_id="fd-2", config="cfg-2",
+        db, draft_id="fd-ret-2", config="cfg-2",
         provider_contract_hash="pc-1", strategy_identity_hash="st-1",
         now="2026-08-23T00:00:00Z")
-    assert (draft_id, created) == ("fd-2", True)
+    assert (draft_id, created) == ("fd-ret-2", True)
 
     # ONCE. The second attempt finds the exception spent and the tombstone still standing.
     with pytest.raises(DraftRetired):
-        _request(db, draft_id="fd-3", config="cfg-2",
+        _request(db, draft_id="fd-ret-3", config="cfg-2",
                  provider_contract_hash="pc-1", strategy_identity_hash="st-1",
                  now="2026-08-23T00:00:00Z")
 
@@ -255,12 +259,12 @@ def test_WITHOUT_THE_BINDING_FACTS_A_TOMBSTONE_ALWAYS_REFUSES(db):
     caller that cannot name them cannot have one honoured."""
     _request(db)
     tombstone = record_tombstone(
-        db, formula_draft_id="fd-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
         reason="withdrawn", retired_by="user:ops")
     _exception(db, tombstone.tombstone_id, target=_identity(config="cfg-2"))
 
     with pytest.raises(DraftRetired):
-        _request(db, draft_id="fd-2", config="cfg-2")     # no contract, no strategy
+        _request(db, draft_id="fd-ret-2", config="cfg-2")     # no contract, no strategy
 
 
 # ══ A FAILURE IS NOT A PURCHASE ════════════════════════════════════════════════════════════════
@@ -275,11 +279,11 @@ def test_A_TERMINAL_FAILURE_IS_NOT_RETURNED_AS_AN_EXISTING_DRAFT(db, state):
     """
     _request(db)
     db.execute(
-        "UPDATE formula_draft SET state = %s, failure_reason = %s WHERE formula_draft_id = 'fd-1'",
+        "UPDATE formula_draft SET state = %s, failure_reason = %s WHERE formula_draft_id = 'fd-ret-1'",
         (state, "boom" if state == "FAILED" else None))
 
     with pytest.raises(DraftNotAnAnswer, match="not an answer this platform bought"):
-        _request(db, draft_id="fd-2")
+        _request(db, draft_id="fd-ret-2")
 
 
 def test_A_BLOCKED_DRAFT_IS_STILL_AN_ANSWER(db):
@@ -288,7 +292,7 @@ def test_A_BLOCKED_DRAFT_IS_STILL_AN_ANSWER(db):
     _request(db)
     db.execute(
         "UPDATE formula_draft SET state = 'BLOCKED', blockers = '[{\"code\": \"NO_GRAIN\"}]'::jsonb "
-        "WHERE formula_draft_id = 'fd-1'")
+        "WHERE formula_draft_id = 'fd-ret-1'")
 
-    draft_id, created = _request(db, draft_id="fd-2")
-    assert (draft_id, created) == ("fd-1", False)
+    draft_id, created = _request(db, draft_id="fd-ret-2")
+    assert (draft_id, created) == ("fd-ret-1", False)
