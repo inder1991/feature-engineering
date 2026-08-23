@@ -3089,6 +3089,49 @@ only in `max_cost`; the deterministic route-refusal test monkeypatches the resol
 end-to-end real-REVIEWED proof yet); the job route's log line lost `llm_members`; the
 `control-plane` authoring-environment note belongs in §0.1.x proper.
 
+### ▲ Task 6 ACCEPTANCE record (2026-08-24) — five rounds, the one law, and the queue
+
+**Accepted and merged** into `feature/run-spine-stage1` at the peer's `f828aca9`; my lane's
+final commit is `b35d3249`. Suite at acceptance: 13,516 passed. The review ran five rounds at
+the cap, every defect probe-proven before it was believed — including two of the reviewer's own
+premises withdrawn on evidence.
+
+**The bullet above is CORRECTED by rounds 4–5** — it records the round-2/3 shape. The final law:
+* **THE ONE LAW**: every covering withdrawal (tombstone) must be individually NAMED by a valid
+  — then CONSUMED — regeneration exception coupon. `covering_tombstones()` is a SET read (both
+  scopes); `tombstone_covering()` survives as display-only single-pick and is called by nothing
+  in src. One approval act binds the FULL covering set: one 1103 row per covering tombstone.
+* **The regeneration ordinal is per-EXACT-binding** (round-5 C1, the money invariant): the
+  exhausted-count's WHERE carries every identity-folded field — identity, tombstone_id (IS NOT
+  DISTINCT FROM), provider_contract_hash, strategy_identity_hash, actor_subject,
+  llm_spend_authorization_id, expires_at, max_uses. Counting at (identity, tombstone) alone let
+  a SIBLING binding's exhaustion bump this binding's ordinal, so a replay of a still-live
+  approval minted a second live coupon — two paid regenerations from one governance decision.
+* **The approval writer runs under the scope lock** the mint and the withdrawal already hold;
+  the carrying argument is the MONOTONE count collapsing under ON CONFLICT, not the lock alone.
+* **Expired-but-unexhausted is a stated decision**: the ordinal counts EXHAUSTED coupons only;
+  an identical re-approval returns the dead coupon (`created=False`); re-arming needs the next
+  day's floored expiry or changed terms.
+* **NULL-closure, both derivations agreeing**: the only nullable identity column is
+  `tombstone_id` (already IS NOT DISTINCT FROM); `llm_spend_authorization_id` is NOT NULL as of
+  1105:146, inside the interlocked migration range, so `=` is vacuously NULL-safe on the rest.
+
+**Queue (consolidated — none gating; the paragraph above stands, plus):**
+* ▲ ON THE RECORD: the `expires_at` representation-aliasing closure DEPENDS on
+  `llm_spend_authorization_id` staying co-folded in BOTH the coupon identity and the ordinal
+  count — nobody drops it from either fold.
+* The ordinal count filters seven columns behind a single-column index — perf nit at current
+  row counts; an index on the binding fields (or `exact_formula_identity_hash` — same owed
+  migration) when convenient.
+* `retirement_scope.__all__` omits `approve_regeneration_exception` and `covering_tombstones`
+  while still listing the deprecated `tombstone_covering`.
+* From the round-5 ledger (reviewer's file:line record is the source of truth): the
+  201-with-"budget in effect" message over a dead coupon; the spend-preference query's missing
+  expiry/exhaustion filters and the refuses-vs-substitutes posture (flagged for the
+  whole-branch review); the fence naming query's reliance on the 1107 one-live invariant; the
+  deterministic refusal citing `covering[0]`; one-ceiling-across-N-bindings and
+  expired-unexhausted pins; coupon stacking when differing only in `max_cost`.
+
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`
 **UNAVAILABLE** until production governance exists. **They stay specified and they stop being
