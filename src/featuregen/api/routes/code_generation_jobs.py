@@ -192,10 +192,19 @@ def _member_plans(conn, body: JobRequestIn) -> list[dict[str, Any]]:
             " WHERE i.identity_version = 1 AND i.retirement_scope_key = %s "
             "   AND d.state = 'READY' LIMIT 1", (scope_key,)).fetchone()
         if legacy_ready is not None and decision.strategy is FormulaStrategy.LLM_AUTHORED:
-            exception = conn.execute(
-                "SELECT 1 FROM formula_draft_regeneration_exception "
-                " WHERE target_formula_identity_hash = %s AND consumed_at IS NULL "
-                "   AND expires_at > now() LIMIT 1", (identity_hash,)).fetchone()
+            # ▲ Through the ONE exception reader — its bindings are the point: an exception
+            # authorizes one exact identity under one provider contract and one strategy. The
+            # first cut hand-rolled this query against a column that does not exist
+            # (`consumed_at`; the real ledger is uses_consumed/max_uses) — found by the run-spine
+            # session mapping the frozen SHA, and exactly why a second composition of a governed
+            # read is banned (§8.3, applied to reads).
+            from featuregen.overlay.upload.retirement_scope import valid_exception_for
+
+            exception = valid_exception_for(
+                conn, target_formula_identity_hash=identity_hash,
+                provider_contract_hash=provider_contract,
+                strategy_identity_hash=decision.strategy_identity_hash,
+                now=conn.execute("SELECT now()").fetchone()[0])
             if exception is None:
                 blockers.append("LEGACY_REGENERATION_NOT_APPROVED")
 

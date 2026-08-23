@@ -398,3 +398,23 @@ def test_a_draft_with_no_ceiling_binds_NOTHING(db):
     from featuregen.overlay.upload.formula_draft_worker import _spend_binding_for
 
     assert _spend_binding_for(db, "fd-none") is None
+
+
+def test_a_FAILED_PREDECESSOR_blocks_the_member_by_name_never_the_whole_job(db, monkeypatch):
+    """DraftNotAnAnswer is a considered refusal (§11.1.2): the member blocks with the code, the
+    job settles as BLOCKED — not FAILED as a 'coordinator crash'. Found by the run-spine session:
+    the control-flow exception was uncaught in both service callers."""
+    from featuregen.overlay.upload import formula_draft_service
+    from featuregen.overlay.upload.formula_draft_service import NotAnAnswerAtRequest
+
+    job_id = _job(db, "naa", n_members=1)
+
+    def fake(conn, **kwargs):
+        raise NotAnAnswerAtRequest("the existing draft records a failure")
+
+    monkeypatch.setattr(formula_draft_service, "request_draft_for_candidate", fake)
+    process_code_generation_once(db, worker_id="w1")
+
+    job = read_job(db, job_id)
+    assert job.status is JobStatusV1.BLOCKED, "a product refusal, never a platform crash"
+    assert read_members(db, job_id)[0].blockers == ("FORMULA_DRAFT_NOT_AN_ANSWER",)
