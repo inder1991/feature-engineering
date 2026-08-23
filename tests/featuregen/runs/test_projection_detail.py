@@ -4,6 +4,7 @@ Envelopes are built directly rather than minted (see `test_projection_list`): th
 an envelope as data and verifies nothing, and the seeded chain must carry the SAME subject spelling
 the caller does.
 """
+import pytest
 from psycopg.types.json import Jsonb
 from tests.featuregen.runs._chain import seed_run_chain
 
@@ -64,6 +65,17 @@ def _drop_the_pin(db):
     db.execute("DROP TABLE selection_formula_binding CASCADE")
 
 
+@pytest.fixture
+def generation_on(monkeypatch):
+    """The deployment switch `POST /build-sets` is gated behind, ON.
+
+    Default-OFF is the honest state of every test and dev database, and with it off the rail's
+    `GENERATE_PREVIEW` answer is decided before the pin is ever consulted — so a test that means to
+    exercise the PIN half has to turn the switch on first, exactly as the route's own tests do.
+    """
+    monkeypatch.setenv("FEATUREGEN_GENERATION_V2_ENABLED", "1")
+
+
 def _rail(detail):
     return {s["stage"]: s for s in detail["rail"]}
 
@@ -78,7 +90,7 @@ def test_rail_mapping_is_total_over_1090s_check():
     assert set(_AUTHOR_SEVERITY) == set(RAIL_FROM_DRAFT_STATE.values())
 
 
-def test_detail_shows_sockets_and_two_axes(db):
+def test_detail_shows_sockets_and_two_axes(db, generation_on):
     _seed_retired_ready_draft(db, "rd-a")
     _drop_the_pin(db)
     out = run_detail(db, _ADMIN, "rd-a")
@@ -111,17 +123,38 @@ def test_detail_shows_sockets_and_two_axes(db):
     assert len(out["rail"]) == 9
 
 
-def test_preview_is_not_started_once_the_pin_exists(db):
+def test_preview_is_not_started_once_the_pin_exists(db, generation_on):
     """The other half of the DERIVED availability rule (spec §7 [R3.1]).
 
-    Without this, a `_pin_exists` that always answered False — a hardcoded UNAVAILABLE — would pass
-    the whole file. `GENERATE_PREVIEW` is the one stage whose availability moves with the schema;
-    the five sockets do not, so they stay UNAVAILABLE here too."""
+    Without this, a `pin_exists` that always answered False — a hardcoded UNAVAILABLE — would pass
+    the whole file. `GENERATE_PREVIEW` is the one stage whose availability moves with the
+    deployment; the five sockets do not, so they stay UNAVAILABLE here too.
+
+    NOT_STARTED needs BOTH conditions, which is why the switch fixture is here: this is the only
+    combination in which the entrance actually opens."""
     _seed_retired_ready_draft(db, "rd-p")
     by_stage = _rail(run_detail(db, _ADMIN, "rd-p"))
     assert by_stage["GENERATE_PREVIEW"] == {"stage": "GENERATE_PREVIEW", "state": "NOT_STARTED",
                                             "reason_code": None}
     assert by_stage["EXECUTE_SANDBOX"]["state"] == "UNAVAILABLE"
+
+
+def test_preview_unavailable_while_generation_is_switched_off(db, monkeypatch):
+    """The switch half of the fold, in the state EVERY test and dev database is actually in.
+
+    1101 is a committed migration, so the pin exists here; `FEATUREGEN_GENERATION_V2_ENABLED` is
+    default-OFF, so `POST /build-sets` — `GENERATE_PREVIEW`'s only entrance — answers 404 on this
+    deployment. A rail that read the pin alone reported NOT_STARTED into that 404: the false rail
+    spec §7 [R3.1] forbids, inviting a person into a stage they cannot reach.
+
+    The reason code must be the SWITCH's, not the pin's. Both answers are UNAVAILABLE, so the state
+    alone cannot tell the two apart, and they send an operator to different remedies — flip a
+    deployment switch, or apply a migration.
+    """
+    monkeypatch.delenv("FEATUREGEN_GENERATION_V2_ENABLED", raising=False)
+    _seed_retired_ready_draft(db, "rd-off")
+    assert _rail(run_detail(db, _ADMIN, "rd-off"))["GENERATE_PREVIEW"] == {
+        "stage": "GENERATE_PREVIEW", "state": "UNAVAILABLE", "reason_code": "GENERATION_DISABLED"}
 
 
 def test_milestones_and_identity_are_derived_from_evidence(db):

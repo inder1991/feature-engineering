@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.materialize.generation_lane import generation_enabled
+from featuregen.runs.pin import PRE_PIN_REASON_CODE, pin_exists
 from featuregen.runs.read_policy import visibility_where
 
 
@@ -96,13 +98,37 @@ _SOCKETS = (
 )
 
 
-def _pin_exists(conn) -> bool:
-    """Whether the 1101 selection→formula pin has landed in THIS database.
+def _generate_preview_stage(conn) -> dict:
+    """`GENERATE_PREVIEW`'s availability, folded from BOTH conditions its only entrance imposes.
 
-    Availability is DERIVED, never a static list (spec §7 [R3.1]): the rail reads the deployment it
-    is actually running against, so an environment where 1101 has not been applied cannot be shown
-    a stage its only entrance would 409."""
-    return conn.execute("SELECT to_regclass('selection_formula_binding')").fetchone()[0] is not None
+    That entrance is `POST /build-sets`, and it is shut two independent ways: the deployment switch
+    (`generation_enabled`, a router-level dependency that 404s every path on the surface) and the
+    1101 pin (a 409 raised inside each producer). Availability is DERIVED from the deployment, so
+    the rail must fold BOTH — spec §7 [R3.1] forbids a rail that reads NOT_STARTED over an entrance
+    that refuses.
+
+    Reading the pin alone was exactly that false rail, and not in some exotic deployment: 1101 is a
+    committed migration and the switch is default-OFF, so EVERY test and dev database sat in the
+    combination the old code called NOT_STARTED while the POST answered 404.
+
+    PRECEDENCE follows the route's own order, and the order carries meaning rather than tidiness.
+    The switch is answered first because a switched-off deployment does not have this surface AT ALL
+    — the entrance is not shut, it is absent — and telling a person the pin is missing there would
+    send them to an operator who would apply a migration and change nothing. Only where the surface
+    exists does the pin decide; only where both hold can the stage honestly read NOT_STARTED.
+
+    The pin is probed only under an enabled switch: a deployment that does not run V2 generation
+    pays no query for a fact that cannot change its answer.
+    """
+    if not generation_enabled():
+        # This deployment does not run V2 generation, so `GENERATION_DISABLED` names the remedy
+        # honestly: a deployment decision to reverse, not a schema to migrate.
+        return {"stage": "GENERATE_PREVIEW", "state": "UNAVAILABLE",
+                "reason_code": "GENERATION_DISABLED"}
+    if not pin_exists(conn):
+        return {"stage": "GENERATE_PREVIEW", "state": "UNAVAILABLE",
+                "reason_code": PRE_PIN_REASON_CODE}
+    return {"stage": "GENERATE_PREVIEW", "state": "NOT_STARTED", "reason_code": None}
 
 
 def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
@@ -163,8 +189,6 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
         "eligibility": "withdrawn" if reason else "current",
         "retirement_reason": reason,
     } for fid, opt, state, reason in drafts]
-    # One catalog read, used by both fields, so the state and its reason can never disagree.
-    pinned = _pin_exists(conn)
     rail = [
         {"stage": "CHOOSE_CANDIDATES",
          "state": "SUCCEEDED" if choices else "NOT_STARTED", "reason_code": None},
@@ -174,9 +198,8 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
          "reason_code": None},
         # Nothing can write a binding in the foundation, so this milestone has no evidence to read.
         {"stage": "BIND_SELECTIONS", "state": "NOT_STARTED", "reason_code": None},
-        {"stage": "GENERATE_PREVIEW",
-         "state": "NOT_STARTED" if pinned else "UNAVAILABLE",
-         "reason_code": None if pinned else "BUILD_SET_DECLARATION_WITHHELD_PRE_PIN"},
+        # One helper, one entry: state and reason are decided together, so they cannot disagree.
+        _generate_preview_stage(conn),
         *({"stage": s, "state": "UNAVAILABLE", "reason_code": code} for s, code in _SOCKETS),
     ]
     return {
