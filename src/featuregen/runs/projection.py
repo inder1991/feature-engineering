@@ -39,7 +39,7 @@ def list_runs(conn, identity: IdentityEnvelope, *, limit: int = 25,
             LEFT JOIN feature_run_identity fri USING (generation_run_id)
             LEFT JOIN feature_run_profile  frp USING (generation_run_id)
             LEFT JOIN contract_intent      ci  ON ci.intent_id = fgr.intent_id
-            WHERE {frag} {cursor_sql}
+            WHERE ({frag}) {cursor_sql}
             ORDER BY fgr.created_at DESC, fgr.generation_run_id DESC
             LIMIT %s""",
         (*params, *cursor_params, limit + 1)).fetchall()

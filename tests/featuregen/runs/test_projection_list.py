@@ -3,6 +3,7 @@
 The envelopes are built directly rather than minted through `mint_test_identity`: the projection
 takes an envelope as data (it verifies nothing), and the seeded chains must carry the SAME subject
 spelling the caller does, which a directly-built envelope makes explicit."""
+from psycopg.types.json import Jsonb
 from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -35,6 +36,27 @@ def test_groups_by_intent_and_marks_pre_spine(db):
     runs = {r["generation_run_id"]: r for g in out["groups"] for r in g["runs"]}
     assert runs["pl-a"]["pre_spine"] is False
     assert runs["pl-b"]["pre_spine"] is True
+
+
+def test_intent_groups_are_exact_and_never_invent_a_header(db):
+    """The GROUPS themselves, not the runs flattened back out of them (spec §12).
+
+    Every other test in this file reads `groups` only to flatten it, so all of them pass against a
+    projection that returns one group under a fabricated header. The structure is the contract:
+    runs sharing an intent share a group carrying that intent's real hypothesis, and a run with no
+    intent gets a group whose header is honestly ABSENT rather than invented."""
+    seed_run_chain(db, run_id="zz-1", intent_id="shared-i")
+    seed_run_chain(db, run_id="zz-2", intent_id="shared-i")
+    # Seeded directly: `seed_run_chain` always mints an intent, and an intent-less run is exactly
+    # the case with no header to show.
+    db.execute("INSERT INTO feature_generation_run (generation_run_id, intent_id, actor, flags) "
+               "VALUES ('zz-0', NULL, %s, '{}')", (Jsonb({"subject": "u1"}),))
+    out = list_runs(db, _ADMIN, limit=50)
+    # One transaction, so all three share `created_at` and run id alone orders them: zz-2, zz-1,
+    # zz-0. The two shared-intent runs are therefore adjacent and must land in ONE group.
+    assert [(g["intent_id"], g["hypothesis"], [r["generation_run_id"] for r in g["runs"]])
+            for g in out["groups"]] == [("shared-i", "h", ["zz-2", "zz-1"]),
+                                        (None, None, ["zz-0"])]
 
 
 def test_owner_sees_only_their_runs(db):
