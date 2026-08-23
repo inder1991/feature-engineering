@@ -272,6 +272,9 @@ def _requested(conn, *, request_id="req-pc", draft_id=None, set_id="bs-pc") -> s
             environment_id=ENV, logical_group_name=GROUP, build_set_revision_id=build_set,
             target_mode=TargetModeV1.EXPLORATION, target_ref=None),
         authorized_by="user:ops", authorized_at="t")
+    from tests.featuregen.materialize.test_generation_lane import _decided
+
+    decision_id = _decided(conn, build_set, approval)
     request_id, created = request_generation(
         conn, request_id=request_id, build_set_revision_id=build_set, environment_id=ENV,
         requested_by="user:ops", requested_at="t",
@@ -284,7 +287,8 @@ def _requested(conn, *, request_id="req-pc", draft_id=None, set_id="bs-pc") -> s
             availability_promise=AvailabilityPromiseV1(calendar_days=1),
             physical_type_policy=POLICY, empty_values={FEATURE: "0"},
             operand_facts=OPERAND_FACTS, engine_id="kedro-pyspark",
-            roles=tuple(_ROLES), compiled_at="t", sealed_at="2026-08-21T00:00:00Z"))
+            roles=tuple(_ROLES), compiled_at="t", sealed_at="2026-08-21T00:00:00Z",
+            action_decision_revision_id=decision_id))
     return request_id
 
 

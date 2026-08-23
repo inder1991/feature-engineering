@@ -63,6 +63,7 @@ from featuregen.materialize.generation_authorization import (
     load_generation_authorization,
 )
 from featuregen.materialize.generation_lane import (
+    authorize_and_decide_generation,
     GenerationJobV2,
     enqueue_generation,
     generation_enabled,
@@ -310,6 +311,24 @@ def request_build(
             detail=f"build set {body.build_set_revision_id!r} cannot be read by this build: "
                    f"{exc}") from exc
 
+    # ▲ THE REQUEST-TIME DECISION (§8.2), recorded so the worker's second look has something to
+    # compare against. Server-owned end to end: the authorization is minted from the authenticated
+    # identity and the decision's pins are read from the recorded build set — nothing here comes
+    # from the request body. The OLD generation_authorization stays authoritative for 1095's chain
+    # until 1100b's contract migration; this is the NEW model's expand half running beside it.
+    decision_id, decision = authorize_and_decide_generation(
+        conn,
+        build_set_revision_id=body.build_set_revision_id,
+        build_set_content_hash=build_set.content_hash,
+        generation_authorization_revision_id=body.generation_authorization_revision_id,
+        environment_id=authorization.environment_id,
+        actor_subject=identity.subject)
+    if not decision.allowed:
+        raise HTTPException(status_code=409, detail={
+            "code": "ACTION_REFUSED",
+            "blockers": list(decision.blockers),
+            "detail": "the generation decision refused; nothing was queued"})
+
     request_id, created = request_generation(
         conn,
         request_id=mint_id("gen"),
@@ -341,7 +360,8 @@ def request_build(
                     engine_id=body.engine_id,
                     roles=tuple(body.roles),
                     compiled_at=now,
-                    sealed_at=now),
+                    sealed_at=now,
+                    action_decision_revision_id=decision_id),
                 environment_id=authorization.environment_id,
                 logical_group_name=authorization.logical_group_name)
         except QueueIdempotencyConflict as exc:

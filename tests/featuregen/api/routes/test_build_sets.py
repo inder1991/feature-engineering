@@ -385,3 +385,33 @@ def test_THE_REFUSED_BUILD_QUEUES_NOTHING(
 
     after = conn.execute("SELECT count(*) FROM queue").fetchone()[0]
     assert after == before
+
+
+def test_A_QUEUED_BUILD_CARRIES_ITS_RECORDED_DECISION(client, conn, enabled,
+                                                      engineer_headers) -> None:
+    """▲ §8.2's first moment, asserted at the route: the decision is DURABLE (migration 1106) and
+    its id is frozen into the queue payload — which is what gives the worker's second look something
+    to compare against. A decision that lived only in the response would be gone by then."""
+    build_set, approval = _seed(conn)
+
+    response = client.post(GENERATIONS, json=_body(build_set, approval),
+                           headers=engineer_headers)
+
+    assert response.status_code == 202, response.text
+    payload = conn.execute(
+        "SELECT payload FROM queue WHERE message_id = %s",
+        (f"generation:{response.json()['request_id']}",)).fetchone()[0]
+    decision_id = payload["action_decision_revision_id"]
+    assert decision_id, "the frozen job names its decision"
+
+    stored = conn.execute(
+        "SELECT action, resource_identity_hash, allowed FROM action_decision_revision "
+        "WHERE decision_id = %s", (decision_id,)).fetchone()
+    assert stored == ("GENERATE_PREVIEW", build_set, True)
+    # And the authorization it binds is SERVER-owned: minted from the authenticated identity,
+    # never a request field.
+    actor = conn.execute(
+        "SELECT a.actor_subject FROM action_authorization_revision a "
+        "JOIN action_decision_revision d ON d.authorization_id = a.authorization_id "
+        "WHERE d.decision_id = %s", (decision_id,)).fetchone()[0]
+    assert actor == "user:sam"

@@ -53,6 +53,15 @@ class CompilationRefusalCode(StrEnum):
     AXES_MISMATCH = "AXES_MISMATCH"
     INTENT_HASH_MISMATCH = "INTENT_HASH_MISMATCH"
 
+    # The action decision (§8.2) — the request-time answer the worker re-checks before the act.
+    #: The job carries no request-time decision. However well-formed the message looks, an act with
+    #: no decision is a QUEUE BYPASS: nothing was ever answered about it, so nothing may run.
+    ACTION_DECISION_MISSING = "ACTION_DECISION_MISSING"
+    #: The decision exists and its evidence moved between the answer and the act. ▲ A REFUSAL a
+    #: person re-requests, never a re-decision — re-evaluating usually returns "allowed" again, and
+    #: the act then proceeds under a verdict nobody was shown.
+    ACTION_DECISION_DRIFTED = "ACTION_DECISION_DRIFTED"
+
     # Read scope and safety classification.
     READ_SCOPE_INSUFFICIENT = "READ_SCOPE_INSUFFICIENT"
     PROHIBITED_INPUT = "PROHIBITED_INPUT"

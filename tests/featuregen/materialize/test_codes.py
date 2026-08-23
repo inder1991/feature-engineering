@@ -18,6 +18,10 @@ def test_compilation_codes_are_exactly_the_spec_set():
     assert {c.value for c in CompilationRefusalCode} == {
         "AUTHORING_RUN_INCOMPLETE", "TERMINAL_PAYLOAD_TAMPERED", "NOT_RESOLVED",
         "FORMULA_HASH_MISMATCH", "FORMULA_SCHEMA_UNSUPPORTED", "AXES_MISMATCH", "INTENT_HASH_MISMATCH",
+        # Step 3 (§8.2): the request-time decision, re-checked at the worker. MISSING is a queue
+        # bypass (nothing was ever answered); DRIFTED is evidence that moved between the answer and
+        # the act — a refusal a person re-requests, never a re-decision.
+        "ACTION_DECISION_MISSING", "ACTION_DECISION_DRIFTED",
         "READ_SCOPE_INSUFFICIENT", "PROHIBITED_INPUT", "COLUMN_NOT_GOVERNED",
         # Step 6. Deliberately NOT folded into READ_SCOPE_INSUFFICIENT: read scope is a fact about
         # the CALLER and someone else may be permitted, leakage is a fact about the FEATURE and is

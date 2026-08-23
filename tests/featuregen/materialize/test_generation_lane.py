@@ -86,9 +86,25 @@ def _inventory() -> ClusterInventoryV1:
         engine_versions=fixtures.ENGINE_VERSIONS, captured_at="2026-08-21T00:00:00Z")
 
 
+def _decided(db, build_set: str, approval: str) -> str:
+    """The request-time decision, through the SAME helper the route uses — so the fixture's pins can
+    never drift from the worker's recompute."""
+    from featuregen.overlay.upload.build_set_store import read_build_set
+
+    from featuregen.materialize.generation_lane import authorize_and_decide_generation
+
+    decision_id, decision = authorize_and_decide_generation(
+        db, build_set_revision_id=build_set,
+        build_set_content_hash=read_build_set(db, build_set).content_hash,
+        generation_authorization_revision_id=approval,
+        environment_id=ENV, actor_subject="user:ops")
+    assert decision.allowed
+    return decision_id
+
+
 @pytest.fixture
 def enqueued(db):
-    """A recorded build set, an approval, a REQUESTED request, and its job on the queue."""
+    """A recorded build set, an approval, a REQUESTED request, and its DECIDED job on the queue."""
     build_set, _ = _set(db, revision_id="bs-lane", members=("sel-a",), target="trr-lane")
     approval = _approval(db, build_set, ENV)
     request_id, created = request_generation(
@@ -96,7 +112,9 @@ def enqueued(db):
         requested_by="user:ops", requested_at="2026-08-21T00:00:00Z",
         generation_authorization_revision_id=approval)
     assert created
-    enqueue_generation(db, job=_job(request_id), environment_id=ENV, logical_group_name=GROUP)
+    enqueue_generation(
+        db, job=_job(request_id, action_decision_revision_id=_decided(db, build_set, approval)),
+        environment_id=ENV, logical_group_name=GROUP)
     return request_id
 
 
@@ -153,10 +171,20 @@ def test_the_GENERAL_CONSUMER_can_never_claim_a_generation(enqueued, db) -> None
 
 def test_ENQUEUEING_ONE_REQUEST_TWICE_IS_ONE_JOB(enqueued, db) -> None:
     """A double-click must not start a second compile. The message id is derived from the request,
-    so the second enqueue finds the first."""
+    so the second enqueue finds the first.
+
+    ▲ The re-enqueue carries the SAME decision id, read back off the frozen payload — because a
+    re-enqueue with a DIFFERENT decision is a different job, and the guard rightly refuses that
+    (the next test pins it). This test is about the identical case.
+    """
+    stored = db.execute("SELECT payload FROM queue WHERE message_id = %s",
+                        (f"generation:{enqueued}",)).fetchone()[0]
     first = db.execute("SELECT count(*) FROM queue WHERE handler = %s",
                        (GENERATION_HANDLER,)).fetchone()[0]
-    enqueue_generation(db, job=_job(enqueued), environment_id=ENV, logical_group_name=GROUP)
+    enqueue_generation(
+        db, job=_job(enqueued,
+                     action_decision_revision_id=stored["action_decision_revision_id"]),
+        environment_id=ENV, logical_group_name=GROUP)
 
     assert db.execute("SELECT count(*) FROM queue WHERE handler = %s",
                       (GENERATION_HANDLER,)).fetchone()[0] == first == 1
@@ -303,3 +331,61 @@ def test_generation_is_OFF_unless_the_deployment_says_otherwise(monkeypatch) -> 
 
     monkeypatch.setenv("FEATUREGEN_GENERATION_V2_ENABLED", "maybe")
     assert generation_enabled() is False
+
+
+# ══ THE SECOND LOOK (§8.2) ═════════════════════════════════════════════════════════════════════
+def test_a_JOB_WITH_NO_DECISION_IS_REFUSED_AS_A_BYPASS(db):
+    """▲ The direct-queue-bypass test, made real. Work submitted straight to the queue — however
+    well-formed the payload — carries no request-time decision, and an act nothing was ever answered
+    about is refused at the worker, not built. REFUSED, not FAILED: the platform is working."""
+    build_set, _ = _set(db, revision_id="bs-nodecision", members=("sel-a",), target="trr-lane")
+    approval = _approval(db, build_set, ENV)
+    request_id, _ = request_generation(
+        db, request_id="req-bypass", build_set_revision_id=build_set, environment_id=ENV,
+        requested_by="user:ops", requested_at="t",
+        generation_authorization_revision_id=approval)
+    enqueue_generation(db, job=_job(request_id), environment_id=ENV, logical_group_name=GROUP)
+
+    outcome = process_generation_once(db, owner="w1", inventory=_inventory())
+
+    assert outcome.status == "refused", outcome
+    assert "ACTION_DECISION_MISSING" in outcome.detail
+    request = read_request(db, request_id)
+    assert request.status is GenerationStatusV1.REFUSED
+    assert request.refusals[0]["code"] == "ACTION_DECISION_MISSING"
+
+
+def test_MOVED_EVIDENCE_REFUSES_THE_ACT_rather_than_re_deciding(db):
+    """▲ Drift is a refusal a person re-requests. A worker that re-evaluated would usually get
+    "allowed" again and proceed under a verdict nobody was shown — so the decision recorded against
+    one world must refuse in another, naming what moved."""
+    from featuregen.materialize.action_authorization import ActionV1, authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+
+    build_set, _ = _set(db, revision_id="bs-drift", members=("sel-a",), target="trr-lane")
+    approval = _approval(db, build_set, ENV)
+    request_id, _ = request_generation(
+        db, request_id="req-drift", build_set_revision_id=build_set, environment_id=ENV,
+        requested_by="user:ops", requested_at="t",
+        generation_authorization_revision_id=approval)
+    # A decision recorded against DIFFERENT evidence than the worker will recompute — the tamper
+    # path: sound authorization, stale pins.
+    authorization = authorize_action(
+        db, action=ActionV1.GENERATE_PREVIEW, resource_identity_hash=build_set,
+        actor_subject="user:ops", environment_id=ENV)
+    decision_id, _ = decide(
+        db, ActionRequestV1(
+            action=ActionV1.GENERATE_PREVIEW, resource_identity_hash=build_set,
+            evidence_pins={"build_set_content_hash": "sha256:a-world-that-moved",
+                           "generation_authorization_revision_id": approval}),
+        authorization_id=authorization.authorization_id)
+    enqueue_generation(
+        db, job=_job(request_id, action_decision_revision_id=decision_id),
+        environment_id=ENV, logical_group_name=GROUP)
+
+    outcome = process_generation_once(db, owner="w1", inventory=_inventory())
+
+    assert outcome.status == "refused", outcome
+    assert "ACTION_DECISION_DRIFTED" in outcome.detail
+    assert "build_set_content_hash" in outcome.detail, "the refusal names WHICH pin moved"
+    assert read_request(db, request_id).status is GenerationStatusV1.REFUSED

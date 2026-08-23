@@ -173,6 +173,10 @@ class GenerationJobV2:
     #: timestamps, and `now()` at claim time would make one request's two deliveries two artifacts.
     compiled_at: str = ""
     sealed_at: str = ""
+    #: The request-time action decision this act runs under (migration 1106). `None` decodes from a
+    #: payload frozen before the field existed — and the worker REFUSES it (`ACTION_DECISION_MISSING`)
+    #: rather than defaulting, because an act with no decision is a queue bypass however it got here.
+    action_decision_revision_id: str | None = None
 
 
 def encode_job(job: GenerationJobV2) -> dict[str, Any]:
@@ -195,6 +199,7 @@ def encode_job(job: GenerationJobV2) -> dict[str, Any]:
         "policy_realization_ids": dict(job.policy_realization_ids or {}),
         "compiled_at": job.compiled_at,
         "sealed_at": job.sealed_at,
+        "action_decision_revision_id": job.action_decision_revision_id,
     }
 
 
@@ -252,7 +257,45 @@ def decode_job(payload: Mapping[str, Any]) -> GenerationJobV2:
                                 for ref, value in realizations.items()},
         compiled_at=_text(material.get("compiled_at"), where="job compiled_at"),
         sealed_at=_text(material.get("sealed_at"), where="job sealed_at"),
+        # `.get`, not `_text`: absence is a legal DECODE (an old payload) and an illegal ACT — the
+        # worker refuses it by name rather than this codec inventing one.
+        action_decision_revision_id=material.get("action_decision_revision_id") or None,
     )
+
+
+def authorize_and_decide_generation(
+    conn, *, build_set_revision_id: str, build_set_content_hash: str,
+    generation_authorization_revision_id: str, environment_id: str, actor_subject: str,
+):
+    """Mint the server-owned authorization and RECORD the request-time decision. Returns
+    ``(decision_id, decision)``.
+
+    ONE definition, called by the route and by every test that enqueues a job, because a fixture
+    that hand-rolled its own pins would drift from the worker's recompute the first time either
+    changed — and the drift check would then fire on healthy jobs, which teaches people to delete it.
+
+    ▲ The pins are the two facts whose movement would change the answer, both re-readable
+    server-side at worker time: the build set's content hash (which since 1101 folds every member's
+    pinned formula) and the generation approval it runs under. The ACTOR is not a pin — the decision
+    already binds its authorization, and the authorization binds the actor.
+    """
+    from featuregen.materialize.action_authorization import ActionV1, authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+
+    authorization = authorize_action(
+        conn, action=ActionV1.GENERATE_PREVIEW,
+        resource_identity_hash=build_set_revision_id,
+        actor_subject=actor_subject, environment_id=environment_id)
+    return decide(
+        conn,
+        ActionRequestV1(
+            action=ActionV1.GENERATE_PREVIEW,
+            resource_identity_hash=build_set_revision_id,
+            evidence_pins={
+                "build_set_content_hash": build_set_content_hash,
+                "generation_authorization_revision_id": generation_authorization_revision_id,
+            }),
+        authorization_id=authorization.authorization_id)
 
 
 # ── the producer ─────────────────────────────────────────────────────────────────────────────────
@@ -477,6 +520,30 @@ def _drive(
             f"such set exists: its membership is what would be built, so there is nothing to build")
 
     advance_request(conn, job.request_id, GenerationStatusV1.RUNNING)
+
+    # ── 0. THE SECOND LOOK (§8.2): the request-time decision, re-checked before the act ─────────
+    # Same service, second moment. The pins are recomputed from what the DATABASE says now — never
+    # from the payload, which is the thing a bypass would have written.
+    from featuregen.materialize.action_decision import DecisionDrift, DecisionMissing, recheck
+
+    try:
+        if job.action_decision_revision_id is None:
+            raise DecisionMissing(
+                f"generation job {job.request_id} carries no action decision: work submitted "
+                f"straight to the queue is refused at the worker, not built")
+        recheck(conn, job.action_decision_revision_id, current_pins={
+            "build_set_content_hash": build_set.content_hash,
+            "generation_authorization_revision_id":
+                request.generation_authorization_revision_id,
+        })
+    except DecisionMissing as exc:
+        return _refuse(conn, claim, job, MaterializationRefused(
+            CompilationRefusalCode.ACTION_DECISION_MISSING, str(exc)))
+    except DecisionDrift as exc:
+        # ▲ REFUSED, never re-decided. Re-evaluating moved evidence usually returns "allowed" again,
+        # and the act then proceeds under a verdict nobody was shown.
+        return _refuse(conn, claim, job, MaterializationRefused(
+            CompilationRefusalCode.ACTION_DECISION_DRIFTED, str(exc)))
 
     # ── 1. THE MEMBERS, rehydrated from the write-once authoring trace ──────────────────────────
     try:
