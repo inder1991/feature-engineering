@@ -3,6 +3,7 @@ from psycopg.types.json import Jsonb
 from tests.featuregen._helpers import mint_test_identity
 from tests.featuregen.runs._chain import seed_run_chain
 
+from featuregen.canonical import jcs_sha256
 from featuregen.runs.run_identity import record_run_identity
 
 _ENV = mint_test_identity(subject="user:priya", role_claims=("feature_engineer",), tenant="t1")
@@ -62,6 +63,31 @@ def test_the_written_row_carries_every_chain_link_and_no_parent(db):
         "created_by FROM feature_run_identity WHERE generation_run_id='ri-a2'").fetchone()
     assert row == ("V1", c["intent_id"], c["scope_id"], "gh", c["considered_revision_id"], "cch",
                    c["snapshot_id"], "ch", None, "user:priya")
+
+
+def test_the_hash_payload_is_pinned_to_thirteen_literal_fields(db):
+    """Golden vector: the hash is exactly these field NAMES over these VALUES.
+
+    Pins, in one assertion, that the payload carries no timestamp (a clock read would make the hash
+    unreproducible), never hashes the identity hash itself (non-self-reference), and keeps the field
+    names stable — any rename, addition or removal changes the digest and fails here."""
+    c = seed_run_chain(db, run_id="ri-golden")
+    h = record_run_identity(db, "ri-golden", _ENV)
+    assert h == jcs_sha256({
+        "workflow_definition_version": "V1",
+        "generation_run_id": "ri-golden",
+        "intent_id": c["intent_id"],
+        "confirmed_scope_id": c["scope_id"],
+        "generation_input_content_hash": "gh",
+        "considered_revision_id": c["considered_revision_id"],
+        "considered_content_hash": "cch",
+        "metadata_snapshot_id": c["snapshot_id"],
+        "metadata_snapshot_content_hash": "ch",
+        "owner_subject": "user:priya",
+        "owner_tenant": "t1",
+        "root_generation_run_id": "ri-golden",
+        "parent_generation_run_id": None,
+    })
 
 
 def test_returns_none_when_the_chain_is_incomplete(db):
