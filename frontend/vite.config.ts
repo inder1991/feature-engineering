@@ -33,7 +33,12 @@ const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', 
   // verification, publish. Behind the SAME server switch as /materialization-runs, and listed here
   // for the same reason — a missing prefix answers a POST with 405 from the SPA rather than a 404
   // anyone would recognise as routing.
-  '/feature-execution', '/considered-revisions', '/formula-drafts']
+  '/feature-execution', '/considered-revisions', '/formula-drafts',
+  // The read-only run spine: GET /feature-runs (list) and /feature-runs/{id} (detail). Note this
+  // is a DIFFERENT prefix from /features and /feature-execution — Vite matches on the literal
+  // string, so neither of those covers it and without this entry the dev server answers the
+  // list request itself with index.html.
+  '/feature-runs']
 
 export default defineConfig({
   plugins: [react()],
