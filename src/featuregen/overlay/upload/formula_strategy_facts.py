@@ -125,7 +125,18 @@ def assemble_strategy_facts(
     catalog_snapshot_hash: str, binding_plan_hash: str | None = None,
     method_override_revision_id: str | None = None,
 ) -> AssembledStrategyFactsV1:
-    """Everything `resolve_formula_strategy` needs, read once and normalized."""
+    """Everything `resolve_formula_strategy` needs, read once and normalized.
+
+    ▲ §11.3: when the caller supplies no override id, the assembler RESOLVES the candidate's
+    current unexpired override itself — it has the connection, and an input fact the assembler
+    cannot see is an input fact every caller has to remember to thread (the grain_refs lesson).
+    The resolver still decides; this only surfaces recorded evidence.
+    """
+    if method_override_revision_id is None:
+        from featuregen.overlay.upload.method_override import current_method_override
+
+        method_override_revision_id = current_method_override(
+            conn, considered_revision_id=considered_revision_id, option_id=option_id)
     from featuregen.overlay.upload.recipe_formula_blueprint_derivation import (
         BlueprintDerivationRefusal,
         derive_blueprint_v2,

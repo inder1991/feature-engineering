@@ -2995,8 +2995,18 @@ into the dispatch context; per-call worst case is the approval's own arithmetic,
 ceilings enforce jointly and exhaustion refuses BEFORE egress). **5b shipped in part** — the
 seven-stage workspace, the plan-then-confirm action, route/proxy wiring, and the gold-line
 warning reshape; the child plan records the honest gap (no frontend surface lists selections
-yet, so the rail integration has no host). Remaining near-term: §11.3's method-override
-migration. Steps 0/0b remain OPERATOR; 7–10 are release-readiness per §0.1.0.
+yet, so the rail integration has no host). **§11.3 is DONE** (2026-08-23, migration
+**1112** — renumbered at write time): `formula_method_override_revision` append-only with the
+refusal code CLOSED to the one deterministic refusal, spend NOT NULL, expiry CHECKed;
+`method_override.request_method_override` VERIFIES the named draft is BLOCKED by that code for
+THAT candidate under a live ceiling before recording; `current_method_override` compares expiry
+against `clock_timestamp()` (its test caught that `now()` is frozen at transaction start — an
+override could expire mid-transaction and keep being honoured, failing open); the facts
+assembler resolves the candidate's current override ITSELF (the grain_refs lesson), so the
+resolver's existing override branch finally has a writer feeding it; and the route verifies,
+records, and never accepts a formula method from the body. **The near-term path 0→6 is now
+ENGINEERING-COMPLETE**; what remains anywhere is operator work (0/0b, migrations to live, corpus
+growth) and steps 7–10 as release-readiness per §0.1.0.
 
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`
@@ -3068,7 +3078,7 @@ still follow step order.**
 | 1106 | **parent §7.1 / §0.1.2** | ▲ `action_decision_revision` + ▲ **the NOT NULL `action_decision_revision_id` columns and composite FKs on every request/attempt table** (R6) | 3 |
 | 1107 | **parent §11.1.2** | ▲ **DONE — TAKEN by the money-guard scope fix** (adversarial finding W4): 1090's unique index narrowed to `WHERE state NOT IN ('FAILED','CANCELLED')`, because a failed draft bought nothing and must not hold the identity slot — without this, the regeneration exception's remedy was structurally unreachable. A NEW file: 1090 is applied live and immutable | 2 |
 | 1108b→ | — | ▲ **RESERVATIONS SHIFT BY ONE from here**: work-item split (was 1107) → **1108**, method override (was 1108) → **1109**, and so on. Re-verify the ledger at write time, as this table already instructs | — |
-| 1108 | **parent §11.3** | ▲ `formula_method_override_revision` | 4 |
+| 1108 | **parent §11.3** | ▲ **MOVED — written as 1112** (1108 was taken by the generation-request decision binding; §17's own rule: re-verify the ledger at write time) | 4 |
 | 1109 | **child §3.5 / parent §0.1.3** | `code_generation_job` + `_member` + `_event` + ▲ **`code_generation_job_action` — one authorization and decision PER ACTION** (R7) | 5 |
 | 1110 | **parent §9.0** | ▲ `verification_request` lease/fence columns + the sandbox output revision identity | **6** |
 | 1111 | **parent §9.1** | ▲ production **materialization** attempt state machine + `materialized_output_revision` | 7 |

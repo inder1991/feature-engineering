@@ -33,6 +33,7 @@ from typing import Annotated, Any
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel, ConfigDict, Field
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import get_conn, get_identity, require_permission
@@ -182,6 +183,70 @@ def _retired_detail(conn, candidate, option_id: str, *, config_hash: str) -> dic
         "reason": row[1],
         "detail": row[2],
         "replacement_draft_id": row[3],
+    }
+
+
+class MethodOverrideIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    refused_formula_draft_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    llm_spend_authorization_id: str = Field(min_length=1)
+    #: Bounded server-side: an approval given inside a triage window must not still authorize an
+    #: LLM retry weeks later — the blueprint may have been fixed, and the correct answer then is
+    #: the deterministic one.
+    expires_in_hours: int = Field(default=24, ge=1, le=168)
+
+
+@router.post(
+    "/considered-revisions/{revision_id}/options/{option_id}/formula-method-overrides",
+    status_code=201,
+    dependencies=[Depends(require_permission("feature:generate"))])
+def request_formula_method_override(
+    revision_id: str, option_id: str, body: MethodOverrideIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """§11.3 — "Try AI formula", as an act the server VERIFIES and records.
+
+    The browser never sends a formula method (parent §7). It names the refused draft; the server
+    checks that draft is BLOCKED by the deterministic instantiation refusal for THIS candidate,
+    that a live spend ceiling covers the retry (§11.2), and records the override append-only with
+    an expiry — the strategy resolver then consumes it as an input fact on the NEXT draft
+    request, which mints a NEW draft identity (child D2): nothing re-labels the refused one.
+    """
+    from featuregen.overlay.upload.method_override import (
+        OverrideRefusalUnverified,
+        request_method_override,
+    )
+
+    expires = conn.execute(
+        "SELECT (now() + make_interval(hours => %s))::text",
+        (body.expires_in_hours,)).fetchone()[0]
+    try:
+        override_id, created = request_method_override(
+            conn, considered_revision_id=revision_id, option_id=option_id,
+            refused_formula_draft_id=body.refused_formula_draft_id,
+            actor_subject=identity.subject, reason=body.reason,
+            llm_spend_authorization_id=body.llm_spend_authorization_id,
+            expires_at=expires)
+    except OverrideRefusalUnverified as exc:
+        # 409: the request is well-formed; what is wrong is the RELATION between it and the
+        # recorded world — no such refusal, wrong candidate, or no live ceiling.
+        raise HTTPException(status_code=409, detail={
+            "code": "OVERRIDE_REFUSAL_UNVERIFIED", "detail": str(exc)}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    counters.incr("featuregen.formula_method_override.recorded" if created
+                  else "featuregen.formula_method_override.deduplicated")
+    log("featuregen.formula_method_override.recorded", override_id=override_id,
+        considered_revision_id=revision_id, option_id=option_id, created=created)
+    return {
+        "override_id": override_id,
+        "created": created,
+        "detail": ("the override is recorded and expires on schedule — request the formula "
+                   "again and the resolver will author by LLM, with the override named in the "
+                   "draft's identity" if created else
+                   "this exact override is already recorded; it is the one in effect"),
     }
 
 

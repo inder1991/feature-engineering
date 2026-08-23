@@ -389,3 +389,55 @@ def test_A_CONCEPTUAL_CANDIDATE_CANNOT_MINT_A_DRAFT(client, conn, engineer_heade
     assert detail["code"] == "CONCEPTUAL_PATTERN_NOT_AUTHORABLE"
     assert "next_step" in detail
     assert conn.execute("SELECT count(*) FROM formula_draft").fetchone()[0] == 0
+
+
+# ══ §11.3 — "Try AI formula" is a VERIFIED act, never a request field ═══════════════════════════
+def test_AN_OVERRIDE_IS_VERIFIED_AND_RECORDED_with_server_owned_expiry(
+        client, conn, engineer_headers):
+    """The browser names a refused draft; the server checks the refusal actually happened and
+    records the override append-only. No formula method ever rides the request body."""
+    import json as _json
+
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+
+    _revision(conn, revision_id="crev-ovr", snapshot_id="snap-ovr")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, blockers, requested_by, "
+        "requested_at) VALUES ('fd-ovr','crev-ovr','opt-a','h','h','h','r','ident-ovr',"
+        "'BLOCKED',%s::jsonb,'user:sam','2026-08-23T00:00:00Z')",
+        (_json.dumps([{"code": "REVIEWED_BLUEPRINT_NOT_EXECUTABLE", "reason": "x"}]),))
+    spend = authorize_spend(
+        conn, action="AUTHOR_FORMULA", actor_subject="user:sam", job_identity="job-ovr",
+        member_identities=["sel-ovr"], provider_contract_hash="sha256:c", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+
+    response = client.post(
+        "/considered-revisions/crev-ovr/options/opt-a/formula-method-overrides",
+        json={"refused_formula_draft_id": "fd-ovr", "reason": "operand renamed upstream",
+              "llm_spend_authorization_id": spend},
+        headers=engineer_headers)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["created"] is True
+    row = conn.execute(
+        "SELECT actor_subject, original_refusal_code FROM formula_method_override_revision "
+        "WHERE override_id = %s", (response.json()["override_id"],)).fetchone()
+    assert row == ("user:sam", "REVIEWED_BLUEPRINT_NOT_EXECUTABLE")
+
+
+def test_AN_UNVERIFIED_REFUSAL_IS_A_409_NOT_AN_OVERRIDE(client, conn, engineer_headers):
+    """A refusal that did not happen authorizes nothing — otherwise this is a client-chosen
+    method with extra steps."""
+    _revision(conn, revision_id="crev-noref", snapshot_id="snap-noref")
+    response = client.post(
+        "/considered-revisions/crev-noref/options/opt-a/formula-method-overrides",
+        json={"refused_formula_draft_id": "fd-absent", "reason": "r",
+              "llm_spend_authorization_id": "spend-x"},
+        headers=engineer_headers)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "OVERRIDE_REFUSAL_UNVERIFIED"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM formula_method_override_revision").fetchone() == (0,)
