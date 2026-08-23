@@ -35,6 +35,18 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from featuregen.aggregates.ids import mint_id
+import json
+
+from featuregen.canonical import jcs_sha256
+from featuregen.overlay.upload.retirement_scope import retirement_scope_key
+from featuregen.overlay.upload.formula_strategy import (
+    FormulaStrategy,
+    resolve_formula_strategy,
+)
+from featuregen.overlay.upload.formula_strategy_facts import (
+    assemble_strategy_facts,
+    current_author_contract_hash,
+)
 from featuregen.api.deps import get_conn, get_identity, require_permission
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.formula_draft_store import (
@@ -101,6 +113,9 @@ def _frozen_candidate(conn: psycopg.Connection, revision_id: str, option_id: str
 
     return {
         "considered_revision_id": revision[0],
+        # The frozen idea itself — the strategy assembler reads its provenance fields when the
+        # option has no decision row. Server-resolved above; a body could never supply it.
+        "idea": idea,
         # The frozen catalog the model will be given. Part of the draft's identity, so a catalog
         # that moves produces a DIFFERENT draft rather than silently reusing an answer about a world
         # that no longer exists. Falls back to the revision's own content hash when no metadata
@@ -134,6 +149,52 @@ def request_formula_draft(
     candidate = _frozen_candidate(conn, revision_id, option_id)
     minted = mint_id(_DRAFT_PREFIX)
 
+    # ▲ THE METHOD IS RESOLVED FROM EVIDENCE, HERE, BEFORE THE DRAFT IDENTITY EXISTS — owner ruling
+    # 2026-08-23 item 2. The strategy and its evidence hash are FOLDED INTO the identity below, so
+    # "which method was chosen" is part of "is this the same draft" — a re-request after the
+    # registry moves is a different draft, not a silent re-route of this one.
+    assembled = assemble_strategy_facts(
+        conn, considered_revision_id=candidate["considered_revision_id"], option_id=option_id,
+        idea=candidate["idea"], catalog_snapshot_hash=candidate["catalog_snapshot_hash"])
+    decision = resolve_formula_strategy(assembled.facts)
+
+    if decision.strategy in (FormulaStrategy.NON_FORMULA, FormulaStrategy.MODEL_WORKFLOW):
+        # 409, and the message is a NEXT STEP, not a dead end: a conceptual pattern is saved or
+        # specified, a governed model output goes to the model workflow. Neither is a formula, so
+        # neither may mint a draft — a draft row for a non-formula would be a formula-shaped
+        # promise about a thing that is not one.
+        raise HTTPException(status_code=409, detail={
+            "code": decision.blockers[0] if decision.blockers else "NOT_A_FORMULA",
+            "formula_strategy": str(decision.strategy),
+            "detail": ("this candidate is not a deterministic formula, so no formula can be "
+                       "drafted for it"),
+            "next_step": ("save the idea or specify the computation"
+                          if decision.strategy is FormulaStrategy.NON_FORMULA
+                          else "configure it through the model workflow")})
+    if decision.blockers:
+        raise HTTPException(status_code=409, detail={
+            "code": decision.blockers[0],
+            "formula_strategy": str(decision.strategy),
+            "detail": "the resolved authoring method cannot proceed",
+            "blockers": list(decision.blockers)})
+
+    # ▲ IDENTITY V2 — the corrected composition, ACTIVATED. The old `_authoring_config_hash` was a
+    # CONSTANT (getattr on a dict), so the money guard was blind to model, prompts and method since
+    # it shipped. Safe to correct ONLY because 1103 moved retirement off the identity hash first:
+    # every tombstone keys on the retirement scope, so re-minting identities cannot un-retire
+    # anything. LLM drafts fold the FROZEN provider contract (where prompt identity actually
+    # lives); reviewed drafts fold none, because no provider would be called.
+    provider_contract = (current_author_contract_hash()
+                        if decision.strategy is FormulaStrategy.LLM_AUTHORED else None)
+    config_payload: dict[str, Any] = {
+        "identity_version": 2,
+        "formula_strategy": str(decision.strategy),
+        "strategy_identity_hash": decision.strategy_identity_hash,
+    }
+    if provider_contract is not None:
+        config_payload["provider_contract_hash"] = provider_contract
+    config_hash = jcs_sha256(config_payload)
+
     try:
         draft_id, created = request_draft(
             conn,
@@ -142,10 +203,13 @@ def request_formula_draft(
             option_id=option_id,
             planning_request_hash=candidate["planning_request_hash"],
             catalog_snapshot_hash=candidate["catalog_snapshot_hash"],
-            authoring_config_hash=_authoring_config_hash(),
+            authoring_config_hash=config_hash,
             definition_revision=candidate["definition_revision"],
             requested_by=identity.subject,
-            requested_at=_now(conn))
+            requested_at=_now(conn),
+            provider_contract_hash=provider_contract,
+            strategy_identity_hash=decision.strategy_identity_hash,
+            now=_now(conn))
     except DraftRetired as exc:
         # ▲ 409, NOT a 500. `request_draft` raises this deliberately — the identity belongs to a
         # RETIRED draft — and with nothing catching it the global handler turned a considered
@@ -156,7 +220,7 @@ def request_formula_draft(
         # conflicts is the state of the world. The body carries what somebody actually needs to act
         # — which draft, why, what replaced it, and WHICH input has to change — because
         # `formula_identity_hash` is unique, so retrying with a new draft id lands on the same row.
-        retired = _retired_detail(conn, candidate, option_id)
+        retired = _retired_detail(conn, candidate, option_id, config_hash=config_hash)
         raise HTTPException(status_code=409, detail={
             "code": "FORMULA_DRAFT_RETIRED",
             "message": str(exc),
@@ -170,6 +234,45 @@ def request_formula_draft(
         }) from exc
 
     if created:
+        # ▲ THE PLAN, PERSISTED IN THE SAME TRANSACTION AS THE DRAFT AND ITS QUEUE MESSAGE. The
+        # worker RE-READS this row and never recomputes the strategy — a registry or review moving
+        # between the request and the work must not silently re-route a draft whose identity folded
+        # the FIRST answer. 1104's CHECKs enforce the shape: an LLM plan names its contract and
+        # cannot claim a review; a reviewed plan names its blueprint at generation v2 and no
+        # contract.
+        facts = assembled.facts
+        conn.execute(
+            "INSERT INTO formula_draft_authoring_plan (formula_draft_id, candidate_origin, "
+            "formula_strategy, strategy_identity_hash, recipe_id, recipe_revision_hash, "
+            "expectation_ref, expectation_generation, reviewed_blueprint_revision, "
+            "reviewed_blueprint_hash, provider_contract_hash, method_override_revision_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (draft_id, facts.candidate_origin, str(decision.strategy),
+             decision.strategy_identity_hash, facts.recipe_id, facts.recipe_revision_hash,
+             facts.expectation_ref if facts.recipe_id else None,
+             facts.expectation_generation if facts.recipe_id else None,
+             assembled.reviewed_blueprint_revision
+             if decision.strategy is FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT else None,
+             assembled.reviewed_blueprint_hash
+             if decision.strategy is FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT else None,
+             provider_contract, facts.method_override_revision_id))
+
+        # ▲ AND THE IDENTITY COMPANION — version 2, explicitly. Its composite FK to
+        # (formula_draft_id, authoring_config_hash) is what makes "this companion describes that
+        # draft" a constraint rather than a hope; migration 1109 records version 1 for every draft
+        # that predates this composition.
+        conn.execute(
+            "INSERT INTO formula_draft_authoring_identity (formula_draft_id, identity_version, "
+            "retirement_scope_key, config_payload_json, config_hash) "
+            "VALUES (%s, 2, %s, %s::jsonb, %s)",
+            (draft_id,
+             retirement_scope_key(
+                 considered_revision_id=candidate["considered_revision_id"], option_id=option_id,
+                 planning_request_hash=candidate["planning_request_hash"],
+                 catalog_snapshot_hash=candidate["catalog_snapshot_hash"],
+                 definition_revision=candidate["definition_revision"]),
+             json.dumps(config_payload, sort_keys=True), config_hash))
+
         # Enqueued ONLY for a genuinely new draft. Re-enqueuing an existing one would put a second
         # job on the lane for work already in flight or already finished.
         insert_outbox_message_checked(
@@ -193,13 +296,18 @@ def request_formula_draft(
         # showed "started" for a request that started nothing would be describing a spend that did
         # not happen.
         "created": created,
+        # ▲ The RESOLVED method and the reasons, surfaced — the plan row is the durable record,
+        # this is the same answer at the moment of asking. A client never sends a strategy; it
+        # reads the one the server chose.
+        "formula_strategy": str(decision.strategy),
+        "strategy_warnings": list(decision.warnings),
         "detail": ("the formula draft was requested; a worker authors it" if created else
                    "an identical draft already exists for this candidate, catalog snapshot and "
                    "configuration — nothing was queued and nothing was spent"),
     }
 
 
-def _retired_detail(conn, candidate, option_id: str) -> dict[str, object]:
+def _retired_detail(conn, candidate, option_id: str, *, config_hash: str) -> dict[str, object]:
     """Which draft was retired, why, and what replaced it — read for the 409 body.
 
     A refusal that named only "retired" would send the caller to ask three more questions, and the
@@ -211,7 +319,11 @@ def _retired_detail(conn, candidate, option_id: str) -> dict[str, object]:
         considered_revision_id=candidate["considered_revision_id"], option_id=option_id,
         planning_request_hash=candidate["planning_request_hash"],
         catalog_snapshot_hash=candidate["catalog_snapshot_hash"],
-        authoring_config_hash=_authoring_config_hash(),
+        # The SAME V2 hash the request computed — recomputing the identity here under a different
+        # composition would look up a row the refusal was never about. Legacy V1 retirements are
+        # found by the tombstone path in `request_draft` itself, whose scope key ignores the
+        # configuration entirely; this lookup only decorates the 409 body.
+        authoring_config_hash=config_hash,
         definition_revision=candidate["definition_revision"])
     row = conn.execute(
         "SELECT d.formula_draft_id, r.reason, r.detail, r.replacement_draft_id "
@@ -276,23 +388,15 @@ def formula_draft_status(formula_draft_id: str, conn: _Conn) -> dict[str, Any]:
     }
 
 
-def _authoring_config_hash() -> str:
-    """The authoring configuration and model contract this build would author under.
-
-    Read from the shipped settings rather than recorded per request, because it describes the
-    BUILD: two drafts authored under different model contracts are not interchangeable, and the
-    identity has to notice.
-    """
-    from featuregen.formula.audited import current_formula_generation_settings
-
-    settings = current_formula_generation_settings()
-    from featuregen.canonical import jcs_sha256
-
-    return jcs_sha256({
-        "model": getattr(settings, "model", ""),
-        "max_tokens": getattr(settings, "max_tokens", 0),
-        "prompt_id": getattr(settings, "prompt_id", ""),
-    })
+# ▲ `_authoring_config_hash` IS GONE, and what it was is recorded where its victims are. It called
+# `getattr` on a DICT, so `model`, `max_tokens` and `prompt_id` all fell to their defaults on every
+# deployment and the "identity" was the constant
+# f5c34b84d694062755f4b88605f9fc8d67e2f4ac1699054f99f6ccd09bfdc3c8 — the money guard blind to
+# model, prompts and method since it shipped. Identity V2 (computed inline in the request route)
+# folds the FROZEN provider contract and the resolved strategy instead. Migration 1109 records the
+# constant era explicitly on every pre-V2 draft, as the defect it was. Deleting the function rather
+# than fixing it is deliberate: a corrected version would still be a SECOND composition beside the
+# route's, and two compositions of one identity is how they drift.
 
 
 def _now(conn: psycopg.Connection) -> str:

@@ -28,6 +28,7 @@ def _reviewed(**over) -> FormulaStrategyFactsV1:
     """A current, reviewed, V2 registry entry that binds — the one deterministic case."""
     base = dict(expectation_ref="posted_debit_amount", expectation_generation="v2",
                 reviewed_expectation_current=True, blueprint_bindable=True,
+                deterministic_lane_available=True,
                 reviewed_blueprint_revision="rev-1", reviewed_blueprint_hash="h-1")
     return _facts(**{**base, **over})
 
@@ -157,3 +158,26 @@ def test_EVERY_EVIDENCE_FIELD_MOVES_THE_IDENTITY(field, value):
 def test_THE_SAME_EVIDENCE_IS_THE_SAME_IDENTITY():
     assert (resolve_formula_strategy(_reviewed()).strategy_identity_hash
             == resolve_formula_strategy(_reviewed()).strategy_identity_hash)
+
+
+def test_A_REVIEWED_ENTRY_WITH_THE_LANE_OFF_ROUTES_LLM_with_the_reason_recorded():
+    """▲ A PLATFORM capability gap is not a CANDIDATE defect. While the deterministic lane's
+    grounding-context plumbing is unpersisted, a reviewed-V2 candidate authors by LLM — with the
+    reason RECORDED, never silently, and never wearing REVIEWED_BLUEPRINT_NOT_EXECUTABLE, which is
+    reserved for a blueprint that genuinely failed against this candidate."""
+    decision = resolve_formula_strategy(_reviewed(deterministic_lane_available=False))
+
+    assert decision.strategy is FormulaStrategy.LLM_AUTHORED
+    assert "REVIEWED_LANE_UNAVAILABLE" in decision.warnings
+    assert "REVIEWED_BLUEPRINT_NOT_EXECUTABLE" not in decision.blockers
+
+
+def test_THE_LANE_POSTURE_IS_NOT_IN_THE_IDENTITY_but_the_strategy_it_changes_is():
+    """The posture is a MEASURED deployment fact and stays out of the hash; it moves the identity
+    only through the STRATEGY it selects — the front door, never a re-mint of an existing draft."""
+    lane_on = resolve_formula_strategy(_reviewed())
+    lane_off = resolve_formula_strategy(_reviewed(deterministic_lane_available=False))
+
+    # Different strategies, so different identities — through the strategy axis.
+    assert lane_on.strategy is not lane_off.strategy
+    assert lane_on.strategy_identity_hash != lane_off.strategy_identity_hash

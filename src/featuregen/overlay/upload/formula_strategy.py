@@ -77,6 +77,7 @@ class FormulaStrategyFactsV1:
     reviewed_blueprint_hash: str | None = None
     review_validity_evidence: str | None = None
 
+
     provider_contract_hash: str | None = None
     catalog_snapshot_hash: str | None = None
     binding_plan_hash: str | None = None
@@ -86,6 +87,12 @@ class FormulaStrategyFactsV1:
     #: A server-authored override (parent §11.3), consumed as an INPUT FACT. The client never sends
     #: a method; it asks for an override, and the server verifies the refusal it names.
     method_override_revision_id: str | None = None
+
+    #: ▲ The deterministic lane's EXECUTION POSTURE — a declared deployment capability, and a
+    #: MEASURED fact that stays OUT of the identity hash. It changes which STRATEGY is chosen, and
+    #: the strategy is what the identity folds — so flipping the posture changes future drafts'
+    #: identities through the front door, never by re-minting an existing one.
+    deterministic_lane_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +142,14 @@ def _decide(facts: FormulaStrategyFactsV1) -> tuple[FormulaStrategy, tuple[str, 
         return FormulaStrategy.LLM_AUTHORED, (), ("METHOD_OVERRIDDEN_TO_LLM",)
 
     if facts.reviewed_expectation_current and facts.expectation_generation == "v2":
+        if not facts.deterministic_lane_available:
+            # ▲ A PLATFORM capability gap is not a CANDIDATE defect, and the two must not share a
+            # code. The deterministic lane cannot execute in this deployment (its grounding-context
+            # plumbing is not yet persisted to draft time), so the candidate authors by LLM — WITH
+            # THE REASON RECORDED, which is what makes this routing honest rather than silent.
+            # `REVIEWED_BLUEPRINT_NOT_EXECUTABLE` below stays reserved for a blueprint that
+            # genuinely failed against this candidate.
+            return FormulaStrategy.LLM_AUTHORED, (), ("REVIEWED_LANE_UNAVAILABLE",)
         if not facts.blueprint_bindable:
             # Named, and it does NOT fall back. A silent fallback would hide a broken reviewed
             # blueprint, change the cost and change which certificate production needs.

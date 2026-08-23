@@ -472,6 +472,13 @@ def _author(
         _renew(claim, lease_seconds=lease_seconds)
         _sync_from_trace(draft_id)
 
+    # ▲ DISPATCH BY THE STORED PLAN, NEVER BY RECOMPUTATION — owner ruling 2026-08-23 item 2. The
+    # strategy was resolved at request time from evidence and FOLDED INTO the draft's identity; the
+    # registry or a review moving since then must not re-route a draft whose identity claims the
+    # first answer. A draft with no plan row predates the strategy contract and authors by LLM,
+    # which is what every such draft's identity actually recorded.
+    reviewed = _reviewed_blueprint_for(conn, draft_id)
+
     return run_authoring_v2_replay(
         conn,
         facts["intent"],
@@ -485,7 +492,83 @@ def _author(
         critic_metadata_loader=frozen.get_column_metadata,
         progress_callback=progress,
         formula_schema_version=_DRAFT_FORMULA_SCHEMA_VERSION,
+        reviewed_blueprint=reviewed,
     )
+
+
+#: ▲ THE BOUND-CONTEXT SEAM for the reviewed lane. `None` — the shipped default — means this
+#: deployment cannot rebuild a candidate's grounding context at draft time (it is a serving-time
+#: product nothing yet persists), which is exactly why `formula_strategy_facts` declares the lane
+#: posture OFF and the resolver routes reviewed candidates to the LLM with `REVIEWED_LANE_UNAVAILABLE`
+#: recorded. The seam exists NOW, with its dispatch wired and tested, so that landing the context
+#: plumbing is a loader plus a posture flip — never a re-derivation of this routing under deploy
+#: pressure. Tests inject a binder to drive the whole reviewed path, zero provider calls included.
+_BOUND_CONTEXT_LOADER = None
+
+
+def _reviewed_blueprint_for(conn, draft_id: str):
+    """The BOUND blueprint this draft's plan pinned, verified — or ``None`` for the LLM lane.
+
+    Raises:
+        _DraftBlocked: the plan says REVIEWED and the blueprint cannot be rebuilt, has moved since
+            the plan pinned it, or no bound context is obtainable. ▲ Named, never a silent LLM
+            fallback — a fallback would hide a broken reviewed blueprint, change the cost, and
+            change which certificate production needs.
+    """
+    plan = conn.execute(
+        "SELECT formula_strategy, recipe_id, reviewed_blueprint_revision, "
+        "       reviewed_blueprint_hash "
+        "  FROM formula_draft_authoring_plan WHERE formula_draft_id = %s",
+        (draft_id,)).fetchone()
+    if plan is None or plan[0] != "REVIEWED_RECIPE_BLUEPRINT":
+        return None
+
+    from featuregen.overlay.upload.recipe_formula_blueprint_derivation import (
+        BlueprintDerivationRefusal,
+        derive_blueprint_v2,
+    )
+    from featuregen.overlay.upload.recipe_formula_contracts import (
+        RecipeFormulaPreflightError,
+    )
+    from featuregen.overlay.upload.recipe_formula_contracts_v2 import (
+        bind_formula_expectation_v2,
+        expectation_content_hash_v2,
+    )
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+    _strategy, recipe_id, pinned_revision, pinned_hash = plan
+    definition = v2_recipe_by_id(recipe_id)
+    derived = None if definition is None else derive_blueprint_v2(definition)
+    if derived is None or isinstance(derived, BlueprintDerivationRefusal):
+        raise _DraftBlocked({
+            "code": "REVIEWED_BLUEPRINT_NOT_EXECUTABLE",
+            "reason": f"the plan pinned a reviewed blueprint for {recipe_id!r} and the registry "
+                      f"no longer derives one: "
+                      f"{getattr(derived, 'code', 'recipe missing')}"})
+    # ▲ THE PLAN PINNED BYTES, AND THE BYTES MUST NOT HAVE MOVED. The draft's identity folded the
+    # strategy over THIS blueprint; authoring a newer one under the old identity would seal a
+    # method claim about bytes nobody chose.
+    if expectation_content_hash_v2(derived) != pinned_hash:
+        raise _DraftBlocked({
+            "code": "REVIEWED_BLUEPRINT_NOT_EXECUTABLE",
+            "reason": f"the reviewed blueprint for {recipe_id!r} moved after this draft's plan "
+                      f"pinned it ({pinned_hash} -> {expectation_content_hash_v2(derived)}); a "
+                      f"NEW draft request resolves against the current one"})
+
+    if _BOUND_CONTEXT_LOADER is None:
+        raise _DraftBlocked({
+            "code": "REVIEWED_BLUEPRINT_NOT_EXECUTABLE",
+            "reason": "this deployment has no bound-context loader for the deterministic lane; "
+                      "the resolver's posture should have routed this draft to the LLM, so a "
+                      "REVIEWED plan reaching this worker is a posture/plan disagreement"})
+    context = _BOUND_CONTEXT_LOADER(conn, draft_id)
+    try:
+        return bind_formula_expectation_v2(context, derived)
+    except RecipeFormulaPreflightError as exc:
+        raise _DraftBlocked({
+            "code": "REVIEWED_BLUEPRINT_NOT_EXECUTABLE",
+            "reason": f"the reviewed blueprint for {recipe_id!r} does not bind to this "
+                      f"candidate: {exc.code}"}) from None
 
 
 def _admit(

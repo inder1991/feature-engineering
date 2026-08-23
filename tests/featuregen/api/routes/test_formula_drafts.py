@@ -330,3 +330,62 @@ def test_THE_POLLING_ROUTE_REPORTS_RETIREMENT(client, conn, engineer_headers):
     assert body["terminal"] is True, "a retired draft is not still in flight"
     assert body["retirement"]["reason"] == "WITHDRAWN"
     assert body["retirement"]["retired_by"] == "ops@bank"
+
+
+# ══ OWNER RULING 2026-08-23, ITEMS 1+2: THE STRATEGY IS RESOLVED, RECORDED, AND FOLDED ═════════
+def test_THE_PLAN_AND_IDENTITY_V2_ARE_RECORDED_in_the_request_transaction(
+        client, conn, engineer_headers):
+    """▲ The resolved method is a durable row the worker re-reads, and the identity companion says
+    WHICH composition minted the draft. The old identity was a CONSTANT — getattr on a dict — so
+    the money guard was blind to model, prompts and method since it shipped."""
+    _revision(conn)
+
+    response = client.post(
+        "/considered-revisions/crev-1/options/opt-a/formula-drafts", headers=engineer_headers)
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["formula_strategy"] == "LLM_AUTHORED"     # an anchor idea, no recipe
+    draft_id = body["formula_draft_id"]
+
+    plan = conn.execute(
+        "SELECT candidate_origin, formula_strategy, provider_contract_hash, "
+        "       reviewed_blueprint_revision FROM formula_draft_authoring_plan "
+        "WHERE formula_draft_id = %s", (draft_id,)).fetchone()
+    assert plan[0] == "llm_intent"                        # llm_freeform normalized, never raw
+    assert plan[1] == "LLM_AUTHORED"
+    assert plan[2], "an LLM plan names its frozen provider contract"
+    assert plan[3] is None, "and cannot claim a reviewed blueprint (1104's CHECK backs this)"
+
+    companion = conn.execute(
+        "SELECT identity_version, config_hash FROM formula_draft_authoring_identity "
+        "WHERE formula_draft_id = %s", (draft_id,)).fetchone()
+    assert companion[0] == 2
+    # ▲ NOT the constant. The exact defect value, refused by name.
+    assert companion[1] != "f5c34b84d694062755f4b88605f9fc8d67e2f4ac1699054f99f6ccd09bfdc3c8"
+    stored = conn.execute(
+        "SELECT authoring_config_hash FROM formula_draft WHERE formula_draft_id = %s",
+        (draft_id,)).fetchone()[0]
+    assert stored == companion[1], "the companion's composite FK describes the draft it names"
+
+
+def test_A_CONCEPTUAL_CANDIDATE_CANNOT_MINT_A_DRAFT(client, conn, engineer_headers):
+    """A conceptual pattern is saved or specified — a draft row for a non-formula would be a
+    formula-shaped promise about a thing that is not one. 409 with a next step, not a dead end."""
+    _revision(conn, revision_id="crev-conceptual")
+    conn.execute(
+        "INSERT INTO semantic_option_decision (decision_id, considered_revision_id, option_id, "
+        "generation_run_id, source_definition_id, generation_source, computation_kind, "
+        "planning_request_hash, binding_state, readiness, review_current, metadata_snapshot_id) "
+        "VALUES ('dec-conceptual', 'crev-conceptual', 'opt-a', 'run-1', 'concept-1', 'recipe', "
+        "'conceptual_pattern', 'h', 'bound', 'CONCEPTUAL_ONLY', false, 'snap-1')")
+
+    response = client.post(
+        "/considered-revisions/crev-conceptual/options/opt-a/formula-drafts",
+        headers=engineer_headers)
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "CONCEPTUAL_PATTERN_NOT_AUTHORABLE"
+    assert "next_step" in detail
+    assert conn.execute("SELECT count(*) FROM formula_draft").fetchone()[0] == 0

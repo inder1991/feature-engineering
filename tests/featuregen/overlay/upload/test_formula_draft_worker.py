@@ -334,3 +334,125 @@ def test_the_terminal_kinds_are_deliberately_unmapped():
     not been asked yet."""
     assert "completed" not in _KIND_STATE
     assert "failed" not in _KIND_STATE
+
+
+# ══ THE REVIEWED LANE'S REBUILD (owner ruling 2026-08-23 item 2) ═══════════════════════════════
+def _reviewed_plan(db, *, draft_id="fd-rev-1", pinned_hash=None):
+    """A draft whose PLAN pinned the shipped recipe's reviewed blueprint."""
+    from tests.featuregen.materialize.provenance_fixtures import BLUEPRINT_RECIPE
+
+    from featuregen.overlay.upload.recipe_formula_blueprint_derivation import derive_blueprint_v2
+    from featuregen.overlay.upload.recipe_formula_contracts_v2 import expectation_content_hash_v2
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+    real_hash = expectation_content_hash_v2(derive_blueprint_v2(v2_recipe_by_id(BLUEPRINT_RECIPE)))
+    db.execute(
+        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
+        "VALUES ('int-rev','h','hypothesis') ON CONFLICT DO NOTHING")
+    db.execute(
+        "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
+        "generation_run_id, considered_json, considered_content_hash, canonicalization_version) "
+        "VALUES ('crev-rev','int-rev','run-rev','{}'::jsonb,'sha256:c','contract-considered-v3') "
+        "ON CONFLICT DO NOTHING")
+    db.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, definition_revision, "
+        "formula_identity_hash, state, requested_by, requested_at) VALUES "
+        "(%s,'crev-rev','opt-rev','h1','h2','cfg-rev','r', %s,'REQUESTED','user:s','t') "
+        "ON CONFLICT DO NOTHING", (draft_id, f"ident-{draft_id}"))
+    db.execute(
+        "INSERT INTO formula_draft_authoring_plan (formula_draft_id, candidate_origin, "
+        "formula_strategy, strategy_identity_hash, recipe_id, expectation_ref, "
+        "expectation_generation, reviewed_blueprint_revision, reviewed_blueprint_hash) "
+        "VALUES (%s, 'recipe', 'REVIEWED_RECIPE_BLUEPRINT', 'sih-1', %s, %s, 'v2', %s, %s)",
+        (draft_id, BLUEPRINT_RECIPE, BLUEPRINT_RECIPE, BLUEPRINT_RECIPE,
+         pinned_hash or real_hash))
+    return draft_id, real_hash
+
+
+def _fixture_context():
+    """The hand-built grounding context the provenance fixtures already bind with."""
+    from tests.featuregen.materialize.provenance_fixtures import (
+        BLUEPRINT_BINDINGS,
+        BLUEPRINT_RECIPE,
+        _binding,
+    )
+
+    from featuregen.overlay.upload.recipe_grounding_context import (
+        RecipeGroundingContextV1,
+        semantic_parameter_hash,
+    )
+    from featuregen.overlay.upload.recipe_grounding_context import (
+        content_hash as grounding_content_hash,
+    )
+    from featuregen.overlay.upload.templates import SourceEntityRoleResolution
+
+    parameters = (("window", 30),)
+    definition_json = {"version": "reviewed-lane-test", "window": 30}
+    return RecipeGroundingContextV1(
+        recipe_candidate_key="candidate-30", recipe_id=BLUEPRINT_RECIPE,
+        source_entity_need_role=BLUEPRINT_BINDINGS[0][0],
+        source_entity_role_resolution=SourceEntityRoleResolution.INFERRED_UNAMBIGUOUS,
+        need_bindings=tuple(_binding(role, ref) for role, ref in BLUEPRINT_BINDINGS),
+        semantic_parameters=parameters,
+        semantic_parameter_binding_hash=semantic_parameter_hash(BLUEPRINT_RECIPE, parameters),
+        template_definition=definition_json,
+        template_content_hash=grounding_content_hash(definition_json))
+
+
+def test_A_DRAFT_WITH_NO_PLAN_AUTHORS_BY_LLM(db):
+    """Every pre-strategy draft's identity recorded the LLM method, because every draft WAS
+    LLM-authored — so absence routes exactly as the identity claims."""
+    from featuregen.overlay.upload.formula_draft_worker import _reviewed_blueprint_for
+
+    assert _reviewed_blueprint_for(db, "fd-never-planned") is None
+
+
+def test_A_REVIEWED_PLAN_REBUILDS_VERIFIES_AND_BINDS(db, monkeypatch):
+    """▲ The deterministic lane's worker half: derive from the registry, verify the bytes against
+    the PIN the plan froze, bind against the candidate's context — and hand the orchestrator the
+    bound object whose bypass names exactly that blueprint. Zero provider involvement anywhere."""
+    import featuregen.overlay.upload.formula_draft_worker as worker_mod
+
+    draft_id, real_hash = _reviewed_plan(db)
+    monkeypatch.setattr(worker_mod, "_BOUND_CONTEXT_LOADER",
+                        lambda conn, d: _fixture_context())
+
+    bound = worker_mod._reviewed_blueprint_for(db, draft_id)
+
+    assert bound is not None
+    assert bound.blueprint_content_hash == real_hash
+    from featuregen.formula.deterministic_producer import bypass_for
+    bypass = bypass_for(bound)
+    assert bypass.expectation_hash == real_hash
+
+
+def test_A_MOVED_BLUEPRINT_BLOCKS_BY_NAME_never_falls_back(db, monkeypatch):
+    """▲ The draft's identity folded the strategy over the PINNED bytes. Authoring a newer
+    blueprint under the old identity would seal a method claim about bytes nobody chose — and a
+    silent LLM fallback would hide the movement entirely. Named, blocked, new request required."""
+    import featuregen.overlay.upload.formula_draft_worker as worker_mod
+
+    draft_id, _ = _reviewed_plan(db, draft_id="fd-rev-moved", pinned_hash="a" * 64)
+    monkeypatch.setattr(worker_mod, "_BOUND_CONTEXT_LOADER",
+                        lambda conn, d: _fixture_context())
+
+    with pytest.raises(worker_mod._DraftBlocked) as raised:
+        worker_mod._reviewed_blueprint_for(db, draft_id)
+    assert raised.value.blocker["code"] == "REVIEWED_BLUEPRINT_NOT_EXECUTABLE"
+    assert "moved" in raised.value.blocker["reason"]
+
+
+def test_THE_SHIPPED_POSTURE_HAS_NO_LOADER_and_a_reviewed_plan_blocks_loudly(db):
+    """▲ The resolver's posture routes reviewed candidates to the LLM while the context plumbing is
+    unpersisted, so a REVIEWED plan reaching this worker is a posture/plan DISAGREEMENT — blocked
+    loudly, never quietly LLM'd, because quiet is how a disagreement becomes a norm."""
+    import featuregen.overlay.upload.formula_draft_worker as worker_mod
+
+    draft_id, _ = _reviewed_plan(db, draft_id="fd-rev-noloader")
+
+    assert worker_mod._BOUND_CONTEXT_LOADER is None
+    with pytest.raises(worker_mod._DraftBlocked) as raised:
+        worker_mod._reviewed_blueprint_for(db, draft_id)
+    assert raised.value.blocker["code"] == "REVIEWED_BLUEPRINT_NOT_EXECUTABLE"
+    assert "posture" in raised.value.blocker["reason"]
