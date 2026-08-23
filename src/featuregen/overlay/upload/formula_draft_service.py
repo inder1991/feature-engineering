@@ -456,6 +456,31 @@ def request_draft_for_candidate(
     # route-dies — would 409 every "Draft formula" click until an approval UI exists, which
     # punishes the user for a surface nobody has built.
     if decision.strategy is FormulaStrategy.LLM_AUTHORED and spend_authorization_id is None:
+        # ▲ AN APPROVED CEILING OUTRANKS THE DEV ENVELOPE (round-4 acceptance probe 2): a
+        # governed regeneration carries its own cost-confirmed spend authorization, bound to the
+        # exception at approval. Minting an envelope over it would enforce the ceiling nobody
+        # confirmed and leave the approved one decorative. One approval act shares ONE spend
+        # authorization across however many withdrawals it binds — never double-reserved,
+        # because reservation happens per physical call against this ONE id on the plan row.
+        from featuregen.overlay.upload.formula_draft_store import formula_identity
+
+        approved = conn.execute(
+            "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception e "
+            "  JOIN llm_spend_authorization_revision a "
+            "    ON a.spend_authorization_id = e.llm_spend_authorization_id "
+            " WHERE e.target_formula_identity_hash = %s AND e.provider_contract_hash = %s "
+            "   AND e.strategy_identity_hash = %s AND a.expires_at > now() "
+            " ORDER BY e.approved_at DESC LIMIT 1",
+            (formula_identity(
+                considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+                planning_request_hash=candidate.planning_request_hash,
+                catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+                authoring_config_hash=config_hash,
+                definition_revision=candidate.definition_revision),
+             provider_contract, decision.strategy_identity_hash)).fetchone()
+        if approved is not None:
+            spend_authorization_id = approved[0]
+    if decision.strategy is FormulaStrategy.LLM_AUTHORED and spend_authorization_id is None:
         if not mint_development_envelope:
             # ▲ THE JOB PATH REFUSES, NEVER SUBSTITUTES (Task 5 review 4b): a coordinator member
             # reaches here with None exactly when the job's cost-confirmed ceiling EXPIRED — and

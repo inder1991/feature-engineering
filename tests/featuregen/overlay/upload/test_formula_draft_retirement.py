@@ -964,3 +964,40 @@ def test_the_fence_refusal_carries_the_REPLACEMENT_POINTER(db):
 
     with pytest.raises(DraftRetired, match="use fd-ptr-replacement"):
         advance(db, minted, DraftStateV1.CRITIC_REVIEW)
+
+
+def test_SECOND_FAILURE_a_fresh_approval_is_a_FRESH_coupon_not_the_exhausted_one(db):
+    """Round-4 acceptance probe 1: without the regeneration ordinal in the exception identity, a
+    same-day same-ceiling re-approval after the override FAILED AGAIN content-addressed straight
+    back to the exhausted coupon — the dead end one level up. Each approval generation now has
+    its own identity, and the second journey completes."""
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        approve_regeneration_exception,
+        retirement_scope_key,
+    )
+
+    minted, identity = _override_minted(db, "second")   # first override consumed its coupon
+    db.execute("UPDATE formula_draft SET state = 'FAILED', failure_reason = 'again' "
+               "WHERE formula_draft_id = %s", (minted,))
+
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-second",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-second",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    ids, created = approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
+    assert created is True, "a fresh GENERATION, not the exhausted coupon handed back"
+
+    second, was_created = _request_again(
+        db, draft_id="fd-second-retry2", option_id="opt-fd-second",
+        provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+    assert was_created is True
+    advance(db, second, DraftStateV1.AUTHORING)   # and it can run — not dead on arrival

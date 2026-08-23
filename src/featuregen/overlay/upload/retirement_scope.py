@@ -326,6 +326,18 @@ def approve_regeneration_exception(
     exception_ids: list[str] = []
     any_created = False
     for tombstone_id in tombstone_ids:
+        # ▲ THE REGENERATION ORDINAL (round-4 acceptance probe 1): without it, a same-day
+        # same-ceiling re-approval after the override FAILED AGAIN content-addressed straight
+        # back to the EXHAUSTED coupon — NB-1's dead end one level up. Folding the count of
+        # already-exhausted coupons for this exact binding gives each approval GENERATION its
+        # own identity: a replay while a coupon is still live is that same coupon (count
+        # unchanged), and an approval after exhaustion is a fresh one — which is what the
+        # governance actor clicking approve again is asking for.
+        exhausted_before = conn.execute(
+            "SELECT COUNT(*) FROM formula_draft_regeneration_exception "
+            "WHERE target_formula_identity_hash = %s "
+            "  AND tombstone_id IS NOT DISTINCT FROM %s AND uses_consumed >= max_uses",
+            (target_formula_identity_hash, tombstone_id)).fetchone()[0]
         exception_id = "exc-" + jcs_sha256({
             "target_formula_identity_hash": target_formula_identity_hash,
             "provider_contract_hash": provider_contract_hash,
@@ -335,6 +347,7 @@ def approve_regeneration_exception(
             "expires_at": str(expires_at),
             "max_uses": max_uses,
             "tombstone_id": tombstone_id,
+            "regeneration_ordinal": exhausted_before,
         })[:32]
         inserted = conn.execute(
             "INSERT INTO formula_draft_regeneration_exception (exception_id, tombstone_id, "

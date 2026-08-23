@@ -767,3 +767,45 @@ def test_HALF_NAMED_COVERAGE_refuses_the_same_way_on_both_routes(client, conn,
                           headers=engineer_headers)
     assert refused.status_code == 409, "and the STORE refuses — one answer, both routes"
     assert refused.json()["detail"]["code"] == "FORMULA_DRAFT_RETIRED"
+
+
+def test_the_APPROVED_ceiling_is_the_one_enforced_never_a_dev_envelope_over_it(
+        client, conn, engineer_headers):
+    """Round-4 acceptance probe 2: a governed regeneration carries its own cost-confirmed
+    ceiling — the plan row must thread THAT to the dispatch seam, not a server-minted dev
+    envelope that would leave the approved ceiling decorative. And one approval act = ONE spend
+    authorization shared across its bindings — nothing double-reserved."""
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _revision(conn, revision_id="crev-appc", snapshot_id="snap-appc")
+    candidate = frozen_candidate(conn, "crev-appc", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-appc', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-appc', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    record_tombstone(conn, formula_draft_id="fd-appc",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post("/formula-drafts/fd-appc/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+    approval_spend = approved.json()["spend_authorization_id"]
+
+    minted = client.post(DRAFT_PATH.format(rev="crev-appc", opt="opt-a"),
+                         headers=engineer_headers)
+    assert minted.status_code == 202, minted.text
+    plan_spend = conn.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_authoring_plan "
+        "WHERE formula_draft_id = %s", (minted.headers["X-Formula-Draft-Id"],)).fetchone()
+    assert plan_spend == (approval_spend,), \
+        "the plan row carries the APPROVED ceiling — the seam reserves against what was confirmed"
+    envelopes = conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision "
+        "WHERE pricing_version = 'development'").fetchone()
+    assert envelopes == (0,), "no dev envelope was minted over the approval"
