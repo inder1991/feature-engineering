@@ -140,6 +140,13 @@ class GenerationRequestV1:
     #: reader that has to fetch it separately is a reader that can forget to, and every downstream
     #: check about "was this authorized" would then be optional.
     generation_authorization_revision_id: str
+    #: WHICH request-time decision this attempt runs under (1106/1108). ▲ On the ROW, not only in
+    #: the queue payload: the queue row is the work item and this is the record — a redelivered or
+    #: reaped message takes the payload's copy with it, and "which decision did this attempt run
+    #: under" must survive that. `None` predates the column (nullable expand — the running image
+    #: writes this table, which is the 1095 lesson); the WORKER refuses a missing decision at act
+    #: time regardless, so a nullable column is not a nullable gate.
+    action_decision_revision_id: str | None
     status: GenerationStatusV1
     sealed_artifact_id: str | None
     refusals: tuple[Mapping[str, str], ...]
@@ -296,6 +303,7 @@ def request_generation(
     requested_by: str,
     requested_at: str,
     generation_authorization_revision_id: str,
+    action_decision_revision_id: str | None = None,
 ) -> tuple[str, bool]:
     """Start an attempt, or return the LIVE one for this set and environment.
 
@@ -316,12 +324,13 @@ def request_generation(
     """
     inserted = conn.execute(
         "INSERT INTO generation_request (request_id, build_set_revision_id, environment_id, "
-        "status, requested_by, requested_at, generation_authorization_revision_id) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+        "status, requested_by, requested_at, generation_authorization_revision_id, "
+        "action_decision_revision_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT DO NOTHING RETURNING request_id",
         (request_id, build_set_revision_id, environment_id,
          GenerationStatusV1.REQUESTED.value, requested_by, requested_at,
-         generation_authorization_revision_id)).fetchone()
+         generation_authorization_revision_id, action_decision_revision_id)).fetchone()
     if inserted is not None:
         return inserted[0], True
 
@@ -402,12 +411,12 @@ def read_request(conn: DbConn, request_id: str) -> GenerationRequestV1 | None:
     """One attempt as stored, or ``None``."""
     row = conn.execute(
         "SELECT build_set_revision_id, environment_id, status, sealed_artifact_id, refusals, "
-        "failure_reason, generation_authorization_revision_id "
+        "failure_reason, generation_authorization_revision_id, action_decision_revision_id "
         "FROM generation_request WHERE request_id = %s", (request_id,)).fetchone()
     if row is None:
         return None
     return GenerationRequestV1(
         request_id=request_id, build_set_revision_id=row[0], environment_id=row[1],
-        generation_authorization_revision_id=row[6],
+        generation_authorization_revision_id=row[6], action_decision_revision_id=row[7],
         status=GenerationStatusV1(row[2]), sealed_artifact_id=row[3],
         refusals=tuple(row[4] or ()), failure_reason=row[5])

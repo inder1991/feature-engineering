@@ -389,3 +389,30 @@ def test_MOVED_EVIDENCE_REFUSES_THE_ACT_rather_than_re_deciding(db):
     assert "ACTION_DECISION_DRIFTED" in outcome.detail
     assert "build_set_content_hash" in outcome.detail, "the refusal names WHICH pin moved"
     assert read_request(db, request_id).status is GenerationStatusV1.REFUSED
+
+
+def test_THE_REQUEST_ROW_CARRIES_THE_DECISION_and_the_worker_prefers_it(db):
+    """▲ Owner ruling 2026-08-23 item 5: the decision persists on the AUTHORITATIVE row (1108), not
+    only inside the queue payload — a redelivered or reaped message takes the payload's copy with
+    it, and "which decision did this attempt run under" must survive that. The worker reads the row
+    first; a job whose payload predates the field still runs, from the row."""
+    build_set, _ = _set(db, revision_id="bs-row", members=("sel-a",), target="trr-lane")
+    approval = _approval(db, build_set, ENV)
+    decision_id = _decided(db, build_set, approval)
+    request_id, _ = request_generation(
+        db, request_id="req-row", build_set_revision_id=build_set, environment_id=ENV,
+        requested_by="user:ops", requested_at="t",
+        generation_authorization_revision_id=approval,
+        action_decision_revision_id=decision_id)
+
+    assert read_request(db, request_id).action_decision_revision_id == decision_id
+
+    # A payload with NO decision id — as if frozen before 1108 — and the row carries it: the gate
+    # passes on the ROW's copy and the lane proceeds to its ordinary restore refusal, proving the
+    # decision gate was satisfied from the record rather than the work item.
+    enqueue_generation(db, job=_job(request_id), environment_id=ENV, logical_group_name=GROUP)
+    outcome = process_generation_once(db, owner="w1", inventory=_inventory())
+
+    assert outcome.status == "refused"
+    assert "ACTION_DECISION" not in outcome.detail, outcome.detail
+    assert "NOT_RESOLVED" in outcome.detail

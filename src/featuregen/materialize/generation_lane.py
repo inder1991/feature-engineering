@@ -263,9 +263,26 @@ def decode_job(payload: Mapping[str, Any]) -> GenerationJobV2:
     )
 
 
+def generation_evidence_pins(
+    *, build_set_content_hash: str, generation_authorization_revision_id: str,
+) -> dict[str, str]:
+    """The pins a GENERATE_PREVIEW decision is taken against — ONE definition, per-action.
+
+    ▲ The route's decide and the worker's recheck must build these from the SAME function, or the
+    two dictionaries drift apart the first time either changes and the drift check fires on healthy
+    jobs — which teaches people to delete it. Owner ruling 2026-08-23 item 4: evidence assemblers
+    are per-action and server-owned.
+    """
+    return {
+        "build_set_content_hash": build_set_content_hash,
+        "generation_authorization_revision_id": generation_authorization_revision_id,
+    }
+
+
 def authorize_and_decide_generation(
     conn, *, build_set_revision_id: str, build_set_content_hash: str,
     generation_authorization_revision_id: str, environment_id: str, actor_subject: str,
+    member_names: tuple[str, ...] = (),
 ):
     """Mint the server-owned authorization and RECORD the request-time decision. Returns
     ``(decision_id, decision)``.
@@ -291,10 +308,12 @@ def authorize_and_decide_generation(
         ActionRequestV1(
             action=ActionV1.GENERATE_PREVIEW,
             resource_identity_hash=build_set_revision_id,
-            evidence_pins={
-                "build_set_content_hash": build_set_content_hash,
-                "generation_authorization_revision_id": generation_authorization_revision_id,
-            }),
+            # ▲ Every member BY NAME, clean ones included — a member absent from the record is a
+            # member the decision cannot be shown to have covered.
+            member_names=member_names,
+            evidence_pins=generation_evidence_pins(
+                build_set_content_hash=build_set_content_hash,
+                generation_authorization_revision_id=generation_authorization_revision_id)),
         authorization_id=authorization.authorization_id)
 
 
@@ -526,16 +545,19 @@ def _drive(
     # from the payload, which is the thing a bypass would have written.
     from featuregen.materialize.action_decision import DecisionDrift, DecisionMissing, recheck
 
+    # ▲ THE ROW IS AUTHORITATIVE, the payload is the fallback (1108). The queue row is the work
+    # item; generation_request is the record — and the record must answer "which decision did this
+    # attempt run under" even after the message is redelivered, dead-lettered or reaped. The payload
+    # copy remains for jobs frozen before 1108's column existed.
+    decision_id = request.action_decision_revision_id or job.action_decision_revision_id
     try:
-        if job.action_decision_revision_id is None:
+        if decision_id is None:
             raise DecisionMissing(
                 f"generation job {job.request_id} carries no action decision: work submitted "
                 f"straight to the queue is refused at the worker, not built")
-        recheck(conn, job.action_decision_revision_id, current_pins={
-            "build_set_content_hash": build_set.content_hash,
-            "generation_authorization_revision_id":
-                request.generation_authorization_revision_id,
-        })
+        recheck(conn, decision_id, current_pins=generation_evidence_pins(
+            build_set_content_hash=build_set.content_hash,
+            generation_authorization_revision_id=request.generation_authorization_revision_id))
     except DecisionMissing as exc:
         return _refuse(conn, claim, job, MaterializationRefused(
             CompilationRefusalCode.ACTION_DECISION_MISSING, str(exc)))

@@ -322,7 +322,8 @@ def request_build(
         build_set_content_hash=build_set.content_hash,
         generation_authorization_revision_id=body.generation_authorization_revision_id,
         environment_id=authorization.environment_id,
-        actor_subject=identity.subject)
+        actor_subject=identity.subject,
+        member_names=tuple(build_set.selection_revision_ids))
     if not decision.allowed:
         raise HTTPException(status_code=409, detail={
             "code": "ACTION_REFUSED",
@@ -336,7 +337,8 @@ def request_build(
         environment_id=authorization.environment_id,
         requested_by=identity.subject,
         requested_at=_now(conn),
-        generation_authorization_revision_id=body.generation_authorization_revision_id)
+        generation_authorization_revision_id=body.generation_authorization_revision_id,
+        action_decision_revision_id=decision_id)
 
     if created:
         # SAME TRANSACTION as the request above. See the module docstring: a request with no queue

@@ -215,3 +215,48 @@ def test_DECIDING_AGAINST_AN_UNUSABLE_AUTHORIZATION_REFUSES_TYPED_and_records_no
     other = _authorized(db, action=ActionV1.AUTHOR_FORMULA)
     with pytest.raises(AuthorizationUnusable):
         decide(db, _request(ActionV1.GENERATE_PREVIEW), authorization_id=other)
+
+
+# ══ OWNER RULING 2026-08-23, ITEM 4 ════════════════════════════════════════════════════════════
+def test_DIFFERENT_MEMBER_VERDICTS_ARE_DIFFERENT_DECISIONS_even_over_the_same_pins(db):
+    """▲ Member facts are NOT evidence pins, and the id used to omit them — so two decisions over
+    the same pins with different member verdicts collided on one id, ON CONFLICT kept whichever was
+    first, and the second caller proceeded believing its answer was recorded. The id now covers the
+    entire canonical payload, so a same-id conflict IS the identical decision."""
+    authorization = _authorized(db)
+
+    clean_id, _ = decide(db, _request(warnings={"feature_a": []}),
+                         authorization_id=authorization)
+    blocked_id, _ = decide(db, _request(blockers={"feature_a": ["TARGET_LEAKAGE_BLOCKED"]}),
+                           authorization_id=authorization)
+
+    assert clean_id != blocked_id
+    assert db.execute("SELECT count(*) FROM action_decision_revision").fetchone()[0] == 2
+
+
+def test_A_CLEAN_MEMBER_IS_RECORDED_BY_NAME_not_vanished(db):
+    """▲ The member set used to be derived from the blocker/warning map keys, so a member with
+    neither vanished from the record — and "which members did this decision cover" was unanswerable
+    for exactly the members that passed."""
+    authorization = _authorized(db)
+
+    decision = ask(db, ActionRequestV1(
+        action=ActionV1.GENERATE_PREVIEW, resource_identity_hash=RESOURCE,
+        member_names=("clean_feature", "warned_feature"),
+        member_warnings={"warned_feature": ["METHOD_CERTIFICATE_MISSING"]},
+        evidence_pins=PINS), authorization_id=authorization)
+
+    assert [v.member_name for v in decision.per_member] == ["clean_feature", "warned_feature"]
+    clean = decision.per_member[0]
+    assert clean.allowed is True and clean.blockers == () and clean.warnings == ()
+
+
+def test_ASK_IS_GENUINELY_READ_ONLY_needing_no_authorization(db):
+    """▲ ask() used to REQUIRE an authorization id, so a read-only /plan preflight had to WRITE one
+    first — a preflight that writes is not a preflight. Under the development policy decide() mints
+    its own server-owned authorization, so its absence at ask time is not a fact about the act."""
+    decision = ask(db, _request())
+
+    assert decision.allowed is True
+    assert db.execute("SELECT count(*) FROM action_authorization_revision").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM action_decision_revision").fetchone()[0] == 0

@@ -87,6 +87,11 @@ class ActionRequestV1:
 
     action: ActionV1
     resource_identity_hash: str
+    #: ▲ EVERY member, by name — including the clean ones. Deriving the member set from the keys of
+    #: the blocker/warning maps made a clean member VANISH from the record entirely, so "which
+    #: members did this decision cover" could not be answered for exactly the members that passed.
+    #: Owner ruling 2026-08-23 item 4: explicit member identities even when clean.
+    member_names: tuple[str, ...] = ()
     member_blockers: Mapping[str, Sequence[str]] = field(default_factory=dict)
     member_warnings: Mapping[str, Sequence[str]] = field(default_factory=dict)
     evidence_pins: Mapping[str, str] = field(default_factory=dict)
@@ -106,7 +111,7 @@ class ActionDecisionV1:
     evidence_hash: str
 
 
-def _fold(conn, request: ActionRequestV1, *, authorization_id: str) -> ActionDecisionV1:
+def _fold(conn, request: ActionRequestV1, *, authorization_id: str | None) -> ActionDecisionV1:
     """The one implementation. Reads; writes nothing.
 
     ▲ **ALL-MUST-PASS.** One refused member refuses the act. A caller handed the survivors of a
@@ -120,10 +125,15 @@ def _fold(conn, request: ActionRequestV1, *, authorization_id: str) -> ActionDec
     if not action_available(request.action):
         blockers.append("ACTION_UNAVAILABLE")
 
-    authorization = load_action_authorization(conn, authorization_id)
-    if authorization is None:
+    # ▲ `None` means a READ-ONLY PREFLIGHT — /plan asking "what would this decision say" before
+    # anything is minted. Under the development policy decide() creates the server-owned
+    # authorization itself, so its absence at ASK time is not a fact about the act; requiring an id
+    # here forced every read-only caller to WRITE one first, which made the preflight a write.
+    authorization = None if authorization_id is None else load_action_authorization(
+        conn, authorization_id)
+    if authorization_id is not None and authorization is None:
         blockers.append("ACTION_AUTHORIZATION_MISSING")
-    else:
+    if authorization is not None:
         # ▲ THE AUTHORIZATION MUST BE FOR THIS ACT ON THIS RESOURCE. The composite foreign key makes
         # a mismatched pair unwritable, and this makes it unaskable — so the refusal names the
         # relationship rather than a constraint.
@@ -133,7 +143,8 @@ def _fold(conn, request: ActionRequestV1, *, authorization_id: str) -> ActionDec
         if authorization.permission_result != "allowed":
             blockers.append("ACTION_AUTHORIZATION_REFUSED")
 
-    members = sorted(set(request.member_blockers) | set(request.member_warnings))
+    members = sorted(set(request.member_names)
+                     | set(request.member_blockers) | set(request.member_warnings))
     verdicts = tuple(
         MemberVerdictV1(
             member_name=name,
@@ -150,7 +161,7 @@ def _fold(conn, request: ActionRequestV1, *, authorization_id: str) -> ActionDec
         policy_version=DECISION_POLICY_VERSION, evidence_hash=request.evidence_hash)
 
 
-def ask(conn, request: ActionRequestV1, *, authorization_id: str) -> ActionDecisionV1:
+def ask(conn, request: ActionRequestV1, *, authorization_id: str | None = None) -> ActionDecisionV1:
     """Answer without recording. For eligibility reads, button state and cost estimates.
 
     ▲ Nothing here writes. A decision row per screen render is write amplification and an audit
@@ -189,12 +200,25 @@ def decide(
             f"{sorted(unusable & set(decision.blockers))}. Ask() answers this question without "
             f"recording; a decision cannot be recorded against an authorization that does not "
             f"cover the act")
+    # ▲ THE ID COVERS THE ENTIRE CANONICAL PAYLOAD — owner ruling 2026-08-23 item 4. An earlier
+    # composition omitted the per-member verdicts, blockers and warnings, and the member facts are
+    # NOT part of the evidence pins — so two decisions over the same pins with DIFFERENT member
+    # verdicts collided on one id, and ON CONFLICT DO NOTHING kept whichever was first while the
+    # second caller proceeded believing its answer was recorded. With the full payload inside the
+    # id, a same-id conflict IS the identical decision, and DO NOTHING is genuinely idempotent.
+    canonical_members = [
+        {"member_name": v.member_name, "allowed": v.allowed,
+         "blockers": list(v.blockers), "warnings": list(v.warnings)}
+        for v in decision.per_member]
     decision_id = jcs_sha256({
         "action": str(request.action),
         "resource_identity_hash": request.resource_identity_hash,
         "authorization_id": authorization_id,
         "evidence_hash": decision.evidence_hash,
         "allowed": decision.allowed,
+        "per_member": canonical_members,
+        "blockers": list(decision.blockers),
+        "warnings": list(decision.warnings),
         "policy_version": decision.policy_version,
     })
     conn.execute(
@@ -204,12 +228,22 @@ def decide(
         "VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s::jsonb, %s, %s::jsonb, %s) "
         "ON CONFLICT (decision_id) DO NOTHING",
         (decision_id, str(request.action), request.resource_identity_hash, authorization_id,
-         json.dumps([{"member_name": v.member_name, "allowed": v.allowed,
-                      "blockers": list(v.blockers), "warnings": list(v.warnings)}
-                     for v in decision.per_member]),
+         json.dumps(canonical_members),
          decision.allowed, json.dumps(list(decision.blockers)),
          json.dumps(list(decision.warnings)), decision.policy_version,
          json.dumps(dict(sorted(request.evidence_pins.items()))), decision.evidence_hash))
+    # ▲ INSERT-OR-VERIFY, the W7 discipline. With the full payload inside the id a divergent stored
+    # row should be impossible — which is precisely why finding one must be LOUD: it means the store
+    # and the fold disagree about what one id says, and returning success would hand the caller an
+    # id that resolves to a different answer.
+    stored = conn.execute(
+        "SELECT allowed, evidence_hash FROM action_decision_revision WHERE decision_id = %s",
+        (decision_id,)).fetchone()
+    if stored != (decision.allowed, decision.evidence_hash):
+        raise RuntimeError(
+            f"action decision {decision_id} already exists with a DIFFERENT answer "
+            f"(stored allowed={stored[0]}, this fold allowed={decision.allowed}): the store and "
+            f"the fold disagree about one id, which is corruption, not idempotency")
     return decision_id, decision
 
 
