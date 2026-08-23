@@ -59,6 +59,10 @@ from featuregen.overlay.upload.bridge_realization_governance import (
     link_authority_view,
     list_bridge_realization_views,
 )
+from featuregen.overlay.upload.governed_observation_store import (
+    observation_queues,
+    resolution_summary,
+)
 from featuregen.overlay.upload.join_drift import (
     acknowledge_governed_join_divergence,
     list_governed_join_divergences,
@@ -965,3 +969,37 @@ def bulk_reject_entity_bridges(body: BulkRejectEntityBridgesRequest, conn: _Conn
         counts["rejected"] += 1
 
     return {"category": body.category, "counts": counts, "results": results}
+
+
+# ── S1B-4: the bridge-demand surface ───────────────────────────────────────────────────────────
+# The queue beside this one answers "which crossings has somebody PROPOSED?". This one answers the
+# question that funds them: "which crossings did governed planning need and not have?" — read-only
+# derivations over the governed observation ledger (migrations 1120 + 1121), which the two planning
+# lanes write.
+#
+# NOTHING HERE DECIDES ANYTHING, and there is deliberately no propose sibling: `propose_bridge` is
+# reachable only from catalog INGESTION, which mints proposals from declared join evidence. A
+# reviewer's decisions on this subject are all made on the entity-bridge routes above.
+
+#: A governance read, not a bulk export. The store aggregates over the FULL filtered population and
+#: only then pages, so a wide page costs the same aggregate and returns more of it — the bound is
+#: the route's so no caller can ask for an unbounded one.
+_DEMAND_PAGE_MAX = 100
+
+
+@router.get("/governance/bridge-demand", dependencies=[Depends(require_confirmer)])
+def bridge_demand(conn: _Conn,
+                  limit: int = Query(default=50, ge=1, le=_DEMAND_PAGE_MAX),
+                  cursor: str | None = None) -> dict:
+    """The three demand queues + the resolution summary — READ-ONLY derivations over the governed
+    observation ledger. Confirmer-gated like the entity-bridge queue beside it.
+
+    The cursor is an OPAQUE token minted by the store; a caller that hands back one this store did
+    not mint gets a 400, because "your token is unusable" is a client fact and a 500 would report it
+    as an outage.
+    """
+    try:
+        queues = observation_queues(conn, limit=limit, cursor=cursor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {**queues, "resolution_summary": resolution_summary(conn)}

@@ -82,7 +82,7 @@ def _governed_confirm(db):
     ``routes/contract.py`` applies to the compiled plan before drafting, so the confirmed contract
     records the same full read set an HTTP confirm would. Returns (contract_id, envelope)."""
     _cross_seed(db)                      # ops + rev + a VERIFIED bridge → a resolvable cross-catalog plan
-    ideas, rejections = _governed_cross_catalog_options(
+    ideas, rejections, _evidence = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
     assert len(ideas) == 1, rejections

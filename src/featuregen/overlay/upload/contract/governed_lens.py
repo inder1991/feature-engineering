@@ -92,7 +92,7 @@ from featuregen.overlay.upload.field_resolution import (
     current_resolution_pins,
     pin_authority,
 )
-from featuregen.overlay.upload.object_ref import normalize_ref
+from featuregen.overlay.upload.object_ref import normalize_ref, qualify_object_ref
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
     BindingPlanV1,
@@ -597,13 +597,11 @@ def governed_options_from_requests(conn, *, requests: Sequence[FeaturePlanningRe
                              request.source_definition_id)
             # The SAME key set as every other rejection, blank — a consumer must never branch on
             # which rejection shape it is holding to find out whether a field exists.
-            rejections.append({"lens": _LENS, "reason": ReasonCode.planner_internal_error.value,
+            rejections.append({"lens": _LENS,
                                "recipe_id": request.source_definition_id,
                                "request_hash": request.source_content_hash,
                                "planning_request_hash": planning_request_hash(request),
-                               **_plan_facts(None),
-                               "reason_codes": [ReasonCode.planner_internal_error.value],
-                               "unmet_hops": []})
+                               **rejection_evidence(None)})
             continue
         plan = _selected_resolved_plan(result)
         envelope = plan_envelope_from_result(result) if plan is not None else None
@@ -783,6 +781,45 @@ def _unmet_hop_demand(hop: UnmetHopV1) -> dict:
             "near_side_key_refs": list(hop.near_side_key_refs)}
 
 
+def rejection_evidence(result: BindingPlanningResultV1 | None) -> dict:
+    """THE evidence half of a refusal — the headline reason, the best plan's own facts, its ordered
+    path segments and its unmet hops — with NO request-identity fields on it at all.
+
+    **One derivation, three writers.** :func:`_rejection` composes it with the request's identity
+    for the telemetry lane; ``gate1._governed_cross_catalog_options`` records it verbatim for the
+    LIVE lane (which plans a ``Template`` and holds no ``FeaturePlanningRequestV1``, so it cannot
+    call ``_rejection`` at all); and a planner explosion passes ``None`` for the all-blank shape.
+    Splitting it out is what stops the live lane from growing a second, drifting copy of the two
+    demand sources' input contract.
+
+    ``result=None`` is the planner-failure shape: every key present, every value blank, so a
+    consumer never branches on which shape it is holding to find out whether a field exists.
+    """
+    if result is None:
+        failure = ReasonCode.planner_internal_error.value
+        return {"reason": failure, **_plan_facts(None), "reason_codes": [failure],
+                "unmet_hops": []}
+    unmet: list[dict] = []
+    seen: set[str] = set()
+    for plan in result.candidate_plans:
+        if (plan.path_resolution_status is not PathResolutionStatus.source_to_target_rejected
+                or plan.unmet_hop is None):
+            continue
+        demand = _unmet_hop_demand(plan.unmet_hop)
+        marker = json.dumps(demand, sort_keys=True)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unmet.append(demand)
+    reason = _rejection_reason(result)
+    facts = _plan_facts(_best_plan(result))
+    # The headline leads the codes and is never duplicated inside them: a ledger row's
+    # `reason_codes[0]` is the answer to "why did this refuse?", and the rest is what else the
+    # plan observed on the way.
+    facts["reason_codes"] = [reason, *(c for c in facts["reason_codes"] if c != reason)]
+    return {"reason": reason, **facts, "unmet_hops": unmet}
+
+
 def _rejection(request: FeaturePlanningRequestV1, result: BindingPlanningResultV1) -> dict:
     """The evidence-bearing refusal. ``unmet_hops`` carries one entry per source→target-REJECTED
     candidate that named the hop it died on (S1B-2). It stays EMPTY, honestly, for a refusal that
@@ -810,33 +847,17 @@ def _rejection(request: FeaturePlanningRequestV1, result: BindingPlanningResultV
     Identical hop dicts are collapsed: two rejected candidates can dead-end on the SAME hop at the
     SAME position by different routes (the diamond case), and that is one demand, not two. The
     store would dedupe them anyway on ``demand_identity_hash``; doing it here keeps the payload
-    honest about how many distinct demands were actually found. Order is preserved."""
-    unmet: list[dict] = []
-    seen: set[str] = set()
-    for plan in result.candidate_plans:
-        if (plan.path_resolution_status is not PathResolutionStatus.source_to_target_rejected
-                or plan.unmet_hop is None):
-            continue
-        demand = _unmet_hop_demand(plan.unmet_hop)
-        marker = json.dumps(demand, sort_keys=True)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        unmet.append(demand)
-    reason = _rejection_reason(result)
-    facts = _plan_facts(_best_plan(result))
-    # The headline leads the codes and is never duplicated inside them: a ledger row's
-    # `reason_codes[0]` is the answer to "why did this refuse?", and the rest is what else the
-    # plan observed on the way.
-    facts["reason_codes"] = [reason, *(c for c in facts["reason_codes"] if c != reason)]
-    return {"lens": _LENS, "reason": reason,
+    honest about how many distinct demands were actually found. Order is preserved. (Both the
+    collapse and the reason/facts derivation live in :func:`rejection_evidence`, which the LIVE
+    lane shares.)"""
+    return {"lens": _LENS,
             "recipe_id": request.source_definition_id,
             "request_hash": request.source_content_hash,
             # The REQUEST's own identity. `recipe_id` + `request_hash` are both definition-level:
             # two parameter variants of one recipe agree on BOTH, so neither maps a rejection back
             # to the request that produced it. This does.
             "planning_request_hash": planning_request_hash(request),
-            **facts, "unmet_hops": unmet}
+            **rejection_evidence(result)}
 
 
 # ── pass 2: ONE batch, then project ───────────────────────────────────────────────────────────
@@ -851,13 +872,11 @@ def _logical_ref(catalog_source: str, object_ref: str) -> str:
     recovering it costs one graph row per ref — precisely the N+1 this builder forbids. Known
     limitation, carried openly: for such a source the pin lookup misses and the binding's
     authority reads ``absent``, which is the fail-closed direction (never a fabricated authority).
+
+    The reconstruction itself is ``object_ref.qualify_object_ref`` — shared, because the
+    bridge-demand queue's endpoint sample needs the identical answer and a second copy could drift.
     """
-    parts = object_ref.split(".")
-    if len(parts) >= 3:
-        return normalize_ref(catalog_source, parts[0], parts[-2], parts[-1])
-    if len(parts) == 2:
-        return normalize_ref(catalog_source, "public", parts[0], parts[1])
-    return normalize_ref(catalog_source, "public", object_ref)
+    return qualify_object_ref(catalog_source, object_ref)
 
 
 def _read_set_pairs(plan: BindingPlanV1) -> tuple[tuple[str, str], ...]:
@@ -1077,4 +1096,5 @@ __all__ = [
     "fold_governed_binding_plan",
     "governed_options_from_requests",
     "governed_requests_for_scope",
+    "rejection_evidence",
 ]

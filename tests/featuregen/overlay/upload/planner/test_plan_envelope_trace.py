@@ -105,7 +105,7 @@ def test_a_multi_bridge_path_keeps_its_order():
 # ── the live governed lens carries it ───────────────────────────────────────────────────────────
 def test_a_governed_cross_catalog_option_carries_its_trace(db):
     _cross_seed(db)   # ops + rev + a VERIFIED bridge -> a resolved cross-catalog plan
-    ideas, rejections = _governed_cross_catalog_options(
+    ideas, rejections, _evidence = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
     assert len(ideas) == 1 and not rejections
@@ -132,10 +132,10 @@ def test_the_cross_catalog_trace_is_reproducible_for_the_same_catalog_state(db):
     instead.
     """
     _cross_seed(db)
-    first, _ = _governed_cross_catalog_options(
+    first, _, _ = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
-    second, _ = _governed_cross_catalog_options(
+    second, _, _ = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
     assert len(first) == len(second) == 1

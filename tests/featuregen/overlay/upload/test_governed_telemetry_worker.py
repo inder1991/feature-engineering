@@ -403,7 +403,8 @@ def test_a_rejection_carrying_both_sources_files_into_both_queues(db):
                         "verdict": "unsanctioned_bridge", "realizers": [],
                         "near_side_key_refs": ["public.transactions.account_id"]}],
     }
-    demands = demands_for_rejection(db, request, rejection)
+    demands = demands_for_rejection(db, rejection,
+                                    recipe_revision_hash=request.source_content_hash)
     assert [d["verdict"] for d in demands] == ["unsanctioned_bridge", "missing_realization"]
 
     (observation_id,) = record_planning_observations(
@@ -424,10 +425,9 @@ def test_a_rejection_carrying_both_sources_files_into_both_queues(db):
 
 def test_an_unrealized_bridge_reports_that_no_revision_exists(db):
     _two_catalogs(db)
-    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
-    demands = demands_for_rejection(db, request, {
+    demands = demands_for_rejection(db, {
         "reason_codes": ["physical_cardinality_unavailable"], "anchor_catalog_source": "ops",
-        "evidence": [_bridge_segment()]})
+        "evidence": [_bridge_segment()]}, recipe_revision_hash="rev-hash")
     assert demands[0]["realizers"][0]["realization_state"] == REALIZATION_NONE
 
 
@@ -437,13 +437,12 @@ def test_an_existing_but_unattached_realization_is_a_different_work_item(db, mon
     Asking the store the separate question is what stops a "go build this bridge" ticket being
     filed for a bridge somebody already built."""
     _two_catalogs(db)
-    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
     monkeypatch.setattr(
         "featuregen.overlay.upload.bridge_store.executable_bridge_realizations",
         lambda conn, **kwargs: ("a-current-executable-realization",))
-    demands = demands_for_rejection(db, request, {
+    demands = demands_for_rejection(db, {
         "reason_codes": ["physical_cardinality_unavailable"], "anchor_catalog_source": "ops",
-        "evidence": [_bridge_segment()]})
+        "evidence": [_bridge_segment()]}, recipe_revision_hash="rev-hash")
     assert len(demands) == 1
     assert demands[0]["realizers"][0]["realization_state"] == REALIZATION_EXISTS_UNATTACHED
 
@@ -451,10 +450,10 @@ def test_an_existing_but_unattached_realization_is_a_different_work_item(db, mon
 def test_an_attached_realization_files_no_demand_at_all(db):
     """Nothing is missing on a segment whose realization the plan already carries."""
     _two_catalogs(db)
-    request = _intent_request(v2_recipe_by_id(RECIPE_ID))
-    assert demands_for_rejection(db, request, {
+    assert demands_for_rejection(db, {
         "reason_codes": ["physical_cardinality_unavailable"], "anchor_catalog_source": "ops",
-        "evidence": [_bridge_segment(has_realization_revision=True)]}) == []
+        "evidence": [_bridge_segment(has_realization_revision=True)]},
+        recipe_revision_hash="rev-hash") == []
     assert contract_level_demands(
         {"reason_codes": ["physical_cardinality_unavailable"],
          "evidence": [_bridge_segment(has_realization_revision=True)]},

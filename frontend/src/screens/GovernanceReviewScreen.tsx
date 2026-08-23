@@ -25,6 +25,7 @@ import {
   rejectTableFact,
   reviewBridgeRealization,
 } from '../api'
+import { BridgeDemandPanel } from './BridgeDemandPanel'
 import { ConceptConfirmationPanel } from './ConceptConfirmationPanel'
 import { DataUsePolicyPanel } from './DataUsePolicyPanel'
 import { varyingParts } from './candidateDiff'
@@ -1907,6 +1908,15 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
           </button>
         </p>
       )}
+
+      {/* Bridge demand (S1B-4). The queue above answers "which crossings has somebody PROPOSED?";
+          this answers the question that funds them — which crossings governed planning NEEDED and
+          did not have. It sits directly under the queue rather than among the standing panels
+          because it is the entity-bridge section's other half: the same subject read from the
+          other end, and the reviewer deciding a bridge above is the person who wants to know how
+          much planning is waiting on one. It is READ-ONLY — every decision on this subject is made
+          in the queue above, so this panel offers no control of its own. */}
+      <BridgeDemandPanel />
 
       {/* Data-use policies (D14). A STANDING decision rather than a queued one — nothing proposes
           it, so it has no queue row and would have no home if it were not here. It belongs on the

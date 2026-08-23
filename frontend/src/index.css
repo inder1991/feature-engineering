@@ -8231,3 +8231,72 @@ button.stat:hover {
     to { opacity: 1; transform: none; }
   }
 }
+
+/* ── Bridge demand (S1B-4) — what governed planning needed and did not have ────────────────────
+   Quiet by construction, like the data-use panel above it. Nothing here is a fault: a demand row
+   records that the platform could not complete a roll-up and said so, so it carries INK, never an
+   alarm tone. The three queues are separated by their headings and nothing else — a colour that
+   ranked one of them would be this screen deciding which work matters, which is the reviewer's
+   call and not the interface's. */
+.bd-queue {
+  margin-top: 14px;
+}
+
+.bd-queue-about,
+.bd-about {
+  margin: 2px 0 0;
+}
+
+.bd-summary {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.bd-groups {
+  margin-top: 8px;
+}
+
+.bd-group {
+  display: grid;
+  gap: 4px;
+}
+
+.bd-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.bd-crossing {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.bd-counts {
+  margin: 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bd-mode,
+.bd-endpoints,
+.bd-next {
+  margin: 0;
+}
+
+/* The nested position rows: where an engineer would actually build it. Indented under the crossing
+   rather than given their own card — they are a breakdown of the row above, not siblings of it. */
+.bd-positions {
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0 0 0 12px;
+  border-left: 1px solid var(--line);
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--ink-faint);
+}

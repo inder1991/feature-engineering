@@ -77,6 +77,11 @@ def _observation(**overrides) -> dict:
 
 
 def _rejection(**overrides) -> dict:
+    """One demand in the shape its PRODUCERS actually emit — ``governed_lens._unmet_hop_demand``
+    for the two JSONB evidence lists in particular: a realizer is a ``RealizerFactV1`` projection
+    (``catalog_source`` / ``to_object_ref`` / ``from_key_ref`` / ``to_key_ref``) and a near-side key
+    ref is a bare, catalog-less ``public.table.column`` string. Anything else here would make the
+    endpoint sample pass against evidence no writer ever writes."""
     rejection = {
         "verdict": "unsanctioned_bridge",
         "recipe_revision_hash": "r" * 64,
@@ -85,11 +90,14 @@ def _rejection(**overrides) -> dict:
         "from_entity": "party",
         "to_entity": "account",
         "position_catalog": "core_banking",
-        "position_table_ref": "core_banking.party",
+        "position_table_ref": "public.party",
         "hop_index": 0,
-        "realizers": [{"table_ref": "core_banking.party_account"}],
-        "near_side_key_refs": [{"column": "party_id"}],
-        "to_endpoint_hint": "cards.account_id",
+        "realizers": [{"catalog_source": "cards",
+                       "to_object_ref": "public.accounts",
+                       "from_key_ref": "public.party.party_id",
+                       "to_key_ref": "public.accounts.account_id"}],
+        "near_side_key_refs": ["public.party.party_id"],
+        "to_endpoint_hint": "cards::public.accounts.account_id",
     }
     rejection.update(overrides)
     return rejection
@@ -608,7 +616,7 @@ def test_a_live_claim_is_invisible_to_a_second_connection(_dsn) -> None:
 
 
 def _seed_demand_group(conn, suffix: str, *, relationship_id: str, mode: str = "live",
-                       table_ref: str = "core_banking.party", recorded_at=None,
+                       table_ref: str = "public.party", recorded_at=None,
                        intent_id: str | None = None, run_id: str | None = None) -> str:
     """One observation plus one bridge demand. ``recorded_at`` is supplied at INSERT time (never
     by a later UPDATE — the table is append-only and stays that way for its own tests)."""
@@ -630,8 +638,10 @@ def _seed_demand_group(conn, suffix: str, *, relationship_id: str, mode: str = "
         "realizers, near_side_key_refs, recorded_at) "
         "VALUES (%s, %s, 'bridge_demand', %s, %s, %s, '1.0.0', 'party', 'account', "
         "'core_banking', %s, 0, 'unsanctioned_bridge', "
-        "'[{\"table_ref\": \"core_banking.party_account\"}]'::jsonb, "
-        "'[{\"column\": \"party_id\"}]'::jsonb, %s)",
+        "'[{\"catalog_source\": \"cards\", \"to_object_ref\": \"public.accounts\", "
+        "  \"from_key_ref\": \"public.party.party_id\", "
+        "  \"to_key_ref\": \"public.accounts.account_id\"}]'::jsonb, "
+        "'[\"public.party.party_id\"]'::jsonb, %s)",
         (f"bdo_seed_{suffix}", observation_id, hashlib.sha256(suffix.encode()).hexdigest(),
          "r" * 64, relationship_id, table_ref, recorded_at))
     return observation_id
@@ -669,14 +679,14 @@ def test_rollup_aggregates_the_full_population_then_limits(conn) -> None:
 
     by_relationship = {group["relationship_id"]: group for group in seen}
     fat = by_relationship["rel_02"]
-    assert fat["observations"] == 4, "the whole group is counted, not the slice on this page"
+    assert fat["demand_rows"] == 4, "the whole group is counted, not the slice on this page"
     assert fat["distinct_runs"] == 4
     assert fat["distinct_intents"] == 4
-    assert fat["nested"][0]["observations"] == 4, "and the nested level aggregates fully too"
-    assert sum(group["observations"] for group in seen) == 8
+    assert fat["nested"][0]["demand_rows"] == 4, "and the nested level aggregates fully too"
+    assert sum(group["demand_rows"] for group in seen) == 8
     for thin in ("rel_00", "rel_01", "rel_03", "rel_04"):
-        assert by_relationship[thin]["observations"] == 1
-    assert by_relationship["rel_04"]["nested"][0]["position_table_ref"] == "core_banking.party"
+        assert by_relationship[thin]["demand_rows"] == 1
+    assert by_relationship["rel_04"]["nested"][0]["position_table_ref"] == "public.party"
 
 
 def test_rollup_counts_intents_and_runs_separately(conn) -> None:
@@ -693,7 +703,7 @@ def test_rollup_counts_intents_and_runs_separately(conn) -> None:
     group = observation_queues(conn)["queues"]["bridge_demand"][0]
     assert group["distinct_intents"] == 1
     assert group["distinct_runs"] == 5
-    assert group["observations"] == 5
+    assert group["demand_rows"] == 5
 
 
 def test_rollup_splits_recent_from_historical_and_counts_per_mode(conn) -> None:
@@ -703,13 +713,45 @@ def test_rollup_splits_recent_from_historical_and_counts_per_mode(conn) -> None:
     _seed_demand_group(conn, "split_old", relationship_id="rel_split", mode="telemetry",
                        recorded_at=now - timedelta(days=30))
     group = observation_queues(conn)["queues"]["bridge_demand"][0]
-    assert group["observations"] == 2
+    assert group["demand_rows"] == 2
     assert group["recent_observations"] == 1
     assert group["historical_observations"] == 1
     assert group["live_observations"] == 1
     assert group["telemetry_observations"] == 1
     assert group["suggested_endpoints"], "realizers + near-side key refs, sampled"
     assert len(group["suggested_endpoints"]) <= 5
+
+
+def test_suggested_endpoints_are_flat_catalog_qualified_refs(conn) -> None:
+    """ONE shape, and each side qualified by the catalog that makes it useful.
+
+    The two JSONB evidence columns arrive heterogeneous — a realizer is an object, a near-side key
+    ref is a bare ``public.t.c`` string that names a different column in every catalog that has one
+    — so this queue's first consumer would otherwise have to re-derive both. The realizer is
+    qualified by its OWN catalog (the far one that already does the crossing); the near-side ref by
+    the group's ``position_catalog`` (where the bridge would be anchored)."""
+    _seed_demand_group(conn, "endpoints", relationship_id="rel_endpoints")
+    group = observation_queues(conn)["queues"]["bridge_demand"][0]
+    expected = ["cards::public.accounts.account_id", "core_banking::public.party.party_id"]
+    assert group["suggested_endpoints"] == expected
+    assert group["nested"][0]["suggested_endpoints"] == expected
+    assert all(isinstance(endpoint, str) for endpoint in group["suggested_endpoints"])
+
+
+def test_a_malformed_evidence_entry_never_takes_the_queue_down(conn) -> None:
+    """An endpoint sample is advisory. A realizer that names no catalog, and a near-side entry that
+    is an object rather than a ref, contribute NOTHING — never a half-built string, and never an
+    exception out of a governance read."""
+    intent_id, run_id = _seed_run(conn, "malformed")
+    observation_id = record_planning_observations(
+        conn, generation_run_id=run_id, intent_id=intent_id, observation_mode="live",
+        rows=[_observation(resolution_status="unresolved")])[0]
+    record_bridge_demand(conn, observation_id=observation_id, rejections=[_rejection(
+        relationship_id="rel_malformed",
+        realizers=[{"to_key_ref": "public.accounts.account_id"}, {"catalog_source": "cards"}],
+        near_side_key_refs=[{"column": "party_id"}, "public.party.party_id"])])
+    group = observation_queues(conn)["queues"]["bridge_demand"][0]
+    assert group["suggested_endpoints"] == ["core_banking::public.party.party_id"]
 
 
 def test_rollup_honours_as_of(conn) -> None:
@@ -721,7 +763,7 @@ def test_rollup_honours_as_of(conn) -> None:
     as_of = now - timedelta(days=5)
     result = observation_queues(conn, as_of=as_of)
     assert result["as_of"] == as_of
-    assert result["queues"]["bridge_demand"][0]["observations"] == 1
+    assert result["queues"]["bridge_demand"][0]["demand_rows"] == 1
 
 
 def test_rollup_separates_the_three_queues(conn) -> None:

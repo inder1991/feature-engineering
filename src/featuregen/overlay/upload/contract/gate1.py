@@ -24,6 +24,10 @@ from featuregen.overlay.upload.contract._serial import (
     requirements_from_json,
     requirements_to_json,
 )
+from featuregen.overlay.upload.contract.governed_identity import (
+    DEFINITION_ORIGIN_RECIPE_V2,
+    GovernedVariantIdentityV1,
+)
 from featuregen.overlay.upload.contract.intake import Intent
 from featuregen.overlay.upload.contract.intake_ticket import signed_reading_for
 from featuregen.overlay.upload.contract.near_label_critic import annotate_near_label
@@ -600,12 +604,21 @@ def _governed_idea_from_result(result: BindingPlanningResultV1, template: Templa
 
 def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe_ids,
                                     roles=(), now, templates: Sequence[Template] | None = None,
-                                    ) -> tuple[list[FeatureIdea], list[dict]]:
+                                    ) -> tuple[list[FeatureIdea], list[dict], list[dict]]:
     """Resolve the run scope ONCE, compile each eligible recipe's binding plan (compile ON), and split
     the outcomes: a SELECTED RESOLVED contract plan becomes a governed :class:`FeatureIdea`; anything
     unresolved becomes a rejection dict ``{lens, reason, recipe_id}`` carrying its primary reason code.
     A per-recipe savepoint isolates a planner DB error (it becomes a rejection, never poisons the
-    request txn nor 500s the whole considered set)."""
+    request txn nor 500s the whole considered set).
+
+    **THREE returns, and the third one never leaves the server** (S1B-4). ``cs.rejections`` is in the
+    Gate-#1 response body (``routes/contract.py``) and is hashed into the immutable considered
+    revision, so it stays exactly the three keys it has always had — widening it would publish
+    bridge fact keys and physical object refs to every caller of the considered set, and would move
+    a content hash for a telemetry feature. The planner EVIDENCE a demand row needs (the best plan's
+    facts, its path segments, its typed unmet hops — :func:`governed_lens.rejection_evidence`, the
+    same derivation the telemetry lane's rejections carry) rides on the third value instead, which
+    only :func:`_record_live_governed_evidence` consumes."""
     roles = tuple(roles)
     tmpls = templates if templates is not None else ALL_TEMPLATES
     by_id = {t.id: t for t in tmpls}
@@ -623,6 +636,7 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
                            clock=time.monotonic)
     ideas: list[FeatureIdea] = []
     rejections: list[dict] = []
+    evidence: list[dict] = []
     for rid in sorted(eligible_recipe_ids):
         tmpl = by_id.get(rid)
         if tmpl is None:
@@ -635,6 +649,7 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
             logger.exception("governed cross-catalog planning failed for recipe %s", rid)
             rejections.append({"lens": "governed", "reason": ReasonCode.planner_internal_error.value,
                                "recipe_id": rid})
+            evidence.append(_governed_evidence(rid, tmpl, None))
             continue
         idea = _governed_idea_from_result(result, tmpl, target_entity, roles=roles)
         if idea is not None:
@@ -642,7 +657,132 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
         else:
             rejections.append({"lens": "governed", "reason": _governed_rejection_reason(result),
                                "recipe_id": rid})
-    return ideas, rejections
+            evidence.append(_governed_evidence(rid, tmpl, result))
+    return ideas, rejections, evidence
+
+
+def _governed_evidence(recipe_id: str, template: Template, result) -> dict:
+    """One unresolved recipe's SERVER-ONLY evidence: the lens's shared refusal derivation plus the
+    two identifying facts the ledger row needs and the result does not carry (which recipe, and
+    what it is FOR). ``result=None`` is the planner-explosion shape.
+
+    Imported HERE rather than at module scope, matching this module's convention for its heavier
+    collaborators: ``governed_lens`` pulls the whole request/readiness/review stack, and only the
+    live entity-scoped branch ever reaches this line."""
+    from featuregen.overlay.upload.contract.governed_lens import rejection_evidence
+
+    return {"recipe_id": recipe_id,
+            "primary_objective": template.primary_objective or "",
+            **rejection_evidence(result)}
+
+
+# ── S1B-4: the LIVE lane's governed observation ────────────────────────────────────────────────
+
+#: THE identity decision for this lane's rows, and it is S1B-3's, applied to the other mandatory
+#: identity field. The telemetry worker records an unplanned row with
+#: ``physical_plan_content_hash = "unresolved"`` — deliberately NOT hash-shaped, so a reader can
+#: never mistake it for a plan that compiled, and stored in the row's own column as well as hashed
+#: into ``governed_variant_id`` so the id stays recomputable from the row's values alone.
+#:
+#: This branch plans a ``Template`` — the V1 recipe registry — and therefore has no
+#: ``FeaturePlanningRequestV1`` and no ``planning_request_hash`` either. ``GovernedVariantIdentityV1``
+#: refuses a blank one (correctly: blank would collapse every legacy row of one definition onto one
+#: id, and it is a MANDATORY column on 1120). Same ruling, same shape: a non-hash-shaped sentinel,
+#: stored as well as hashed. A consumer that would otherwise call ``v2_recipe_by_id`` on this row's
+#: ``canonical_definition_id`` can see from the row itself that it is holding the legacy template
+#: lane — only 106 of the 157 templates are V2 recipes, so that tell is load-bearing.
+_LEGACY_TEMPLATE_REQUEST_HASH = "legacy_template"
+
+
+def _record_live_governed_evidence(conn, *, generation_run_id: str, intent_id: str,
+                                   target_entity: str, roles, rejections: Sequence[dict]) -> int:
+    """One ``governed_planning_observation`` per governed rejection, in mode ``live``, with the
+    demand children the telemetry lane's own two-source function files. Returns the demand count.
+
+    **Why this lane records at all.** The engine arm (S1B-3) queues a work item and replans off the
+    request path. This branch has no work item: it plans inline, so a crossing it could not make is
+    known HERE and nowhere else. A telemetry programme that can only see the engine's refusals
+    reports demand for one of the platform's two planning lanes and silently zero for the other.
+
+    **``definition_origin`` is ``recipe_v2``, and that is an approximation this comment owns.**
+    ``DEFINITION_ORIGINS`` is closed at two members; a template is a recipe rather than an LLM
+    intent, so ``llm_intent`` would be the worse of the two available lies. The
+    ``planning_request_hash`` sentinel is what marks the row as the legacy lane.
+
+    ``compiler_input_fingerprint`` and ``metadata_snapshot_id`` stay at 1120's defaults, honestly:
+    this lane freezes no compiler inputs, and it runs BEFORE the C0 snapshot is minted (the snapshot
+    is built over the considered set this branch is still assembling).
+    """
+    from featuregen.overlay.upload.governed_observation_store import (
+        record_bridge_demand,
+        record_planning_observations,
+    )
+    from featuregen.overlay.upload.governed_scope_material import governed_scope_material
+    from featuregen.overlay.upload.governed_telemetry_worker import (
+        UNRESOLVED_PLAN_CONTENT_HASH,
+        demands_for_rejection,
+    )
+
+    if not rejections:
+        return 0
+    # The scope material this run PLANNED under, read on this connection inside this transaction.
+    # Recorded in the telemetry lane's shape so `catalog_scope_material->>'frozen'` groups the whole
+    # table across both modes. `replan_matched` is TRUE and is not an unchecked claim: there is
+    # exactly ONE read here and it is both the frozen material and the material the plan ran under
+    # — the across-time comparison the telemetry worker makes is degenerate on the request path.
+    material = {"frozen": governed_scope_material(conn, roles=roles, target_entity=target_entity),
+                "replan_matched": True}
+    rows: list[dict] = []
+    demands_per_row: list[list[dict]] = []
+    realization_cache: dict[str, str] = {}
+    for rejection in rejections:
+        recipe_id = str(rejection.get("recipe_id") or "")
+        identity = GovernedVariantIdentityV1(
+            canonical_definition_id=recipe_id,
+            definition_origin=DEFINITION_ORIGIN_RECIPE_V2,
+            planning_request_hash=_LEGACY_TEMPLATE_REQUEST_HASH,
+            physical_plan_content_hash=UNRESOLVED_PLAN_CONTENT_HASH)
+        reason = str(rejection.get("reason") or "")
+        rows.append({
+            "definition_origin": DEFINITION_ORIGIN_RECIPE_V2,
+            "canonical_definition_id": recipe_id,
+            "recipe_id": recipe_id,
+            "governed_variant_id": identity.governed_variant_id,
+            "planning_request_hash": _LEGACY_TEMPLATE_REQUEST_HASH,
+            "physical_plan_content_hash": UNRESOLVED_PLAN_CONTENT_HASH,
+            "selected_physical_plan_id": str(rejection.get("physical_plan_id") or ""),
+            "contract_id": str(rejection.get("contract_id") or "") or None,
+            "primary_objective": str(rejection.get("primary_objective") or ""),
+            "target_entity": target_entity,
+            # The plan's OWN anchor when the refusal has a plan to name one. Blank only when there
+            # is genuinely no plan (a planner explosion) — this lane has no run-level anchor to fall
+            # back on, because an entity-scoped run has no single catalog.
+            "anchor_catalog_source": str(rejection.get("anchor_catalog_source") or ""),
+            "resolution_status": reason,
+            "reason_codes": list(rejection.get("reason_codes") or ([reason] if reason else [])),
+            "participating_catalogs": list(rejection.get("participating_catalogs") or ()),
+            "hop_count": int(rejection.get("hop_count") or 0),
+            "bridge_count": int(rejection.get("bridge_count") or 0),
+            # Nothing was bound, so nothing was measured — the worker's ruling, verbatim.
+            "authority_floor_status": "unevaluated",
+            "catalog_scope_material": material,
+        })
+        # The V1 template registry carries no revision hash, so this lane passes "" rather than
+        # inventing one; the demand's identity is then its hop material, its verdict and the two
+        # engine versions, which is exactly what a template-lane demand IS about.
+        demands_per_row.append(demands_for_rejection(
+            conn, rejection, recipe_revision_hash="", realization_cache=realization_cache))
+    observation_ids = record_planning_observations(
+        conn, generation_run_id=generation_run_id, intent_id=intent_id,
+        observation_mode="live", rows=rows)
+    filed = 0
+    for observation_id, demands in zip(observation_ids, demands_per_row, strict=True):
+        if demands:
+            filed += len(record_bridge_demand(conn, observation_id=observation_id,
+                                              rejections=demands))
+    logger.info("live governed evidence recorded: run=%s observations=%d demands=%d",
+                generation_run_id, len(rows), filed)
+    return filed
 
 
 def _reject_cross_catalog_llm(alternatives: list[FeatureSet]) -> tuple[list[FeatureSet], list[dict]]:
@@ -1139,12 +1279,29 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
             eligible = (applicability.eligible_ids if applicability is not None
                         else frozenset(t.id for t in
                                        (templates if templates is not None else ALL_TEMPLATES)))
-            governed_ideas, governed_rejections = _governed_cross_catalog_options(
-                conn, target_entity=target_entity, eligible_recipe_ids=eligible, roles=roles,
-                now=now, templates=templates)
+            governed_ideas, governed_rejections, governed_evidence = (
+                _governed_cross_catalog_options(
+                    conn, target_entity=target_entity, eligible_recipe_ids=eligible, roles=roles,
+                    now=now, templates=templates))
             if governed_ideas:
                 alternatives.append(FeatureSet(lens="templates", features=governed_ideas))
             rejections.extend(governed_rejections)
+            # S1B-4 — the LIVE lane's own recording. This branch plans INLINE, on the request path,
+            # so there is no work item and no replan: what it learned about a crossing it could not
+            # make is known here and nowhere else, and until now it was discarded the moment a
+            # result became a three-key rejection dict. Savepointed and fail-soft for the same
+            # reason the telemetry enqueue below is: a ledger write is never worth a 500, and a
+            # refused write (an unminted run, 1120's FK) must not leave the request's transaction
+            # unusable.
+            if generation_run_id:
+                try:
+                    with conn.transaction():
+                        _record_live_governed_evidence(
+                            conn, generation_run_id=generation_run_id,
+                            intent_id=intent.intent_id, target_entity=target_entity,
+                            roles=roles, rejections=governed_evidence)
+                except Exception:
+                    logger.exception("live governed evidence recording failed (fail-soft)")
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         # B1: the anchor is EXTRACTED as an abstract intent (meaning only — the model is

@@ -33,7 +33,7 @@ def _governed_idea(db):
     """Seed ops+rev+a VERIFIED bridge+fresh watermarks, run the governed planner, and return the single
     resolved governed FeatureIdea (carrying the exact compiled plan envelope)."""
     _cross_seed(db)
-    ideas, rejections = _governed_cross_catalog_options(
+    ideas, rejections, _evidence = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
     assert len(ideas) == 1 and not rejections

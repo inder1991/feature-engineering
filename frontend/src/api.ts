@@ -867,6 +867,86 @@ export function bulkRejectEntityBridges(
   })
 }
 
+// ---- bridge DEMAND (GET /governance/bridge-demand) -------------------------------------------
+// The queue above answers "which crossings has somebody proposed?". This answers the question that
+// funds them: "which crossings did governed planning NEED and not have?" — three read-only queues
+// derived from the governed planning-observation ledger, plus the resolution summary.
+//
+// THE COUNTS ARE THREE DIFFERENT QUESTIONS AND MUST NOT BE FUSED:
+//   * `demand_rows`      — how many planning attempts filed this demand. ONE observation can file
+//     TWO rows (an unmet hop AND a contract-level realization gap are different work for different
+//     people), so this is never a count of features, questions or people.
+//   * `distinct_intents` — how many separate questions somebody asked. FIVE retries of one intent
+//     is one team asking once.
+//   * `distinct_runs`    — how many generation runs hit it. Shown BESIDE the intents so a retry
+//     storm is visible as a retry storm rather than read as demand.
+//
+// `live_observations` / `telemetry_observations` split the same demand rows by which lane recorded
+// them: `live` is the request path's own planning, `telemetry` is the off-request replan. They are
+// not two demands; they are two observers of the same platform.
+export interface BridgeDemandCounts {
+  demand_rows: number
+  distinct_intents: number
+  distinct_runs: number
+  live_observations: number
+  telemetry_observations: number
+  recent_observations: number
+  historical_observations: number
+}
+
+// Where an engineer would BUILD it: the catalog and table the demand is positioned in.
+export interface BridgeDemandPosition extends BridgeDemandCounts {
+  position_catalog: string
+  position_table_ref: string
+  // FLAT, catalog-qualified `catalog::schema.table.column` refs — the far realizer's key column
+  // first, then the near-side anchor. A sample, never a catalogue.
+  suggested_endpoints: string[]
+}
+
+// The crossing somebody wants. Blank `relationship_id` / entities are the CAPACITY shape: a
+// planner-budget row drops its hop identity by ruling (the demand is the budget, not whichever hop
+// the frontier was sitting on), so those fields are honestly empty rather than absent.
+export interface BridgeDemandGroup extends BridgeDemandCounts {
+  relationship_id: string
+  from_entity: string
+  to_entity: string
+  suggested_endpoints: string[]
+  nested: BridgeDemandPosition[]
+}
+
+export interface BridgeDemandRate {
+  observations: number
+  resolved: number
+  resolution_rate: number
+}
+
+// `resolved` is STRICT: `resolved_with_ambiguity` (several equally-good plans, none chosen) is not
+// counted as a clean success, so "resolution rate" never quietly means "produced something".
+export interface BridgeDemandResolutionSummary {
+  as_of: string
+  resolved_statuses: string[]
+  by_origin: Array<BridgeDemandRate & { definition_origin: string }>
+  by_anchor_catalog: Array<BridgeDemandRate & { anchor_catalog_source: string }>
+  totals: BridgeDemandRate
+}
+
+export interface BridgeDemandResp {
+  as_of: string
+  limit: number
+  cursor: string | null
+  next_cursor: string | null
+  queues: {
+    bridge_demand: BridgeDemandGroup[]
+    realization_gap: BridgeDemandGroup[]
+    planner_capacity: BridgeDemandGroup[]
+  }
+  resolution_summary: BridgeDemandResolutionSummary
+}
+
+export function getBridgeDemand(): Promise<BridgeDemandResp> {
+  return request('/governance/bridge-demand')
+}
+
 export interface BridgeRealizationView {
   realization_id: string
   realization_revision_id: string

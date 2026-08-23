@@ -31,7 +31,7 @@ def _client() -> FakeLLM:
 def _governed_idea(db) -> FeatureIdea:
     """A REAL governed cross-catalog FeatureIdea — carries a compiled plan envelope and spans >1 catalog
     (built via the same production helper the live Gate-#1 lens uses, so the envelope is genuine)."""
-    ideas, rejections = _governed_cross_catalog_options(
+    ideas, rejections, _evidence = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
     assert ideas and ideas[0].plan_envelope is not None, rejections

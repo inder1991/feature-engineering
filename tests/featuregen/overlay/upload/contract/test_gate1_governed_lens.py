@@ -14,14 +14,19 @@ integration tests now assert the stronger fact, that there is nothing left for i
 """
 from __future__ import annotations
 
+import pytest
+from psycopg.rows import dict_row
 from tests.featuregen.overlay.upload.planner.test_plan import (
     _NOW,
+    _far_realizer_split,
     _freshness,
+    _seed,
     _split,
     _txn_template,
 )
 from tests.featuregen.overlay.upload.planner.test_shadow_capture import _cross_seed
 
+import featuregen.overlay.upload.contract.gate1 as gate1
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.gate1 import (
@@ -30,9 +35,12 @@ from featuregen.overlay.upload.contract.gate1 import (
     _reject_cross_catalog_llm,
     build_considered_set,
 )
+from featuregen.overlay.upload.contract.governed_identity import GovernedVariantIdentityV1
 from featuregen.overlay.upload.contract.intake import submit_intent
 from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet
+from featuregen.overlay.upload.feature_metadata_snapshot import ensure_generation_run
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.templates import Need
 
 
 def _minimal(db):
@@ -54,10 +62,10 @@ def _recommend_set_client() -> FakeLLM:
 # ── (b) a resolved governed plan → a governed option (helper) ─────────────────────────────────────────
 def test_helper_surfaces_resolved_governed_plan_as_option(db):
     _cross_seed(db)   # ops + rev + a VERIFIED bridge + fresh watermarks -> a resolved cross-catalog plan
-    ideas, rejections = _governed_cross_catalog_options(
+    ideas, rejections, evidence = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
-    assert len(ideas) == 1 and not rejections
+    assert len(ideas) == 1 and not rejections and not evidence
     idea = ideas[0]
     assert idea.origin == "governed_planner"
     assert idea.path_authority == "governed_cross_catalog"
@@ -71,7 +79,7 @@ def test_helper_surfaces_resolved_governed_plan_as_option(db):
 def test_helper_unresolved_governed_plan_becomes_a_rejection(db):
     _split(db)                 # ops + rev but NO bridge -> the account roll-up cannot complete
     _freshness(db, "ops", "rev")
-    ideas, rejections = _governed_cross_catalog_options(
+    ideas, rejections, evidence = _governed_cross_catalog_options(
         db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
         now=_NOW, templates=(_txn_template(),))
     assert ideas == []
@@ -79,6 +87,14 @@ def test_helper_unresolved_governed_plan_becomes_a_rejection(db):
     rej = rejections[0]
     assert rej["lens"] == "governed" and rej["recipe_id"] == "t_roll"
     assert isinstance(rej["reason"], str) and rej["reason"]   # carries a primary reason code
+    # S1B-4: the SERVED rejection stays exactly these three keys — the planner evidence rides on
+    # the third return value, which no route serializes. `cs.rejections` IS in the Gate-#1
+    # response body (`routes/contract.py`), so widening it would publish bridge fact keys and
+    # physical object refs to every caller of the considered set.
+    assert set(rej) == {"lens", "reason", "recipe_id"}
+    assert len(evidence) == 1 and evidence[0]["recipe_id"] == "t_roll"
+    assert evidence[0]["reason"] == rej["reason"]          # one reason, one precedence
+    assert "unmet_hops" in evidence[0] and "evidence" in evidence[0]
 
 
 # ── (d)/(e) the LLM cross-catalog filter (pure) ───────────────────────────────────────────────────────
@@ -161,3 +177,146 @@ def test_flag_off_skips_the_governed_branch_entirely(db, monkeypatch):
     # — an entity-only run has no candidate source at all since the E4 cutover (2026-08-14) — so what
     # this pins is the skip, proven by the booms that never raised.
     assert cs.alternatives == []
+
+
+# =============================================================================================
+# S1B-4 — the LIVE lane records its own governed evidence.
+#
+# S1B-3 gave the ENGINE arm a telemetry replan off the request path. This branch has no engine and
+# no work item: it plans inline, on the request path, and until now threw its planner evidence away
+# the moment it turned a result into a three-key rejection dict. One observation per rejection, in
+# mode "live", with the demand children the SAME two-source function files for the telemetry lane.
+# =============================================================================================
+
+RUN_ID = "grun_s1b4_live"
+
+
+def _unsanctioned_bridge_seeds(db):
+    """A run that genuinely has NO governed plan and dead-ends on a crossing somebody could build.
+
+    ``_far_realizer_split`` on its own is not that run: ``rev`` carries the transaction grain AND
+    declares the transaction -> account join, so ``rev`` binds the whole recipe intra-catalog and
+    the run RESOLVES. The unmet hop is still sitting on the ``ops`` candidate — but a resolved run
+    files no demand, in this lane or the telemetry one, because nobody is missing anything.
+
+    Adding a measure only ``ops`` carries is what makes it a demand: ``rev`` can no longer serve the
+    recipe, ``ops`` is the only source, and ``ops`` dead-ends at ``transaction -> account`` with
+    ``rev`` demonstrably realizing that hop one catalog away — ``unsanctioned_bridge``, the exact
+    shape the bridge_demand queue exists to surface."""
+    _far_realizer_split(db)
+    _seed(db, "ops", [
+        (CanonicalRow("ops", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("ops", "transactions", "account_id", "integer"), "account_id"),
+        (CanonicalRow("ops", "transactions", "amount", "numeric", additivity="additive",
+                      currency="USD"), "monetary_flow"),
+    ])
+    _freshness(db, "ops", "rev")
+    return _txn_template(extra_needs=(Need(role="amt", concept="monetary_flow"),))
+
+
+def _live_build(db, *, generation_run_id: str | None, templates, mint_run: bool = True):
+    intent = submit_intent(hypothesis="roll transactions up to the account", actor="ds1")
+    gate1.persist_intent(db, intent)
+    if generation_run_id is not None and mint_run:
+        ensure_generation_run(db, generation_run_id, {"subject": "ds1"},
+                              {"intake_mode": "hypothesis"}, intent_id=intent.intent_id)
+    cs = build_considered_set(
+        db, intent, _recommend_set_client(), catalog_source=None, is_live=True,
+        target_entity="account", templates=templates, generation_run_id=generation_run_id,
+        now=_NOW)
+    return intent, cs
+
+
+def _rows(db, table: str, order: str) -> list[dict]:
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute(f"SELECT * FROM {table} ORDER BY {order}")   # noqa: S608 — literal constants
+        return [dict(row) for row in cur.fetchall()]
+
+
+def _observations(db) -> list[dict]:
+    return _rows(db, "governed_planning_observation", "observation_id")
+
+
+def _demands(db) -> list[dict]:
+    return _rows(db, "bridge_demand_observation", "demand_id")
+
+
+def test_a_live_governed_rejection_leaves_an_observation_and_its_bridge_demand(db):
+    tmpl = _unsanctioned_bridge_seeds(db)
+    intent, cs = _live_build(db, generation_run_id=RUN_ID, templates=(tmpl,))
+    assert cs.alternatives == []          # the run really did fail to plan
+
+    (observation,) = _observations(db)
+    assert observation["observation_mode"] == "live"
+    assert (observation["generation_run_id"], observation["intent_id"]) == (RUN_ID,
+                                                                           intent.intent_id)
+    assert observation["canonical_definition_id"] == "t_roll"
+    assert observation["resolution_status"] == "unsanctioned_bridge"
+    assert observation["target_entity"] == "account"
+    # the S1B-3 unresolved-row identity scheme, one scheme and two writers: the sentinel is stored
+    # in the row's own column as well as hashed into the id, so the id stays recomputable.
+    assert observation["physical_plan_content_hash"] == "unresolved"
+    assert observation["planning_request_hash"] == "legacy_template"
+    assert observation["governed_variant_id"] == GovernedVariantIdentityV1(
+        canonical_definition_id="t_roll", definition_origin="recipe_v2",
+        planning_request_hash="legacy_template",
+        physical_plan_content_hash="unresolved").governed_variant_id
+    # the scope this run PLANNED under, in the same shape the telemetry lane records
+    material = observation["catalog_scope_material"]
+    assert material["replan_matched"] is True
+    assert material["frozen"]["authorized_catalog_sources"] == ["ops", "rev"]
+    assert material["frozen"]["target_entity"] == "account"
+
+    (demand,) = _demands(db)
+    assert demand["observation_id"] == observation["observation_id"]
+    assert demand["demand_queue"] == "bridge_demand"
+    assert demand["verdict"] == "unsanctioned_bridge"
+    assert (demand["from_entity"], demand["to_entity"]) == ("transaction", "account")
+    assert demand["relationship_id"] == "transaction_to_account"
+    assert (demand["position_catalog"], demand["position_table_ref"]) == ("ops",
+                                                                          "public.transactions")
+    # the far realizer that makes this a BRIDGE demand rather than a realization gap
+    assert demand["realizers"] == [{"catalog_source": "rev",
+                                    "to_object_ref": "public.accounts",
+                                    "from_key_ref": "public.transactions.account_id",
+                                    "to_key_ref": "public.accounts.account_id"}]
+    assert demand["near_side_key_refs"] == ["public.transactions.account_id"]
+
+
+def test_a_resolved_live_run_records_nothing(db):
+    """The control. Same lane, same code path, a run that RESOLVED — no observation, no demand.
+    A ledger that filed a row here would report demand for a crossing nobody is missing."""
+    _cross_seed(db)
+    _, cs = _live_build(db, generation_run_id=RUN_ID, templates=(_txn_template(),))
+    assert [f.name for s in cs.alternatives for f in s.features] == ["t_roll"]
+    assert _observations(db) == [] and _demands(db) == []
+
+
+@pytest.mark.parametrize("run_id", [None, "grun_never_minted"])
+def test_a_live_run_with_no_minted_generation_run_records_nothing(db, run_id):
+    """Two ways to have no run: the caller passed none (a direct gate1 unit call), or named one that
+    was never minted (1120's FK refuses it). Both leave an empty ledger and a SERVED considered set
+    — a ledger write is never worth a 500, and a refused write must not leave the request's
+    transaction unusable either."""
+    tmpl = _unsanctioned_bridge_seeds(db)
+    _, cs = _live_build(db, generation_run_id=run_id, templates=(tmpl,), mint_run=False)
+    assert cs.intent_id                        # the build completed and returned its set
+    assert _observations(db) == [] and _demands(db) == []
+    assert db.execute("SELECT 1").fetchone()[0] == 1     # ...and the transaction still works
+
+
+def test_a_poisoned_observation_store_never_fails_the_build(db, monkeypatch):
+    tmpl = _unsanctioned_bridge_seeds(db)
+
+    def _explode(conn, **kwargs):
+        conn.execute("SELECT 1 FROM a_table_that_does_not_exist")
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.governed_observation_store.record_planning_observations",
+        _explode)
+    _, cs = _live_build(db, generation_run_id=RUN_ID, templates=(tmpl,))
+    assert cs.intent_id
+    assert _observations(db) == []
+    # the savepoint held: the request transaction is still usable after the poisoned write
+    assert db.execute("SELECT 1").fetchone()[0] == 1

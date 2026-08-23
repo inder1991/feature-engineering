@@ -89,6 +89,28 @@ def normalize_ref(
     return f"{_norm(source)}{_SOURCE_SEP}{_PATH_SEP.join(parts)}"
 
 
+def qualify_object_ref(source: str, object_ref: str) -> str:
+    """Qualify a graph ``object_ref`` with the catalog it belongs to, as a normalized
+    ``logical_ref``.
+
+    ``graph_node.object_ref`` is stored PUBLIC-FLATTENED (``public.table.column``) and carries no
+    catalog, so the same dotted string means different objects in different catalogs. Every consumer
+    that has the pair and needs one identity — the governed lens's evidence keying, the bridge-demand
+    queue's endpoint sample — needs the SAME reconstruction, so it lives here beside
+    :func:`normalize_ref` rather than once per caller.
+
+    A two-part ref (``table.column``) is assumed to be public-schema; a bare name is a table. The
+    known limitation is the same one every caller inherits: a source whose real schema is not
+    ``public`` cannot have it recovered from the flattened ref without a graph read, and this does
+    not do one."""
+    parts = object_ref.split(_PATH_SEP)
+    if len(parts) >= 3:
+        return normalize_ref(source, parts[0], parts[-2], parts[-1])
+    if len(parts) == 2:
+        return normalize_ref(source, _DEFAULT_SCHEMA, parts[0], parts[1])
+    return normalize_ref(source, _DEFAULT_SCHEMA, object_ref)
+
+
 def parse_ref(logical_ref: str) -> tuple[str, str, str, str | None]:
     """Inverse of :func:`normalize_ref`: recover ``(source, schema, table, column)`` from a ref.
 

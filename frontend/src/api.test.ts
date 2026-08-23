@@ -3,7 +3,7 @@ import {
   ApiError, type AssetDetail, completeSemantics, contractConfirm, contractConsideredSet,
   contractDraft, type ContractDraft, createIntegration, createSync, deleteIntegration, deleteSync,
   discoverServices, type DiscoveredService, type FeatureIdea, getAssetDetail,
-  getFeatureRunDetail, getIntegration,
+  getBridgeDemand, getFeatureRunDetail, getIntegration,
   getSemanticsPending, getSync, importSync, type Integration, type LineageGraph, lineageGraph,
   listContracts, listFeatureRuns, listIntegrations, listSyncs, patchIntegration, patchSync,
   postFieldDecision,
@@ -1024,5 +1024,28 @@ describe('feature run spine client (read-only list + detail)', () => {
     // as ONE path segment, or the request 404s against a route that never saw it.
     await getFeatureRunDetail('grun x/y')
     expect(fetchMock.mock.calls[1][0]).toBe('/feature-runs/grun%20x%2Fy')
+  })
+})
+
+describe('bridge-demand client (the governed observation ledger, read-only)', () => {
+  it('getBridgeDemand hits /governance/bridge-demand with the session headers', async () => {
+    fetchMock.mockImplementation(ok({
+      as_of: '2026-08-24T00:00:00Z', limit: 50, cursor: null, next_cursor: null,
+      queues: { bridge_demand: [], realization_gap: [], planner_capacity: [] },
+      resolution_summary: {
+        as_of: '2026-08-24T00:00:00Z', resolved_statuses: ['resolved'], by_origin: [],
+        by_anchor_catalog: [], totals: { observations: 0, resolved: 0, resolution_rate: 0 },
+      },
+    }))
+    const body = await getBridgeDemand()
+    // The route takes no source argument and no filter: the whole demand record, paged by the
+    // server's own opaque cursor. `/governance` is already in the dev proxy's prefix list.
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/governance/bridge-demand')
+    expect(init.headers['X-User']).toBe('ana')
+    expect(init.headers['X-Roles']).toBe('data_owner,pii_reader')
+    // the three queues arrive as three named lists, never as one merged array
+    expect(Object.keys(body.queues))
+      .toEqual(['bridge_demand', 'realization_gap', 'planner_capacity'])
   })
 })

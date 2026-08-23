@@ -22,7 +22,8 @@ Three writes and two reads:
 * ``resolution_summary`` — the wave-1 report's numerator source.
 
 ``distinct_intents`` and ``distinct_runs`` are reported SEPARATELY on purpose: five retries of one
-intent is one team asking once, and a queue that counts it as five demands ranks noise.
+intent is one team asking once, and a queue that counts it as five demands ranks noise. The headline
+count beside them is ``demand_rows`` — see :data:`_COUNTS` for why it is not called "observations".
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ from psycopg.types.json import Jsonb
 
 from featuregen.contracts import DbConn
 from featuregen.idgen import mint_id
+from featuregen.overlay.upload.object_ref import qualify_object_ref
 from featuregen.overlay.upload.planner.contracts import (
     PLANNER_VERSION,
     PlanResolutionStatus,
@@ -353,8 +355,14 @@ _BASE_CTE = (
     "   WHERE d.recorded_at <= %s"
     ")")
 
+#: The queue rollup's counts. The headline is ``demand_rows`` and not ``observations`` because that
+#: is what ``count(*)`` over ``base`` actually counts: ONE observation carrying an unmet hop AND a
+#: contract-level realization gap files TWO demand rows, by S1B-3's co-occurrence ruling. Calling
+#: that "2 observations" would double-count the run that produced it and inflate every queue that
+#: reports it. The distinct counts beside it are the honest denominators — and the ``live_``,
+#: ``telemetry_``, ``recent_`` and ``historical_`` splits are all splits OF the demand rows.
 _COUNTS = (
-    " count(*) AS observations,"
+    " count(*) AS demand_rows,"
     " count(DISTINCT intent_id) AS distinct_intents,"
     " count(DISTINCT generation_run_id) AS distinct_runs,"
     " count(*) FILTER (WHERE observation_mode = 'live') AS live_observations,"
@@ -364,7 +372,7 @@ _COUNTS = (
     " count(*) FILTER (WHERE recorded_at < %s - make_interval(days => %s))"
     "     AS historical_observations")
 
-_COUNT_KEYS = ("observations", "distinct_intents", "distinct_runs", "live_observations",
+_COUNT_KEYS = ("demand_rows", "distinct_intents", "distinct_runs", "live_observations",
                "telemetry_observations", "recent_observations", "historical_observations")
 
 
@@ -439,7 +447,8 @@ def observation_queues(conn: DbConn, *, limit: int = 100, cursor: str | None = N
                  "position_table_ref": row["position_table_ref"],
                  **{key: row[key] for key in _COUNT_KEYS},
                  "suggested_endpoints": _sample_endpoints(
-                     row["realizer_lists"], row["near_side_lists"])}
+                     row["realizer_lists"], row["near_side_lists"],
+                     row["position_catalog"] or "")}
         nested_by_key.setdefault(_group_key(row), []).append(entry)
 
     for row in top_rows:
@@ -531,22 +540,63 @@ def _decode_cursor(cursor: str) -> tuple[str, str, str, str]:
     return (queue, relationship, from_entity, to_entity)
 
 
-def _sample_endpoints(realizer_lists, near_side_lists) -> list:
-    """Realizers first, then near-side key refs, deduplicated and capped. A sample exists to tell a
-    human where to start, so it is bounded and ordered, never a dump of everything seen."""
-    flat = [item for group in (realizer_lists or []) for item in (group or [])]
-    flat += [item for group in (near_side_lists or []) for item in (group or [])]
-    return _dedupe(flat)
+def _sample_endpoints(realizer_lists, near_side_lists, position_catalog: str) -> list[str]:
+    """Realizers first, then near-side key refs — as FLAT, catalog-qualified ``logical_ref``
+    strings, deduplicated and capped.
+
+    ONE shape, deliberately. The two JSONB evidence columns arrive heterogeneous: a realizer is an
+    object (and two producers write two different objects — S1B-2's ``RealizerFactV1`` and S1B-3's
+    realization-gap entry), while a near-side key ref is a bare, catalog-LESS ``public.t.c`` string.
+    Handing a consumer a list that is sometimes an object and sometimes a string makes every reader
+    of this queue write the same normalization, and a catalog-less ref is ambiguous across catalogs
+    anyway — ``public.accounts.account_id`` names a different column in every catalog that has one.
+
+    The catalog each side is qualified BY is the fact that makes the sample useful:
+
+    * a REALIZER is qualified by its own ``catalog_source`` — the far catalog that already does this
+      crossing, which is where an engineer looks to see how;
+    * a NEAR-SIDE key ref is qualified by the group's ``position_catalog`` — the catalog the demand
+      is positioned in, which is where the bridge would be anchored.
+
+    A realizer's TO-side ``to_key_ref`` is preferred over its ``to_object_ref``: the key COLUMN is
+    what a bridge connects, and it is the field both producers populate. An entry that names neither
+    a catalog nor a ref contributes nothing rather than a half-built string.
+    """
+    endpoints = [_realizer_endpoint(item)
+                 for group in (realizer_lists or []) for item in (group or [])]
+    endpoints += [_qualified(position_catalog, item)
+                  for group in (near_side_lists or []) for item in (group or [])]
+    return _dedupe(endpoint for endpoint in endpoints if endpoint)
 
 
-def _dedupe(items) -> list:
+def _realizer_endpoint(realizer) -> str:
+    """A realizer is an OBJECT by contract — both producers write one. Anything else names no
+    catalog, and a ref with no catalog is not an endpoint, so it contributes nothing."""
+    if not isinstance(realizer, dict):
+        return ""
+    ref = str(realizer.get("to_key_ref") or realizer.get("to_object_ref") or "")
+    return _qualified(str(realizer.get("catalog_source") or ""), ref)
+
+
+def _qualified(catalog_source: str, object_ref) -> str:
+    """``catalog::schema.table.column``, or "" when either half is missing or unusable. Never
+    raises: an endpoint SAMPLE is advisory, and one malformed evidence entry must not take a
+    governance queue down."""
+    if not isinstance(object_ref, str) or not object_ref.strip() or not catalog_source.strip():
+        return ""
+    try:
+        return qualify_object_ref(catalog_source, object_ref)
+    except ValueError:
+        return ""
+
+
+def _dedupe(items) -> list[str]:
     seen: set[str] = set()
-    sample: list = []
+    sample: list[str] = []
     for item in items:
-        marker = json.dumps(item, sort_keys=True, default=str)
-        if marker in seen:
+        if item in seen:
             continue
-        seen.add(marker)
+        seen.add(item)
         sample.append(item)
         if len(sample) == SUGGESTED_ENDPOINT_SAMPLE:
             break

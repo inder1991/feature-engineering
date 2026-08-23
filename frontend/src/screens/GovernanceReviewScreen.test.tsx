@@ -23,6 +23,7 @@ vi.mock('../api', async importOriginal => {
     rejectSemanticBinding: vi.fn(),
     reviewBridgeRealization: vi.fn(),
     getDataUsePolicies: vi.fn(),
+    getBridgeDemand: vi.fn(),
   }
 })
 const getGovernanceQueue = vi.mocked(api.getGovernanceQueue)
@@ -35,6 +36,25 @@ const confirmTableFact = vi.mocked(api.confirmTableFact)
 const confirmSemanticBinding = vi.mocked(api.confirmSemanticBinding)
 const rejectSemanticBinding = vi.mocked(api.rejectSemanticBinding)
 const getDataUsePolicies = vi.mocked(api.getDataUsePolicies)
+const getBridgeDemand = vi.mocked(api.getBridgeDemand)
+
+// The bridge-demand panel is self-fetching, so the screen's suite has to answer for it. An EMPTY
+// ledger is the right default here: this suite is about the decision queue, and the panel's own
+// behaviour is pinned in BridgeDemandPanel.test.tsx.
+const NO_DEMAND: api.BridgeDemandResp = {
+  as_of: '2026-08-24T00:00:00Z',
+  limit: 50,
+  cursor: null,
+  next_cursor: null,
+  queues: { bridge_demand: [], realization_gap: [], planner_capacity: [] },
+  resolution_summary: {
+    as_of: '2026-08-24T00:00:00Z',
+    resolved_statuses: ['resolved'],
+    by_origin: [],
+    by_anchor_catalog: [],
+    totals: { observations: 0, resolved: 0, resolution_rate: 0 },
+  },
+}
 
 // ── fixtures ─────────────────────────────────────────────────────────────────────────────────────
 // Shaped exactly as overlay/upload/governance_queue.py emits them, including the two INDEPENDENT
@@ -300,6 +320,8 @@ beforeEach(() => {
   confirmTableFact.mockResolvedValue({
     governance_status: 'VERIFIED', operational_projection: 'projected',
   })
+  getBridgeDemand.mockReset()
+  getBridgeDemand.mockResolvedValue(NO_DEMAND)
 })
 
 function row(item: api.GovernanceQueueItem): HTMLElement {
@@ -1706,6 +1728,44 @@ it('carries the data-use policy panel the feature refusal points at', async () =
   const panel = await screen.findByTestId('data-use-policies')
   expect(within(panel).getByRole('heading', { name: 'Data-use policies' })).toBeInTheDocument()
   expect(within(panel).getByTestId('dup-pep_flag')).toBeInTheDocument()
+})
+
+// ── the entity-bridge queue's other half (S1B-4) ────────────────────────────────────────────────
+
+it('carries the bridge-demand record beside the entity-bridge decisions', async () => {
+  // The queue answers "which crossings has somebody proposed?"; the panel answers "which crossings
+  // did governed planning need and not have?". A reviewer deciding a bridge above is exactly the
+  // person who wants to know how much planning is waiting on one, so the two live on one screen.
+  getGovernanceQueue.mockResolvedValue(FULL)
+  getBridgeDemand.mockResolvedValue({
+    ...NO_DEMAND,
+    queues: {
+      ...NO_DEMAND.queues,
+      bridge_demand: [{
+        relationship_id: 'transaction_to_account',
+        from_entity: 'transaction',
+        to_entity: 'account',
+        demand_rows: 3, distinct_intents: 2, distinct_runs: 3,
+        live_observations: 3, telemetry_observations: 0,
+        recent_observations: 3, historical_observations: 0,
+        suggested_endpoints: ['rev::public.accounts.account_id'],
+        nested: [],
+      }],
+    },
+  })
+  render(<GovernanceReviewScreen />)
+
+  const panel = await screen.findByTestId('bridge-demand')
+  // The container is "Planning demand" — "Bridge demand" is the first of the three queues INSIDE
+  // it, and a section heading that repeats a child's makes the outline ambiguous.
+  expect(within(panel).getByRole('heading', { name: 'Planning demand', level: 2 }))
+    .toBeInTheDocument()
+  expect(within(panel).getByRole('heading', { name: /^Bridge demand/, level: 3 }))
+    .toBeInTheDocument()
+  expect(within(panel).getByTestId('bd-bridge_demand-group'))
+    .toHaveTextContent('account ← transaction')
+  // it is a RECORD, not a second decision surface: nothing here is pressable
+  expect(within(panel).queryByRole('button')).toBeNull()
 })
 
 // ── semantic bindings in the queue (the 2026-08-10 currency-review gap) ─────────────────────────

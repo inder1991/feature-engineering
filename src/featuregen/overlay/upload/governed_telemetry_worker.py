@@ -262,8 +262,9 @@ def _process_item(conn: DbConn, item: dict, *, now: datetime | None) -> dict:
         rows.append(_rejected_row(entry.request, rejection, common=common,
                                   corroborated=corroborated, divergence=divergence,
                                   fallback_anchor=frozen_anchor))
-        demands_per_row.append(demands_for_rejection(conn, entry.request, rejection,
-                                                     realization_cache=realization_cache))
+        demands_per_row.append(demands_for_rejection(
+            conn, rejection, recipe_revision_hash=entry.request.source_content_hash,
+            realization_cache=realization_cache))
         counts["rejected"] += 1
 
     observation_ids = record_planning_observations(
@@ -546,11 +547,17 @@ def _compiler_input_fingerprint(frozen: dict) -> str:
 # ── the two demand sources ────────────────────────────────────────────────────────────────────
 
 
-def demands_for_rejection(conn: DbConn, request: FeaturePlanningRequestV1, rejection: dict, *,
+def demands_for_rejection(conn: DbConn, rejection: dict, *, recipe_revision_hash: str,
                           realization_cache: dict[str, str] | None = None) -> list[dict]:
     """BOTH demand sources for one rejection, merged with the rejection-level fields the store
     reads (``recipe_revision_hash``, ``anchor_catalog_source`` — passed explicitly so the store
     never has to look the anchor up).
+
+    ``recipe_revision_hash`` is a PARAMETER rather than a field read off a request, because the
+    two writers hold different things: this worker has a ``FeaturePlanningRequestV1`` and passes
+    its ``source_content_hash``, while gate1's live entity-scoped lane plans a ``Template`` — the
+    V1 recipe registry, which has no revision hash at all — and passes ``""`` rather than inventing
+    one. One function, two lanes, no second copy of the two-source logic.
 
     **RULING (S1B-3, on review): the two sources are NOT deduplicated against each other, and a
     rejection that carries both files both rows.** They answer different questions and land in
@@ -563,12 +570,12 @@ def demands_for_rejection(conn: DbConn, request: FeaturePlanningRequestV1, rejec
     contract headline while other candidates dead-ended carrying real hops. Pinned by
     ``test_a_rejection_carrying_both_sources_files_into_both_queues``.
     """
-    revision_hash = request.source_content_hash
     anchor = str(rejection.get("anchor_catalog_source") or "")
-    hops = [{**hop, "recipe_revision_hash": revision_hash, "anchor_catalog_source": anchor}
+    hops = [{**hop, "recipe_revision_hash": recipe_revision_hash, "anchor_catalog_source": anchor}
             for hop in (rejection.get("unmet_hops") or ())]
     states = _realization_states(conn, rejection, cache=realization_cache)
-    return [*hops, *contract_level_demands(rejection, recipe_revision_hash=revision_hash,
+    return [*hops, *contract_level_demands(rejection,
+                                           recipe_revision_hash=recipe_revision_hash,
                                            realization_states=states)]
 
 
