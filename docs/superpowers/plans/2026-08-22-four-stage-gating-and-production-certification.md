@@ -3021,10 +3021,21 @@ certificate bindings the day the policy opens (proved by test with the availabil
 `publish_swap` is fence-CAS (a zombie loses inside the statement); the reconcilers ship WITH the
 machines (§15.1), gated on action availability so the flag-off tick stays byte-identical; and
 `_explained` stopped raising at display time (§5's named defect — service codes and unknown
-codes now render instead of 500ing). What remains: steps 8-remainder (the production evaluators'
-consult of the reader is IN the routes; the §12 programme), 9 (evaluation programmes + corpus —
-migrations renumber past the peer's 1115/1116), 10 (journey tests + legacy deletion), and all
-operator work.
+codes now render instead of 500ing). **Step 9's compiler-programme ENGINEERING is BUILT** (same day, migration
+**1118** — the peer holds 1115–1117): the sibling contract (NO provider hashes, structurally),
+the ONE governed case revision (approved IR + dataset pin + expected rows + empty-constrained
+tolerances + runtime profile under one hash reviewers approve together), the attempt record with
+its honesty CHECKs, both comparisons exactly as §12.1 rules them (structural IR with the first
+differing path and the `IR_INPUT_IDENTITY_MOVED` verdict; banking-value comparison with exact
+rows both directions, multiset grain, NULL/0/absent as three answers, quantize-then-exact
+decimals under the DECLARED policy, no tolerances), the zero-dispatch assertion applied FIRST,
+`UNMEASURED` for a deployment with no execution seam, and the ISSUER that mints
+`method_certificate_revision` — refusing an EMPTY corpus by name (vacuous truth is §10.4's
+strongest-claim-on-weakest-evidence). The loop is CLOSED by test: a passing non-empty corpus
+mints the certificate the step-7 reader finds. What remains: the CORPUS itself (§12.2/§21 —
+approved IRs + reviewed datasets, an operator/governance act; zero cases exist), the L1
+execution adapter wiring (step 0b substrate), step 8's residual (rides step 10's cutover — the
+old route's ladder), step 10 (journey tests + legacy deletion), and all operator work.
 
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`
