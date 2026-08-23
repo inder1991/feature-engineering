@@ -47,7 +47,10 @@ def evaluate_verify(
     sealed_artifact_hash: str,
     inventory_observation_id: str,
     execution_permitted: bool,
-    activation_blockers: Sequence[str] = (),
+    # ▲ NO DEFAULT — §8.1's rule, applied to every gate at once rather than one at a time. An
+    # explicit empty tuple is a CLAIM ("the caller consulted the fold and it carried nothing");
+    # an omitted argument was indistinguishable from a caller that never asked.
+    activation_blockers: Sequence[str],
 ) -> EvaluatorVerdictV1:
     """§0.3's Verify gate: the exact sealed artifact · execution permission · environment
     compatibility.
@@ -133,7 +136,7 @@ def evaluate_publish_sandbox(
     staleness: StalenessV1,
     publication_permitted: bool,
     capability_attestation: str,
-    activation_blockers: Sequence[str] = (),
+    activation_blockers: Sequence[str],
 ) -> EvaluatorVerdictV1:
     """§0.3's Publish gate: a current passing verification · the exact staging output · publication
     permission and capability.

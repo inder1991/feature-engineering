@@ -88,7 +88,11 @@ def generate_v2(
     member_provenance: Sequence[MemberAuthoringInputV1],
     compiled_at: str,
     sealed_at: str,
-    activation_blockers: Sequence[str] = (),
+    # ▲ NO DEFAULT — §8.1. `= ()` meant "supplying nothing is supplying no blockers", and the real
+    # lane supplied nothing, so production generation ran on the empty default from the day it
+    # shipped. The carried set now arrives EXPLICITLY from the request-time action decision the
+    # worker just rechecked — one source, the same one a person was shown.
+    activation_blockers: Sequence[str],
 ) -> GeneratedArtifactV2:
     """Gate, record, render and seal one compiled generation.
 

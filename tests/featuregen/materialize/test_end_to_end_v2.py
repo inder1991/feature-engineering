@@ -146,6 +146,7 @@ def generated(catalog, spine):
     spine_input = derive_requirement(catalog, INVENTORY, table_ref=CUSTOMERS)
     return generate_v2(
         catalog, compiled,
+        activation_blockers=(),   # explicit-empty is a claim — §8.1
         environment_id=ENV,
         generation_authorization_revision_id=_approval(catalog),
         engine_id="kedro-pyspark",

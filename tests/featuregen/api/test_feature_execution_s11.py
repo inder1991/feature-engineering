@@ -200,7 +200,7 @@ def test_VERIFY_REFUSES_AN_ARTIFACT_THAT_DOES_NOT_EXIST(db):
     verdict = evaluate_execution.evaluate_verify(
         db, sealed_artifact_hash="art-never-sealed",
         inventory_observation_id=_observation(db, "obs-1", "hdfc-local"),
-        execution_permitted=True)
+        execution_permitted=True, activation_blockers=())
     assert verdict.allowed is False
     assert verdict.blockers == (R.ARTIFACT_NOT_SERVABLE,)
     assert verdict.action is EvaluatorAction.VERIFY
@@ -214,7 +214,7 @@ def test_VERIFY_REFUSES_A_REFUSED_ARTIFACT(db):
     verdict = evaluate_execution.evaluate_verify(
         db, sealed_artifact_hash="art-1",
         inventory_observation_id=_observation(db, "obs-1", "hdfc-local"),
-        execution_permitted=True)
+        execution_permitted=True, activation_blockers=())
     assert verdict.blockers == (R.ARTIFACT_NOT_SERVABLE,)
 
 
@@ -226,7 +226,7 @@ def test_VERIFY_REFUSES_THE_WRONG_ENVIRONMENT(db):
         db, sealed_artifact_hash="art-1",
         # An observation that genuinely belongs to another cluster — not a string the caller chose.
         inventory_observation_id=_observation(db, "obs-prod", "hdfc-prod"),
-        execution_permitted=True)
+        execution_permitted=True, activation_blockers=())
     assert verdict.blockers == (R.ENVIRONMENT_INCOMPATIBLE,)
 
 
@@ -238,7 +238,7 @@ def test_VERIFY_REFUSES_AN_OBSERVATION_THAT_DOES_NOT_EXIST(db):
     _seal(db)
     verdict = evaluate_execution.evaluate_verify(
         db, sealed_artifact_hash="art-1", inventory_observation_id="obs-imaginary",
-        execution_permitted=True)
+        execution_permitted=True, activation_blockers=())
     assert verdict.blockers == (R.ENVIRONMENT_INCOMPATIBLE,)
 
 
@@ -249,7 +249,7 @@ def test_a_REFUSED_ARTIFACT_does_not_ALSO_report_an_environment_mismatch(db):
     verdict = evaluate_execution.evaluate_verify(
         db, sealed_artifact_hash="art-1",
         inventory_observation_id=_observation(db, "obs-prod", "hdfc-prod"),
-        execution_permitted=True)
+        execution_permitted=True, activation_blockers=())
     assert verdict.blockers == (R.ARTIFACT_NOT_SERVABLE,)
 
 
@@ -258,7 +258,7 @@ def test_VERIFY_REFUSES_WITHOUT_EXECUTION_PERMISSION(db):
     verdict = evaluate_execution.evaluate_verify(
         db, sealed_artifact_hash="art-1",
         inventory_observation_id=_observation(db, "obs-1", "hdfc-local"),
-        execution_permitted=False)
+        execution_permitted=False, activation_blockers=())
     assert verdict.blockers == (R.EXECUTION_AUTHORITY_UNMET,)
 
 
@@ -270,7 +270,7 @@ def test_VERIFY_ALLOWS_A_SERVABLE_ARTIFACT_IN_ITS_OWN_ENVIRONMENT(db):
         # comparison are now loaded, so this passes for the right reason rather than because the
         # caller supplied the artifact's own environment back to it.
         inventory_observation_id=_observation(db, "obs-1", "hdfc-local"),
-        execution_permitted=True)
+        execution_permitted=True, activation_blockers=())
     assert verdict.allowed is True
 
 
@@ -281,7 +281,7 @@ def test_PUBLISH_REFUSES_A_VERIFICATION_THAT_IS_NOT_CURRENT(db, staleness):
     path = _verify(db)
     verdict = evaluate_execution.evaluate_publish_sandbox(
         db, verified_output_revision_id="vo-1", staging_path=path, staleness=staleness,
-        publication_permitted=True, capability_attestation="cap:publisher")
+        publication_permitted=True, capability_attestation="cap:publisher", activation_blockers=())
     assert verdict.blockers == (R.VERIFICATION_NOT_CURRENT,)
 
 
@@ -291,7 +291,7 @@ def test_PUBLISH_REFUSES_THE_WRONG_STAGING_PATH(db):
     verdict = evaluate_execution.evaluate_publish_sandbox(
         db, verified_output_revision_id="vo-1", staging_path="hdfs://nn/somewhere-else",
         staleness=StalenessV1.CURRENT, publication_permitted=True,
-        capability_attestation="cap:publisher")
+        capability_attestation="cap:publisher", activation_blockers=())
     assert verdict.blockers == (R.VERIFICATION_NOT_CURRENT,)
 
 
@@ -299,7 +299,7 @@ def test_PUBLISH_REFUSES_WITHOUT_A_CAPABILITY(db):
     path = _verify(db)
     verdict = evaluate_execution.evaluate_publish_sandbox(
         db, verified_output_revision_id="vo-1", staging_path=path,
-        staleness=StalenessV1.CURRENT, publication_permitted=True, capability_attestation="  ")
+        staleness=StalenessV1.CURRENT, publication_permitted=True, capability_attestation="  ", activation_blockers=())
     assert verdict.blockers == (R.PUBLICATION_CAPABILITY_MISSING,)
 
 
@@ -308,7 +308,7 @@ def test_PUBLISH_ALLOWS_a_current_verification_with_permission_and_capability(db
     verdict = evaluate_execution.evaluate_publish_sandbox(
         db, verified_output_revision_id="vo-1", staging_path=path,
         staleness=StalenessV1.CURRENT, publication_permitted=True,
-        capability_attestation="cap:publisher")
+        capability_attestation="cap:publisher", activation_blockers=())
     assert verdict.allowed is True
     assert verdict.action is EvaluatorAction.PUBLISH_SANDBOX
 
@@ -323,7 +323,7 @@ def test_a_SWEPT_output_cannot_be_published(db):
     verdict = evaluate_execution.evaluate_publish_sandbox(
         db, verified_output_revision_id="vo-1", staging_path=path,
         staleness=StalenessV1.CURRENT, publication_permitted=True,
-        capability_attestation="cap:publisher")
+        capability_attestation="cap:publisher", activation_blockers=())
     assert verdict.blockers == (R.VERIFICATION_NOT_CURRENT,)
 
 

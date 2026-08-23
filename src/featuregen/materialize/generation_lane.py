@@ -555,7 +555,7 @@ def _drive(
             raise DecisionMissing(
                 f"generation job {job.request_id} carries no action decision: work submitted "
                 f"straight to the queue is refused at the worker, not built")
-        recheck(conn, decision_id, current_pins=generation_evidence_pins(
+        decision = recheck(conn, decision_id, current_pins=generation_evidence_pins(
             build_set_content_hash=build_set.content_hash,
             generation_authorization_revision_id=request.generation_authorization_revision_id))
     except DecisionMissing as exc:
@@ -631,6 +631,10 @@ def _drive(
             artifact_id=_artifact_id(job.request_id),
             occurrences_by_member=_occurrences(
                 compiled, admitted, environment_id=request.environment_id),
+            # ▲ FROM THE DECISION, explicitly — §8.1. The same recorded answer a person was shown
+            # at request time, rechecked moments ago; an empty tuple here is that decision's claim
+            # that nothing carried, never a default nobody chose.
+            activation_blockers=tuple(decision.blockers),
             realizations=(),
             member_provenance=_member_provenance(restored, admitted),
             compiled_at=job.compiled_at,

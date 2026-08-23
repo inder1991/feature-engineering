@@ -201,7 +201,11 @@ def verify_eligibility(
     verdict = evaluate_verify(
         conn, sealed_artifact_hash=artifact_id,
         inventory_observation_id=inventory_observation_id,
-        execution_permitted=_may_execute(identity))
+        execution_permitted=_may_execute(identity),
+        # ▲ EXPLICIT-EMPTY IS A CLAIM (§8.1): this route consults no activation fold today, and
+        # says so — an omitted argument was indistinguishable from a caller that never asked. The
+        # carried set arrives when §7's decision service absorbs these gates (step 6's worker).
+        activation_blockers=())
     return {"action": verdict.action.value, "allowed": verdict.allowed,
             "blockers": _explained(verdict.blockers)}
 
@@ -318,7 +322,8 @@ def request_verification(
     verdict = evaluate_verify(
         conn, sealed_artifact_hash=body.sealed_artifact_id,
         inventory_observation_id=body.inventory_observation_id,
-        execution_permitted=_may_execute(identity))
+        execution_permitted=_may_execute(identity),
+        activation_blockers=())   # explicit-empty is a claim — §8.1; see verify_eligibility
     if not verdict.allowed:
         raise HTTPException(
             status_code=409,
@@ -437,7 +442,8 @@ def request_publication(
         conn, verified_output_revision_id=body.verified_output_revision_id,
         staging_path=body.staging_path, staleness=staleness,
         publication_permitted=_may_publish(identity),
-        capability_attestation=body.capability_attestation)
+        capability_attestation=body.capability_attestation,
+        activation_blockers=())   # explicit-empty is a claim — §8.1; see verify_eligibility
     if not verdict.allowed:
         raise HTTPException(
             status_code=409,

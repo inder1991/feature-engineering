@@ -98,6 +98,7 @@ def _generate(catalog, compiled, *, occurrences=None, engine_id="kedro-pyspark",
 
     return generate_v2(
         catalog, compiled,
+        activation_blockers=(),   # explicit-empty is a claim — §8.1
         environment_id=ENV,
         generation_authorization_revision_id=kwargs.pop("approval", _approval(catalog)),
         engine_id=engine_id,
@@ -156,3 +157,23 @@ def test_A_MEMBER_WITH_NO_OCCURRENCES_IS_A_CALLER_ERROR(catalog, spine):
     compiled = _compiled(catalog, spine)
     with pytest.raises(ValueError, match="no policy occurrences supplied"):
         _generate(catalog, compiled, occurrences={})
+
+
+def test_THE_ACTIVATION_BLOCKERS_HAVE_NO_DEFAULT_anywhere():
+    """▲ §8.1, pinned. `= ()` meant "supplying nothing is supplying no blockers", and the real lane
+    supplied nothing — so production generation ran on the empty default from the day it shipped.
+    An explicit empty tuple is a CLAIM the caller makes; an omitted argument was indistinguishable
+    from a caller that never asked. If this test fails, someone put the default back."""
+    import inspect
+
+    from featuregen.materialize.evaluate_execution import (
+        evaluate_publish_sandbox,
+        evaluate_verify,
+    )
+    from featuregen.materialize.generate_v2 import generate_v2
+
+    for fn in (generate_v2, evaluate_verify, evaluate_publish_sandbox):
+        parameter = inspect.signature(fn).parameters["activation_blockers"]
+        assert parameter.default is inspect.Parameter.empty, (
+            f"{fn.__name__} regained a default for activation_blockers — the silent bypass §8.1 "
+            f"closed")
