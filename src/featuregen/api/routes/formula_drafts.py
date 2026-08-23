@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import get_conn, get_identity, require_permission
+from featuregen.api.routes.code_generation_jobs import MoneyCeiling
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.formula_draft_service import (
     FORMULA_DRAFT_HANDLER,
@@ -279,7 +280,11 @@ class RegenerationApprovalIn(BaseModel):
 
     max_calls: int = Field(gt=0)
     max_tokens: int = Field(gt=0)
-    max_cost: str = Field(min_length=1)
+    #: THE one declaration of a confirmed amount of money, read-only from the code-generation
+    #: route's body types — the reason `feature_runs` imports `SpendApprovalIn` rather than
+    #: re-declaring it. Without it this field carried the same raw-500 hole: a string that only
+    #: fails at the `numeric` cast, three layers below the person who typed it.
+    max_cost: MoneyCeiling
     currency: str = Field(min_length=3, max_length=3)
     pricing_version: str = Field(min_length=1)
     expires_at: str = Field(min_length=1)

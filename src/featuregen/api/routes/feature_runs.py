@@ -1,15 +1,17 @@
-"""The run spine's surface (spec §5/§11/§12) — two reads, and ONE gesture (§R4.4.2).
+"""The run spine's surface (spec §5/§11/§12) — two reads, and TWO gestures (§R4.4.2, §R4.2).
 
 404 covers both absence and denial, deliberately: a distinguishable 403 would confirm the run id
-exists — a shape leak the read policy exists to prevent. That rule governs the write too: a caller
-who may not see a run gets the same body for triggering it as for a run that does not exist.
+exists — a shape leak the read policy exists to prevent. That rule governs the writes too: a caller
+who may not see a run gets the same body for acting on it as for a run that does not exist.
 
-The two GETs are pure reads over the stores that already hold the evidence. The POST is NOT a new
-lifecycle: it records nothing of its own, derives nothing a person must decide, and stores no state
-on the run. It resolves the run's own frozen facts and hands them to the ONE job-creation service
-(`materialize.code_generation_coordinator.request_code_generation_job`) that the code-generation
-route also calls — so the run page and that route reach the same gates, in the same order, and
-their refusals are the same refusals with the same statuses.
+The two GETs are pure reads over the stores that already hold the evidence. NEITHER POST is a new
+lifecycle: each records nothing of its own, derives nothing a person must decide, and stores no
+state on the run. `prepare-code` resolves the run's own frozen facts and hands them to the ONE
+job-creation service (`materialize.code_generation_coordinator.request_code_generation_job`) the
+code-generation route also calls; `authoring-retries` hands one recorded attempt's candidate to the
+ONE draft-request composition (`overlay.upload.formula_draft_service.request_draft_for_candidate`)
+the formula-draft route also calls. Both surfaces therefore reach the same gates, in the same
+order, and their refusals are the same refusals with the same statuses.
 """
 from __future__ import annotations
 
@@ -44,6 +46,16 @@ RUN_CANDIDATE_NOT_SELECTED = "RUN_CANDIDATE_NOT_SELECTED"
 
 #: A candidate named twice. Also this surface's own — a body is not a fact about a run.
 RUN_CANDIDATE_NAMED_TWICE = "RUN_CANDIDATE_NAMED_TWICE"
+
+#: The named draft is not one of THIS run's recorded attempts. This surface's own, for the same
+#: reason as the two above: a body is not a fact about a run, and the run's own attempt history is
+#: what decides. It says nothing about whether that draft exists somewhere else — which is the point.
+RUN_ATTEMPT_NOT_RECORDED = "RUN_ATTEMPT_NOT_RECORDED"
+
+#: The named attempt bought something, or is still buying it. Retry is the question asked of an
+#: attempt that bought NOTHING (spec §R4.2); asking it of an answer is R4.2's still-deferred
+#: "request another opinion", which needs the identity to move and has no surface yet.
+RUN_ATTEMPT_IS_NOT_A_FAILURE = "RUN_ATTEMPT_IS_NOT_A_FAILURE"
 
 router = APIRouter(dependencies=[Depends(require_feature_read)])
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -301,4 +313,162 @@ def prepare_run_code(run_id: str, body: PrepareCodeIn, conn: _Conn,
                    "generation workspace" if created else
                    "this exact request is already live; its job is the answer, and nothing was "
                    "queued or spent again"),
+    }
+
+
+class RetryAuthoringIn(BaseModel):
+    """WHICH recorded attempt to buy again. Nothing else, and the omission is the design.
+
+    The candidate is the ATTEMPT's — resolved from this run's own history — so a body cannot aim
+    one run's retry at another run's candidate, and cannot name a considered revision this run does
+    not own. The ceiling is not here either: a retry rides the ceiling its GOVERNANCE APPROVAL
+    already confirmed (§11.2, and 1103's spend authorization is NOT NULL), so a ceiling collected
+    at click time would be a second, unapproved one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    formula_draft_id: str = Field(min_length=1)
+
+
+@router.post("/feature-runs/{run_id}/authoring-retries", status_code=202,
+             dependencies=[Depends(require_feature_generate)])
+def retry_run_authoring(run_id: str, body: RetryAuthoringIn, conn: _Conn,
+                        identity: _Identity) -> dict[str, Any]:
+    """Buy a failed formula attempt again — the run page's second write (spec §R4.2).
+
+    `202`: a draft is REQUESTED, not authored. The worker drives it, and the refreshed run detail in
+    the answer is where it will be watched — Task 2's fold shows the new attempt as the candidate's
+    current reading and the failure as the history that got it there.
+
+    **THIS ROUTE IS AN ADAPTER, NOT A SECOND AUTHORITY**, exactly as `prepare-code` is. The
+    approval, the ceiling, the tombstones and the money guard all belong to
+    `request_draft_for_candidate` — the same function `POST /considered-revisions/.../formula-drafts`
+    calls — and its typed refusals are re-raised here with the statuses that route already answers
+    with, so a person cannot get two different answers to one question by arriving through two
+    doors.
+
+    THE ORDER OF THE GATES, and why each is where it is:
+
+    1. **§11 object policy first.** `run_detail` returns None for a run that does not exist AND for
+       one this caller may not see, and both become the byte-identical 404 the GET answers with.
+    2. **The attempt is the RUN's.** The body names a draft; this run's own attempt history is what
+       says whether it is one of its attempts. A draft the history does not carry is refused without
+       saying whether it exists elsewhere — a build of the same rule the 404 above enforces.
+    3. **The gesture's own availability** — taken WHOLE from the projection's `retryable` /
+       `retry_blockers`, which is the same derivation the run page draws the control from. §7
+       [R3.1]: a control offered over an entrance that refuses is a false rail with a click in it,
+       and re-deciding it here in words of this file's own is precisely the drift that rule exists
+       to prevent.
+    4. **Everything else is the service's**, unchanged and un-second-guessed.
+
+    ▲ **NO SECOND CONFIRM.** The exception WAS the approval moment: somebody with `governance:
+    confirm` approved this regeneration and confirmed its cost, durably, against the exact identity
+    this mint will produce. A modal here would ask the engineer to re-agree to a decision that is
+    not theirs, and §11.2's own rule is that a modal is not a money guard.
+    """
+    from featuregen.aggregates.ids import mint_id
+    from featuregen.overlay.upload.formula_draft_service import (
+        AuthoringRefused,
+        CandidateUnavailable,
+        NotAFormulaCandidate,
+        NotAnAnswerAtRequest,
+        RetiredAtRequest,
+        StrategyRefused,
+        request_draft_for_candidate,
+    )
+    from featuregen.overlay.upload.semantic_eligibility_reasons import (
+        FORMULA_DRAFT_NOT_AN_ANSWER,
+        FORMULA_DRAFT_RETIRED,
+    )
+    from featuregen.runs.projection import RETRY_ATTEMPT_ALREADY_LIVE
+
+    detail = run_detail(conn, identity, run_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    attempt = next((row for row in detail["authoring"]["history"]
+                    if row["formula_draft_id"] == body.formula_draft_id), None)
+    if attempt is None:
+        raise _refusal(
+            RUN_ATTEMPT_NOT_RECORDED,
+            "this run has no such formula attempt, so there is nothing here to buy again — a "
+            "retry is a retry OF something this run recorded",
+            formula_draft_id=body.formula_draft_id)
+    if not attempt["retryable"]:
+        blockers = attempt["retry_blockers"]
+        if not blockers:
+            # No blockers means the QUESTION was never asked of this row, not that it was asked and
+            # refused — so the refusal has to say which, rather than quoting an empty list.
+            raise _refusal(
+                RUN_ATTEMPT_IS_NOT_A_FAILURE,
+                f"this attempt is {attempt['state']}: it bought an answer, or is still buying one, "
+                f"and it holds the formula identity while it does. Retry answers a FAILED or "
+                f"CANCELLED attempt; asking another opinion of a live one needs the identity to "
+                f"move, and that surface does not exist yet",
+                state=attempt["state"])
+        # VERBATIM, code and sentence: the greyed-out control and this 409 are one refusal.
+        raise _refusal(blockers[0]["code"], blockers[0]["detail"],
+                       blockers=[b["code"] for b in blockers])
+
+    try:
+        result = request_draft_for_candidate(
+            conn, revision_id=attempt["considered_revision_id"],
+            option_id=attempt["option_id"], formula_draft_id=mint_id("fd"),
+            requested_by=identity.subject,
+            # The database's clock, so two application instances cannot disagree about when — the
+            # formula-draft route's own rule, and the value the store folds into its ordering.
+            now=str(conn.execute("SELECT now()").fetchone()[0]))
+    except CandidateUnavailable as exc:
+        raise HTTPException(
+            status_code={"unknown_revision": 404,
+                         "option_not_in_revision": 422}.get(exc.kind, 409),
+            detail=exc.detail) from exc
+    except NotAFormulaCandidate as exc:
+        raise _refusal(exc.code, "this candidate is not a deterministic formula, so no formula "
+                                 "can be drafted for it",
+                       formula_strategy=str(exc.strategy)) from exc
+    except StrategyRefused as exc:
+        raise _refusal(exc.blockers[0],
+                       "the authoring strategy could not be resolved for this candidate",
+                       blockers=list(exc.blockers)) from exc
+    except AuthoringRefused as exc:
+        raise _refusal(exc.blockers[0] if exc.blockers else "AUTHORING_REFUSED",
+                       "the authoring decision refused; nothing was recorded or spent",
+                       blockers=list(exc.blockers)) from exc
+    except NotAnAnswerAtRequest as exc:
+        # Reachable only through a race with a consumer of the same coupon — the gate above already
+        # answered it — and the statuses must still be the formula-draft route's.
+        raise _refusal(FORMULA_DRAFT_NOT_AN_ANSWER, str(exc)) from exc
+    except RetiredAtRequest as exc:
+        raise _refusal(FORMULA_DRAFT_RETIRED, str(exc)) from exc
+
+    if not result.created:
+        # ▲ THE MONEY GUARD HAD THE LAST WORD. 1107's partial index refused the INSERT because an
+        # answer — or a purchase in flight — already holds this identity, and `request_draft`
+        # returned that row without consuming any coupon. Reporting it as a new attempt would
+        # describe a purchase that did not happen, so it is the same refusal the page renders.
+        raise _refusal(
+            RETRY_ATTEMPT_ALREADY_LIVE,
+            f"draft {result.formula_draft_id} already holds this formula identity, so nothing was "
+            f"minted and nothing was spent — watch that attempt instead",
+            formula_draft_id=result.formula_draft_id)
+
+    counters.incr("featuregen.feature_run.authoring_retry.requested")
+    log("featuregen.feature_run.authoring_retry", run_id=run_id,
+        retried_formula_draft_id=body.formula_draft_id,
+        formula_draft_id=result.formula_draft_id)
+    return {
+        "formula_draft_id": result.formula_draft_id,
+        "created": True,
+        # The method the SERVER chose and the reasons it recorded — a client never sends a strategy,
+        # it reads the one that was resolved.
+        "formula_strategy": str(result.strategy),
+        "strategy_warnings": list(result.warnings),
+        # The run, READ BACK after the write rather than patched from the request: the attempt table
+        # now carries both rows, and a client that trusted an echo would render an attempt the store
+        # might not have accepted.
+        "run": run_detail(conn, identity, run_id),
+        "detail": ("the retry was recorded; a worker authors it — watch this run's attempts. The "
+                   "failure stays on the record, because what was tried is part of what happened"),
     }

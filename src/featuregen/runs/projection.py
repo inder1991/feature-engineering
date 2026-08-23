@@ -6,6 +6,16 @@ from featuregen.materialize.action_authorization import ActionV1, action_availab
 from featuregen.materialize.generation_lane import generation_enabled
 from featuregen.materialize.queue_lane import materialization_enabled
 from featuregen.materialize.verification_lane import verification_enabled
+
+# The governed refusals the retry derivation can report, IMPORTED rather than spelled: these are the
+# substrate's closed vocabulary (SE-4's `REASON_FAMILIES` pins every one), and a copy of the string
+# here is a copy that keeps its old spelling on the day the substrate changes its mind.
+from featuregen.overlay.upload.semantic_eligibility_reasons import (
+    COST_AUTHORIZATION_EXHAUSTED,
+    FORMULA_DRAFT_NOT_AN_ANSWER,
+    FORMULA_DRAFT_RETIRED,
+    LEGACY_REGENERATION_NOT_APPROVED,
+)
 from featuregen.runs.pin import PRE_PIN_REASON_CODE, pin_exists
 from featuregen.runs.read_policy import visibility_where
 
@@ -128,6 +138,64 @@ GENERATION_DISABLED_REASON_CODE = "GENERATION_DISABLED"
 #: the route quotes them into its 409 and the tests assert them.
 PRE_SPINE_NOT_ACTIONABLE = "PRE_SPINE_NOT_ACTIONABLE"
 RUN_BUILD_DECLARATION_ABSENT = "RUN_BUILD_DECLARATION_ABSENT"
+
+#: The three ways the RETRY gesture (spec §R4.2) can be unavailable for a reason that is not a
+#: governed disposition. PROJECTION-LOCAL, on the same terms as the two codes above: no registry row
+#: defines them, none of them duplicates a substrate refusal, and `retry_availability` is the only
+#: thing that emits them. Every OTHER code in `retry_blockers` is the SUBSTRATE's own — asked of its
+#: own locators and reported verbatim — because a second spelling of a governed refusal is exactly
+#: how the page and the entrance start giving two answers to one question.
+#:
+#: A draft that bought something, or is buying it, already holds the identity a retry would mint
+#: (1107's partial index). Re-requesting lands on that row and mints nothing, so a control offered
+#: here would be a click that changes nothing.
+RETRY_ATTEMPT_ALREADY_LIVE = "RETRY_ATTEMPT_ALREADY_LIVE"
+#: The frozen record can no longer name this candidate, so the identity a retry would mint cannot be
+#: computed at all. The substrate's own sentence rides the detail.
+RETRY_CANDIDATE_UNRESOLVABLE = "RETRY_CANDIDATE_UNRESOLVABLE"
+#: 1103's approval store and 1105's ceiling store have not landed in THIS database — `pin_exists`'s
+#: rule applied to the governed-retry substrate, and not a hypothetical: the live ledger stands at
+#: 1099, where reading either table would take the whole run page down with an `UndefinedTable`.
+RETRY_SUBSTRATE_ABSENT = "RETRY_SUBSTRATE_ABSENT"
+
+#: The sentence each blocker renders with. The CODE is the substrate's and the SENTENCE is this
+#: surface's — the same division `prepare_code_availability` already draws, and the route quotes
+#: both, so a person reading the greyed-out control and a person reading the 409 read one refusal.
+#: A code absent from here still renders: the fallback names the class of refusal rather than
+#: explaining a code this file does not own.
+_RETRY_BLOCKER_DETAIL = {
+    FORMULA_DRAFT_RETIRED:
+        "somebody withdrew this candidate, and no approved regeneration NAMES that withdrawal. "
+        "Withdrawal is a decision rather than a cost, so it refuses both authoring lanes: use the "
+        "replacement, or have a governance approval bind the withdrawal before retrying",
+    FORMULA_DRAFT_NOT_AN_ANSWER:
+        "the previous attempt at this exact formula failed, and a recorded failure is not an "
+        "answer this platform bought — re-authoring spends again, so it needs an approved, "
+        "cost-confirmed regeneration exception",
+    LEGACY_REGENERATION_NOT_APPROVED:
+        "a legacy-identity draft already answers for this candidate, and re-authoring it under the "
+        "corrected identity would buy the same answer a second time: it needs an approved "
+        "regeneration",
+    COST_AUTHORIZATION_EXHAUSTED:
+        "the approved ceiling for this regeneration has no budget left, and spend is reserved per "
+        "provider call — retrying now would stop at the dispatch seam. A fresh approval is the "
+        "remedy, and it is a governance act",
+    RETRY_SUBSTRATE_ABSENT:
+        "this database has no regeneration-approval store and no spend ceiling store, so a "
+        "governed retry cannot be recorded here at all. An operator applies the migrations; "
+        "nothing a person does to this run can produce them",
+}
+
+#: For a strategy the resolver refused: the same sentence `POST .../formula-drafts` answers with,
+#: because it is the same refusal reached from a second door.
+_STRATEGY_REFUSAL_DETAIL = (
+    "the authoring strategy could not be resolved for this candidate, so there is no attempt to "
+    "buy again")
+
+#: For anything else the substrate names. Deliberately does NOT explain the code: this surface does
+#: not own it, and a sentence invented here could contradict the one that does.
+_UNNAMED_BLOCKER_DETAIL = (
+    "the authoring decision refuses this candidate by this name; nothing was recorded or spent")
 
 
 def _static_socket(stage: str) -> dict:
@@ -432,6 +500,167 @@ def prepare_code_availability(*, pre_spine: bool, has_job: bool) -> dict:
     return {"available": True, "reason_code": None, "detail": None}
 
 
+def _blocker(code: str, detail: str | None = None) -> dict:
+    """One refusal, in the shape both surfaces render: the substrate's code and a sentence."""
+    return {"code": code,
+            "detail": detail if detail is not None
+            else _RETRY_BLOCKER_DETAIL.get(code, _UNNAMED_BLOCKER_DETAIL)}
+
+
+def retry_substrate_exists(conn) -> bool:
+    """Whether 1103's approval store and 1105's ceiling store have landed in THIS database.
+
+    `pin_exists`'s rule, applied to the governed-retry substrate — and for its exact reason. The
+    derivation below reads `formula_draft_regeneration_exception`, `formula_draft_retirement_
+    tombstone` and the spend ledger; on a database at 1099 none of them exists, and a projection
+    that read them would turn every run detail carrying one failed draft into an `UndefinedTable`
+    500. The runner applies pending migrations IN ORDER, so 1105 present implies 1103 present;
+    both are probed anyway, because "implies" is a fact about the runner and this is a fact about
+    the database being served.
+
+    Self-retiring, like the pin: the day the migrations apply, `to_regclass` answers and this is
+    True for ever after with no code change.
+    """
+    row = conn.execute(
+        "SELECT to_regclass('formula_draft_regeneration_exception'), "
+        "       to_regclass('llm_spend_authorization_revision')").fetchone()
+    return row[0] is not None and row[1] is not None
+
+
+def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> dict:
+    """Whether a bought-nothing attempt on this candidate may be bought AGAIN, and why not
+    (spec §R4.2). Returns ``{"retryable": bool, "retry_blockers": [{code, detail}]}``.
+
+    ▲ **THIS PROJECTION RE-DERIVES NOTHING.** Every verdict below is ASKED of the substrate's own
+    locators — `candidate_governance_blockers` (the ONE composition the plan preview and the
+    AUTHOR_FORMULA decision both consult), `covering_tombstones`, `valid_exception_for`,
+    `remaining_spend` — and reported. A parallel judgement of "is this coupon valid" would be a
+    second answer to a question the store already answers, and the two would disagree on the day
+    one of them changed.
+    """
+    if not retry_substrate_exists(conn):
+        return {"retryable": False, "retry_blockers": [_blocker(RETRY_SUBSTRATE_ABSENT)]}
+
+    from featuregen.overlay.upload.formula_draft_service import (
+        CandidateUnavailable,
+        candidate_governance_blockers,
+        current_authoring_config,
+        frozen_candidate,
+    )
+    from featuregen.overlay.upload.formula_draft_store import formula_identity
+    from featuregen.overlay.upload.formula_strategy import resolve_formula_strategy
+    from featuregen.overlay.upload.formula_strategy_facts import assemble_strategy_facts
+    from featuregen.overlay.upload.llm_spend import remaining_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        covering_tombstones,
+        retirement_scope_key,
+        valid_exception_for,
+    )
+
+    # ▲ THE IDENTITY A RETRY WOULD MINT IS TODAY'S, not the failed row's — the candidate's frozen
+    # facts under the CURRENT strategy resolution and the CURRENT provider contract, which is what
+    # `request_draft` will check and what `approve_regeneration_for_draft` binds an approval to.
+    # Reading the old row's `authoring_config_hash` instead would answer about an identity nobody
+    # is about to ask for: move the model and the retry is a different question, admitted free.
+    try:
+        candidate = frozen_candidate(conn, considered_revision_id, option_id)
+    except CandidateUnavailable as exc:
+        # The one refusal a read-only projection MUST absorb: legacy revisions cannot name their
+        # options, and a run page that 500s on one of them shows nothing at all.
+        return {"retryable": False,
+                "retry_blockers": [_blocker(RETRY_CANDIDATE_UNRESOLVABLE, exc.detail)]}
+
+    assembled = assemble_strategy_facts(
+        conn, considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+        idea=candidate.idea, catalog_snapshot_hash=candidate.catalog_snapshot_hash)
+    decision = resolve_formula_strategy(assembled.facts)
+    if decision.blockers:
+        # A conceptual pattern, a governed model output, or a genuine bind failure — the service
+        # raises on each of these before any draft exists, so the retry cannot be offered and the
+        # resolver's own codes say which.
+        return {"retryable": False,
+                "retry_blockers": [_blocker(code, _STRATEGY_REFUSAL_DETAIL)
+                                   for code in decision.blockers]}
+
+    # ▲ THE LANE DISCRIMINATOR IS THE STORE'S OWN: a reviewed draft folds no provider contract
+    # (`current_authoring_config`), calls no provider and spends nothing, and `_request_draft_locked`
+    # branches on exactly this value. Owner ruling 2026-08-23 (Option 2): deterministic retries are
+    # FREE BY CONSTRUCTION, so the gate that guards a re-spend does not apply to them. Tombstones
+    # still refuse both lanes — withdrawal is a decision, not a cost.
+    provider_contract, _config_payload, config_hash = current_authoring_config(decision)
+    scope_key = retirement_scope_key(
+        considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        definition_revision=candidate.definition_revision)
+    identity = formula_identity(
+        considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        authoring_config_hash=config_hash,
+        definition_revision=candidate.definition_revision)
+
+    # THE ONE LAW's read (Task 6 round-4), borrowed whole rather than re-implemented: RETIRED iff
+    # some covering withdrawal lacks a valid naming coupon, and a warning where every one is named.
+    # The run page, the plan preview and the store therefore give ONE answer by construction.
+    blockers = [_blocker(code) for code in candidate_governance_blockers(
+        conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
+        strategy_identity_hash=decision.strategy_identity_hash,
+        provider_contract_hash=provider_contract, config_hash=config_hash,
+        scope_key=scope_key)[0]]
+
+    now = conn.execute("SELECT now()").fetchone()[0]
+    # The 1107 index's own predicate, spelled from the constant that already states it. A FAILED or
+    # CANCELLED row is history and holds nothing; anything else is an answer or a purchase in
+    # flight, and the INSERT would land on it.
+    live = conn.execute(
+        "SELECT formula_draft_id FROM formula_draft "
+        " WHERE formula_identity_hash = %s AND NOT (state = ANY(%s)) LIMIT 1",
+        (identity, list(_BOUGHT_NOTHING))).fetchone()
+
+    covering = covering_tombstones(conn, scope_key=scope_key, formula_identity_hash=identity)
+    if provider_contract is not None and not covering and live is None:
+        # `_request_draft_locked`'s not-an-answer gate, asked in the same order it asks it: with
+        # nothing covering and a recorded failure at THIS identity, the LLM lane needs the plain
+        # retry coupon. Where a withdrawal DOES cover, the coupons that name it are the approval,
+        # and the block above has already reported whether they exist.
+        bought_nothing = conn.execute(
+            "SELECT formula_draft_id FROM formula_draft "
+            " WHERE formula_identity_hash = %s AND state = ANY(%s) LIMIT 1",
+            (identity, list(_BOUGHT_NOTHING))).fetchone()
+        if bought_nothing is not None and valid_exception_for(
+                conn, target_formula_identity_hash=identity,
+                provider_contract_hash=provider_contract,
+                strategy_identity_hash=decision.strategy_identity_hash,
+                covering_tombstone_id=None, now=now) is None:
+            blockers.append(_blocker(FORMULA_DRAFT_NOT_AN_ANSWER))
+    if live is not None:
+        blockers.append(_blocker(
+            RETRY_ATTEMPT_ALREADY_LIVE,
+            f"draft {live[0]} already holds this formula identity — it is an answer, or a purchase "
+            f"still in flight — so a retry would mint nothing (migration 1107's money guard covers "
+            f"exactly these). Watch that attempt; retry becomes the question again if it fails"))
+    if provider_contract is not None:
+        # ▲ THE CEILING THE RETRY WOULD ACTUALLY RIDE, read with the SAME query the service picks
+        # it with: an approved regeneration carries its own cost-confirmed authorization, and
+        # offering a retry over a spent one sends a person into `SpendExhausted` at the dispatch
+        # seam. With no approved ceiling the service mints its bounded development envelope, so
+        # there is nothing here to be exhausted and nothing to report.
+        approved = conn.execute(
+            "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception e "
+            "  JOIN llm_spend_authorization_revision a "
+            "    ON a.spend_authorization_id = e.llm_spend_authorization_id "
+            " WHERE e.target_formula_identity_hash = %s AND e.provider_contract_hash = %s "
+            "   AND e.strategy_identity_hash = %s AND a.expires_at > now() "
+            " ORDER BY e.approved_at DESC LIMIT 1",
+            (identity, provider_contract, decision.strategy_identity_hash)).fetchone()
+        if approved is not None:
+            left = remaining_spend(conn, approved[0], now=now)
+            if left.calls <= 0 or left.tokens <= 0 or left.cost <= 0:
+                blockers.append(_blocker(COST_AUTHORIZATION_EXHAUSTED))
+    return {"retryable": not blockers, "retry_blockers": blockers}
+
+
 def _current_by_candidate(history: list[dict]) -> list[dict]:
     """The CURRENT answer per candidate, folded from the attempt history (spec §R4.4.1).
 
@@ -548,12 +777,33 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     # only meaningful inside the revision that froze it (1090's own words), and a run can hold
     # several considered revisions, so two rows reading `o1` may be two different candidates with
     # two different current answers.
-    history = [{
-        "formula_draft_id": fid, "considered_revision_id": ccr_of, "option_id": opt,
-        "state": state, "rail_state": RAIL_FROM_DRAFT_STATE[state],
-        "eligibility": "withdrawn" if reason else "current",
-        "retirement_reason": reason,
-    } for fid, ccr_of, opt, state, reason in drafts]
+    #
+    # `retryable` / `retry_blockers` ride EVERY row and are derived only where the question exists
+    # (spec §R4.2). The question is asked of an attempt that BOUGHT NOTHING — 1107's own line, and
+    # the same constant the money guard's index is spelled from. A READY or BLOCKED draft is an
+    # ANSWER and a working draft is a purchase in flight: both hold the identity slot, so "retry"
+    # there is R4.2's still-deferred "request another opinion", and those rows carry `false` with NO
+    # blockers — the absence of the question rather than a refusal nobody made.
+    #
+    # ASKED ONCE PER CANDIDATE, because the answer is about the candidate: the identity a retry
+    # would mint is today's, so two failed attempts of one candidate have one answer between them,
+    # and a per-row derivation would pay for it twice and could report it two ways.
+    retry: dict[tuple[str, str], dict] = {}
+    history = []
+    for fid, ccr_of, opt, state, reason in drafts:
+        if state not in _BOUGHT_NOTHING:
+            answer = {"retryable": False, "retry_blockers": []}
+        else:
+            if (ccr_of, opt) not in retry:
+                retry[(ccr_of, opt)] = retry_availability(
+                    conn, considered_revision_id=ccr_of, option_id=opt)
+            answer = retry[(ccr_of, opt)]
+        history.append({
+            "formula_draft_id": fid, "considered_revision_id": ccr_of, "option_id": opt,
+            "state": state, "rail_state": RAIL_FROM_DRAFT_STATE[state],
+            "eligibility": "withdrawn" if reason else "current",
+            "retirement_reason": reason, **answer,
+        })
     current = _current_by_candidate(history)
     # ONE derivation, two surfaces: the rail entry and the milestone's own rows are the same
     # reading of the same pins, so the count on the rail and the list under it cannot disagree.

@@ -4616,6 +4616,15 @@ export interface RunAuthoringRow {
   rail_state: string
   eligibility: 'current' | 'withdrawn'
   retirement_reason: string | null
+  // Whether this attempt may be bought AGAIN (spec §R4.2), derived SERVER-side from the approval,
+  // the ceiling, the withdrawals and the money guard. The question is only asked of an attempt that
+  // bought nothing — a FAILED or CANCELLED draft — so an answered or in-flight row reads `false`
+  // with an EMPTY `retry_blockers`: the absence of the question, never a refusal nobody made.
+  retryable: boolean
+  // Why not, in the server's own words. The code is the substrate's vocabulary and the sentence is
+  // the run surface's; both render verbatim, because the greyed-out control and the entrance's 409
+  // are one refusal and a client that re-worded either would be a second policy.
+  retry_blockers: { code: string; detail: string }[]
 }
 
 // One candidate's CURRENT answer — an attempt row plus the one thing only the latest attempt can
@@ -4713,6 +4722,28 @@ export function prepareRunCode(
   detail: string
 }> {
   return post(`/feature-runs/${encodeURIComponent(runId)}/prepare-code`, body)
+}
+
+// The run page's second write (spec §R4.2): buy a failed formula attempt again.
+//
+// The body names the ATTEMPT and nothing else. Its candidate is resolved from the run's own recorded
+// history — a client that named one could aim this run's retry at another run's candidate — and the
+// ceiling is not here either: a retry rides the ceiling its governance approval already confirmed,
+// so there is no cost modal on this path and adding one would collect a second, unapproved number.
+export function retryRunAuthoring(
+  runId: string,
+  body: { formula_draft_id: string },
+): Promise<{
+  // The NEW attempt. `created` is always true on a 202: a request that landed on an existing draft
+  // minted nothing, and the server refuses it rather than reporting a purchase that did not happen.
+  formula_draft_id: string
+  created: boolean
+  formula_strategy: string
+  strategy_warnings: string[]
+  run: FeatureRunDetail
+  detail: string
+}> {
+  return post(`/feature-runs/${encodeURIComponent(runId)}/authoring-retries`, body)
 }
 
 // The SIX keys the code-generation screen's confirmation carries, unchanged: it is the same act of

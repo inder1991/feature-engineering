@@ -10,12 +10,22 @@ import { RunDetailScreen } from './RunDetailScreen'
 // exercising the path it exists to pin. Every assertion of the brief's test is kept verbatim.
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, getFeatureRunDetail: vi.fn(), prepareRunCode: vi.fn() }
+  return {
+    ...actual,
+    getFeatureRunDetail: vi.fn(),
+    prepareRunCode: vi.fn(),
+    retryRunAuthoring: vi.fn(),
+  }
 })
 const getFeatureRunDetail = vi.mocked(api.getFeatureRunDetail)
 const prepareRunCode = vi.mocked(api.prepareRunCode)
+const retryRunAuthoring = vi.mocked(api.retryRunAuthoring)
 
 const RUN_ID = 'grun_01M02SAZQQQQ'
+
+// The retry answer for a row where the question is not asked at all — an attempt that bought
+// something, or one still in flight. Absence, never a refusal, so there is nothing to explain.
+const NO_RETRY = { retryable: false, retry_blockers: [] }
 
 // A run whose only draft SUCCEEDED and was then withdrawn (the §6.7 two-axis case), and a rail
 // carrying one worked stage plus two sockets with their reasons. One attempt, so it is also its
@@ -23,6 +33,7 @@ const RUN_ID = 'grun_01M02SAZQQQQ'
 const DRAFT_1: api.RunAuthoringRow = {
   formula_draft_id: 'd1', considered_revision_id: 'c', option_id: 'o1', state: 'READY',
   rail_state: 'SUCCEEDED', eligibility: 'withdrawn', retirement_reason: 'CANDIDATE_SUPERSEDED',
+  ...NO_RETRY,
 }
 
 const DETAIL: api.FeatureRunDetail = {
@@ -54,6 +65,7 @@ beforeEach(() => {
   getFeatureRunDetail.mockReset()
   getFeatureRunDetail.mockResolvedValue(DETAIL)
   prepareRunCode.mockReset()
+  retryRunAuthoring.mockReset()
 })
 
 // jsdom implements no clipboard, so the copy test installs one onto the SHARED navigator. Put back
@@ -76,10 +88,11 @@ it('renders the rail honestly and both authoring axes, and offers ONE write', as
   expect(screen.getByText('BUILD_SET_DECLARATION_WITHHELD_PRE_PIN')).toBeInTheDocument()
   expect(screen.getByText(/SUCCEEDED/)).toBeInTheDocument()          // outcome axis
   expect(screen.getByText(/Withdrawn/)).toBeInTheDocument()          // eligibility axis
-  // The absent controls are still the design: preparing formulas is the ONE thing this screen can
-  // write, and nothing here re-runs, retries, executes or forks a run.
+  // The absent controls are still the design: nothing here re-runs, executes or forks a run, and
+  // retry is an ATTEMPT's affair — offered only where the server says a bought-nothing attempt may
+  // be bought again, which this READY draft is not.
   expect(screen.queryAllByRole('button').filter(b =>
-    /re-run|retry|execute|fork/i.test(b.textContent ?? ''))).toHaveLength(0)
+    /re-run|execute|fork|retry/i.test(b.textContent ?? ''))).toHaveLength(0)
   expect(screen.getByRole('button', { name: /Prepare formulas/ })).toBeInTheDocument()
 })
 
@@ -119,7 +132,7 @@ it('keeps the outcome axis intact on a draft the eligibility axis calls withdraw
 // a second draft against it). Both attempts are real rows; only one is where the candidate stands.
 const ATTEMPT_FAILED: api.RunAuthoringRow = {
   formula_draft_id: 'd0', considered_revision_id: 'c', option_id: 'o1', state: 'FAILED',
-  rail_state: 'FAILED', eligibility: 'current', retirement_reason: null,
+  rail_state: 'FAILED', eligibility: 'current', retirement_reason: null, ...NO_RETRY,
 }
 const ATTEMPT_READY: api.RunAuthoringRow = {
   ...DRAFT_1, formula_draft_id: 'd2', eligibility: 'current', retirement_reason: null,
@@ -513,6 +526,32 @@ it('refuses to confirm a ceiling that is not a number', async () => {
   expect(screen.getByRole('button', { name: /cost ceiling/ })).toBeEnabled()
 })
 
+// ▲ THE COST FIELD'S TWIN OF THE SAME DEFECT (carried from Task 4). `max_cost` travels as a STRING
+// and lands in a NUMERIC column, so 'twelve' was not a 422 about a missing field — it was a raw 500
+// out of the driver's cast. A trim check accepts every one of these.
+it('refuses to confirm a COST ceiling that is not a positive number', async () => {
+  getFeatureRunDetail.mockResolvedValue(THREE_CHOSEN)
+  prepareRunCode.mockRejectedValue(new api.ApiError(
+    409, 'confirm the ceiling', null, 'COST_AUTHORIZATION_MISSING',
+    { code: 'COST_AUTHORIZATION_MISSING', llm_members: 1, estimated_provider_calls: 45 }))
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+  await waitFor(() => expect(screen.getByText(/up to 45 provider calls/)).toBeInTheDocument())
+  await userEvent.type(screen.getByLabelText(/Token ceiling/), '200000')
+
+  for (const typed of ['twelve', '0', '-5']) {
+    await userEvent.clear(screen.getByLabelText(/Cost ceiling/))
+    await userEvent.type(screen.getByLabelText(/Cost ceiling/), typed)
+    expect(screen.getByRole('button', { name: /cost ceiling/ })).toBeDisabled()
+  }
+  await userEvent.clear(screen.getByLabelText(/Cost ceiling/))
+  await userEvent.type(screen.getByLabelText(/Cost ceiling/), '12.50')
+  expect(screen.getByRole('button', { name: /cost ceiling/ })).toBeEnabled()
+  expect(prepareRunCode).toHaveBeenCalledTimes(1)     // the refused ceilings sent nothing
+})
+
 it('never lands a prepare answer under a run the screen has since moved to', async () => {
   getFeatureRunDetail.mockResolvedValue(THREE_CHOSEN)
   let land: (v: unknown) => void = () => {}
@@ -540,4 +579,152 @@ it('never lands a prepare answer under a run the screen has since moved to', asy
     .toBeInTheDocument())
   expect(screen.queryByText('cgj-stale')).toBeNull()
   expect(screen.queryByTestId('prepare-status')).toBeNull()
+})
+
+// ▲ AND THE ERROR BRANCH, which the success case above does not cover (carried from Task 4). A
+// refusal of the PREVIOUS run's gesture landing here would paint an alert about work this run
+// never asked for — and the reader has no way to tell whose refusal they are reading.
+it('never paints a refusal that belongs to a run the screen has since left', async () => {
+  getFeatureRunDetail.mockResolvedValue(THREE_CHOSEN)
+  let refuse: (e: unknown) => void = () => {}
+  prepareRunCode.mockImplementation(() => new Promise((_, reject) => { refuse = reject }) as never)
+  const { rerender } = render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+
+  getFeatureRunDetail.mockResolvedValue({ ...DETAIL, generation_run_id: 'grun_other' })
+  rerender(<RunDetailScreen runId="grun_other" />)
+  await waitFor(() => expect(getFeatureRunDetail).toHaveBeenCalledWith('grun_other'))
+
+  refuse(new api.ApiError(409, 'no code-generation job has ever been requested for this run', null,
+    'RUN_BUILD_DECLARATION_ABSENT', { code: 'RUN_BUILD_DECLARATION_ABSENT' }))
+
+  await waitFor(() => expect(screen.getByText('Retail churn')).toBeInTheDocument())
+  expect(screen.queryByRole('alert')).toBeNull()
+  // ...and a cost quote is the same stale answer wearing a different shape: it would put the
+  // previous run's ceiling form under this address.
+  expect(screen.queryByText(/Confirm the AI cost ceiling/)).toBeNull()
+})
+
+// ── the retry gesture (spec §R4.2) ──────────────────────────────────────────────────────────────
+// A candidate whose only attempt bought nothing. Whether it may be bought AGAIN is the server's
+// derivation — an approved regeneration, a ceiling with budget left, no withdrawal, no live attempt
+// holding the identity slot — and this screen renders that answer rather than folding its own.
+const OFFERED: api.RunAuthoringRow = { ...ATTEMPT_FAILED, retryable: true, retry_blockers: [] }
+const REFUSED: api.RunAuthoringRow = {
+  ...ATTEMPT_FAILED,
+  retryable: false,
+  retry_blockers: [{
+    code: 'FORMULA_DRAFT_NOT_AN_ANSWER',
+    detail: 'the previous attempt at this exact formula failed; re-authoring spends again, so it '
+      + 'needs an approved, cost-confirmed regeneration exception',
+  }],
+}
+
+function detailWith(row: api.RunAuthoringRow): api.FeatureRunDetail {
+  return { ...DETAIL, authoring: { current: [{ ...row, resolved: false }], history: [row] } }
+}
+
+it('offers Retry only where the server says the attempt may be bought again', async () => {
+  getFeatureRunDetail.mockResolvedValue(detailWith(OFFERED))
+  retryRunAuthoring.mockResolvedValue({
+    formula_draft_id: 'd9', created: true, formula_strategy: 'LLM_AUTHORED',
+    strategy_warnings: [], detail: 'the retry was recorded; a worker authors it',
+    run: detailWith({ ...ATTEMPT_FAILED, ...NO_RETRY }),
+  })
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('d0')).toBeInTheDocument())
+
+  // Rendering alone must spend nothing: the row is on screen and no request has gone out.
+  expect(retryRunAuthoring).not.toHaveBeenCalled()
+  const retry = screen.getByRole('button', { name: /Retry attempt d0/ })
+  expect(retry).toBeEnabled()
+
+  await userEvent.click(retry)
+
+  expect(retryRunAuthoring).toHaveBeenCalledTimes(1)
+  expect(retryRunAuthoring).toHaveBeenCalledWith(RUN_ID, { formula_draft_id: 'd0' })
+  // The run comes back READ from the store, so the attempt table below is the store's own answer.
+  await waitFor(() => expect(screen.getByTestId('retry-status')).toHaveTextContent('d9'))
+})
+
+it('disables Retry with the server’s own blockers, and the click reaches no request', async () => {
+  getFeatureRunDetail.mockResolvedValue(detailWith(REFUSED))
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('d0')).toBeInTheDocument())
+
+  const row = rowOf('d0')
+  // Verbatim, code and sentence: this screen holds no policy and owns no words for a refusal.
+  expect(within(row).getByText('FORMULA_DRAFT_NOT_AN_ANSWER')).toBeInTheDocument()
+  expect(within(row).getByText(/cost-confirmed regeneration exception/)).toBeInTheDocument()
+  expect(within(row).getByRole('button', { name: /Retry attempt d0/ })).toBeDisabled()
+
+  // ...and the pair holds. A screen that only LOOKED disabled would still send this.
+  await userEvent.click(within(row).getByRole('button', { name: /Retry attempt d0/ }))
+  expect(retryRunAuthoring).not.toHaveBeenCalled()
+})
+
+it('offers no retry control where the question is not asked at all', async () => {
+  // A READY attempt bought an answer, so "retry" is not the question — and `retry_blockers` is
+  // empty because there is nothing to explain. A greyed-out button here would invite the reader to
+  // hunt for a refusal nobody made.
+  getFeatureRunDetail.mockResolvedValue(detailWith({ ...DRAFT_1, eligibility: 'current',
+    retirement_reason: null }))
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('d1')).toBeInTheDocument())
+
+  expect(within(rowOf('d1')).queryByRole('button')).toBeNull()
+})
+
+it('shows a retry refusal in the server’s words and records nothing of its own', async () => {
+  getFeatureRunDetail.mockResolvedValue(detailWith(OFFERED))
+  retryRunAuthoring.mockRejectedValue(new api.ApiError(
+    409, 'a live attempt already holds this identity', null, 'RETRY_ATTEMPT_ALREADY_LIVE',
+    { code: 'RETRY_ATTEMPT_ALREADY_LIVE' }))
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('d0')).toBeInTheDocument())
+
+  await userEvent.click(screen.getByRole('button', { name: /Retry attempt d0/ }))
+
+  expect(await screen.findByRole('alert'))
+    .toHaveTextContent('a live attempt already holds this identity')
+  expect(screen.queryByTestId('retry-status')).toBeNull()
+})
+
+it('never lands a retry answer under a run the screen has since moved to', async () => {
+  getFeatureRunDetail.mockResolvedValue(detailWith(OFFERED))
+  let land: (v: unknown) => void = () => {}
+  retryRunAuthoring.mockImplementation(() => new Promise(resolve => { land = resolve }) as never)
+  const { rerender } = render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('d0')).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('button', { name: /Retry attempt d0/ }))
+
+  getFeatureRunDetail.mockResolvedValue({ ...DETAIL, generation_run_id: 'grun_other' })
+  rerender(<RunDetailScreen runId="grun_other" />)
+  await waitFor(() => expect(getFeatureRunDetail).toHaveBeenCalledWith('grun_other'))
+
+  land({
+    formula_draft_id: 'd-stale', created: true, formula_strategy: 'LLM_AUTHORED',
+    strategy_warnings: [], detail: 'recorded', run: detailWith(OFFERED),
+  })
+
+  await waitFor(() => expect(screen.getByText('d1')).toBeInTheDocument())
+  expect(screen.queryByTestId('retry-status')).toBeNull()
+  expect(screen.queryByText('d0')).toBeNull()
+})
+
+// ── the stage cell, when a stage has BOTH a reason and a count (carried from Task 4) ─────────────
+it('separates a stage’s reason code from its count instead of running them together', async () => {
+  getFeatureRunDetail.mockResolvedValue({
+    ...DETAIL,
+    rail: [{ stage: 'BIND_SELECTIONS', state: 'UNAVAILABLE', detail: '0 of 3 bound',
+      reason_code: 'BUILD_SET_DECLARATION_WITHHELD_PRE_PIN' }],
+  })
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('BIND_SELECTIONS')).toBeInTheDocument())
+
+  // Concatenated, the two read as one nonsense token: `…PRE_PIN0 of 3 bound`.
+  const why = rowOf('BIND_SELECTIONS').querySelectorAll('td')[2]
+  expect(why.textContent).toBe('BUILD_SET_DECLARATION_WITHHELD_PRE_PIN — 0 of 3 bound')
 })

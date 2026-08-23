@@ -1,18 +1,24 @@
 // One feature run opened to its record (GET /feature-runs/{id}) — identity, milestones, the
-// authoring rows, the stage rail, and ONE gesture.
+// authoring rows, the stage rail, and TWO gestures.
 //
-// **EXACTLY ONE CONTROL WRITES, AND EVERY ABSENT CONTROL IS STILL THE DESIGN.** There is no run,
-// re-run, retry, execute or fork button here, and none is missing: the spine DERIVES every field
-// below from stores that already hold the evidence, and no write endpoint exists behind those words
-// to offer. The one that does exist is `Prepare formulas` (spec §R4.4.2) — it hands the candidates a
-// person picked to the code-generation coordinator, and it fires from an onClick and nowhere else.
-// A button that could not do what its word says would be worse than no button, which is why it is
-// DISABLED whenever the server says its entrance would refuse.
+// **TWO CONTROLS WRITE, AND EVERY ABSENT CONTROL IS STILL THE DESIGN.** There is no run, re-run,
+// execute or fork button here, and none is missing: the spine DERIVES every field below from stores
+// that already hold the evidence, and no write endpoint exists behind those words to offer. The two
+// that do exist are `Prepare formulas` (spec §R4.4.2) — which hands the candidates a person picked
+// to the code-generation coordinator — and per-attempt `Retry` (spec §R4.2), which buys a failed
+// formula again through the same governed composition the formula-draft route calls. Each fires
+// from an onClick and nowhere else. A button that could not do what its word says would be worse
+// than no button, which is why each is DISABLED whenever the server says its entrance would refuse.
 //
-// **THE SERVER DECIDES WHETHER THAT BUTTON CAN RUN.** `prepare_code.available` is derived beside
-// the rail, from the same facts the POST refuses on, and `prepare_code.detail` is the sentence —
-// rendered verbatim, never re-worded here. A screen that decided enablement for itself would be a
-// second policy, and the day the two disagreed a person would click into a refusal.
+// **THE SERVER DECIDES WHETHER EITHER BUTTON CAN RUN.** `prepare_code.available` and each attempt's
+// `retryable` are derived beside the rail, from the same facts the POSTs refuse on, and their
+// sentences render verbatim, never re-worded here. A screen that decided enablement for itself would
+// be a second policy, and the day the two disagreed a person would click into a refusal.
+//
+// **AND RETRY ASKS FOR NO SECOND CONFIRMATION.** The approval WAS the moment: somebody with
+// governance authority approved that regeneration and confirmed its cost, durably, against the exact
+// identity the retry will mint. A modal here would ask the reader to re-agree to a decision that is
+// not theirs — and §11.2's own rule is that a modal is not a money guard.
 //
 // **THIS SCREEN HOLDS NO POLICY** (the FeatureExecutionScreen rule). A stage is UNAVAILABLE because
 // its machinery does not exist, and WHICH machinery is the server's sentence: `reason_code` renders
@@ -44,6 +50,7 @@ import {
   type RunRailStage,
   getFeatureRunDetail,
   prepareRunCode,
+  retryRunAuthoring,
 } from '../api'
 import { codeGenerationEnabled } from '../nav'
 
@@ -126,6 +133,12 @@ export function RunDetailScreen({ runId }: { runId: string }) {
   const [maxCost, setMaxCost] = useState('')
   const [prepareError, setPrepareError] = useState('')
   const [prepareNotice, setPrepareNotice] = useState('')
+  // The retry gesture's own state, kept apart from the prepare gesture's: they are two acts with
+  // two refusals, and one shared banner would show a person the wrong one. `retrying` is the draft
+  // id in flight rather than a boolean, so only the row that was clicked goes busy.
+  const [retrying, setRetrying] = useState('')
+  const [retryError, setRetryError] = useState('')
+  const [retryNotice, setRetryNotice] = useState('')
   // WHICH run this screen is pointed at RIGHT NOW. The load effect guards itself with a local
   // `live` flag, but the POST needs the same protection and cannot use it: its promise outlives the
   // effect that started none of it. A prepare answer landing after a run -> run deep link would put
@@ -144,6 +157,9 @@ export function RunDetailScreen({ runId }: { runId: string }) {
     setQuote(null)
     setPrepareError('')
     setPrepareNotice('')
+    setRetrying('')
+    setRetryError('')
+    setRetryNotice('')
     getFeatureRunDetail(runId).then(
       detail => {
         if (live) setRun(detail)
@@ -220,6 +236,32 @@ export function RunDetailScreen({ runId }: { runId: string }) {
         else setPrepareError(err instanceof ApiError ? err.detail : String(err))
       },
     ).finally(() => setBusy(false))
+  }
+
+  // THE SECOND WRITE, and it fires from an onClick alone. No ceiling travels with it and no modal
+  // precedes it: the governance approval this retry rides already confirmed the cost, against this
+  // exact identity, durably. The server decides whether the click is possible at all — this only
+  // sends the attempt the person clicked.
+  function retry(formulaDraftId: string) {
+    setRetrying(formulaDraftId)
+    setRetryError('')
+    setRetryNotice('')
+    retryRunAuthoring(runId, { formula_draft_id: formulaDraftId }).then(
+      response => {
+        // The answer belongs to the run it was asked ABOUT, not to whichever run this screen is
+        // showing when it lands — the load effect's `live` rule, for the write.
+        if (pointedAt.current !== runId) return
+        // READ back from the store: the attempt table now carries both rows, and the server's fold
+        // decides which is the candidate's current answer.
+        setRun(response.run)
+        setRetryNotice(`${response.detail} (draft ${response.formula_draft_id})`)
+      },
+      err => {
+        if (pointedAt.current !== runId) return
+        // The server's sentence, verbatim — this screen owns no vocabulary for a refusal.
+        setRetryError(err instanceof ApiError ? err.detail : String(err))
+      },
+    ).finally(() => setRetrying(''))
   }
 
   if (error)
@@ -402,6 +444,7 @@ export function RunDetailScreen({ runId }: { runId: string }) {
                 <th>Outcome</th>
                 <th>Eligibility</th>
                 <th>Reading</th>
+                <th>Retry</th>
               </tr>
             </thead>
             <tbody>
@@ -410,10 +453,16 @@ export function RunDetailScreen({ runId }: { runId: string }) {
                   key={row.formula_draft_id}
                   row={row}
                   current={currentAnswers.get(row.formula_draft_id)}
+                  busy={retrying !== ''}
+                  onRetry={() => retry(row.formula_draft_id)}
                 />
               ))}
             </tbody>
           </table>
+          {retryNotice && (
+            <p className="hint" role="status" data-testid="retry-status">{retryNotice}</p>
+          )}
+          {retryError && <p role="alert" className="error">{retryError}</p>}
         </>
       )}
 
@@ -488,12 +537,14 @@ export function RunDetailScreen({ runId }: { runId: string }) {
       <button
         type="button"
         className="btn"
-        // `Number(maxTokens) > 0` is ONE guard covering empty, non-numeric and zero: the field is
-        // free text, `Number('twelve')` is NaN, and NaN serialises to `null` — which the server
-        // refuses as a raw 422 about a missing field rather than the number the person typed. A
-        // trim check alone let that through.
+        // `Number(x) > 0` is ONE guard covering empty, non-numeric, zero and negative: both fields
+        // are free text, and `Number('twelve')` is NaN. The two fail DIFFERENTLY and both fail
+        // badly — `max_tokens` is an int, so NaN serialises to `null` and the server answers a raw
+        // 422 about a missing field; `max_cost` travels as a STRING into a NUMERIC column, so
+        // 'twelve' reached the driver's cast and came back a 500. A trim check accepts every one of
+        // these, which is what it used to do here.
         disabled={!run.prepare_code.available || picked.length === 0 || busy
-          || (quote !== null && (!(Number(maxTokens) > 0) || !maxCost.trim()))}
+          || (quote !== null && (!(Number(maxTokens) > 0) || !(Number(maxCost) > 0)))}
         onClick={() => prepare(quote !== null)}
       >
         {quote === null
@@ -567,9 +618,15 @@ function RailRow({ stage }: { stage: RunRailStage }) {
 
           The stage's own count rides beside it when it has one ("2 of 5 bound — accumulating").
           It was computed and then dropped on the floor here, which is the worse half of the D3
-          rule: a number derived and never shown is indistinguishable from one never derived. */}
+          rule: a number derived and never shown is indistinguishable from one never derived.
+
+          SEPARATED when a stage carries both. No stage does today, and that is exactly why this was
+          wrong and unnoticed: concatenated, the pair reads as one nonsense token
+          (`…WITHHELD_PRE_PIN0 of 3 bound`), and the day a stage grows a count beside its reason the
+          reader is the one who finds out. */}
       <td className="mono">
         {stage.reason_code ?? (stage.detail ? '' : '—')}
+        {stage.reason_code && stage.detail ? ' — ' : ''}
         {stage.detail && <span className="stage-detail">{stage.detail}</span>}
       </td>
     </tr>
@@ -580,7 +637,18 @@ function RailRow({ stage }: { stage: RunRailStage }) {
 // current answer, and undefined when it is an earlier attempt — the distinction the whole §R4.4.1
 // split exists to make, so it is carried as presence/absence rather than as a boolean nobody can
 // trace back to a row.
-function AuthoringRow({ row, current }: { row: RunAuthoringRow; current?: RunAuthoringCurrent }) {
+function AuthoringRow(
+  { row, current, busy, onRetry }: {
+    row: RunAuthoringRow
+    current?: RunAuthoringCurrent
+    busy: boolean
+    onRetry: () => void
+  },
+) {
+  // Whether the retry QUESTION applies to this attempt at all. `retryable` false with no blockers is
+  // an attempt that bought something or is still buying it — the question was never asked, so there
+  // is nothing here: a greyed-out button would send the reader hunting for a refusal nobody made.
+  const asked = row.retryable || row.retry_blockers.length > 0
   return (
     <tr className={current ? 'attempt-current' : 'attempt-earlier'}>
       <td className="mono">{row.formula_draft_id}</td>
@@ -615,6 +683,32 @@ function AuthoringRow({ row, current }: { row: RunAuthoringRow; current?: RunAut
           // The candidate's latest word, and it bought nothing — every attempt failed or was
           // cancelled. Saying "current answer" here would report a purchase that never happened.
           <span className="badge held">Current — no answer bought</span>
+        )}
+      </td>
+      <td>
+        {!asked ? (
+          <span className="stage-detail">—</span>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="btn"
+              // The id is in the label because a table of attempts is a table of identical words:
+              // "Retry" alone names nothing a screen reader can tell apart.
+              aria-label={`Retry attempt ${row.formula_draft_id}`}
+              disabled={!row.retryable || busy}
+              onClick={onRetry}
+            >
+              Retry
+            </button>
+            {/* WHY it is off, in the server's words. Not translated, not summarised: the code names
+                the governed refusal and the sentence names which person fixes what. */}
+            {row.retry_blockers.map(blocker => (
+              <div key={blocker.code} className="stage-detail">
+                <span className="mono">{blocker.code}</span> — {blocker.detail}
+              </div>
+            ))}
+          </>
         )}
       </td>
     </tr>

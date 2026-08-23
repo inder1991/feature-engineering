@@ -24,7 +24,7 @@ from typing import Annotated, Any
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
 from featuregen.api.deps import (
     get_conn,
@@ -67,6 +67,38 @@ def _now(conn: psycopg.Connection) -> str:
     return str(conn.execute("SELECT now()").fetchone()[0])
 
 
+def _positive_money(value: str) -> str:
+    """A cost ceiling is a POSITIVE decimal amount, refused HERE or nowhere.
+
+    ▲ It travels as a STRING and lands in a `numeric` column, so `max_cost: "twelve"` passed every
+    check on the way down and came back as `InvalidTextRepresentation` out of the driver — a raw
+    500 for a value a person typed into a form. `max_calls` and `max_tokens` are ints and pydantic
+    already refuses those; this is the same guard for the field that could not have one for free.
+
+    Positivity for the same reason the sibling fields carry `gt=0`: a ceiling of nothing authorizes
+    nothing, and a negative one authorizes a refund. Non-finite is checked FIRST because `Decimal`
+    parses `'NaN'` and `'Infinity'` happily, and comparing a NaN raises rather than answering.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        amount = Decimal(value)
+    except InvalidOperation:
+        raise ValueError(
+            "max_cost must be a decimal amount of money, for example '12.50'") from None
+    if not amount.is_finite():
+        raise ValueError("max_cost must be a finite amount: an unbounded ceiling is not a ceiling")
+    if amount <= 0:
+        raise ValueError("max_cost must be greater than zero: a ceiling of nothing authorizes "
+                         "nothing, and every provider call reserves against it")
+    return value
+
+
+#: The one declaration of "a confirmed amount of money", so the two approval bodies that carry one
+#: cannot be validated two different ways.
+MoneyCeiling = Annotated[str, Field(min_length=1), AfterValidator(_positive_money)]
+
+
 class SpendApprovalIn(BaseModel):
     """The user's cost confirmation, DURABLY recorded — never just a dismissed modal (§11.2)."""
 
@@ -74,7 +106,7 @@ class SpendApprovalIn(BaseModel):
 
     max_calls: int = Field(gt=0)
     max_tokens: int = Field(gt=0)
-    max_cost: str = Field(min_length=1)
+    max_cost: MoneyCeiling
     currency: str = Field(min_length=3, max_length=3)
     pricing_version: str = Field(min_length=1)
     expires_at: str = Field(min_length=1)

@@ -5,6 +5,57 @@ chain in one call. Ids default from run_id so two chains never collide."""
 from psycopg.types.json import Jsonb
 
 
+def feature_idea(name, grain="deposits"):
+    """One `FeatureIdea` that resolves to a real authoring strategy — the LLM lane, since nothing
+    seeds a reviewed v2 expectation for it."""
+    from featuregen.overlay.upload.feature_assist import FeatureIdea
+
+    return FeatureIdea(name=name, description=f"{name} over {grain}",
+                       derives_from=[f"{grain}.balance"], aggregation="avg", grain_table=grain)
+
+
+def considered_json(options):
+    """A considered revision carrying SEVERAL options in the shipped canonical v3 shape.
+
+    Assembled with the production helpers (`_candidate_identity`, `_idea_json`) rather than
+    hand-written, for `test_formula_drafts._revision`'s reason: the resolver cross-checks the
+    private identity against its public projection, so a hand-written pair only proves that two
+    hand-written things agree. The first option is the ANCHOR and the rest are alternatives, which
+    is the only shape `_public_option_entries` reads.
+
+    Shared here rather than copied per test module: two spellings of one frozen payload is two
+    fixtures to keep in step with a resolver that cross-checks them.
+    """
+    from featuregen.overlay.field_evidence import canonical_hash
+    from featuregen.overlay.upload.contract.gate1 import _candidate_identity, _idea_json
+
+    public_anchor, options_by_id, alternatives = None, {}, []
+    for position, (option_id, idea) in enumerate(options):
+        source, lens = ("anchor", "anchor") if position == 0 else ("alternative", "deposits")
+        identity = _candidate_identity(path=f"p{position}", source=source, lens=lens, feature=idea)
+        feature = {**_idea_json(idea), "option_id": option_id}
+        if position == 0:
+            public_anchor = feature
+        else:
+            alternatives.append(feature)
+        options_by_id[option_id] = {
+            "source": source, "lens": lens,
+            "canonical_candidate_identity": identity,
+            "canonical_candidate_identity_hash": canonical_hash(identity),
+            "recipe_candidate_key": None,
+        }
+    public = {"anchor": public_anchor, "rejections": []}
+    if alternatives:
+        public["alternatives"] = [{"lens": "deposits", "features": alternatives}]
+    return {
+        "version": "contract-considered-v3",
+        "public": public,
+        "options_by_id": options_by_id,
+        "recipe_grounding_context_by_candidate_key": {},
+        "recipe_candidate_keys_by_recipe_id": {},
+    }
+
+
 def seed_run_chain(conn, *, run_id, intent_id=None, considered_revision_id=None,
                    snapshot_id=None, scope_id=None, recognition_id=None, subject="u1",
                    considered_json=None):

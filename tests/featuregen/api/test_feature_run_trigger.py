@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import pytest
 from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
+from tests.featuregen.runs._chain import considered_json as _considered_json
+from tests.featuregen.runs._chain import feature_idea as _idea
 from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -42,52 +44,6 @@ def enabled(monkeypatch):
 
 def _hdr(user="priya", roles="feature_engineer"):
     return {"X-User": user, "X-Roles": roles}
-
-
-def _idea(name, grain):
-    from featuregen.overlay.upload.feature_assist import FeatureIdea
-
-    return FeatureIdea(name=name, description=f"{name} over {grain}",
-                       derives_from=[f"{grain}.balance"], aggregation="avg", grain_table=grain)
-
-
-def _considered_json(options):
-    """A considered revision carrying SEVERAL options in the shipped canonical v3 shape.
-
-    Assembled with the production helpers (`_candidate_identity`, `_idea_json`) rather than
-    hand-written, for `test_formula_drafts._revision`'s reason: the resolver cross-checks the
-    private identity against its public projection, so a hand-written pair only proves that two
-    hand-written things agree. The first option is the ANCHOR and the rest are alternatives, which
-    is the only shape `_public_option_entries` reads.
-    """
-    from featuregen.overlay.field_evidence import canonical_hash
-    from featuregen.overlay.upload.contract.gate1 import _candidate_identity, _idea_json
-
-    public_anchor, options_by_id, alternatives = None, {}, []
-    for position, (option_id, idea) in enumerate(options):
-        source, lens = ("anchor", "anchor") if position == 0 else ("alternative", "deposits")
-        identity = _candidate_identity(path=f"p{position}", source=source, lens=lens, feature=idea)
-        feature = {**_idea_json(idea), "option_id": option_id}
-        if position == 0:
-            public_anchor = feature
-        else:
-            alternatives.append(feature)
-        options_by_id[option_id] = {
-            "source": source, "lens": lens,
-            "canonical_candidate_identity": identity,
-            "canonical_candidate_identity_hash": canonical_hash(identity),
-            "recipe_candidate_key": None,
-        }
-    public = {"anchor": public_anchor, "rejections": []}
-    if alternatives:
-        public["alternatives"] = [{"lens": "deposits", "features": alternatives}]
-    return {
-        "version": "contract-considered-v3",
-        "public": public,
-        "options_by_id": options_by_id,
-        "recipe_grounding_context_by_candidate_key": {},
-        "recipe_candidate_keys_by_recipe_id": {},
-    }
 
 
 def _seed_run(conn, *, run_id="trg", subject="user:priya", with_identity=True,
@@ -347,6 +303,24 @@ def test_a_candidate_with_no_selection_is_refused_by_name(client, conn, enabled)
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "RUN_CANDIDATE_NOT_SELECTED"
     assert response.json()["detail"]["option_ids"] == ["opt-ghost"]
+
+
+@pytest.mark.parametrize("typed", ["twelve", "0", "-5", "NaN", "Infinity"])
+def test_a_CEILING_THAT_IS_NOT_A_POSITIVE_AMOUNT_is_a_422_not_a_500(client, conn, enabled, typed):
+    """▲ `max_cost` travels as a STRING into a `numeric` column, so nothing on the way down looked
+    at it and `'twelve'` came back as `InvalidTextRepresentation` — a raw 500 for a value a person
+    typed into a form. Zero and negative are the same refusal for the sibling ints' reason: a
+    ceiling of nothing authorizes nothing."""
+    run = _seed_run(conn, run_id=f"trg-money-{abs(hash(typed))}")
+    _declare(client, run)
+
+    response = client.post(PREPARE.format(run=run["run_id"]),
+                           json={"option_ids": ["opt-a"],
+                                 "spend_approval": {**_APPROVAL, "max_cost": typed}},
+                           headers=_hdr())
+
+    assert response.status_code == 422, response.text
+    assert conn.execute("SELECT COUNT(*) FROM code_generation_job").fetchone() == (1,)
 
 
 def test_a_candidate_named_twice_is_a_422_naming_it(client, conn, enabled):

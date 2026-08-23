@@ -558,10 +558,13 @@ def test_a_failed_attempt_is_history_and_the_retry_is_the_current_answer(db):
     # The current answer is the one row that HOLDS the identity slot, and `resolved` says the
     # platform actually bought something. Both halves of the candidate key ride each row: the
     # option id alone is not the candidate.
+    # `retryable` rides every row and is FALSE here with no blockers: this attempt bought an answer
+    # and holds the identity slot, so the retry question (spec §R4.2) is not asked of it at all.
     assert out["authoring"]["current"] == [{
         "formula_draft_id": "rd-h-d2", "considered_revision_id": c["considered_revision_id"],
         "option_id": "o1", "state": "READY", "rail_state": "SUCCEEDED",
-        "eligibility": "current", "retirement_reason": None, "resolved": True}]
+        "eligibility": "current", "retirement_reason": None, "resolved": True,
+        "retryable": False, "retry_blockers": []}]
     assert _rail(out)["AUTHOR_FORMULA"]["state"] == "SUCCEEDED"
     # `resolved` belongs to the CURRENT reading only. Stamping it onto every history row would
     # invite a reader to ask of a superseded attempt a question only the latest one answers.
@@ -588,6 +591,27 @@ def test_a_candidate_whose_every_attempt_bought_nothing_still_has_a_current_read
     assert [(r["formula_draft_id"], r["state"], r["resolved"])
             for r in out["authoring"]["current"]] == [("rd-n-d2", "CANCELLED", False)]
     assert _rail(out)["AUTHOR_FORMULA"]["state"] == "CANCELLED"
+
+
+def test_a_candidate_its_own_revision_can_no_longer_name_refuses_the_retry_INSTEAD_OF_RAISING(db):
+    """▲ A READ-ONLY PROJECTION MUST NOT DIE ON LEGACY DATA (spec §R4.2, the derivation's own
+    guard). Deriving retryability needs the candidate AS FROZEN — the identity a retry would mint
+    is computed from it — and a revision written before exact option identity cannot produce one.
+    That raises `CandidateUnavailable` out of the substrate, and an unabsorbed refusal there would
+    take the WHOLE run page down for one old draft. It is absorbed into the answer instead, with
+    the substrate's own sentence, so the page renders and the control says why it is off.
+
+    The chain here is the one every other test in this file seeds: `considered_json = {}`, which is
+    exactly the legacy shape.
+    """
+    c = seed_run_chain(db, run_id="rd-legacy")
+    _seed_draft(db, c["considered_revision_id"], "rd-legacy-d1", "o1", "FAILED")
+
+    row = run_detail(db, _ADMIN, "rd-legacy")["authoring"]["history"][0]
+
+    assert row["retryable"] is False
+    assert [b["code"] for b in row["retry_blockers"]] == ["RETRY_CANDIDATE_UNRESOLVABLE"]
+    assert row["retry_blockers"][0]["detail"], "the substrate's own sentence, not an empty code"
 
 
 def test_the_current_reading_is_per_candidate_and_the_rail_folds_only_those(db):
