@@ -27,6 +27,7 @@ from featuregen.api.routes import (
     dataset_policies,
     entity,
     entity_map,
+    feature_runs,
     features,
     gate,
     governance,
@@ -211,6 +212,8 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(admin.router)
     app.include_router(uploads.router)
     app.include_router(ingestion_runs.router)
+    # `GET /feature-runs` — the read-only run spine (list + detail), object-level scoped.
+    app.include_router(feature_runs.router)
     app.include_router(integrations.router)
     app.include_router(search.router)
     app.include_router(recipe_funnel.router)
