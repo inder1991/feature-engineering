@@ -42,8 +42,8 @@ _TIME_OPERAND_CLASSES = frozenset({"event_timestamp", "as_of_timestamp"})
 # The four non-measure value classes ride with `measure` on the STEP-0 design read, not on a
 # guess: `need_metadata._derive_one` resolves every need whose concept has no `entity_link` and a
 # `none` `pit_role` — precisely what a dimension / status / direction / policy_input concept is —
-# to `JoinRole.MEASURE` (measured over the legacy corpus: 264 of 264 such needs, via the
-# `template_default` rung), and `declarations.compile_aggregation` stages exactly the
+# to `JoinRole.MEASURE` (measured over the legacy corpus at 1c656743: 264 of 264 such needs, via
+# the `template_default` rung), and `declarations.compile_aggregation` stages exactly the
 # `join_role == "measure"` bindings. So this REPRODUCES legacy semantics rather than inventing a
 # new one. That an operand nobody intended to aggregate is typed as a measure is G2 — a
 # pre-existing semantic SHARED by the legacy and request paths, deliberately left open here and
@@ -126,17 +126,41 @@ def _derived_roles(request: FeaturePlanningRequestV1, operand: RequiredOperandV1
     an operand name, never prose, never tuple position.
 
     This is CLASS-keyed where `_derive_one`'s ladder is CONCEPT-keyed, so the two agree on 1113 of
-    the 1195 V2 operands and disagree on 82 — every one an operand whose authored class and whose
-    concept's governed facts say different things (a `dimension` on an entity-linked or pit-bearing
-    concept, and `device_sharing_velocity`'s two). The class is the RECIPE AUTHOR's declaration
-    about the slot, so the projection honors it rather than overruling it with a role the author
-    did not choose; `test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_g2_lives`
-    pins the divergence by shape so it cannot widen unnoticed, and settling it is G2's ruling."""
+    the 1195 V2 operands and disagree on 82 (measured at 1c656743) — every one an operand whose
+    authored class and whose concept's governed facts say different things (a `dimension` on an
+    entity-linked or pit-bearing concept, and `device_sharing_velocity`'s two). The class is the
+    RECIPE AUTHOR's declaration about the slot, so the projection honors it rather than overruling
+    it with a role the author did not choose;
+    `test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_g2_lives` pins the
+    divergence by shape so it cannot widen unnoticed, and settling it is G2's ruling."""
     if operand.operand_class == "entity_key":
         if anchor_role is not None and operand.role == anchor_role:
             return JoinRole.SOURCE_ENTITY_KEY, None
-        # a key the request's own contract says names the grain it PRODUCES at, versus a key it
+        # A key the request's own contract says names the grain it PRODUCES at, versus a key it
         # must pass THROUGH to get there — the plan's roll-up destination versus a hop key.
+        #
+        # THIS BRANCH IS BRIEF-SPECIFIED AND CORPUS-UNPROVEN. Measured at 1c656743: it fires for
+        # 0 of the 1195 V2 operands. Only 4 non-anchor `entity_key` operands exist at all
+        # (`own_transfer_outflow_amount.payee` and `first_time_payee_high_value.payee` on
+        # `beneficiary`, `customer_worst_days_in_collection.facility` on `facility`,
+        # `device_sharing_velocity.device` on a concept linking NO entity) and not one has
+        # `entity_link == output_grain`, so every non-anchor key today takes the
+        # INTERMEDIATE_ENTITY_KEY line below and the TARGET line has never executed on real data.
+        #
+        # The comparison is also across TWO UNVALIDATED STRING SPACES: `output_grain` is authored
+        # free-text on the recipe, `entity_link` is the concept registry's own vocabulary, and
+        # nothing reconciles them. Measured at 1c656743: 40 of the 317 recipes carry an
+        # `output_grain` that names NO value in the registry's 40-strong `entity_link` vocabulary
+        # — `card` vs `card_account`, `security` vs `instrument`, `reporting_entity` vs
+        # `legal_entity`, `debtor` vs `customer`, `device` vs nothing. Those 40 are saved today
+        # only by carrying a single (anchor) key operand, so the mismatch never reaches this
+        # comparison. That vocabulary gap is NOT this task's to close: it belongs to the G2/G3
+        # charter alongside the operand_class-vs-concept divergence above, because reconciling the
+        # two spaces is a governance act on the registry, not a projection rule.
+        #
+        # `test_no_v2_recipe_projects_a_target_entity_key_today` pins the zero, so the FIRST real
+        # TARGET projection is a deliberate, visible event that fails a test and forces a ruling —
+        # never a silent guess about which of two unreconciled vocabularies was meant.
         if _entity_link(operand) == request.output_grain:
             return JoinRole.TARGET_ENTITY_KEY, None
         return JoinRole.INTERMEDIATE_ENTITY_KEY, None
@@ -167,9 +191,10 @@ def planning_probe(request: FeaturePlanningRequestV1) -> Template:
 
     S1A-4c: each projected need also DECLARES its binding roles. `request_contract` metadata
     resolution deliberately bypasses the legacy resolved-need registry, and 0 of the 1195 operands
-    in the V2 registry declare a `join_role`, so before this the planner saw needs with no roles at
-    all — and `plan._assemble_rollups` starts a roll-up ONLY from a binding whose join role is
-    `source_entity_key`, so no recipe-origin request ever reached its first cross-catalog hop.
+    in the V2 registry declare a `join_role` (measured at 1c656743), so before this the planner saw
+    needs with no roles at all — and `plan._assemble_rollups` starts a roll-up ONLY from a binding
+    whose join role is `source_entity_key`, so no recipe-origin request ever reached its first
+    cross-catalog hop.
     """
     source_entity, anchor_role = _source_anchor(request)
     roles = {operand.role: _projected_roles(request, operand, anchor_role)

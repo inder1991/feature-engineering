@@ -511,6 +511,64 @@ def test_every_v2_recipe_probe_declares_the_roles_the_frontier_needs():
     assert without_source == ["device_sharing_velocity"]
 
 
+def test_no_v2_recipe_projects_a_target_entity_key_today():
+    """The TARGET/INTERMEDIATE split is brief-specified and CORPUS-UNPROVEN — pin the zero so the
+    first real occurrence is a deliberate, visible event rather than a silent guess.
+
+    Measured at ``1c656743``: the ``TARGET_ENTITY_KEY`` line in ``_derived_roles`` fires for 0 of
+    the 1195 V2 operands. Only 4 non-anchor ``entity_key`` operands exist in the whole registry and
+    none has ``entity_link == output_grain``, so every one takes the ``INTERMEDIATE_ENTITY_KEY``
+    line and the TARGET line has never executed on real data. The rule is kept because it is the
+    honest reading of a key that names the grain the feature is PRODUCED at — but nothing in this
+    corpus proves it, and a test that merely re-asserted the hand-made mapping unit row would hide
+    that.
+
+    The comparison also spans TWO UNVALIDATED STRING SPACES: ``output_grain`` is authored on the
+    recipe, ``entity_link`` is the concept registry's vocabulary, and nothing reconciles them —
+    40 of the 317 recipes carry an ``output_grain`` naming no value in the registry's 40-strong
+    ``entity_link`` vocabulary (``card`` vs ``card_account``, ``security`` vs ``instrument``,
+    ``reporting_entity`` vs ``legal_entity``, ``debtor`` vs ``customer``), saved today only by
+    those recipes carrying a single anchor key. Both halves are pinned below. Reconciling the two
+    spaces is a governance act on the registry and belongs to the G2/G3 charter, so **when this
+    test fails, do not delete the assertion**: decide the vocabulary question first, then record
+    the answer here.
+    """
+    from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    targets, non_anchor_keys = [], []
+    for recipe in V2_RECIPES:
+        request = planning_request_from_recipe(recipe)
+        probe = planning_probe(request)
+        by_role = {n.role: n for n in probe.needs}
+        for operand in request.operands:
+            need = by_role[operand.role]
+            if need.join_role is JoinRole.TARGET_ENTITY_KEY:
+                targets.append((recipe.recipe_id, operand.role, operand.concept,
+                                recipe.output_grain))
+            if (operand.operand_class == "entity_key"
+                    and need.join_role is not JoinRole.SOURCE_ENTITY_KEY):
+                non_anchor_keys.append((recipe.recipe_id, operand.role))
+
+    assert targets == [], (
+        "the corpus-unproven TARGET_ENTITY_KEY branch fired — see this test's docstring: settle "
+        f"the output_grain-vs-entity_link vocabulary question before accepting it. {targets}")
+    # …and the zero is not vacuous: non-anchor keys DO exist, they simply never match.
+    assert sorted(non_anchor_keys) == [
+        ("customer_worst_days_in_collection", "facility"),
+        ("device_sharing_velocity", "device"),
+        ("first_time_payee_high_value", "payee"),
+        ("own_transfer_outflow_amount", "payee")]
+
+    # the vocabulary gap itself, measured — the reason the branch cannot be trusted on sight
+    entity_links = {c.entity_link for c in CONCEPT_REGISTRY.values() if c.entity_link}
+    off_vocabulary = sorted({r.output_grain for r in V2_RECIPES} - entity_links)
+    assert off_vocabulary == ["book_bucket", "card", "client", "debtor", "device", "legal_group",
+                              "pool", "position", "program", "reporting_entity",
+                              "respondent_bank", "security"]
+    assert len([r for r in V2_RECIPES if r.output_grain not in entity_links]) == 40
+
+
 def test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_g2_lives():
     """The projection keys on ``operand_class``; ``_derive_one``'s ladder keys on the CONCEPT
     (entity_link, then pit_role, then MEASURE). They agree on 1113 of the 1195 V2 operands and
@@ -527,9 +585,11 @@ def test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_
       links to no entity (ladder: MEASURE; class: a key), and its entity-linked ``account``
       operand is authored as a ``dimension`` (ladder: the fallback source key; class: a value).
 
-    The count is not asserted — the shape is, plus the fact that NOTHING outside these three
-    kinds diverges. G2 and G3 are chartered together; when G2 is settled this test is the record
-    of exactly which operands its ruling has to decide."""
+    The count is not asserted — the SHAPE is, in BOTH directions (``seen == known``, not merely
+    ``<=``): a divergence kind that disappears must be struck from the worklist just as loudly as
+    a new one must be added, so the G2 worklist stays self-maintaining rather than drifting into a
+    list of kinds that no longer exist. G2 and G3 are chartered together; when G2 is settled this
+    test is the record of exactly which operands its ruling has to decide."""
     import dataclasses
 
     from featuregen.overlay.upload.need_metadata import derive_need_metadata
@@ -563,7 +623,7 @@ def test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_
                 unknown.append((recipe.recipe_id, need.role, kind))
 
     assert unknown == [], f"{len(unknown)} unexpected divergences: {unknown[:5]}"
-    assert seen <= known
+    assert seen == known, f"the G2 worklist drifted: gone={known - seen}, new={seen - known}"
     assert agreeing > 1000, agreeing        # the divergence is the exception, not the rule
 
 
