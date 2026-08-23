@@ -109,8 +109,9 @@ def candidate_governance_blockers(
         catalog_snapshot_hash=candidate.catalog_snapshot_hash,
         authoring_config_hash=config_hash,
         definition_revision=candidate.definition_revision)
-    if tombstone_covering(conn, scope_key=scope_key,
-                          formula_identity_hash=identity_hash) is not None:
+    covering = tombstone_covering(conn, scope_key=scope_key,
+                                  formula_identity_hash=identity_hash)
+    if covering is not None:
         blockers.append("FORMULA_DRAFT_RETIRED")
 
     if strategy is _FS.LLM_AUTHORED:
@@ -124,6 +125,7 @@ def candidate_governance_blockers(
                 conn, target_formula_identity_hash=identity_hash,
                 provider_contract_hash=provider_contract_hash,
                 strategy_identity_hash=strategy_identity_hash,
+                covering_tombstone_id=None if covering is None else covering.tombstone_id,
                 now=conn.execute("SELECT now()").fetchone()[0])
             if exception is None:
                 blockers.append("LEGACY_REGENERATION_NOT_APPROVED")

@@ -411,31 +411,29 @@ def _request_draft_locked(
     # later committed burned one use per click — and after max_uses the message silently degraded
     # from the failure explanation to "already withdrawn". Refusals must never consume; only the
     # transaction that actually MINTS the replacement does, after its INSERT.
+    # ▲ TOMBSTONE READ FIRST (Task 6 round-2 reorder): the locator's tombstone predicate needs
+    # the covering withdrawal's id, so coverage is established before locating. Both are reads —
+    # the W4 rule this section carries is CONSUME last, and consumption still happens only in
+    # the transaction that mints.
+    tombstone = tombstone_covering(
+        conn, scope_key=scope_key, formula_identity_hash=identity)
     exception_id = None
     if provider_contract_hash and strategy_identity_hash:
+        # ▲ THE OVERRIDE MUST NAME THE WITHDRAWAL — and the naming filter lives INSIDE the
+        # locator (round-2): the first cut located the OLDEST coupon and nullified on mismatch,
+        # so a pre-withdrawal coupon SHADOWED a younger one that correctly named the tombstone,
+        # and the refusal's own remedy (approve again) could never work. The locator now finds
+        # the coupon matching the CURRENT withdrawal state, whichever its age.
         exception_id = valid_exception_for(
             conn, target_formula_identity_hash=identity,
             provider_contract_hash=provider_contract_hash,
             strategy_identity_hash=strategy_identity_hash,
+            covering_tombstone_id=None if tombstone is None else tombstone.tombstone_id,
             # ▲ The DB's clock when the caller passed none — this line was `_now(conn)`, a
             # helper that never existed in this module: a NameError masked because every prior
             # caller passed `now` explicitly. Found by Task 6's store-level tests.
             now=now if now is not None else conn.execute("SELECT now()").fetchone()[0])
-
-    tombstone = tombstone_covering(
-        conn, scope_key=scope_key, formula_identity_hash=identity)
     if tombstone is not None:
-        if exception_id is not None:
-            # ▲ THE OVERRIDE MUST NAME THE WITHDRAWAL (Task 6 review, item 3): an exception that
-            # predates the tombstone — or was written when no tombstone covered the target —
-            # carries tombstone_id NULL, and letting it unlock a later withdrawal would override
-            # a decision nobody weighed it against, with no audit linkage. Overriding a
-            # withdrawal is an act about THAT withdrawal.
-            names = conn.execute(
-                "SELECT tombstone_id FROM formula_draft_regeneration_exception "
-                "WHERE exception_id = %s", (exception_id,)).fetchone()
-            if names is None or names[0] != tombstone.tombstone_id:
-                exception_id = None
         if exception_id is None:
             raise DraftRetired(
                 f"formula identity {identity} is withdrawn by tombstone "
@@ -619,12 +617,26 @@ def _advance_locked(
             catalog_snapshot_hash=row[5], definition_revision=row[6]),
         formula_identity_hash=row[7])
     if tombstone is not None:
-        raise DraftRetired(
-            f"formula draft {formula_draft_id} is withdrawn by tombstone "
-            f"{tombstone.tombstone_id} at scope {tombstone.scope} ({tombstone.reason}) and must "
-            f"not advance to {to.value}: continuing would spend against a candidate somebody "
-            f"already withdrew"
-            f"{'' if tombstone.replacement_draft_id is None else f'; use {tombstone.replacement_draft_id}'}")
+        # ▲ THE OVERRIDE CASE MUST BE ABLE TO FINISH (Task 6 round-2, item 3): a retry minted
+        # under a coupon that NAMES this withdrawal is exactly the work the approval authorized —
+        # a fence that refused its advances would sell a draft that can never complete, making
+        # the surface ornamental for its one purpose. The exemption is derivable with no schema
+        # change: a CONSUMED exception naming THIS tombstone and targeting THIS draft's identity
+        # exists only when the override mint went through (consumption happens solely in the
+        # minting transaction), and the money guard's one-live rule means the only non-terminal
+        # draft at that identity is the mint it authorized.
+        overridden = conn.execute(
+            "SELECT 1 FROM formula_draft_regeneration_exception "
+            "WHERE target_formula_identity_hash = %s AND tombstone_id = %s "
+            "  AND uses_consumed >= 1 LIMIT 1",
+            (row[7], tombstone.tombstone_id)).fetchone()
+        if overridden is None:
+            raise DraftRetired(
+                f"formula draft {formula_draft_id} is withdrawn by tombstone "
+                f"{tombstone.tombstone_id} at scope {tombstone.scope} ({tombstone.reason}) and "
+                f"must not advance to {to.value}: continuing would spend against a candidate "
+                f"somebody already withdrew"
+                f"{'' if tombstone.replacement_draft_id is None else f'; use {tombstone.replacement_draft_id}'}")
 
     current = DraftStateV1(row[0])
     permitted = _NEXT[current] | (frozenset() if current.is_terminal else _FROM_ANYWHERE)

@@ -235,7 +235,7 @@ def tombstone_covering(
 
 def valid_exception_for(
     conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
-    strategy_identity_hash: str, now,
+    strategy_identity_hash: str, now, covering_tombstone_id: str | None,
 ) -> str | None:
     """The unexpired, unconsumed exception authorizing THIS exact regeneration, or ``None``.
 
@@ -244,13 +244,20 @@ def valid_exception_for(
     the scope and a timestamp, which authorized any regeneration of that candidate, at any cost,
     under any configuration, for ever.
     """
+    # ▲ The tombstone filter lives INSIDE the locator (Task 6 round-2): the first cut located
+    # one row (oldest) and nullified on a tombstone mismatch — so an old non-naming coupon
+    # SHADOWED a younger one that correctly named the withdrawal, and the refusal text
+    # instructed the exact action that could not work (approve again → still refused). With the
+    # predicate here, the locator finds the coupon that matches the CURRENT withdrawal state:
+    # the covering tombstone's id when one covers, NULL when none does.
     row = conn.execute(
         "SELECT exception_id FROM formula_draft_regeneration_exception "
         " WHERE target_formula_identity_hash = %s AND provider_contract_hash = %s "
         "   AND strategy_identity_hash = %s AND expires_at > %s AND uses_consumed < max_uses "
+        "   AND tombstone_id IS NOT DISTINCT FROM %s "
         " ORDER BY approved_at LIMIT 1",
         (target_formula_identity_hash, provider_contract_hash, strategy_identity_hash,
-         now)).fetchone()
+         now, covering_tombstone_id)).fetchone()
     return None if row is None else row[0]
 
 
@@ -272,7 +279,7 @@ def consume_exception(conn, exception_id: str) -> bool:
 def approve_regeneration_exception(
     conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
     strategy_identity_hash: str, actor_subject: str, llm_spend_authorization_id: str,
-    expires_at: str, max_uses: int = 1, scope_key: str | None = None,
+    expires_at: str, scope_key: str, max_uses: int = 1,
 ) -> tuple[str, bool]:
     """Record one approved regeneration — Stage I Task 6's creation act, LLM-lane-only by the
     owner's Option 2 ruling (deterministic retries are free by construction and need none).
@@ -290,10 +297,6 @@ def approve_regeneration_exception(
     """
     from featuregen.canonical import jcs_sha256
 
-    if scope_key is None:
-        raise ValueError("approve_regeneration_exception needs the candidate's scope key: the "
-                         "covering-tombstone derivation must not depend on any draft row "
-                         "existing at the target identity")
     covering = tombstone_covering(
         conn, scope_key=scope_key, formula_identity_hash=target_formula_identity_hash)
     tombstone_id = None if covering is None else covering.tombstone_id

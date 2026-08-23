@@ -594,7 +594,7 @@ def test_an_exception_that_does_not_NAME_the_withdrawal_cannot_override_it(db):
     """Task 6 review item 3: a coupon minted BEFORE the tombstone (tombstone_id NULL) must not
     unlock a LATER withdrawal — overriding a withdrawal is an act about THAT withdrawal, and an
     approval nobody weighed against it carries no audit linkage. The retry refuses as retired."""
-    from featuregen.overlay.upload.formula_draft_store import DraftRetired, formula_identity
+    from featuregen.overlay.upload.formula_draft_store import DraftRetired
     from featuregen.overlay.upload.llm_spend import authorize_spend
     from featuregen.overlay.upload.retirement_scope import (
         RetirementScope,
@@ -627,3 +627,109 @@ def test_an_exception_that_does_not_NAME_the_withdrawal_cannot_override_it(db):
         _request_again(db, draft_id="fd-prearm-retry", option_id="opt-fd-prearm",
                        provider_contract_hash="sha256:llm",
                        strategy_identity_hash="sih-llm")
+
+
+def test_THE_OVERRIDE_MINT_CAN_FINISH_the_fence_honors_the_naming_coupon(db):
+    """Task 6 round-2 item 3, the acceptance chain: FAILED → tombstone → approval NAMING it →
+    retry MINTS → and the worker's advances SUCCEED all the way to READY. Without the fence
+    exemption, the override case bought a draft that could never complete — the surface was
+    ornamental for its one purpose. A sibling draft with NO naming coupon still fences."""
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        approve_regeneration_exception,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-finish")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-finish",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    record_tombstone(db, formula_draft_id="fd-finish",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-finish",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    # Approved AFTER the withdrawal — through the writer, which derives and NAMES the covering
+    # tombstone via the one reader.
+    approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
+
+    minted, created = _request_again(
+        db, draft_id="fd-finish-retry", option_id="opt-fd-finish",
+        provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+    assert created is True
+
+    # The worker's whole ladder, under the covering tombstone, to READY.
+    advance(db, minted, DraftStateV1.AUTHORING, authoring_run_id=None)
+    advance(db, minted, DraftStateV1.CRITIC_REVIEW)
+    advance(db, minted, DraftStateV1.VALIDATING)
+    advance(db, minted, DraftStateV1.ADMISSION)
+    final = advance(db, minted, DraftStateV1.READY,
+                    formula_content_hash="sha256:f-finish",
+                    formula_json={"formula_schema_version": 3})
+    assert final is DraftStateV1.READY
+
+    # Negative control: a DIFFERENT candidate under a tombstone with NO naming coupon fences.
+    from featuregen.overlay.upload.formula_draft_store import DraftRetired
+
+    other = _draft(db, "fd-nofinish", state="REQUESTED")
+    record_tombstone(db, formula_draft_id="fd-nofinish",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="withdrawn", retired_by="user:owner")
+    with pytest.raises(DraftRetired, match="must not advance"):
+        advance(db, other, DraftStateV1.AUTHORING)
+
+
+def test_a_YOUNGER_NAMING_COUPON_is_not_shadowed_by_an_older_blank_one(db):
+    """Round-2 item 2: the filter lives INSIDE the locator. Coupon A (pre-withdrawal, names
+    nothing) → withdrawal → coupon B (names it): the retry MINTS under B — the refusal's own
+    remedy actually works now, instead of A shadowing B until it expires."""
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        approve_regeneration_exception,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-shadow")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-shadow",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+
+    def _spend(tag):
+        return authorize_spend(
+            db, action="AUTHOR_FORMULA", actor_subject="user:owner",
+            job_identity=f"job-shadow-{tag}", member_identities=[identity],
+            provider_contract_hash="sha256:llm", max_calls=5, max_tokens=1000,
+            currency="USD", max_cost="1.00", pricing_version="p@1",
+            expires_at="2026-12-31T00:00:00Z")
+
+    # Coupon A, minted while nothing covers the target (tombstone_id NULL).
+    approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=_spend("a"), expires_at="2026-12-31T00:00:00Z",
+        scope_key=scope)
+    record_tombstone(db, formula_draft_id="fd-shadow",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    # Coupon B — the operator obeying the refusal — NAMES the withdrawal.
+    approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=_spend("b"), expires_at="2026-12-31T00:00:00Z",
+        scope_key=scope)
+
+    minted, created = _request_again(
+        db, draft_id="fd-shadow-retry", option_id="opt-fd-shadow",
+        provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+    assert created is True, "B unlocks; A no longer shadows it"

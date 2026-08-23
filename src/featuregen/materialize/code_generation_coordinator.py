@@ -466,7 +466,6 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
     (`LEGACY_REGENERATION_NOT_APPROVED` — under identity V2 a re-author would mint a DIFFERENT
     identity, so the money guard alone cannot see that the answer was already bought once).
     """
-    from featuregen.canonical import jcs_sha256
     from featuregen.overlay.upload.formula_draft_service import frozen_candidate
     from featuregen.overlay.upload.formula_strategy import (
         FormulaStrategy,
@@ -474,7 +473,6 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
     )
     from featuregen.overlay.upload.formula_strategy_facts import (
         assemble_strategy_facts,
-        current_author_contract_hash,
     )
     from featuregen.overlay.upload.retirement_scope import retirement_scope_key
 

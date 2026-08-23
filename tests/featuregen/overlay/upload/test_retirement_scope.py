@@ -216,6 +216,7 @@ def test_AN_EXCEPTION_THAT_DOES_NOT_BIND_DOES_NOT_AUTHORIZE(db, over, why):
     assert valid_exception_for(
         db, target_formula_identity_hash=_identity(config="cfg-2"),
         provider_contract_hash="pc-1", strategy_identity_hash="st-1",
+        covering_tombstone_id=tombstone.tombstone_id,
         now="2026-08-23T00:00:00Z") is None, why
 
 

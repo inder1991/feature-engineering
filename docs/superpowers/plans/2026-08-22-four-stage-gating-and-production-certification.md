@@ -3067,8 +3067,13 @@ CLOSED:**
   `tombstone_covering` (the one reader — so the writer's "which withdrawal does this override"
   is the gate's own answer), NOT NULL spend minted via `canonical_approval_expiry`,
   content-addressed so a replayed approval is ONE coupon, consumed once by the mint it
-  authorizes. An exception must NAME the covering tombstone at the gate — a coupon minted before
-  a withdrawal cannot silently unlock it.
+  authorizes. An exception must NAME the covering tombstone — and the naming filter
+  lives INSIDE the locator (round-2 correction: the first cut located the OLDEST coupon and
+  nullified on mismatch, which both prevented pre-arm AND disarmed the legitimate
+  post-withdrawal approval — an old blank coupon shadowed the younger naming one, making the
+  refusal's own remedy unreachable until the blank expired). The advance fence honors a
+  CONSUMED naming coupon, so the override mint can FINISH — proven by the acceptance chain
+  (FAILED → tombstone → approve-naming → mint → advance to READY).
 * *(was: the reviewed-lane exception is unrepresentable, so a FAILED reviewed draft is stuck)* —
   the unrepresentability IS the design: `request_draft`'s not-an-answer gate is strategy-aware;
   a reviewed re-attempt (no provider contract, 1104's construction) mints freely with zero
