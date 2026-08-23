@@ -78,7 +78,9 @@ def test_THE_PLAN_WRITES_NOTHING(client, conn, enabled, engineer_headers):
     assert plan["members"][0]["formula_strategy"] == "LLM_AUTHORED"
     assert plan["llm_members"] == 1
     assert plan["spend_approval_required"] is True
-    assert plan["estimated_provider_calls"] == 5, "1 call + 2 retries + 2 repairs, quoted"
+    assert plan["estimated_provider_calls"] == 45, \
+        "the PER-DRAFT bound (8 author turns × 5 attempts + critic's 5) — the ONE constant the " \
+        "quote, the ceiling and the dev envelope all import (re-review carried finding 1)"
     assert plan["spend_approval"] is None, "READS an approval; never creates one"
     # ▲ Nothing durable: no job, no decision revision, no spend ceiling — `ask`, not `decide`.
     for table in ("code_generation_job", "action_decision_revision",

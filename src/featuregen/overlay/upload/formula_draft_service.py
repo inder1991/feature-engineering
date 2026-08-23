@@ -49,6 +49,7 @@ __all__ = [
     "NotAnAnswerAtRequest",
     "RetiredAtRequest",
     "StrategyRefused",
+    "PER_DRAFT_CALL_ENVELOPE",
     "authoring_evidence_pins",
     "candidate_governance_blockers",
     "frozen_candidate",
@@ -80,7 +81,7 @@ def authoring_evidence_pins(
 
 
 def candidate_governance_blockers(
-    conn, *, candidate: "FrozenCandidateV1", option_id: str, strategy,
+    conn, *, candidate: FrozenCandidateV1, option_id: str, strategy,
     strategy_identity_hash: str, provider_contract_hash: str | None, config_hash: str,
     scope_key: str,
 ) -> tuple[str, ...]:
@@ -222,9 +223,19 @@ class DraftRequestedV1:
 #: repair anywhere exhausted mid-draft into a FALSE technical_failure plus a false
 #: security-audit signal). Both ceilings raised TOGETHER, since per-call reservation is
 #: max_tokens/max_calls and raising one alone reshapes what a single call may reserve.
-_DEV_ENVELOPE_MAX_CALLS = 45          # 8 author turns × 5 + critic envelope of 5
+#: ▲ THE ONE per-draft provider-call bound — every quoter and every ceiling imports THIS
+#: (the Task 5 re-review found the job path still quoting 5 from its own stale copy, which
+#: re-created exactly the one-repair-exhausts-mid-draft defect C-1 fixed here).
+PER_DRAFT_CALL_ENVELOPE = 45          # 8 author turns × 5 physical attempts + critic envelope of 5
+
+_DEV_ENVELOPE_MAX_CALLS = PER_DRAFT_CALL_ENVELOPE
 _DEV_ENVELOPE_MAX_TOKENS = 250_000    # AUTHOR_TOKEN_BUDGET (200k) + critic allowance (50k)
 _DEV_ENVELOPE_MAX_COST = "25.00"
+# ▲ A deliberate trade, named (re-review): per-call reservation is max_tokens/max_calls ≈ 5.6k,
+# well under one call's possible usage — so the seam's guarantee here is BOUNDED OVERSHOOT THEN
+# REFUSE (the ledger enforces both totals across calls; a single call may start with less
+# headroom than it ends up using) rather than strict pre-egress worst-case. Strictness would
+# need a per-call worst-case constant the provider contract does not yet declare.
 
 
 def _development_spend_envelope(
@@ -245,9 +256,12 @@ def _development_spend_envelope(
     # whoever's session applied it. With expiry now inside authorize_spend's idempotency
     # identity, a within-the-day re-request is genuinely ONE authorization and the next UTC day
     # genuinely mints a fresh bounded envelope — the renewal the first cut only claimed.
+    # ▲ Rendered with an EXPLICIT offset, because this string sits inside the spend idempotency
+    # identity: a bare ::text renders in the SESSION timezone, and two sessions with different
+    # tz would mint two "identical" same-day envelopes (re-review, minor 2).
     expires = conn.execute(
-        "SELECT ((((now() AT TIME ZONE 'utc')::date + 2)::timestamp) "
-        "AT TIME ZONE 'utc')::text").fetchone()[0]
+        "SELECT to_char((now() AT TIME ZONE 'utc')::date + 2, 'YYYY-MM-DD') "
+        "|| 'T00:00:00+00:00'").fetchone()[0]
     return authorize_spend(
         conn, action="AUTHOR_FORMULA", actor_subject=actor_subject,
         job_identity=f"draft-dev-envelope:{config_hash}",

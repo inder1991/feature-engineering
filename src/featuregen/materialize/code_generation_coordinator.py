@@ -26,13 +26,13 @@ NEW job identity created by an explicit user act — never a silent drop of a se
 from __future__ import annotations
 
 import traceback
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.overlay.upload.code_generation_job_store import (
     CodeGenJobV1,
-    CodeGenMemberV1,
     JobStatusV1,
     MemberStateV1,
     advance_job,
@@ -43,6 +43,9 @@ from featuregen.overlay.upload.code_generation_job_store import (
     record_job_action,
     release_job,
     update_member,
+)
+from featuregen.overlay.upload.formula_draft_service import (
+    PER_DRAFT_CALL_ENVELOPE as CALL_ENVELOPE_PER_LLM_MEMBER,
 )
 from featuregen.runtime.observability import counters, log
 
@@ -446,11 +449,12 @@ class SpendApprovalRequired(Exception):
         self.estimated_provider_calls = estimated_provider_calls
 
 
-#: The authoring call envelope per LLM member — quoted by /plan, sized by the write.
-CALL_ENVELOPE_PER_LLM_MEMBER = 5
+#: The authoring call envelope per LLM member — THE one per-draft bound (see the import at the
+#: top of this module), so the quote, the write and the dev envelope can never disagree again
+#: (Task 5 re-review, carried finding 1).
 
 
-def member_authoring_plans(conn, request: "CodeGenJobRequestV1") -> list[dict[str, Any]]:
+def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str, Any]]:
     """Resolve each selection's frozen candidate and authoring strategy — READ-ONLY.
 
     Raises `SelectionUnavailable` for a selection that cannot anchor the build, and lets the
@@ -472,10 +476,7 @@ def member_authoring_plans(conn, request: "CodeGenJobRequestV1") -> list[dict[st
         assemble_strategy_facts,
         current_author_contract_hash,
     )
-    from featuregen.overlay.upload.retirement_scope import (
-        retirement_scope_key,
-        tombstone_covering,
-    )
+    from featuregen.overlay.upload.retirement_scope import retirement_scope_key
 
     plans: list[dict[str, Any]] = []
     for position, selection_revision_id in enumerate(request.selection_revision_ids):

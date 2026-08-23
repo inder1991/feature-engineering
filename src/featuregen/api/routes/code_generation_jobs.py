@@ -26,7 +26,6 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
-from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import (
     get_conn,
     get_identity,
@@ -36,10 +35,8 @@ from featuregen.api.deps import (
 from featuregen.api.routes.build_sets import require_generation_enabled
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.code_generation_job_store import (
-    JobMemberSpecV1,
     JobStatusV1,
     advance_job,
-    create_job,
     job_content_identity,
     read_events,
     read_job,
@@ -49,16 +46,17 @@ from featuregen.overlay.upload.code_generation_job_store import (
 from featuregen.overlay.upload.formula_draft_service import (
     CandidateUnavailable,
     FormulaStrategy,
-    frozen_candidate,
 )
 from featuregen.runtime.observability import counters, log
 
 __all__ = ["router"]
 
-#: The authoring call envelope per LLM member — 1 call + 2 retries + 2 repairs, the same budgets
-#: `intake/llm.py` enforces. Quoted by `/plan` so an approval's `max_calls` has a basis a person
-#: can check against the enforcement rather than against a guess.
-CALL_ENVELOPE_PER_LLM_MEMBER = 5
+#: The authoring call envelope per LLM member — imported from THE one per-draft bound (8 author
+#: turns × 5 physical attempts + the critic's 5), so the /plan quote, the recorded ceiling and
+#: the dev envelope can never disagree (Task 5 re-review, carried finding 1: this file carried a
+#: stale 5, /plan quoted it, the confirm dialog sent the quote verbatim as the ceiling, and a
+#: job member got one-repair-exhausts-mid-draft back).
+from featuregen.materialize.code_generation_coordinator import CALL_ENVELOPE_PER_LLM_MEMBER
 
 router = APIRouter(dependencies=[Depends(require_generation_enabled)])
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -147,8 +145,8 @@ def plan_code_generation(body: JobRequestIn, conn: _Conn, identity: _Identity) -
     from featuregen.materialize.action_authorization import ActionV1
     from featuregen.materialize.action_decision import ActionRequestV1, ask
     from featuregen.materialize.build_set_declaration import (
-        decode_declaration,
         declaration_identity,
+        decode_declaration,
     )
 
     try:
@@ -229,8 +227,6 @@ def request_code_generation(
         SpendApprovalRequired,
         request_code_generation_job,
     )
-    from featuregen.overlay.upload.formula_draft_service import CandidateUnavailable
-
     try:
         job_id, created = request_code_generation_job(
             conn, _service_request(body), actor_subject=identity.subject)
