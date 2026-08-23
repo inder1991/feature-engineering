@@ -195,6 +195,10 @@ _ROWS: dict[str, dict[ActionV1, Disposition]] = {
     # A FAILED/CANCELLED occupant of this identity: re-buying the answer is an approved act
     # (§11.1.2 — the money guard released the slot; the APPROVAL is what re-opens the wallet).
     R.FORMULA_DRAFT_NOT_AN_ANSWER: _row(_B, _D, _D, _D, _B, _B),
+    # A withdrawal is being overridden by a governance-approved regeneration (Task 6 round-3):
+    # authoring proceeds — that is what the approval IS — and the caller must be told; moot
+    # downstream, where the draft exists legitimately.
+    R.RETIREMENT_OVERRIDDEN: _row(_W, _D, _D, _D, _D, _D),
 }
 
 #: §5's shape: ``(code, action) -> Disposition``, 6 cells per vocabulary code, proved complete

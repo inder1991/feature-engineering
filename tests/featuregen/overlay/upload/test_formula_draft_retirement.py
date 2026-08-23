@@ -733,3 +733,119 @@ def test_a_YOUNGER_NAMING_COUPON_is_not_shadowed_by_an_older_blank_one(db):
         db, draft_id="fd-shadow-retry", option_id="opt-fd-shadow",
         provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
     assert created is True, "B unlocks; A no longer shadows it"
+
+
+def _override_minted(db, tag: str) -> tuple[str, str]:
+    """A draft minted under a coupon naming the candidate-wide withdrawal — round-3's shared
+    arrangement. Returns (minted_draft_id, its identity)."""
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        approve_regeneration_exception,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, f"fd-{tag}")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id=f"opt-fd-{tag}",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    record_tombstone(db, formula_draft_id=f"fd-{tag}",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity=f"job-{tag}",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
+    minted, created = _request_again(
+        db, draft_id=f"fd-{tag}-retry", option_id=f"opt-fd-{tag}",
+        provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+    assert created is True
+    return minted, identity
+
+
+def test_an_EXACT_withdrawal_of_the_override_draft_STOPS_it_mid_ladder(db):
+    """Round-3's blocking probe: the candidate-first pick let the OLD broad tombstone (which the
+    coupon names) MASK a fresh EXACT_DRAFT withdrawal of the mint itself — the fence advanced a
+    freshly-withdrawn draft. The rule now: an exact withdrawal at the mint's identity ALWAYS
+    refuses — it necessarily post-dates the coupon, so no approval can have weighed it."""
+    from featuregen.overlay.upload.formula_draft_store import (
+        DraftRetired,
+        DraftStateV1,
+        advance,
+    )
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    minted, _identity = _override_minted(db, "exact")
+    advance(db, minted, DraftStateV1.AUTHORING)   # the ladder starts under the named override
+
+    # The operator withdraws the OVERRIDE DRAFT ITSELF, mid-ladder, exactly.
+    record_tombstone(db, formula_draft_id=minted, scope=RetirementScope.EXACT_DRAFT,
+                     reason="wrong after all", retired_by="user:owner")
+
+    with pytest.raises(DraftRetired, match="withdrawn EXACTLY"):
+        advance(db, minted, DraftStateV1.CRITIC_REVIEW)
+
+
+def test_an_EXPIRED_coupon_still_lets_the_ladder_FINISH_deliberately(db):
+    """Round-3, stated and pinned rather than implied: the coupon's expiry bounds NEW MINTS —
+    the authorized moment was the mint, the money was reserved then, and refusing mid-ladder
+    because the coupon aged out would re-strand exactly the draft the approval freed."""
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+
+    minted, identity = _override_minted(db, "expired")
+    db.execute(
+        "UPDATE formula_draft_regeneration_exception SET expires_at = now() - interval '1 day' "
+        "WHERE target_formula_identity_hash = %s", (identity,))
+
+    advance(db, minted, DraftStateV1.AUTHORING)
+    advance(db, minted, DraftStateV1.CRITIC_REVIEW)
+    advance(db, minted, DraftStateV1.VALIDATING)
+    advance(db, minted, DraftStateV1.ADMISSION)
+    final = advance(db, minted, DraftStateV1.READY,
+                    formula_content_hash="sha256:f-exp",
+                    formula_json={"formula_schema_version": 3})
+    assert final is DraftStateV1.READY
+
+
+def test_the_REQUEST_gate_shares_the_masking_fix(db):
+    """The same class at the mint: a coupon naming the broad tombstone must not slip past an
+    EXACT withdrawal of the target identity that the candidate-first pick masked."""
+    from featuregen.overlay.upload.formula_draft_store import DraftRetired
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        RetirementScope,
+        approve_regeneration_exception,
+        record_tombstone,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-mask")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-mask",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    record_tombstone(db, formula_draft_id="fd-mask",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-mask",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
+    # An EXACT withdrawal of the target identity, recorded after the approval, masked by the
+    # broad pick — must still refuse the mint.
+    record_tombstone(db, formula_draft_id="fd-mask", scope=RetirementScope.EXACT_DRAFT,
+                     reason="this exact one is wrong", retired_by="user:owner")
+
+    with pytest.raises(DraftRetired):
+        _request_again(db, draft_id="fd-mask-retry", option_id="opt-fd-mask",
+                       provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")

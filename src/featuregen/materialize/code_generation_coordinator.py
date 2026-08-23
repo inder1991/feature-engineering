@@ -516,7 +516,7 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
         )
 
         provider_contract, _payload, config_hash = current_authoring_config(decision)
-        blockers.extend(candidate_governance_blockers(
+        governance_blockers, governance_warnings = candidate_governance_blockers(
             conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
             strategy_identity_hash=decision.strategy_identity_hash,
             provider_contract_hash=provider_contract, config_hash=config_hash,
@@ -524,7 +524,9 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
                 considered_revision_id=candidate.considered_revision_id, option_id=option_id,
                 planning_request_hash=candidate.planning_request_hash,
                 catalog_snapshot_hash=candidate.catalog_snapshot_hash,
-                definition_revision=candidate.definition_revision)))
+                definition_revision=candidate.definition_revision))
+        blockers.extend(governance_blockers)
+        warnings.extend(governance_warnings)
 
         plans.append({
             "position": position,

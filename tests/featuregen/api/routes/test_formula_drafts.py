@@ -639,3 +639,42 @@ def test_approving_a_regeneration_is_a_GOVERNANCE_act_not_an_engineer_click(
     response = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
                            json=_CEILING, headers=engineer_headers)
     assert response.status_code == 403, response.text
+
+
+def test_a_NAMING_COUPON_turns_RETIRED_into_an_OVERRIDDEN_warning_one_answer_both_routes(
+        client, conn, engineer_headers):
+    """Round-3 item 2: the preview/decision said RETIRED for exactly the candidate the store
+    mints under a naming coupon — two answers by route. Now the decision consults the SAME
+    locator: with a valid naming coupon the request MINTS (202) and carries the
+    RETIREMENT_OVERRIDDEN warning instead of refusing."""
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _revision(conn, revision_id="crev-ovw", snapshot_id="snap-ovw")
+    candidate = frozen_candidate(conn, "crev-ovw", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-ovw', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-ovw', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    record_tombstone(conn, formula_draft_id="fd-ovw",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+
+    refused = client.post(DRAFT_PATH.format(rev="crev-ovw", opt="opt-a"),
+                          headers=engineer_headers)
+    assert refused.status_code == 409, "without a coupon, RETIRED refuses — through the decision"
+
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post("/formula-drafts/fd-ovw/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+
+    minted = client.post(DRAFT_PATH.format(rev="crev-ovw", opt="opt-a"),
+                         headers=engineer_headers)
+    assert minted.status_code == 202, minted.text
+    assert "RETIREMENT_OVERRIDDEN" in minted.json()["strategy_warnings"], \
+        "the withdrawal's override is DISPLAYED, never silent — one answer, both routes"

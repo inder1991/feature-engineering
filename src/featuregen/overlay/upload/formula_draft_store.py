@@ -434,6 +434,18 @@ def _request_draft_locked(
             # caller passed `now` explicitly. Found by Task 6's store-level tests.
             now=now if now is not None else conn.execute("SELECT now()").fetchone()[0])
     if tombstone is not None:
+        # ▲ Round-3, the same masking class as the fence: `tombstone_covering` picks
+        # CANDIDATE-first, so a coupon naming the broad tombstone must not slip past an EXACT
+        # withdrawal of this very identity that the pick masked. When both cover, the coupon can
+        # name only one — refuse, and the operator escalates (fail-closed on a withdrawal).
+        if exception_id is not None and (
+                tombstone.exact_formula_identity_hash != identity):
+            masked_exact = conn.execute(
+                "SELECT 1 FROM formula_draft_retirement_tombstone "
+                "WHERE scope = 'EXACT_DRAFT' AND exact_formula_identity_hash = %s LIMIT 1",
+                (identity,)).fetchone()
+            if masked_exact is not None:
+                exception_id = None
         if exception_id is None:
             raise DraftRetired(
                 f"formula identity {identity} is withdrawn by tombstone "
@@ -616,6 +628,24 @@ def _advance_locked(
             considered_revision_id=row[2], option_id=row[3], planning_request_hash=row[4],
             catalog_snapshot_hash=row[5], definition_revision=row[6]),
         formula_identity_hash=row[7])
+    # ▲ Round-3 correction: the single `tombstone_covering` pick is CANDIDATE-first, so asking
+    # only it let the OLD broad tombstone (which the coupon names) MASK a fresh EXACT_DRAFT
+    # withdrawal of the override mint itself — the reviewer's probe advanced a freshly-withdrawn
+    # draft. The rule is: the exemption holds only when EVERY covering tombstone is the named
+    # one. Concretely: an EXACT_DRAFT tombstone at THIS draft's identity ALWAYS refuses — it is
+    # unambiguous, and for an override mint it necessarily post-dates the coupon, so the coupon
+    # cannot have weighed it. The candidate-wide tombstone exempts only when a CONSUMED coupon
+    # names it.
+    exact_withdrawal = conn.execute(
+        "SELECT tombstone_id, reason FROM formula_draft_retirement_tombstone "
+        "WHERE scope = 'EXACT_DRAFT' AND exact_formula_identity_hash = %s LIMIT 1",
+        (row[7],)).fetchone()
+    if exact_withdrawal is not None:
+        raise DraftRetired(
+            f"formula draft {formula_draft_id} is withdrawn EXACTLY by tombstone "
+            f"{exact_withdrawal[0]} ({exact_withdrawal[1]}) and must not advance to {to.value}: "
+            f"an exact withdrawal of this draft post-dates any approval that minted it, so no "
+            f"coupon can have weighed it")
     if tombstone is not None:
         # ▲ THE OVERRIDE CASE MUST BE ABLE TO FINISH (Task 6 round-2, item 3): a retry minted
         # under a coupon that NAMES this withdrawal is exactly the work the approval authorized —
@@ -625,6 +655,12 @@ def _advance_locked(
         # exists only when the override mint went through (consumption happens solely in the
         # minting transaction), and the money guard's one-live rule means the only non-terminal
         # draft at that identity is the mint it authorized.
+        #
+        # ▲ EXPIRY IS DELIBERATELY NOT CHECKED HERE (round-3, stated rather than implied): the
+        # coupon's expiry bounds NEW MINTS — the moment of authorization was the mint, the money
+        # was reserved then, and refusing an in-flight ladder because the coupon aged out
+        # mid-run would re-strand exactly the draft the approval existed to free. Pinned by a
+        # deliberate test.
         overridden = conn.execute(
             "SELECT 1 FROM formula_draft_regeneration_exception "
             "WHERE target_formula_identity_hash = %s AND tombstone_id = %s "

@@ -91,9 +91,15 @@ def candidate_governance_blockers(
     `member_authoring_plans` and never showed them to the decision, which made the gate
     ceremonial — the Task 5 review's 4a).
 
-    * a retirement tombstone covering the candidate → ``FORMULA_DRAFT_RETIRED``;
+    * a retirement tombstone covering the candidate → ``FORMULA_DRAFT_RETIRED`` — UNLESS a
+      valid coupon NAMES the covering tombstone (the store would mint and advance under it;
+      round-3: a preview saying RETIRED for exactly the candidate the store admits is the
+      two-answers-by-route class), in which case the WARNING ``RETIREMENT_OVERRIDDEN`` is the
+      honest fact;
     * identity V2 active, a READY legacy V1 draft on this scope, LLM strategy, and no valid
       regeneration exception → ``LEGACY_REGENERATION_NOT_APPROVED``.
+
+    Returns ``(blockers, warnings)``.
     """
     from featuregen.overlay.upload.formula_draft_store import formula_identity
     from featuregen.overlay.upload.formula_strategy import FormulaStrategy as _FS
@@ -109,10 +115,20 @@ def candidate_governance_blockers(
         catalog_snapshot_hash=candidate.catalog_snapshot_hash,
         authoring_config_hash=config_hash,
         definition_revision=candidate.definition_revision)
+    warnings: list[str] = []
     covering = tombstone_covering(conn, scope_key=scope_key,
                                   formula_identity_hash=identity_hash)
     if covering is not None:
-        blockers.append("FORMULA_DRAFT_RETIRED")
+        override = valid_exception_for(
+            conn, target_formula_identity_hash=identity_hash,
+            provider_contract_hash=provider_contract_hash,
+            strategy_identity_hash=strategy_identity_hash,
+            covering_tombstone_id=covering.tombstone_id,
+            now=conn.execute("SELECT now()").fetchone()[0]) if provider_contract_hash else None
+        if override is not None:
+            warnings.append("RETIREMENT_OVERRIDDEN")
+        else:
+            blockers.append("FORMULA_DRAFT_RETIRED")
 
     if strategy is _FS.LLM_AUTHORED:
         legacy_ready = conn.execute(
@@ -129,7 +145,7 @@ def candidate_governance_blockers(
                 now=conn.execute("SELECT now()").fetchone()[0])
             if exception is None:
                 blockers.append("LEGACY_REGENERATION_NOT_APPROVED")
-    return tuple(blockers)
+    return tuple(blockers), tuple(warnings)
 
 
 def current_authoring_config(strategy_decision) -> tuple[str | None, dict[str, Any], str]:
@@ -393,18 +409,19 @@ def request_draft_for_candidate(
     # the plan preview reads — so the §5 fold is what refuses a retired or unapproved-legacy
     # candidate here, BEFORE the money guard and before any queue row. A gate that cannot refuse
     # is ceremonial; this one is not, and its refusal test authors nothing.
-    member_blockers = candidate_governance_blockers(
+    member_blockers, governance_warnings = candidate_governance_blockers(
         conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
         strategy_identity_hash=decision.strategy_identity_hash,
         provider_contract_hash=provider_contract, config_hash=config_hash,
         scope_key=scope_key)
+    member_warnings = tuple(decision.warnings) + governance_warnings
     decision_id, authoring_decision = decide(
         conn,
         ActionRequestV1(
             action=ActionV1.AUTHOR_FORMULA, resource_identity_hash=scope_key,
             member_names=(option_id,),
             member_blockers={option_id: member_blockers} if member_blockers else {},
-            member_warnings={option_id: tuple(decision.warnings)} if decision.warnings else {},
+            member_warnings={option_id: member_warnings} if member_warnings else {},
             evidence_pins=authoring_evidence_pins(
                 retirement_scope_key=scope_key,
                 catalog_snapshot_hash=candidate.catalog_snapshot_hash,
@@ -514,7 +531,9 @@ def request_draft_for_candidate(
         considered_revision_id=revision_id, option_id=option_id, created=created)
     return DraftRequestedV1(
         formula_draft_id=draft_id, created=created, strategy=decision.strategy,
-        warnings=tuple(decision.warnings), config_hash=config_hash, candidate=candidate,
+        # The FULL warning set — the resolver's route announcements AND the governance facts
+        # (RETIREMENT_OVERRIDDEN et al.): a warning computed and dropped is worse than none (D3).
+        warnings=member_warnings, config_hash=config_hash, candidate=candidate,
         action_decision_revision_id=decision_id)
 
 
