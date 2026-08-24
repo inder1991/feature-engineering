@@ -398,9 +398,11 @@ def test_every_existing_call_site_is_byte_identical(db) -> None:
     sites = _call_sites()
     seam = "src/featuregen/overlay/upload/enrich_llm.py"
     callers = {module for module, _line, _name, _kw in sites} - {seam}
-    # 13 distinct caller modules / 14 call sites outside the seam module itself (the plan said 12).
-    assert len(callers) == 13, sorted(callers)
-    assert len([s for s in sites if s[0] != seam]) == 14
+    # 14 distinct caller modules / 15 call sites outside the seam module itself (the plan said 12;
+    # 13/14 before S1C-3 added the shadow parameter chooser, overlay/upload/param_choice.py — a
+    # schema-only caller that passes no validate_semantics).
+    assert len(callers) == 14, sorted(callers)
+    assert len([s for s in sites if s[0] != seam]) == 15
 
     passing = {(module, name) for module, _line, name, kwargs in sites
                if "validate_semantics" in kwargs}

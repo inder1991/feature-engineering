@@ -31,6 +31,7 @@ from tests.featuregen.overlay.upload.contract.test_governed_lens_requests import
 )
 
 import featuregen.overlay.upload.governed_telemetry_worker as worker_module
+from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.gate1 import persist_intent
 from featuregen.overlay.upload.contract.intake import submit_intent
@@ -62,12 +63,18 @@ from featuregen.overlay.upload.governed_telemetry_worker import (
     demands_for_rejection,
     run_governed_telemetry_once,
 )
+from featuregen.overlay.upload.param_choice import (
+    PARAM_CHOICE_PROMPT_VERSION,
+    PARAM_CHOICE_TASK,
+    param_choice_content_address,
+)
 from featuregen.overlay.upload.planner.contracts import (
     READ_SCOPE_POLICY_VERSION as _POLICY_VERSION,
 )
 from featuregen.overlay.upload.planner.contracts import (
     ROLE_RESOLUTION_VERSION as _ROLE_VERSION,
 )
+from featuregen.overlay.upload.recipe_contract_v2 import day_window_parameter
 from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES, v2_recipe_by_id
 
 _NOW = datetime(2026, 7, 14, tzinfo=UTC)
@@ -725,3 +732,125 @@ def test_the_request_cap_drops_deterministically_and_counts_the_drop(db, monkeyp
     assert summary["planned"] == 1              # the kept recipe id is unknown here, so stale
     kept = {row["canonical_definition_id"] for row in _observations(db, run_id)}
     assert kept == {twin.source_definition_id, "zz_recipe_0"}
+
+
+# ── 7. the shadow parameter chooser (S1C-3): evaluation-only, injected, default OFF ───────────
+
+
+def _chooser_client(pick: str = "90") -> FakeLLM:
+    return FakeLLM(script={PARAM_CHOICE_TASK: FakeResponse(output={"pick": pick})})
+
+
+class _ExplodingChooserClient:
+    """A provider that is DOWN — the chooser must degrade to honest absence, never fail the item."""
+
+    def call(self, request):
+        raise RuntimeError("billing exhausted")
+
+
+def _rows_modulo_lineage(db, run_id) -> list[dict]:
+    """Observation rows with the lineage-minted columns dropped, so two runs of IDENTICAL frozen
+    inputs under two lineages can be compared byte for byte."""
+    lineage = {"observation_id", "generation_run_id", "intent_id", "recorded_at"}
+    return [{k: v for k, v in row.items() if k not in lineage}
+            for row in _observations(db, run_id)]
+
+
+def test_no_chooser_is_byte_identical_and_the_default_is_no_chooser(db):
+    """THE pin for default-off: the historical call shape (no kwarg) and an explicit
+    ``param_chooser=None`` write byte-identical observation rows — and neither carries a chooser
+    entry, so the no-chooser path is provably today's behavior."""
+    _two_catalogs(db)
+    intent_a, run_a = _lineage(db)
+    _enqueue(db, run_id=run_a, intent=intent_a, recipe_ids=[RECIPE_ID])
+    run_governed_telemetry_once(db, owner=_OWNER, now=_NOW)          # the call everywhere today
+
+    intent_b, run_b = _lineage(db)
+    _enqueue(db, run_id=run_b, intent=intent_b, recipe_ids=[RECIPE_ID])
+    run_governed_telemetry_once(db, owner=_OWNER, now=_NOW, param_chooser=None)
+
+    rows_a, rows_b = _rows_modulo_lineage(db, run_a), _rows_modulo_lineage(db, run_b)
+    assert rows_a == rows_b
+    assert rows_a, "the pin must compare real rows"
+    assert all(entry.get("source") != "chooser"
+               for row in rows_a for entry in row["param_divergence"])
+
+
+def test_the_chooser_entry_rides_beside_the_token_match_never_replacing_it(db):
+    """With a chooser injected, the recipe-origin row carries BOTH divergence sources: the
+    token-match entry in its EXACT existing shape, and the chooser entry appended beside it with
+    the pick, the closed status, the content address and the agreement verdict."""
+    _two_catalogs(db)
+    intent, run_id = _lineage(db)          # hypothesis names 90 days; the primary variant binds 30
+    twin = _intent_request(v2_recipe_by_id(RECIPE_ID))
+    _enqueue(db, run_id=run_id, intent=intent, recipe_ids=[RECIPE_ID], intent_requests=[twin])
+
+    summary = run_governed_telemetry_once(db, owner=_OWNER, now=_NOW,
+                                          param_chooser=_chooser_client("90"))
+    assert summary["status"] == "done"
+
+    rows = _observations(db, run_id)
+    recipe = v2_recipe_by_id(RECIPE_ID)
+    primary = dict(planning_request_from_recipe(recipe).parameter_values)
+    divergence = _by_id(rows, RECIPE_ID)["param_divergence"]
+    token_entries = [e for e in divergence if e.get("source") != "chooser"]
+    chooser_entries = [e for e in divergence if e.get("source") == "chooser"]
+    # additive only: the token-match entry keeps its exact pre-chooser shape
+    assert token_entries == [{"parameter": "window", "hypothesis_implied": "90d",
+                              "primary_value": f"{int(primary['window'])}d"}]
+    menu = tuple(str(v) for v in day_window_parameter(recipe).allowed_values)
+    assert chooser_entries == [{
+        "parameter": "window", "source": "chooser", "pick": "90", "status": "chosen",
+        "content_address": param_choice_content_address(
+            parameter="window", menu=menu, hypothesis=intent.redacted_hypothesis),
+        "prompt_version": PARAM_CHOICE_PROMPT_VERSION,
+        "primary_value": f"{int(primary['window'])}d",
+        "agrees_with_hypothesis_tokens": True,
+    }]
+    # intent-origin rows get NO chooser entry: an intent carries its own parameters already
+    intent_divergence = _by_id(rows, twin.source_definition_id)["param_divergence"]
+    assert all(e.get("source") != "chooser" for e in intent_divergence)
+
+
+def test_a_chooser_disagreeing_with_the_tokens_is_recorded_false(db):
+    """The measurement the whole task exists for: the chooser's pick against the hypothesis's own
+    token-implied window, recorded per observation."""
+    _two_catalogs(db)
+    intent, run_id = _lineage(db)          # hypothesis names 90 days
+    _enqueue(db, run_id=run_id, intent=intent, recipe_ids=[RECIPE_ID])
+    run_governed_telemetry_once(db, owner=_OWNER, now=_NOW, param_chooser=_chooser_client("180"))
+
+    (entry,) = [e for e in _by_id(_observations(db, run_id), RECIPE_ID)["param_divergence"]
+                if e.get("source") == "chooser"]
+    assert (entry["pick"], entry["status"]) == ("180", "chosen")
+    assert entry["agrees_with_hypothesis_tokens"] is False
+
+
+def test_a_windowless_hypothesis_records_none_for_agreement(db):
+    """No token-implied window means agreement is UNMEASURABLE — None, never a fabricated bool."""
+    _two_catalogs(db)
+    intent, run_id = _lineage(db, hypothesis="dormant accounts are quietly closing")
+    _enqueue(db, run_id=run_id, intent=intent, recipe_ids=[RECIPE_ID])
+    run_governed_telemetry_once(db, owner=_OWNER, now=_NOW, param_chooser=_chooser_client("90"))
+
+    (entry,) = [e for e in _by_id(_observations(db, run_id), RECIPE_ID)["param_divergence"]
+                if e.get("source") == "chooser"]
+    assert entry["status"] == "chosen"
+    assert entry["agrees_with_hypothesis_tokens"] is None
+
+
+def test_a_chooser_provider_failure_degrades_and_the_item_still_completes(db):
+    """Fail-soft end to end: a provider that is down yields an honest ``unavailable`` entry (empty
+    pick, agreement None — no pick means agreement is unmeasurable) and the work item completes
+    ``done`` exactly as if the chooser had answered."""
+    _two_catalogs(db)
+    intent, run_id = _lineage(db)
+    _enqueue(db, run_id=run_id, intent=intent, recipe_ids=[RECIPE_ID])
+    summary = run_governed_telemetry_once(db, owner=_OWNER, now=_NOW,
+                                          param_chooser=_ExplodingChooserClient())
+    assert summary["status"] == "done"
+
+    (entry,) = [e for e in _by_id(_observations(db, run_id), RECIPE_ID)["param_divergence"]
+                if e.get("source") == "chooser"]
+    assert (entry["status"], entry["pick"]) == ("unavailable", "")
+    assert entry["agrees_with_hypothesis_tokens"] is None

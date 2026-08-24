@@ -1582,6 +1582,14 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                 "required": ["template_id", "param", "value"]}},
         },
         "required": ["choices"]},
+    # S1C-3 — the SHADOW V2 parameter chooser's single-pick shape: exactly one string field. The
+    # closed-selection check (pick ∈ menu) runs CODE-SIDE after the call — a per-menu enum cannot
+    # ride here because the registry registers static bodies — and an off-menu answer is recorded
+    # `invalid_pick`, never trusted.
+    ("param_choice_pick", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"pick": {"type": "string", "maxLength": 64}},
+        "required": ["pick"]},
     # SE-6 — abstract feature intents: meaning WITHOUT columns. The schema carries NO field that
     # could name physical data (no table/column/ref/SQL fields exist to fill), vocabularies are
     # enum-closed where the contract's are, and every item is re-parsed code-side through the

@@ -414,3 +414,28 @@ class RecipeDefinitionV2:
                      "a model output is not a deterministic formula (BR-7A owns its spec)")
             _require(bool(self.model_feature_ref.strip()),
                      "a governed model output must reference its ModelFeatureSpec")
+
+
+def day_window_parameter(recipe: RecipeDefinitionV2) -> ParameterSpecV2 | None:
+    """The recipe's day-scale ``window`` parameter, or None.
+
+    None is a real answer: a minute-scale recipe (``window_minutes``) and a windowless one both
+    have no day window — nothing to diverge from, nothing for a chooser to choose. THE shared
+    definition: the S1C-1 corpus floors and S1C-3's chooser measurement both read this, so
+    "which recipes have a day window" cannot drift between the ground truth and the metric."""
+    for parameter in recipe.parameters:
+        if parameter.name == "window" and parameter.allowed_values:
+            return parameter
+    return None
+
+
+def primary_window_days(recipe: RecipeDefinitionV2) -> int | None:
+    """``allowed_values[0]`` of the day-window parameter, or None — "the primary window of a
+    recipe". First-in-list IS the authored default (``planning_request_from_recipe`` resolves an
+    omitted parameter to exactly this value, pinned by test), so the corpus floors and the
+    telemetry worker's request-bound primary provably agree."""
+    parameter = day_window_parameter(recipe)
+    if parameter is None:
+        return None
+    value = parameter.allowed_values[0]
+    return value if isinstance(value, int) and not isinstance(value, bool) else None

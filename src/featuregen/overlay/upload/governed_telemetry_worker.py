@@ -75,9 +75,15 @@ from featuregen.overlay.upload.governed_scope_material import (
     governed_scope_material,
     planning_request_from_frozen,
 )
+from featuregen.overlay.upload.param_choice import (
+    PARAM_CHOICE_PROMPT_VERSION,
+    STATUS_CHOSEN,
+    choose_parameter,
+)
 from featuregen.overlay.upload.planner.contracts import ReasonCode
 from featuregen.overlay.upload.planner.declarations import CompileBudget
 from featuregen.overlay.upload.planner.shadow import COMPILE_BUDGET, MAX_COMPILES_PER_RUN
+from featuregen.overlay.upload.recipe_contract_v2 import day_window_parameter
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
 from featuregen.overlay.upload.semantic_eligibility import clears
 
@@ -145,7 +151,8 @@ class _Restored:
 
 
 def run_governed_telemetry_once(conn: DbConn, *, owner: str,
-                                now: datetime | None = None) -> dict | None:
+                                now: datetime | None = None,
+                                param_chooser=None) -> dict | None:
     """Claim one outbox item, restore its frozen inputs, plan, record observations + demand,
     complete. Returns a summary dict, or None when nothing was claimable.
 
@@ -153,6 +160,12 @@ def run_governed_telemetry_once(conn: DbConn, *, owner: str,
     integrity error is THIS ITEM's failure (``complete_telemetry_work(ok=False)``, which is
     terminal by S1B-1's ruling — a failure worth re-running is re-enqueued deliberately, with its
     own frozen inputs, never silently re-attempted under inputs nobody re-checked).
+
+    ``param_chooser`` (S1C-3) is the INJECTED provider client for the shadow parameter chooser —
+    evaluation-only: its picks land in ``param_divergence`` beside the token-match entry and are
+    never served. ``None`` (the default everywhere today) is chooser-off, byte-identical to the
+    pre-chooser worker. The worker still reads NO environment: whatever scheduler constructs a
+    real chooser resolves the flag and the API key outside and hands the client in.
     """
     item = claim_telemetry_work(conn, owner=owner)
     if item is None:
@@ -165,7 +178,8 @@ def run_governed_telemetry_once(conn: DbConn, *, owner: str,
     discarded = 0
     try:
         with conn.transaction():
-            summary = {**base, **_process_item(conn, item, now=now), "status": "done"}
+            summary = {**base, **_process_item(conn, item, now=now,
+                                               param_chooser=param_chooser), "status": "done"}
             discarded = summary["observations"]
             if not complete_telemetry_work(conn, work_item_id=work_item_id, owner=owner,
                                            fence=fence, ok=True):
@@ -190,7 +204,8 @@ def run_governed_telemetry_once(conn: DbConn, *, owner: str,
 # ── one item ──────────────────────────────────────────────────────────────────────────────────
 
 
-def _process_item(conn: DbConn, item: dict, *, now: datetime | None) -> dict:
+def _process_item(conn: DbConn, item: dict, *, now: datetime | None,
+                  param_chooser=None) -> dict:
     frozen = dict(item["frozen_inputs"] or {})
     version = str(frozen.get("frozen_inputs_version") or "")
     if version != FROZEN_INPUTS_VERSION:
@@ -245,6 +260,11 @@ def _process_item(conn: DbConn, item: dict, *, now: datetime | None) -> dict:
                         and _signature(entry.request) in corroborating)
         divergence = (_param_divergence(entry.request, hypothesis)
                       if entry.request.origin == DEFINITION_ORIGIN_RECIPE_V2 else [])
+        if param_chooser is not None and entry.request.origin == DEFINITION_ORIGIN_RECIPE_V2:
+            chooser_entry = _chooser_divergence_entry(
+                conn, request=entry.request, hypothesis=hypothesis, llm=param_chooser)
+            if chooser_entry is not None:
+                divergence = [*divergence, chooser_entry]
         if option is not None:
             rows.append(_resolved_row(option, common=common, corroborated=corroborated,
                                       divergence=divergence))
@@ -764,6 +784,19 @@ def _days(text: str) -> int | None:
     return int(match.group(1)) * _UNIT_DAYS[match.group(2).lower()]
 
 
+def _bound_window_days(request: FeaturePlanningRequestV1) -> int | None:
+    """THE primary-window lookup: the request's own resolved ``window`` parameter, normalized to
+    days. ONE derivation — the token-match divergence and the S1C-3 chooser entry both read this,
+    so "the primary value" cannot mean two different things on one observation row. (For a
+    recipe-origin request this is provably the recipe's ``allowed_values[0]`` —
+    ``planning_request_from_recipe`` resolves an omitted parameter to exactly that, pinned by
+    test — which is the same definition the S1C-1 corpus floors use.)"""
+    bound = next((value for name, value in request.parameter_values if name == "window"), None)
+    if bound is None:
+        return None
+    return _days(f"{bound}d") if str(bound).isdigit() else _days(str(bound))
+
+
 def _param_divergence(request: FeaturePlanningRequestV1, hypothesis: str) -> list[dict]:
     """R21 — did the person's own words imply a window the primary variant does not bind?
 
@@ -773,14 +806,49 @@ def _param_divergence(request: FeaturePlanningRequestV1, hypothesis: str) -> lis
     implied = _days(hypothesis)
     if implied is None:
         return []
-    bound = next((value for name, value in request.parameter_values if name == "window"), None)
-    if bound is None:
-        return []
-    primary = _days(f"{bound}d") if str(bound).isdigit() else _days(str(bound))
+    primary = _bound_window_days(request)
     if primary is None or primary == implied:
         return []
     return [{"parameter": "window", "hypothesis_implied": f"{implied}d",
              "primary_value": f"{primary}d"}]
+
+
+def _chooser_divergence_entry(conn: DbConn, *, request: FeaturePlanningRequestV1,
+                              hypothesis: str, llm) -> dict | None:
+    """S1C-3 — the shadow chooser's ``param_divergence`` entry for one RECIPE-origin request.
+
+    Evaluation-only and strictly ADDITIVE: it rides beside the token-match entry (whose shape is
+    untouched) and is never served. None when there is nothing to measure — the recipe left the
+    registry mid-item, has no day-window menu, or binds no day-scale primary — because a chooser
+    verdict over a menu that does not exist would be a fabricated measurement.
+
+    ``agrees_with_hypothesis_tokens`` is the accuracy join: the chooser's pick against the SAME
+    token-derived window the divergence regex found. None when the hypothesis names no window OR
+    the chooser produced no pick (``invalid_pick``/``unavailable``) — absence is not agreement and
+    not disagreement."""
+    definition = v2_recipe_by_id(request.source_definition_id)
+    if definition is None:
+        return None
+    parameter = day_window_parameter(definition)
+    if parameter is None:
+        return None
+    primary = _bound_window_days(request)   # the ONE primary-window lookup, reused
+    if primary is None:
+        return None
+    menu = tuple(str(value) for value in parameter.allowed_values)
+    choice = choose_parameter(conn, llm=llm, hypothesis=hypothesis,
+                              parameter=parameter.name, menu=menu)
+    implied = _days(hypothesis)
+    agrees: bool | None = None
+    if implied is not None and choice.status == STATUS_CHOSEN:
+        pick_days = (_days(f"{choice.pick}d") if choice.pick.isdigit()
+                     else _days(choice.pick))
+        agrees = pick_days == implied
+    return {"parameter": parameter.name, "source": "chooser", "pick": choice.pick,
+            "status": choice.status, "content_address": choice.content_address,
+            "prompt_version": PARAM_CHOICE_PROMPT_VERSION,
+            "primary_value": f"{primary}d",
+            "agrees_with_hypothesis_tokens": agrees}
 
 
 __all__: list[str] = [

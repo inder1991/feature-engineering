@@ -39,7 +39,7 @@ from featuregen.overlay.upload.hypothesis_corpus import (
     load_hypothesis_corpus,
     parse_hypothesis_corpus,
 )
-from featuregen.overlay.upload.recipe_contract_v2 import RecipeDefinitionV2
+from featuregen.overlay.upload.recipe_contract_v2 import primary_window_days
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
 from featuregen.overlay.upload.taxonomy.dimensions import known_entities
 
@@ -212,16 +212,10 @@ def test_validation_is_all_or_nothing() -> None:
 # ══ 2. the seed sweep ════════════════════════════════════════════════════════════════════════════
 
 
-def _primary_window_days(recipe: RecipeDefinitionV2) -> int | None:
-    """``ParameterSpecV2.allowed_values[0]`` of the recipe's day-window parameter, or None.
-
-    None is a real answer: a minute-scale recipe (``window_minutes``) and a windowless one both
-    have no day window to diverge FROM, so neither can evidence a parameter divergence."""
-    for parameter in recipe.parameters:
-        if parameter.name == "window" and parameter.allowed_values:
-            value = parameter.allowed_values[0]
-            return int(value) if isinstance(value, int) else None
-    return None
+# "The primary window of a recipe" is now ONE shared definition —
+# ``recipe_contract_v2.primary_window_days`` (allowed_values[0] of the day-window parameter) —
+# promoted in S1C-3 so these corpus floors and the telemetry worker's chooser measurement cannot
+# silently diverge on what "primary" means.
 
 
 @pytest.fixture(scope="module")
@@ -294,7 +288,7 @@ def test_the_seed_covers_the_parameter_divergence_axis(
         if not entry.implied_windows_days:
             continue
         primaries = {window for window in
-                     (_primary_window_days(v2_recipe_by_id(rid))  # type: ignore[arg-type]
+                     (primary_window_days(v2_recipe_by_id(rid))  # type: ignore[arg-type]
                       for rid in entry.expected_recipe_ids)
                      if window is not None}
         if primaries and not primaries.issubset(set(entry.implied_windows_days)):
