@@ -54,9 +54,11 @@ _PROPOSAL_V2_NODE: dict = {
 #: diagnosed with, because both inherit the same bare-enum idiom from their proposal ``$defs``
 #: (``"type": {"enum": [...]}`` with no ``"type"`` keyword). Legal JSON Schema; refused by the
 #: provider's structured-output subset, which requires every subschema to declare what it is.
-#: Fifteen of them here. Purely additive — the members already state the type — and the canonical
-#: ``proposal_v2.schema.json`` is still never touched. See ``turns_v3.py`` for the live diagnostic
-#: this came out of, and for why the transform is applied per DEFINITION rather than to ``$defs``.
+#: Fifteen of them here (46 across v1/v2/v3). Purely additive to VALIDATION — the members already
+#: state the type — and the canonical ``proposal_v2.schema.json`` is still never touched.
+#: ▲ It DOES move v2's ``schema_content_hash`` and every identity derived from it, exactly as it
+#: moves v3's. See ``turns_v3.py`` for the live diagnostic this came out of, for the identity
+#: consequence in full, and for why the transform is applied per DEFINITION rather than to ``$defs``.
 _PROPOSAL_V2_DEFS: dict = {
     _name: declare_enum_types(_node) for _name, _node in {
         **_proposal_v2["$defs"],

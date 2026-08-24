@@ -11,12 +11,20 @@ every subschema to declare a type, so the provider refused the whole schema. Bec
 property was literally NAMED ``type`` (``$defs.typedLiteral.properties.type``), the 400's
 ``keyword=type`` read as a keyword misattribution rather than as the plain statement of fact it was.
 
-The 2026-08-14 ratchet in ``test_schema_projection.py`` swept the enrichment registry and passed
-throughout, because it asked ``provider_incompatibilities`` — which counted ``enum`` as one of the
-keys that make a node dispatchable, and so shared the exact blind spot. **That is why the walker
-below is written out here rather than imported.** A pin that asks the production checker whether the
-production checker is right can only ever confirm it; this one is an independent statement of the
-subset's invariants, and it fails whether or not ``schema_projection`` agrees.
+**TWO blind spots let it through, and the order matters.** The decisive one was COVERAGE: the
+2026-08-14 ratchet in ``test_schema_projection.py`` and the fail-closed bootstrap guard in
+``enrich_llm.register_enrichment_schemas`` both iterate ``enrich_llm._SCHEMAS``, and that registry
+contains no ``formula_author_turn*`` id — the author turn schemas were audited by NOTHING, so no
+detector ever got the chance to be wrong about them. The second, real but downstream, was
+DETECTION: ``provider_incompatibilities`` counted ``enum`` among the keys that make a node
+dispatchable, so it would have passed a bare enum even had the sweep reached one. This module fixes
+the first (it sweeps every provider-bound schema in the build, from the closed registries wherever
+one exists) and ``schema_projection`` fixes the second.
+
+**That is also why the walker below is written out here rather than imported.** A pin that asks the
+production checker whether the production checker is right can only ever confirm it; this one is an
+independent statement of the subset's invariants, and it fails whether or not ``schema_projection``
+agrees.
 
 The three invariants asserted, and how far each is actually EVIDENCED:
   * **enums are typed** — verified against the live provider (the 400 above).
@@ -194,12 +202,34 @@ def test_a_dispatchable_node_is_never_flagged():
     (["string", "integer", "decimal"], "string"),
     ([1, -1], "integer"),
     ([True, False], "boolean"),
+    ([1.5, 2.5], "number"),
+    ([1, 2.5], "number"),        # any float present → the honest declaration is the wider one
+    ([None], "null"),
 ])
 def test_projection_declares_the_type_a_bare_enum_already_implies(members, declared):
     """Layer 2 of the fix: the members already say what the type is, so the wire says it too.
     Purely additive — the set of accepted values is identical before and after."""
     out = project_for_anthropic({"type": "object", "properties": {"f": {"enum": list(members)}}})
     assert out["properties"]["f"] == {"type": declared, "enum": list(members)}
+
+
+def test_an_x_wire_enum_lands_on_the_wire_TYPED_even_on_an_untyped_node():
+    """▲ **THE SECOND DOOR** — the one this outage class could have walked straight back through.
+
+    `x-wire-enum` MINTS an `enum` during projection (step 3c), lifting a vocabulary onto a node
+    whose canonical form deliberately carries none. The first cut of this fix declared enum types
+    at step 1b, upstream of that swap, so a vocabulary lifted onto a node with no `"type"` of its
+    own arrived at the provider as a bare enum — the exact shape that 400ed every author call, re-
+    entering through the one other door in the module. The declaration now runs downstream of both
+    producers. No canonical schema uses this combination today; the point is that it cannot become
+    an outage the day one does.
+    """
+    wire = project_for_anthropic(
+        {"type": "object", "additionalProperties": False,
+         "properties": {"role": {"x-wire-enum": ["a", "b"]}}})
+    assert wire["properties"]["role"] == {"type": "string", "enum": ["a", "b"]}
+    assert provider_subset_violations(wire) == []
+    assert provider_incompatibilities(wire) == []
 
 
 def test_projection_leaves_a_mixed_enum_alone_rather_than_guessing():
@@ -241,6 +271,46 @@ def test_the_author_turn_schemas_declare_their_enum_types_at_rest():
         "type": "integer", "enum": [1, -1]}
 
 
+#: The ``schema_content_hash`` each author turn schema currently mints, frozen by VALUE.
+#: Recomputed 2026-08-24 when the type declarations landed; both moved, which is the whole point of
+#: the pin below.
+AUTHOR_TURN_SCHEMA_CONTENT_HASHES = {
+    "v2": "160c5b6eae0350ee1fe3db9239d84e94637170125d8ff4a1be1bc544ce3ff050",
+    "v3": "c6fed4125eb200ba6e6b45dee059cc45137d0ac880a19a6cd2e873d90473eede",
+}
+
+
+def test_editing_an_author_turn_schema_is_an_identity_moving_act():
+    """▲ **THE PRICE OF LAYER 1, PINNED SO IT CANNOT BE PAID BY ACCIDENT.**
+
+    ``freeze_provider_contract`` hashes the schema BYTES into ``schema_content_hash``, which feeds
+    ``contract_hash`` → ``authoring_config_hash`` → ``formula_identity``. So ANY edit to these
+    schemas — including one as innocent-looking as declaring the type an enum already implies —
+    re-mints the identity of the entire LLM authoring lane. Layer 2 alone (a wire-only projection)
+    would have fixed the outage and moved nothing; layer 1 was chosen anyway, because a recorded
+    schema that misdescribes what was sent is the same confidence-without-warrant this program
+    exists to remove. That is a trade, and a trade has to be made on purpose.
+
+    **If this test fails, do not just paste the new hash in.** Confirm the schema edit was intended,
+    update the value here, and write the operator note — the plan doc's T11 OPERATOR CONSEQUENCES
+    section records what moves downstream (sealed shadow work items drift, in-flight regeneration
+    coupons become unredeemable, EXACT-draft tombstones stop covering this lane). The same
+    discipline T1's vocabulary freeze runs under.
+    """
+    from featuregen.formula.frozen_configuration import _canonical_bytes, _hash_bytes
+    from featuregen.formula.turns_v2 import AUTHOR_TURN_V2_SCHEMA
+    from featuregen.formula.turns_v3 import AUTHOR_TURN_V3_SCHEMA
+
+    minted = {
+        "v2": _hash_bytes(_canonical_bytes(dict(AUTHOR_TURN_V2_SCHEMA))),
+        "v3": _hash_bytes(_canonical_bytes(dict(AUTHOR_TURN_V3_SCHEMA))),
+    }
+    assert minted == AUTHOR_TURN_SCHEMA_CONTENT_HASHES, (
+        "an author turn schema changed, which re-mints authoring identity for the whole LLM lane "
+        "(schema_content_hash → contract_hash → authoring_config_hash → formula_identity). Read "
+        "this test's docstring before updating the frozen values.")
+
+
 def test_the_canonical_proposal_schemas_are_still_never_touched():
     """``turns_v2``/``turns_v3`` both promise it in as many words: the strict
     ``proposal_v*.schema.json`` that ``parse_proposal_v*`` loads is the one gate a proposal is
@@ -260,9 +330,14 @@ def test_the_canonical_proposal_schemas_are_still_never_touched():
 
 
 def test_the_bootstrap_guard_now_refuses_an_untyped_enum():
-    """``provider_incompatibilities`` fails closed at overlay bootstrap
-    (``register_enrichment_schemas``). It counted ``enum`` as dispatchable and so waved the author
-    schema's bare enums through for the whole life of the seam; it no longer does."""
+    """The SECOND blind spot, closed. ``provider_incompatibilities`` fails closed at overlay
+    bootstrap (``register_enrichment_schemas``) and counted ``enum`` as dispatchable, so a bare
+    enum read to it as a well-formed node.
+
+    It is worth being precise about what this did and did not cause: the bootstrap guard only ever
+    walked ``enrich_llm._SCHEMAS``, which holds no ``formula_author_turn*`` id, so it never saw the
+    schemas that were failing. Fixing the detector alone would have changed nothing; the sweep above
+    is what makes it able to speak. Both were real, and both are fixed."""
     # Closed objects, so the only thing either assertion can be reporting is the enum.
     assert provider_incompatibilities({
         "type": "object", "additionalProperties": False,

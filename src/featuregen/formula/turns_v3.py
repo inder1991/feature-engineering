@@ -67,12 +67,24 @@ _PROPOSAL_V3_NODE: dict = {
 #: REFUSES it: every subschema must declare what it is. Live diagnostic (draft
 #: ``fd_01M0SZTAJCQDR0KG4JPV16T9ZP``): every ``formula.author`` call this platform has ever made
 #: died with ``HTTP 400, keyword=type`` on ``typedLiteral.properties.type`` and
-#: ``parameterDecl.properties.type`` — sixteen such enums in this schema — and the error read as a
-#: keyword misattribution only because the offending property is itself NAMED ``type``.
+#: ``parameterDecl.properties.type`` — SEVENTEEN such enums in this schema (46 across v1/v2/v3),
+#: not the two the 400 happened to name — and the error read as a keyword misattribution only
+#: because the offending property is itself NAMED ``type``.
 #: ``project_for_anthropic`` now carries the same declaration for every schema on its way out; this
 #: is the belt to that braces, so the schema the audit RECORDS is honest and not only the wire form.
-#: Purely additive: a homogeneous enum's members already state the type, so nothing that validated
-#: before stops validating. The canonical ``proposal_v3.schema.json`` is still never touched.
+#: Purely additive to VALIDATION: a homogeneous enum's members already state the type, so nothing
+#: that validated before stops validating. The canonical ``proposal_v3.schema.json`` is untouched.
+#:
+#: ▲ **BUT IT IS NOT FREE, AND THE PRICE IS AN IDENTITY.** ``freeze_provider_contract`` hashes the
+#: schema BYTES, so this edit moves ``schema_content_hash`` → ``contract_hash`` →
+#: ``authoring_config_hash`` → ``formula_identity`` for BOTH v2 and v3. A wire-only fix (layer 2
+#: alone) would have left every identity untouched; layer 1 buys at-rest honesty by re-minting the
+#: whole LLM authoring lane. That was the right trade — a recorded schema that misdescribes what
+#: was sent is exactly the confidence-without-warrant this program exists to remove — but it is a
+#: DELIBERATE act, never a side effect. ``test_provider_schema_audit`` pins both hashes by value so
+#: the next edit here has to be one too, and the plan doc's T11 OPERATOR CONSEQUENCES records what
+#: moves downstream when it happens (sealed shadow work → ConfigurationDrifted, regeneration
+#: coupons unredeemable, EXACT-draft tombstones stop covering this lane).
 #: (Applied per DEFINITION: ``$defs`` is a name→schema map, not a schema node, so handing the
 #: container to a schema walker would traverse nothing at all — silently.)
 _PROPOSAL_V3_DEFS: dict = {
