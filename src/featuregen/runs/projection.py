@@ -746,7 +746,7 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
     judgement of "is this coupon valid" would be a second answer to a question the store already
     answers, and the two would disagree on the day one of them changed.
 
-    ▲ **TWO LOCAL MIRRORS ARE DELIBERATE, and neither is a second opinion.** This docstring used to
+    ▲ **THE LOCAL MIRRORS ARE DELIBERATE, and none is a second opinion.** This docstring used to
     claim the function "re-derives NOTHING", which was not true of the code beneath it:
 
     * **1107's index predicate** is spelled here as `NOT (state = ANY(_BOUGHT_NOTHING))`. The store
@@ -755,12 +755,15 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
       the money guard, the history fold and the run-detail loop all read. What defends it is the
       constant, not this comment: change the index and the constant moves, and every mirror moves
       with it.
-    * **The per-call worst-case arithmetic** (`ceil(max_tokens/max_calls)`, `max_cost/max_calls`) is
-      the dispatch seam's own bar, re-spelled because the seam applies it inside a reservation this
-      read must not make. What defends it is a coupling test the substrate side owns: the sliver
+    * **`_money_rides` and `_ridable_coupon`** mirror the store's gate closures structurally (no
+      exportable shared helper exists — each carries its own pointer to the original). The per-call
+      arithmetic itself is NOT a mirror any more: both surfaces call the one
+      `llm_spend.per_call_worst_case`. What defends the pair is this side's own pins — the sliver
       test (`test_a_SLIVER_remainder_refuses_on_the_PAGE_and_at_the_DOOR_alike`) puts a remainder
-      above zero and below one call's worth in front of BOTH surfaces and requires the same answer,
-      so a page that drifted back to a zero floor dies there rather than in production.
+      above zero and below one call's worth in front of BOTH surfaces, the last-token test holds
+      the shared arithmetic at the single remainder where floor and ceil disagree, and the
+      loop/consumed-coupon pins die if either surface stops asking the same questions in the same
+      order.
 
     Everything else — the withdrawal law, the coupon validity, the ceiling PICK — is a call.
 

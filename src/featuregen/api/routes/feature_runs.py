@@ -351,8 +351,10 @@ def retry_run_authoring(run_id: str, body: RetryAuthoringIn, conn: _Conn,
     seam now refuses a mint whose approved ceiling cannot cover ONE per-call worst-case
     reservation (`DraftCeilingExhausted` → 409 `COST_AUTHORIZATION_EXHAUSTED`) BEFORE consuming
     the coupon — so both doors refuse the same case with the same code, and this route's
-    pre-flight is an advisory that agrees by construction: same locator
-    (`approved_ceiling_for`), same bar (the dispatch seam's own per-call arithmetic).
+    pre-flight is an advisory that agrees by construction: the SAME pick (the coupon the mint
+    would consume, dead money skipped — `approved_ceiling_for` serves only the no-coupon doors
+    now) and the SAME bar (`llm_spend.per_call_worst_case`, the one arithmetic all three
+    surfaces call).
 
     THREE REPORTING differences remain, all reports rather than purchases and all in the
     conservative direction: on a database without the 1103/1105 substrate this door degrades to
