@@ -170,3 +170,88 @@ def test_refine_revises_the_meaning_through_the_engine(
     assert revised["generation_source"] == "llm_intent"        # honest origin
     assert revised.get("input_role_bindings"), "the BINDER chose the revised columns"
     assert body["regenerate_to_govern"] is True
+
+
+# ── T2 (F6): the refine route's needs-setup answer, and the sentence it gives ──────────────────
+
+def _twin_bank(conn) -> None:
+    """`_bank` plus a SECOND event-timestamp column, so one operand is a genuine unadjudicated
+    tie — the condition that is PRESENCE, not absence."""
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.enrich import content_hash
+    from featuregen.overlay.upload.graph import build_graph
+
+    catalog = [
+        (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True,
+                      entity="Customer"), "customer_id"),
+        (CanonicalRow("bank", "accounts", "event_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow("bank", "accounts", "posted_ts", "timestamp"), "event_timestamp"),
+    ]
+    build_graph(conn, "bank", [r for r, _ in catalog],
+                concepts={content_hash(r): c for r, c in catalog})
+
+
+def _refine(client, catalog_source="bank"):
+    return client.post("/features/refine", json={
+        "candidate": {"name": "activity_recency", "description": "days since last event",
+                      "derives_from": [], "aggregation": None, "grain_table": None},
+        "instruction": "make it deposits only", "catalog_source": catalog_source},
+        headers=AUTH)
+
+
+def test_refine_answers_200_and_says_no_column_carries_the_concept(make_client, conn):
+    """F6/F1 — the needs-setup branch of the route, which shipped untested.
+
+    An operand asking for a concept the catalog does not carry is NOT a refusal: nothing is
+    wrong with the revision, the data is not there. The route answers 200 with the binder's own
+    code and a sentence that says which of the three things actually happened."""
+    import sys
+    sys.path.insert(0, ".")
+    from tests.featuregen.api.test_semantic_v1_serving import _bank, _intent_payload
+
+    payload = _intent_payload()
+    # `securities_loan` is a producible concept the `_bank` catalog carries no column for.
+    payload["intents"][0]["operands"][1] = {
+        "role": "when", "concept": "securities_loan", "operand_class": "measure"}
+    _bank(conn)
+    res = _refine(make_client(llm_client=FakeLLM(script={
+        "overlay.feature.intents": FakeResponse(output=payload)})))
+
+    assert res.status_code == 200, res.text
+    rejected = res.json()["rejected"]
+    assert rejected["code"] == "REQUIRED_OPERAND_MISSING"
+    assert rejected["reason"] == (
+        "the revision did not bind: no read-scoped column carries securities_loan")
+    (entry,) = rejected["needs_setup"]
+    assert entry["unbound_concepts"] == ["securities_loan"]
+    (operand,) = entry["unbound_operands"]
+    assert operand["status"] == "unresolved"
+    assert operand["tied_refs"] == []          # a true absence has nothing to point at
+    assert operand["resolution"]               # and the binder's own remedy rides along
+
+
+def test_refine_says_a_tie_is_a_tie_and_never_calls_it_missing(make_client, conn):
+    """F1's headline, at the route: the catalog CARRIES this concept, on two columns, and the
+    honest answer names them. Saying "does not carry" here would send an operator to onboard
+    data that is already sitting in front of them."""
+    import sys
+    sys.path.insert(0, ".")
+    from tests.featuregen.api.test_semantic_v1_serving import _intent_payload
+
+    _twin_bank(conn)
+    res = _refine(make_client(llm_client=FakeLLM(script={
+        "overlay.feature.intents": FakeResponse(output=_intent_payload())})))
+
+    assert res.status_code == 200, res.text
+    rejected = res.json()["rejected"]
+    (entry,) = rejected["needs_setup"]
+    (operand,) = entry["unbound_operands"]
+    assert operand["concept"] == "event_timestamp"
+    assert operand["status"] == "ambiguous"
+    assert sorted(operand["tied_refs"]) == ["public.accounts.event_ts",
+                                            "public.accounts.posted_ts"]
+    assert rejected["reason"] == (
+        "the revision did not bind: 2 columns carry event_timestamp and the tie is "
+        "unadjudicated: public.accounts.event_ts, public.accounts.posted_ts")
+    assert "does not carry" not in rejected["reason"]
+    assert rejected["code"] == "AMBIGUOUS_TIME_BINDING"

@@ -156,18 +156,21 @@ def _refine_as_intent_revision(conn, body, client, identity) -> dict:
         catalog_source=body.catalog_source, target_ref=body.target_ref)
     served = projection.ideas or projection.actionable_ideas
     if not served:
-        # T2: the revision may have failed for a reason that is not a REFUSAL at all — the
-        # instruction asked for a concept this catalog does not carry, so no card exists to
-        # return. Answering that with the generic "did not survive validation" would hide the
-        # one fact the analyst can act on, so the missing concepts and the binder's own code
-        # are what comes back. Still a 200: this is data the reviewer acts on, not an error.
+        # T2: the revision may have failed for a reason that is not a REFUSAL at all — an
+        # operand did not bind, so no card exists to return. Answering that with the generic
+        # "did not survive validation" would hide the one fact the analyst can act on.
+        #
+        # The sentence comes from the ENTRY, which words each operand from the binder's own
+        # status: no column carries it, several do and the tie is unadjudicated, or one matched
+        # and the evidence did not clear. Spelling it here instead would have re-asserted
+        # absence over an ambiguous operand — on the FTR fixture that is 36 of 66 of them.
+        # Still a 200: this is data the reviewer acts on, not an error.
         if projection.needs_setup:
             entry = projection.needs_setup[0]
             first = next((code for operand in entry.unbound_operands
                           for code in operand.reason_codes), "")
             return {"rejected": {
-                "reason": ("the revision needs a concept this catalog does not carry: "
-                           + ", ".join(entry.missing_concepts)),
+                "reason": f"the revision did not bind: {entry.sentence()}",
                 "code": first or "SEMANTIC_NOT_BINDABLE",
                 "needs_setup": [e.to_json() for e in projection.needs_setup]}}
         reject = projection.rejections[0] if projection.rejections else {

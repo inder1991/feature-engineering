@@ -28,8 +28,10 @@ of the live AML run (135 cards served on catalog ``cib``, SME-keep 0/135):
 
 * **A card is an offer to compute something.** A candidate with ANY unbound REQUIRED operand
   cannot compute, so it never reaches ``ideas``/``actionable_ideas`` — it goes to
-  :attr:`SemanticProjectionV1.needs_setup`, naming the concepts the catalog would have to carry.
-  390 of that run's 591 required operands were unbound.
+  :attr:`SemanticProjectionV1.needs_setup`, naming each unbound operand and what the binder
+  actually found for it — no column carries the concept, several do and the tie is
+  unadjudicated, or one matched and the evidence did not clear. 390 of that run's 591 required
+  operands were unbound.
 * **A badge states the corpus's truth.** ``verification`` is the WEAKER of the gauntlet's design
   verdict and the readiness rungs in hand — 132 of those cards came from ``FORMULA_BLOCKED``
   recipes and wore ``DESIGN-CHECKED`` because this module never read a readiness at all.
@@ -104,9 +106,17 @@ class UnboundOperandV1:
     """One REQUIRED operand this catalog could not bind, in the BINDER's own words.
 
     Every field is copied from a verdict the binder already produced — the concept the recipe
-    asked for, the status it reached, its reason codes and its named remedy. ``status`` is ``""``
-    when the binder emitted no verdict for the role at all: honest absence, not a guess, and the
-    fail-closed direction (a role nobody ruled on has certainly not bound)."""
+    asked for, the status it reached, its reason codes, the columns it was looking at, and its
+    named remedy. ``status`` is ``""`` when the binder emitted no verdict for the role at all:
+    honest absence, not a guess, and the fail-closed direction (a role nobody ruled on has
+    certainly not bound).
+
+    ``tied_refs`` is the field that keeps this honest. "Did not bind" is THREE conditions, and
+    only one of them is an absence: ``unresolved`` means no column carries the concept;
+    ``ambiguous`` means SEVERAL do and nobody has adjudicated between them; ``blocked`` means one
+    or more matched and the evidence did not clear. The last two are PRESENCE, and the refs are
+    the columns a human would be choosing between — dropping them turned "adjudicate this tie"
+    into "onboard this data", which is the wrong remedy given to the wrong owner."""
 
     role: str
     concept: str
@@ -114,11 +124,37 @@ class UnboundOperandV1:
     status: str                           # bound-less verdict status; "" = no verdict emitted
     reason_codes: tuple[str, ...]
     resolution: str
+    #: The columns the verdict was looking at — the tie's members, or the blocked candidates.
+    #: Empty for a true absence and for a role the binder never ruled on.
+    tied_refs: tuple[str, ...] = ()
 
     def to_json(self) -> dict:
         return {"role": self.role, "concept": self.concept,
                 "operand_class": self.operand_class, "status": self.status,
-                "reason_codes": list(self.reason_codes), "resolution": self.resolution}
+                "reason_codes": list(self.reason_codes), "resolution": self.resolution,
+                "tied_refs": list(self.tied_refs), "sentence": self.sentence()}
+
+    def sentence(self) -> str:
+        """What the binder ACTUALLY found, worded from its own status — never from the lane's
+        name. Every branch is a statement this seam can support from the verdict in hand."""
+        concept = self.concept
+        if not self.status:
+            return f"the binder returned no verdict for the {self.role!r} operand ({concept})"
+        if self.status == "ambiguous":
+            listed = ", ".join(self.tied_refs)
+            count = len(self.tied_refs)
+            return (f"{count} column{'s' if count != 1 else ''} carr"
+                    f"{'y' if count != 1 else 'ies'} {concept} and the tie is "
+                    f"unadjudicated: {listed}" if self.tied_refs else
+                    f"{concept} matched more than one column and the tie is unadjudicated")
+        if self.status == "blocked":
+            codes = ", ".join(self.reason_codes) or "no code given"
+            listed = ", ".join(self.tied_refs)
+            return (f"{concept} is carried by {listed} and the binding is blocked ({codes})"
+                    if self.tied_refs else
+                    f"{concept} matched and the binding is blocked ({codes})")
+        # `unresolved` — the ONE condition that is genuinely an absence.
+        return f"no read-scoped column carries {concept}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,27 +162,41 @@ class NeedsSetupCandidateV1:
     """T2 — a candidate held OUT of every served lane because a REQUIRED operand never bound.
 
     Deliberately NOT a card: it carries no computation, no requirements and no option identity,
-    because there is nothing here to offer, save or govern until the data exists. What it does
-    carry is what an operator can act on — WHICH concepts are missing, and the binder's own
-    remedy for each.
+    because there is nothing here to offer, save or govern until the binding is settled. What it
+    does carry is what an operator can act on — WHICH operands did not bind, what the binder
+    found for each, and the binder's own remedy.
 
     It names no OTHER catalog, on purpose. The projection is handed one assembled set and one
     catalog name; it takes no connection and holds no cross-catalog concept inventory, so
     "``monetary_flow`` lives in ``ftr``" is a claim it cannot make from anything it can see.
-    That refusal-with-directions is T5's, which plans with the inventory in hand."""
+    That refusal-with-directions is T5's, which plans with the inventory in hand.
+
+    The concept aggregate is deliberately named ``unbound_concepts`` and NOT ``missing``: on the
+    FTR fixture 36 of 66 unbound required operands are ``ambiguous`` — the catalog carries the
+    concept on several columns and nobody has adjudicated between them — so an aggregate whose
+    NAME says "missing" is false for more than half of them. The name states what every member
+    has in common (it did not bind) and leaves what the binder found to
+    :meth:`UnboundOperandV1.sentence`, which is keyed to its status."""
 
     name: str
     source_definition_id: str
     recipe_id: str | None
     catalog_source: str                   # the catalog this was PLANNED over, no other
-    missing_concepts: tuple[str, ...]     # authored operand order, deduped
+    unbound_concepts: tuple[str, ...]     # authored operand order, deduped; status-neutral
     unbound_operands: tuple[UnboundOperandV1, ...]
 
     def to_json(self) -> dict:
         return {"name": self.name, "source_definition_id": self.source_definition_id,
                 "recipe_id": self.recipe_id, "catalog_source": self.catalog_source,
-                "missing_concepts": list(self.missing_concepts),
-                "unbound_operands": [o.to_json() for o in self.unbound_operands]}
+                "unbound_concepts": list(self.unbound_concepts),
+                "unbound_operands": [o.to_json() for o in self.unbound_operands],
+                "sentence": self.sentence()}
+
+    def sentence(self) -> str:
+        """The candidate-level answer: one clause per unbound operand, each in the words its own
+        status earns. Built HERE so every surface that has to say this — the assist route today,
+        T9's lane tomorrow — says it the same way from the same facts."""
+        return "; ".join(operand.sentence() for operand in self.unbound_operands)
 
 
 def unbound_required_operands(candidate) -> tuple[UnboundOperandV1, ...]:
@@ -171,7 +221,8 @@ def unbound_required_operands(candidate) -> tuple[UnboundOperandV1, ...]:
             operand_class=operand.operand_class,
             status=(verdict.status if verdict is not None else ""),
             reason_codes=(tuple(verdict.reason_codes) if verdict is not None else ()),
-            resolution=(verdict.resolution if verdict is not None else "")))
+            resolution=(verdict.resolution if verdict is not None else ""),
+            tied_refs=(tuple(verdict.tied_refs) if verdict is not None else ())))
     return tuple(unbound)
 
 
@@ -183,7 +234,7 @@ def _needs_setup(candidate, unbound, catalog_source: str) -> NeedsSetupCandidate
                               or candidate.recipe_id),
         recipe_id=(candidate.recipe_id if request.origin == "recipe_v2" else None),
         catalog_source=catalog_source,
-        missing_concepts=tuple(dict.fromkeys(operand.concept for operand in unbound)),
+        unbound_concepts=tuple(dict.fromkeys(operand.concept for operand in unbound)),
         unbound_operands=unbound)
 
 
@@ -421,7 +472,19 @@ def project_assembled_set(assembled_set: AssembledSetV1, *, catalog_source: str,
 
     T2's rule runs FIRST in both loops, because it is the one that decides whether there is a
     card to be had at all: a candidate whose REQUIRED operands did not bind is setup work, and
-    setup work is neither a recommendation nor an option nor a refusal."""
+    setup work is neither a recommendation nor an option nor a refusal.
+
+    What each arm records in ``rejected_ids`` differs, and the difference is the DISPOSITION
+    family the fold lands on (``taxonomy.disposition.evaluate_dispositions``):
+
+    * the ACTIONABLE arm is unchanged — its candidates' codes rode ``rejected_ids`` before T2
+      and still do, so those ids fold exactly where they always did;
+    * the RANKED arm's belt records NOTHING. An id in ``rejected_ids`` folds to
+      ``SAFETY_REJECTED``, whose documented meaning is "it bound (grounding COMPLETED) but the
+      gauntlet refused it (safety FAILED)" — and a diverted candidate did neither. Recording
+      nothing puts it in the fold's ``else`` branch: grounding COMPLETED with ``no_binding``,
+      safety NOT_EVALUATED, ``UNBUILDABLE`` — "it was in scope and grounding ran, but nothing
+      bound", which is literally what happened."""
     ideas: list = []
     rejections: list = []
     grounded: set = set()
@@ -437,9 +500,11 @@ def project_assembled_set(assembled_set: AssembledSetV1, *, catalog_source: str,
         # a silent promotion, which is precisely the direction a fold must never move.
         unbound = unbound_required_operands(candidate)
         if unbound:
-            rejected[candidate.recipe_id] = tuple(dict.fromkeys(
-                code for operand in unbound for code in operand.reason_codes
-            )) or _NOT_BINDABLE
+            # Deliberately records NOTHING in `rejected` or `grounded`: the disposition fold
+            # reads those two, and either one would claim something that did not happen
+            # (SAFETY_REJECTED = bound then refused; ELIGIBLE = bound and passed). Saying
+            # nothing is what puts this candidate in UNBUILDABLE, the family whose documented
+            # meaning — "grounding ran, nothing bound" — is exactly true of it.
             needs_setup.append(_needs_setup(candidate, unbound, catalog_source))
             continue
         # B10: bound but at the WRONG unit of analysis — a visible actionable option with the

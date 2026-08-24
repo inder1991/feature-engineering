@@ -449,22 +449,30 @@ class SemanticEngineUnboundOperandV4Response(_Model):
     concept: str
     operand_class: str
     #: The binder's verdict status for this role; ``""`` when it emitted no verdict at all.
+    #: ``unresolved`` is the only one that means the concept is ABSENT — ``ambiguous`` and
+    #: ``blocked`` both mean the catalog carries it, and ``tied_refs`` names those columns.
     status: str
     reason_codes: list[str]
     resolution: str
+    tied_refs: list[str]
+    #: The operand's own answer, worded from its status — never from the lane's name.
+    sentence: str
 
 
 class SemanticEngineNeedsSetupV4Response(_Model):
     """T2 — why an entry carries no ``card``: a REQUIRED operand of this candidate never bound,
-    so there is no computation to offer. Names the concepts THIS catalog would have to carry;
-    it never names another catalog, because the projection holds no cross-catalog inventory."""
+    so there is no computation to offer. It never names another catalog, because the projection
+    holds no cross-catalog inventory."""
 
     name: str
     source_definition_id: str
     recipe_id: str | None
     catalog_source: str
-    missing_concepts: list[str]
+    #: Status-NEUTRAL: what these concepts have in common is that they did not bind, not that
+    #: they are absent. What the binder found rides each operand's own `status`/`sentence`.
+    unbound_concepts: list[str]
     unbound_operands: list[SemanticEngineUnboundOperandV4Response]
+    sentence: str
 
 
 class SemanticEngineEntryV4Response(_Model):

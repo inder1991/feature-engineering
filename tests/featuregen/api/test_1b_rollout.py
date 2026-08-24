@@ -181,8 +181,11 @@ def test_emergency_rollback_retains_scope_and_recognition_while_the_engine_still
     # carry it — on this catalog no candidate binds all of its required operands, so the
     # engine's honest answer is the needs-setup lane and every lens is empty. The engine's own
     # observation rows are the non-vacuous proof, and they are written only on its path.
+    # Scoped to THIS run: the unscoped contrast call above runs on the same connection, so a
+    # store-wide count would pass even if the scoped run had contributed nothing.
     assert conn.execute(
-        "SELECT count(*) FROM semantic_candidate_observation").fetchone()[0] > 0, \
+        "SELECT count(*) FROM semantic_candidate_observation WHERE generation_run_id = %s",
+        (scoped["generation_run_id"],)).fetchone()[0] > 0, \
         "the engine still runs under rollback"
     assert set(_served(unscoped)) == {"templates"}   # the legacy emergency path, unchanged
 

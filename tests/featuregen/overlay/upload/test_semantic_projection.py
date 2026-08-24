@@ -159,11 +159,17 @@ def test_an_unbound_required_operand_is_setup_work_never_a_card_and_never_hidden
     assert not result.actionable_ideas
     (entry,) = result.needs_setup
     assert entry.source_definition_id == "recipe:proj_probe"
-    assert entry.missing_concepts == ("customer_id",)
+    assert entry.unbound_concepts == ("customer_id",)
     (unbound,) = entry.unbound_operands
     assert unbound.role == "who"
     assert unbound.status == "blocked"                        # the honest state, on the entry
     assert unbound.resolution == "a human confirms the economic role"
+    # F1: the catalog DOES carry this concept — the verdict was looking straight at the column.
+    # The first cut dropped `tied_refs` and let an aggregate called `missing_concepts` say the
+    # opposite of what the binder found, which is the defect this whole task exists to remove.
+    assert unbound.tied_refs == ("public.events.customer_id",)
+    assert "public.events.customer_id" in unbound.sentence()
+    assert "no read-scoped column carries" not in unbound.sentence()
     assert R.ECONOMIC_ROLE_UNPROVEN in result.rejected_ids["recipe:proj_probe"]
 
 
@@ -204,14 +210,14 @@ def _cib_projection(db):
                                              catalog_source=CIB_SOURCE)
 
 
-def test_the_cib_arrangement_serves_no_card_and_names_the_missing_concepts(db):
+def test_the_cib_arrangement_serves_no_card_and_names_what_the_binder_found(db):
     """THE 135-noise-card failure shape, at the seam that produced it.
 
     The live AML run planned over a catalog with no monetary column and served 135 cards whose
     REQUIRED operands could never bind. Here the same arrangement in miniature: three of
     `net_transaction_flow`'s four operands bind, the measure does not, and the projection serves
-    NOTHING — the candidate goes to the typed `needs_setup` lane naming the concept the catalog
-    would have to carry."""
+    NOTHING — the candidate goes to the typed `needs_setup` lane, which says of THIS operand
+    what is true of it: no read-scoped column carries the concept."""
     _cib_catalog(db)
     candidates, result = _cib_projection(db)
 
@@ -230,18 +236,60 @@ def test_the_cib_arrangement_serves_no_card_and_names_the_missing_concepts(db):
     by_definition = {e.source_definition_id: e for e in result.needs_setup}
     flow = by_definition[f"{FLOW.recipe_id}@window=30"]
     assert flow.recipe_id == FLOW.recipe_id
-    assert flow.missing_concepts == ("monetary_flow",)
+    assert flow.unbound_concepts == ("monetary_flow",)
     (unbound,) = flow.unbound_operands
     assert (unbound.role, unbound.operand_class) == ("amount", "measure")
     assert unbound.status == "unresolved"
     assert "REQUIRED_OPERAND_MISSING" in unbound.reason_codes
     assert unbound.resolution                       # the binder's own named remedy, verbatim
+    # THIS operand really is an absence, and only this branch may say so.
+    assert unbound.tied_refs == ()
+    assert unbound.sentence() == "no read-scoped column carries monetary_flow"
+    assert flow.sentence() == unbound.sentence()    # one operand, one clause
+
+
+def test_a_diverted_ranked_candidate_folds_to_unbuildable_not_safety_rejected():
+    """F2 — the DISPOSITION family must mean what happened.
+
+    `rejected_ids` is one of two inputs the disposition fold reads, and an id in it folds to
+    SAFETY_REJECTED, documented as "it bound (grounding COMPLETED) but the gauntlet refused it".
+    A candidate diverted by T2's belt did neither: it never bound, and the gauntlet never ran on
+    it. The first cut recorded its codes there anyway, moving it ELIGIBLE -> SAFETY_REJECTED.
+    Recording NOTHING is what lands it in UNBUILDABLE — "in scope and grounding ran, but nothing
+    bound" — which is literally true of it."""
+    from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
+    from featuregen.overlay.upload.taxonomy.disposition import (
+        FinalDisposition,
+        evaluate_dispositions,
+    )
+
+    # A required role the binder never ruled on: `fold_binding_state` folds it as `bound`, so
+    # the candidate reaches the RANKED arm and only T2's belt catches it.
+    silent = _candidate(verdicts=(BOUND[1],), binding_state="bound")
+    result = _project([silent])
+    assert result.ideas == [] and result.actionable_ideas == []
+    (entry,) = result.needs_setup
+    assert [o.role for o in entry.unbound_operands] == ["who"]
+    assert entry.unbound_operands[0].status == ""      # the binder said nothing at all
+    # The belt recorded nothing in EITHER of the fold's two inputs.
+    assert "recipe:proj_probe" not in result.rejected_ids
+    assert "recipe:proj_probe" not in result.grounded_ids
+
+    applicability = ApplicabilityResult(
+        by_recipe={"recipe:proj_probe": "primary"},
+        eligible_ids=frozenset({"recipe:proj_probe"}),
+        reason_codes={"recipe:proj_probe": ("primary_match",)})
+    (evaluation,) = evaluate_dispositions(
+        applicability, result.grounded_ids, result.rejected_ids,
+        evaluation_version="probe", now="t0")
+    assert evaluation.final_disposition is FinalDisposition.UNBUILDABLE
+    assert evaluation.safety.reason_codes == ("no_binding",)
 
 
 def test_the_needs_setup_lane_names_no_catalog_it_cannot_see(db):
     """Honest absence, deliberately: the projection is handed one assembled set and one catalog
-    name — it holds no cross-catalog concept inventory and takes no connection — so the lane says
-    WHICH concepts are missing and never guesses which other catalog carries them. Naming the
+    name — it holds no cross-catalog concept inventory and takes no connection — so the lane
+    names the unbound operands and never guesses which other catalog carries them. Naming the
     other catalog is T5's refusal, which plans with the inventory in hand."""
     _cib_catalog(db)
     _candidates, result = _cib_projection(db)
@@ -249,6 +297,57 @@ def test_the_needs_setup_lane_names_no_catalog_it_cannot_see(db):
     assert entry.catalog_source == CIB_SOURCE       # the catalog it was PLANNED over, no other
     assert not hasattr(entry, "satisfying_catalog_source")
     assert not hasattr(entry, "available_in")
+
+
+def _unbound(status, **kw):
+    from featuregen.overlay.upload.semantic_projection import UnboundOperandV1
+
+    return UnboundOperandV1(role="who", concept="customer_id", operand_class="entity_key",
+                            status=status, reason_codes=kw.pop("reason_codes", ()),
+                            resolution=kw.pop("resolution", ""), **kw)
+
+
+def test_each_status_earns_its_own_sentence_and_only_absence_may_claim_absence():
+    """F1 — "did not bind" is THREE conditions and only ONE of them is an absence. The first cut
+    said "this catalog does not carry X" for all three; on the FTR fixture 36 of 66 unbound
+    required operands are `ambiguous`, i.e. the catalog carries the concept on several columns
+    and nobody has adjudicated between them. Each sentence is pinned to its status."""
+    absent = _unbound("unresolved", reason_codes=("REQUIRED_OPERAND_MISSING",))
+    assert absent.sentence() == "no read-scoped column carries customer_id"
+
+    tied = _unbound("ambiguous", reason_codes=("AMBIGUOUS_ENTITY_BINDING",),
+                    tied_refs=("public.a.cif_id", "public.b.cust_num"))
+    assert tied.sentence() == ("2 columns carry customer_id and the tie is unadjudicated: "
+                               "public.a.cif_id, public.b.cust_num")
+    assert "does not carry" not in tied.sentence()
+    assert "no read-scoped column" not in tied.sentence()
+
+    blocked = _unbound("blocked", reason_codes=(R.ECONOMIC_ROLE_UNPROVEN,),
+                       tied_refs=("public.a.cif_id",))
+    assert blocked.sentence() == ("customer_id is carried by public.a.cif_id and the binding "
+                                  "is blocked (ECONOMIC_ROLE_UNPROVEN)")
+    assert R.ECONOMIC_ROLE_UNPROVEN in blocked.sentence()   # the code's OWN language
+
+    silent = _unbound("")
+    assert silent.sentence() == (
+        "the binder returned no verdict for the 'who' operand (customer_id)")
+    # Not one of the four may be mistaken for another, and none of them invents a catalog.
+    said = {o.sentence() for o in (absent, tied, blocked, silent)}
+    assert len(said) == 4
+    assert not any("ftr" in sentence for sentence in said)
+
+
+def test_the_candidate_sentence_is_one_clause_per_unbound_operand():
+    from featuregen.overlay.upload.semantic_projection import NeedsSetupCandidateV1
+
+    entry = NeedsSetupCandidateV1(
+        name="Probe", source_definition_id="d", recipe_id=None, catalog_source="bank",
+        unbound_concepts=("customer_id",),
+        unbound_operands=(_unbound("unresolved"),
+                          _unbound("ambiguous", tied_refs=("public.a.x",))))
+    assert entry.sentence() == ("no read-scoped column carries customer_id; "
+                                "1 column carries customer_id and the tie is unadjudicated: "
+                                "public.a.x")
 
 
 # ── T3 — the badge tells the corpus's truth ────────────────────────────────────────────────────
@@ -386,6 +485,61 @@ def test_every_blocked_recipe_in_the_corpus_maps_to_unverified():
     assert len(stamped) == 3
     assert not any(r.readiness == "FORMULA_BLOCKED" for r in V2_RECIPES
                    if r.recipe_id in stamped)
+
+
+def test_the_card_edit_moved_option_identity_and_that_was_a_conscious_act():
+    """F3 — the T11 pattern, applied to this task's own edit.
+
+    Every field on a served card rides `gate1._idea_json` into
+    `canonical_candidate_identity_hash` -> `option_id` -> `considered_content_hash`. T2/T3/T4
+    changed four of those fields (`verification`, `aggregation`, `rationale`, `operation_kind`
+    plus the typed operand refs), so option identity MOVED for every engine-served card.
+
+    Traced and BENIGN: option ids are minted per generation run and every verification compares
+    a stored identity against the same stored identity, so nothing in flight breaks and no
+    persisted record is invalidated — but a hash that moves without anybody noticing is how the
+    next one moves unnoticed too.
+
+    ▲ DO NOT JUST PASTE A NEW VALUE. If this assertion fails, a card field changed. Decide
+    whether that was intended, trace what it moves (option ids, considered_content_hash), write
+    the trace into the plan doc's T2-T4 section as this change did, and only then update the
+    literal below.
+
+    Measured by execution at both ends of this task, same construction:
+        parent d27cae66  85bdaca3...  verification=DESIGN-CHECKED  aggregation=None  rationale=''
+        this task        dffc17d1...  verification=UNVERIFIED      aggregation='sum' rationale=BD
+    """
+    from featuregen.overlay.field_evidence import canonical_hash
+    from featuregen.overlay.upload.contract.gate1 import _candidate_identity
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+    recipe = v2_recipe_by_id("net_transaction_flow")
+    request = planning_request_from_recipe(recipe)
+    verdicts = tuple(
+        OperandBindingVerdictV1(role=op.role, status="bound",
+                                selected_ref=f"public.txns.{op.role}")
+        for op in request.operands)
+    from featuregen.overlay.upload.recipe_planning_lens import DatasetStoryV1
+
+    candidate = V2RecipeCandidateV1(
+        recipe_id=recipe.recipe_id, relationship="primary", planning_request=request,
+        planning_request_hash="prh", recipe_revision_hash="rev", verdicts=verdicts,
+        binding_state="bound", readiness=recipe.readiness, temporal_pit_text="pit",
+        temporal_blocker="", review_current=False, review_missing_roles=(), eligibility={},
+        dataset_story=DatasetStoryV1(population_ref="txns", population_basis="declared_grain",
+                                     dataset_tables=("txns",), cross_dataset=False, codes=()))
+    idea = _project([candidate]).ideas[0]
+    identity = _candidate_identity(path="alternative:0:0", source="alternative",
+                                   lens="engine", feature=idea)
+    assert canonical_hash(identity) == (
+        "dffc17d1ed15c421f0b08184e813f401e8e47fc80223e398abe00130c053cd75")
+    # The three fields whose change moved it, so a failure says WHICH one drifted.
+    assert idea.verification == "UNVERIFIED"
+    assert idea.aggregation == "sum"
+    assert idea.rationale.startswith(recipe.business_definition)
 
 
 # ── T4 — the projection serves the corpus's riches ─────────────────────────────────────────────
