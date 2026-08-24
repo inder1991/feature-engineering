@@ -2786,15 +2786,20 @@ describe('Intake target confirmation', () => {
     // the draft reading renders with the summary one-liner and the window
     expect(await screen.findByText(/I understood your target as/)).toBeInTheDocument()
     expect(screen.getByText('Whether the customer churned in the window.')).toBeInTheDocument()
-    expect(screen.getByText(/label window: 90 days/)).toBeInTheDocument()
+    // T7 (b): the window now says WHERE it came from as well as what it is. This fixture's
+    // window_source is 'stated', so the goal's own horizon is what the 90 is.
+    expect(screen.getByText(/Label window: 90 days — the horizon your goal states/))
+      .toBeInTheDocument()
     // a DRAFT is not a decision: nothing was recorded yet
     expect(contractIntakeTarget).not.toHaveBeenCalled()
 
     await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+    // T7 (c): the acknowledgment is stated on EVERY call, and its default is false. This target's
+    // concept is outcome-family, so the gate never fires and the false rides through untouched.
     expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'confirmed', {
       targetRef: 'public.labels.churned', targetWindowDays: 90,
       targetType: 'binary_classification', businessDomain: ['retail_churn'],
-      catalogSource: undefined,
+      catalogSource: undefined, targetNotOutcomeAcknowledged: false,
     })
     expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
     // the signed target threads into the considered-set request
@@ -2901,6 +2906,218 @@ describe('Intake target confirmation', () => {
     // generation is unimpeded
     await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
     expect(contractConsideredSet).toHaveBeenCalled()
+  })
+
+  // ── T7 (c): THE NON-OUTCOME ACKNOWLEDGMENT ────────────────────────────────────────────────────
+  //
+  // Every sentence below is COPIED, byte for byte, from `_not_outcome_refusal` in
+  // src/featuregen/api/routes/contract.py. That is the point of these three pins: the backend's own
+  // pins (mutation V) hold the wording where it is written, and these hold the screen to rendering
+  // it VERBATIM. Should the two ever drift, one side or the other goes red — which is exactly the
+  // property a single shared banner could not have had.
+  //
+  // Three tiers, three DIFFERENT claims — and the difference is the defect the backend just
+  // removed. `near_label` earns the word PROXY because the registry asserts label-adjacency;
+  // `standard` is the OPPOSITE claim (the registry looked and declassified); an unregistered
+  // concept asserts nothing in either direction. One banner for all three would have re-created
+  // NB-1 in the UI, telling 338 of the registry's 359 concepts they were proxies.
+  describe('the non-outcome acknowledgment', () => {
+    const NEAR_LABEL_REFUSAL =
+      "public.aml.cust_susp_flg carries the concept 'restriction_status', which the registry "
+      + 'marks near_label: a funnel-tail signal that BORDERS the label. Confirming it means '
+      + 'predicting a PROXY for the outcome, and a model trained on it can read its own answer '
+      + 'back. Re-send with target_not_outcome_acknowledged: true to record that you know.'
+    const STANDARD_REFUSAL =
+      "public.aml.cust_susp_flg carries the concept 'account_status', which the registry "
+      + 'classifies as standard: it does not certify this column as an outcome label, and nothing '
+      + 'here asserts it correlates with one. Re-send with target_not_outcome_acknowledged: true '
+      + 'to record that you know.'
+    const UNREGISTERED_REFUSAL =
+      'public.aml.cust_susp_flg carries no registered concept, so nothing certifies it as an '
+      + 'outcome label — and absence is not an assertion the other way either. Re-send with '
+      + 'target_not_outcome_acknowledged: true to record that you know.'
+
+    function banner() {
+      return document.querySelector('[data-role="intake-not-outcome"]') as HTMLElement
+    }
+
+    async function refuseThenRead(detail: string) {
+      contractIntake.mockResolvedValue(INTAKE)
+      contractIntakeTarget.mockRejectedValueOnce(new api.ApiError(422, detail))
+      await generateConfirmOn()
+      await screen.findByText(/I understood your target as/)
+      await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+      return await screen.findByText(detail)
+    }
+
+    it('renders the near_label tier’s sentence verbatim — the PROXY claim the registry earns',
+      async () => {
+        await refuseThenRead(NEAR_LABEL_REFUSAL)
+        expect(banner()).toHaveTextContent(NEAR_LABEL_REFUSAL)
+      })
+
+    it('renders the standard tier’s sentence verbatim — and it claims NO proxy', async () => {
+      await refuseThenRead(STANDARD_REFUSAL)
+      expect(banner()).toHaveTextContent(STANDARD_REFUSAL)
+      // The tier-flattening check: the standard sentence must not pick up the near_label one's
+      // word. This is the assertion a single shared banner could not pass.
+      expect(banner()).not.toHaveTextContent(/PROXY/)
+      expect(banner()).not.toHaveTextContent(/BORDERS the label/)
+    })
+
+    it('renders the unregistered tier’s sentence verbatim — silence, in both directions',
+      async () => {
+        await refuseThenRead(UNREGISTERED_REFUSAL)
+        expect(banner()).toHaveTextContent(UNREGISTERED_REFUSAL)
+        expect(banner()).not.toHaveTextContent(/PROXY/)
+      })
+
+    it('the first attempt never acknowledges; the control re-sends the SAME decision and ref',
+      async () => {
+        contractIntake.mockResolvedValue(INTAKE)
+        contractIntakeTarget.mockRejectedValueOnce(new api.ApiError(422, NEAR_LABEL_REFUSAL))
+        contractIntakeTarget.mockResolvedValueOnce({
+          ...READING, target_concept: 'restriction_status',
+          target_leakage_class: 'near_label', target_is_proxy: true,
+        })
+        await generateConfirmOn()
+        await screen.findByText(/I understood your target as/)
+        await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+        // THE ACKNOWLEDGMENT IS THE PERSON'S. The attempt that earns the sentence must not carry
+        // it — sending it by default is the undisclosed commit this gate exists to stop.
+        expect(contractIntakeTarget).toHaveBeenNthCalledWith(1, 'int_1', 'confirmed',
+          expect.objectContaining({ targetNotOutcomeAcknowledged: false }))
+        await screen.findByText(NEAR_LABEL_REFUSAL)
+
+        await userEvent.click(
+          screen.getByRole('button', { name: /I understand — record this target anyway/i }))
+        expect(contractIntakeTarget).toHaveBeenNthCalledWith(2, 'int_1', 'confirmed',
+          expect.objectContaining({
+            targetRef: 'public.labels.churned', targetNotOutcomeAcknowledged: true,
+          }))
+        expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
+        // The SERVER's echoed class, and the sentence the person actually read — not a
+        // reconstruction of it from the class afterwards.
+        expect(screen.getByText(/registry class:/)).toHaveTextContent('near_label')
+        expect(screen.getByText(/You acknowledged:/)).toHaveTextContent(NEAR_LABEL_REFUSAL)
+      })
+
+    it('a 422 this screen cannot identify stays an error, never an offer to acknowledge',
+      async () => {
+        // The vocabulary refusal from the same route. Turning any 422 into an acknowledge button
+        // would make the control an answer to questions it was never asked.
+        const other = "business_domain outside the use-case vocabulary: ['not_a_use_case']"
+        contractIntake.mockResolvedValue(INTAKE)
+        contractIntakeTarget.mockRejectedValueOnce(new api.ApiError(422, other))
+        await generateConfirmOn()
+        await screen.findByText(/I understood your target as/)
+        await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+        expect(await screen.findByText(other)).toBeInTheDocument()
+        expect(banner()).toBeNull()
+        expect(screen.queryByRole('button', { name: /record this target anyway/i })).toBeNull()
+      })
+  })
+
+  // ── T7 (a)/(b): the ticket's own facts, which nobody was shown on the AML run ─────────────────
+  describe('what the ticket says about the target', () => {
+    it('a contradicted window renders the server’s refusal, naming both numbers', async () => {
+      // Copied from WindowRefusalV1's `detail` in overlay/upload/contract/intake_ticket.py.
+      const detail = 'the objective states a horizon of 90 days; the intake reading returned '
+        + 'target_window_days=0. The two disagree, so no label window is accepted — state the '
+        + 'horizon on the confirm screen.'
+      contractIntake.mockResolvedValue({
+        ...INTAKE,
+        ticket: {
+          ...TICKET, target_window_days: null, window_source: 'contradicted',
+          window_refusal: {
+            code: 'WINDOW_CONTRADICTS_GOAL', stated_text: '90 days', stated_days: 90,
+            ticket_days: 0, detail,
+          },
+        },
+      })
+      await generateConfirmOn()
+      expect(await screen.findByText(detail)).toBeInTheDocument()
+    })
+
+    it('a stated horizon with no day count says so, and invents no number', async () => {
+      // The degraded month-horizon shape: `_degraded` reads the goal with pure code, so a month
+      // horizon lands as source='stated' with days=null. 28, 29, 30 and 31 are all months —
+      // converting one would manufacture the false precision T7 exists to remove.
+      contractIntake.mockResolvedValue({
+        ...INTAKE,
+        ticket: { ...TICKET, target_window_days: null, window_source: 'stated' },
+      })
+      await generateConfirmOn()
+      const line = await screen.findByText(/Label window:/)
+      expect(line).toHaveTextContent('your goal states a horizon, but not one that can be counted')
+      expect(line.textContent).not.toMatch(/\d/)
+    })
+
+    it('an unstated horizon is honest absence, not a default', async () => {
+      contractIntake.mockResolvedValue({
+        ...INTAKE,
+        ticket: { ...TICKET, target_window_days: null, window_source: 'unstated' },
+      })
+      await generateConfirmOn()
+      expect(await screen.findByText(/no horizon stated, and none was read/)).toBeInTheDocument()
+    })
+
+    it('an abstention is an ANSWER: the true labels the catalog holds, and the nearest proxies',
+      async () => {
+        contractIntake.mockResolvedValue({
+          ...INTAKE,
+          ticket: {
+            ...TICKET, target_column: null, confidence: 'abstain',
+            target_concept: '', target_leakage_class: null, target_is_proxy: false,
+            proxy_candidates: [
+              { ref: 'public.aml.cust_susp_flg', concept: 'restriction_status',
+                leakage_class: 'near_label' },
+              { ref: 'public.aml.acct_status', concept: 'account_status',
+                leakage_class: 'standard' },
+            ],
+            outcome_candidates: [
+              { ref: 'public.aml.sar_filed', concept: 'outcome_label', leakage_class: 'outcome' },
+            ],
+          },
+          target_detail: null,
+          proxy_candidate_details: [
+            { ref: 'public.aml.cust_susp_flg', catalog_source: 'cib',
+              concept: 'restriction_status', ai_summary: 'Whether the customer is restricted.' },
+            { ref: 'public.aml.acct_status', catalog_source: 'cib',
+              concept: 'account_status', ai_summary: 'The account lifecycle state.' },
+          ],
+          outcome_candidate_details: [
+            { ref: 'public.aml.sar_filed', catalog_source: 'cib', concept: 'outcome_label',
+              ai_summary: 'Whether a SAR was filed for this customer.' },
+          ],
+        })
+        await generateConfirmOn()
+        // THE LABEL THE MODEL DID NOT PICK — named, because the catalog holds it.
+        expect(await screen.findByText(/The catalog holds a true label:/)).toBeInTheDocument()
+        expect(screen.getByText('public.aml.sar_filed')).toBeInTheDocument()
+        // …and each proxy carries the registry's OWN class beside it, not one shared word.
+        const proxies = document.querySelector('[data-role="proxy-candidates"]') as HTMLElement
+        expect(within(proxies).getByText('near_label')).toBeInTheDocument()
+        expect(within(proxies).getByText('standard')).toBeInTheDocument()
+      })
+
+    it('a pinned NON-outcome column no longer claims to be recorded', async () => {
+      // ▲ NB-2: the server's pin door is outcome-family only now, so "you named it, already
+      // recorded" would be false here — the confirm gate is the one door, and it asks out loud.
+      contractIntake.mockResolvedValue({
+        ...INTAKE,
+        ticket: {
+          ...TICKET, pinned: true, target_concept: 'restriction_status',
+          target_leakage_class: 'near_label', target_is_proxy: true, confidence: 'abstain',
+        },
+      })
+      await generateConfirmOn()
+      await screen.findByText(/I understood your target as/)
+      expect(screen.queryByText(/you named it/)).toBeNull()
+      expect(screen.getByRole('button', { name: /yes, that's my target/i })).toBeInTheDocument()
+      // and the registry's own reading of the column is on screen before anyone signs it
+      expect(screen.getByText(/borders the outcome label/)).toBeInTheDocument()
+    })
   })
 })
 

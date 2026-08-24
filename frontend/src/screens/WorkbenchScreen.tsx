@@ -198,6 +198,60 @@ function qualityNotice(rec: RecognitionResp): string | null {
   return null
 }
 
+// ── T7 (a)–(c): the prediction target, said out loud ────────────────────────────────────────────
+//
+// THE ACKNOWLEDGMENT DISCRIMINATOR. Confirming a target the concept registry does not certify as
+// an outcome label is a typed 422 from /contract/intake/target, written PER TIER — near_label
+// earns the word "proxy" because the registry positively asserts label-adjacency; standard says
+// the registry looked and declassified; unregistered says absence asserts nothing either way. The
+// screen renders that sentence VERBATIM and composes none of its own: one banner covering all
+// three would re-create in the UI exactly the over-claim the backend removed (it had been telling
+// 338 of 359 concepts they were proxies for an outcome nobody measured them against).
+//
+// The refusal carries no error_code, so the discriminator is the server's own closing instruction,
+// which names the field to re-send. Deliberately fail-closed: if that wording ever moves, the
+// sentence still renders verbatim and the acknowledge control simply does not appear — the flow
+// degrades to "read this and pick another target", never to a silent acknowledgment.
+const NOT_OUTCOME_ACK_FIELD = 'target_not_outcome_acknowledged'
+
+// One line per registry class, keyed off the SERVER's closed `target_leakage_class` vocabulary —
+// the same pattern as BINDING_STATE_LABEL below, and each line is the api.ts contract's own
+// wording for that tier, not a paraphrase invented here. Three lines, never one: `standard` is the
+// OPPOSITE claim to `near_label`, and the absent case is a third thing again. The authoritative
+// words at the moment of commitment are still the 422's, rendered verbatim beside the control.
+const LEAKAGE_CLASS_LINE: Record<string, string> = {
+  outcome: 'The registry certifies this concept as an outcome label — the answer itself.',
+  near_label: 'The registry marks this concept near_label: it borders the outcome label, so a '
+    + 'model trained on it can read its own answer back.',
+  standard: 'The registry looked at this concept and did not certify it as an outcome label. '
+    + 'Nothing here says it correlates with one either.',
+}
+// `target_leakage_class: null` — the column carries no registered concept. Silence, in both
+// directions: never rendered as a proxy, and never rendered as safe.
+const LEAKAGE_UNREGISTERED_LINE =
+  'This column carries no registered concept, so nothing certifies it as an outcome label — and '
+  + 'absence is not an assertion the other way either.'
+
+// T7 (b) — where the label window came from, or why there is none. Four outcomes, four sentences,
+// and NO INVENTED NUMBER anywhere: a `stated` source with `target_window_days: null` is the
+// degraded month-horizon case (a month is 28, 29, 30 or 31 days, so the goal states a horizon this
+// code may not count), and it says exactly that rather than picking one. `contradicted` never
+// reaches here — the server's own `window_refusal.detail` names both numbers and is rendered
+// verbatim instead.
+function windowLine(source: string, days: number | null): string {
+  if (source === 'stated') {
+    return days !== null
+      ? `Label window: ${days} days — the horizon your goal states.`
+      : 'Label window: your goal states a horizon, but not one that can be counted in days.'
+  }
+  if (source === 'model_only' && days !== null) {
+    return `Label window: ${days} days — read from your description. Your goal states no horizon `
+      + 'to check it against.'
+  }
+  // `unstated`, and the defensive fall-through for a model_only with no number to show.
+  return 'Label window: no horizon stated, and none was read. Nothing is assumed.'
+}
+
 // The disposition lens, in render order: each final_disposition mapped to its human heading.
 const DISPOSITION_GROUPS: { key: RecipeDisposition['final_disposition']; heading: string }[] = [
   { key: 'eligible', heading: 'Recommended' },
@@ -546,6 +600,86 @@ function Gate({ state, who, title, sub }: {
       </div>
       <div className="gate-sub">{sub}</div>
       <span className="visually-hidden">{GATE_STATE_WORDS[state]}</span>
+    </div>
+  )
+}
+
+// ------------------------------------------------------- T7: what the ticket actually says ----
+//
+// Everything the intake ticket knows about the target that a person deciding needs — the label
+// window and where it came from, the registry's classification of the column, the labels this
+// catalog DOES hold, and the nearest proxies. On the 2026-08-24 AML run every one of these facts
+// existed and none of them was rendered: the objective said "in the next 90 days", the ticket said
+// 0, and the screen showed neither number.
+function TargetTicketFacts({ intake }: { intake: IntakeResp }) {
+  const t = intake.ticket
+  const classLine = t.target_leakage_class === null
+    ? LEAKAGE_UNREGISTERED_LINE
+    : LEAKAGE_CLASS_LINE[t.target_leakage_class]
+  const proxies = intake.proxy_candidate_details ?? []
+  const outcomes = intake.outcome_candidate_details ?? []
+  // The details list is the one-liner material for the same refs, in the same order. Reading the
+  // class off `proxy_candidates` by position would break silently if either list were reordered,
+  // so it is looked up by ref — and an absent entry renders as absent, never as 'standard'.
+  const classByRef = new Map(t.proxy_candidates.map(c => [c.ref, c.leakage_class]))
+  return (
+    <div style={{ display: 'grid', gap: 6 }} data-role="target-facts">
+      {/* T7 (b): a contradiction is the SERVER's typed refusal and names both numbers. Rendered
+          verbatim — a screen that re-derived "90 vs 0" would be quoting itself. */}
+      {t.window_refusal !== null ? (
+        <p className="hint" style={{ margin: 0 }} data-role="window-refusal">
+          {t.window_refusal.detail}
+        </p>
+      ) : (
+        <p className="hint" style={{ margin: 0 }} data-role="window-source">
+          {windowLine(t.window_source, t.target_window_days)}
+        </p>
+      )}
+      {t.target_column !== null && (
+        <p className="hint" style={{ margin: 0 }} data-role="target-class">
+          {t.target_concept
+            ? <>Concept <code>{t.target_concept}</code> · </>
+            : null}
+          {classLine}
+        </p>
+      )}
+      {/* THE LABEL THE MODEL DID NOT PICK. Naming it is the difference between an abstention and a
+          shrug — and on the run this task came from, the catalog held one the whole time. */}
+      {outcomes.length > 0 && (
+        <div data-role="outcome-candidates">
+          <p className="hint" style={{ margin: 0 }}>
+            {outcomes.length === 1
+              ? 'The catalog holds a true label:'
+              : 'The catalog holds these true labels:'}
+          </p>
+          <ul className="hint" style={{ margin: '2px 0 0', paddingLeft: 18 }}>
+            {outcomes.map(c => (
+              <li key={c.ref}>
+                <code>{c.ref}</code> · <span className="mono">{c.concept}</span>
+                {c.ai_summary ? <> — {c.ai_summary}</> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {/* The nearest proxies, each with the registry's OWN class beside it. The list is ranked, not
+          chosen: it reports, it never retargets. A candidate the registry never classified shows
+          'unregistered' — silence rendered as silence. */}
+      {proxies.length > 0 && (
+        <div data-role="proxy-candidates">
+          <p className="hint" style={{ margin: 0 }}>Nearest proxies in this catalog:</p>
+          <ul className="hint" style={{ margin: '2px 0 0', paddingLeft: 18 }}>
+            {proxies.map(c => (
+              <li key={c.ref}>
+                <code>{c.ref}</code> · <span className="mono">{c.concept}</span>
+                {' · '}
+                <span className="mono">{classByRef.get(c.ref) ?? 'unregistered'}</span>
+                {c.ai_summary ? <> — {c.ai_summary}</> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   )
 }
@@ -1214,6 +1348,14 @@ export function WorkbenchScreen() {
   const [intakeCorrection, setIntakeCorrection] = useState('')
   const [intakeBusy, setIntakeBusy] = useState(false)
   const [intakeError, setIntakeError] = useState('')
+  // T7 (c): the confirm gate's refusal, held so the human can read the SERVER's own words and
+  // then act on them. `detail` is rendered verbatim and never summarised; `decision`/`ref` are
+  // what the acknowledge control re-sends, so acknowledging cannot quietly retarget the answer.
+  const [intakeAck, setIntakeAck] = useState<
+    { detail: string; decision: 'confirmed' | 'corrected'; ref: string } | null>(null)
+  // What the person actually acknowledged, kept after the signature so the record on screen is
+  // the sentence they read — not a reconstruction of it.
+  const [intakeAcknowledged, setIntakeAcknowledged] = useState('')
   const [generated, setGenerated] = useState<GeneratedCandidate[] | null>(null)
   // Ordered lenses of the last round's non-empty sets. Two or more render the compare cards;
   // one (or zero) renders the flat single list exactly as before the sets model.
@@ -1911,6 +2053,8 @@ export function WorkbenchScreen() {
     setIntakeReading(null)
     setIntakeCorrecting(false)
     setIntakeError('')
+    setIntakeAck(null)
+    setIntakeAcknowledged('')
     const intakeSeq = seq
     contractIntake(hypothesis.trim(), { catalogSource: source.trim() || undefined })
       .then(resp => {
@@ -1953,7 +2097,16 @@ export function WorkbenchScreen() {
   // click is the extractor's ground-truth telemetry); 'exploring' records an explicit no-target
   // declaration. The signed value is threaded into the manual target field so the considered-set
   // request and the server's record agree.
-  async function answerIntake(decision: 'confirmed' | 'corrected' | 'exploring', ref?: string) {
+  //
+  // T7 (c): `acknowledge` is the PERSON's, so it is sent only from the control the refusal
+  // banner puts under the server's own sentence — never by default, and never on the first
+  // attempt. That first attempt is what earns the sentence; sending the flag ahead of it would be
+  // exactly the undisclosed commit this gate exists to stop.
+  async function answerIntake(
+    decision: 'confirmed' | 'corrected' | 'exploring',
+    ref?: string,
+    acknowledge = false,
+  ) {
     if (!intake || intakeBusy) return
     setIntakeBusy(true)
     setIntakeError('')
@@ -1965,15 +2118,28 @@ export function WorkbenchScreen() {
         targetType: t.target_type !== 'abstain' ? t.target_type : undefined,
         businessDomain: t.business_domain,
         catalogSource: source.trim() || undefined,
+        targetNotOutcomeAcknowledged: acknowledge,
       })
       setIntakeReading(reading)
+      // Keep the sentence the person actually read, so the signed block records THAT rather than
+      // a version of it rebuilt from the class afterwards.
+      setIntakeAcknowledged(acknowledge ? (intakeAck?.detail ?? '') : '')
+      setIntakeAck(null)
       setIntakeCorrecting(false)
       setIntakeCorrection('')
       setTarget(reading.target_ref ?? '')
     } catch (err) {
-      setIntakeError(err instanceof ApiError
-        ? err.detail
-        : 'Could not record the target decision. Try again.')
+      // The confirm gate's own refusal: hold the SERVER's sentence and offer the acknowledgment
+      // beside it. Anything else stays an error line — including a 422 this screen cannot
+      // identify, which must never quietly become an offer to acknowledge.
+      if (err instanceof ApiError && err.status === 422 && decision !== 'exploring' && ref
+        && err.detail.includes(NOT_OUTCOME_ACK_FIELD)) {
+        setIntakeAck({ detail: err.detail, decision, ref })
+      } else {
+        setIntakeError(err instanceof ApiError
+          ? err.detail
+          : 'Could not record the target decision. Try again.')
+      }
     } finally {
       setIntakeBusy(false)
     }
@@ -3115,10 +3281,16 @@ export function WorkbenchScreen() {
           )}
           {/* The target confirm block (intake build): the model's DRAFT reading of the prediction
               target, awaiting the human's signature. The extracted target drives the leakage veto,
-              so it must not take effect as an unreviewed model pick — but a name the user
-              literally TYPED is theirs already (shows-doesn't-gate: recorded without a click, one
-              edit away). Absent intake (older backend, no LLM) renders nothing: the manual target
-              field above carries the flow exactly as before. */}
+              so it must not take effect as an unreviewed model pick. Absent intake (older backend,
+              no LLM) renders nothing: the manual target field above carries the flow exactly as
+              before.
+
+              ▲ T7 (c), NB-2: the shows-doesn't-gate PIN path is now OUTCOME-FAMILY ONLY. The
+              server stopped recording a literally-typed non-outcome column durably — typing a name
+              in prose used to write it onto the very row the leakage gate reads, undisclosed,
+              while CLICKING confirm on that same column was a refusal. So "you named it, already
+              recorded" may only be said where the record actually exists; every other pin falls
+              through to the confirm gate below, which asks for the acknowledgment out loud. */}
           {intake !== null && (
             <div className="scope-target" data-role="intake-target" style={{ marginTop: 16 }}>
               <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
@@ -3130,13 +3302,37 @@ export function WorkbenchScreen() {
                     target any time in the target field above.
                   </p>
                 ) : (
-                  <p role="status" style={{ margin: 0 }}>
-                    <span className="badge recommended">Signed</span>{' '}
-                    Target: <code>{intakeReading.target_ref}</code> — recorded as your decision.
-                    Candidates are screened against it server-side.
-                  </p>
+                  <div style={{ display: 'grid', gap: 8 }}>
+                    <p role="status" style={{ margin: 0 }}>
+                      <span className="badge recommended">Signed</span>{' '}
+                      Target: <code>{intakeReading.target_ref}</code> — recorded as your decision.
+                      Candidates are screened against it server-side.
+                    </p>
+                    {/* The SERVER's derivation from the concept registry, echoed back — never the
+                        flag the client sent. A person cannot relabel a column by acknowledging
+                        one, and the signed block must not read as if they had. */}
+                    <p className="hint" style={{ margin: 0 }} data-role="signed-class">
+                      Concept:{' '}
+                      {intakeReading.target_concept
+                        ? <code>{intakeReading.target_concept}</code>
+                        : <>none registered</>}
+                      {' · registry class: '}
+                      <span className="mono">
+                        {intakeReading.target_leakage_class ?? 'unregistered'}
+                      </span>
+                      {intakeReading.target_is_proxy && (
+                        <> <span className="badge stale">proxy for the outcome</span></>
+                      )}
+                    </p>
+                    {intakeAcknowledged !== '' && (
+                      <p className="hint" style={{ margin: 0 }} data-role="acknowledged">
+                        You acknowledged: {intakeAcknowledged}
+                      </p>
+                    )}
+                  </div>
                 )
-              ) : intake.ticket.pinned && intake.ticket.target_column ? (
+              ) : intake.ticket.pinned && intake.ticket.target_column
+                  && intake.ticket.target_leakage_class === 'outcome' ? (
                 <p role="status" style={{ margin: 0 }}>
                   Target: <code>{intake.ticket.target_column}</code> ✓ (you named it) — edit the
                   target field above to change it.
@@ -3148,10 +3344,16 @@ export function WorkbenchScreen() {
                     {intake.target_detail?.ai_summary
                       ? <> — <em>{intake.target_detail.ai_summary}</em></>
                       : null}
-                    {intake.ticket.target_window_days !== null && (
-                      <> (label window: {intake.ticket.target_window_days} days)</>
-                    )}
                   </p>
+                  {/* T7 (a): the proposal ABSTAINS unless the column's concept is outcome-family,
+                      so a reading is not the same thing as a recommendation. Saying which one this
+                      is costs one line and is the difference between an offer and a suggestion. */}
+                  {intake.ticket.confidence === 'abstain' && (
+                    <p className="hint" style={{ margin: 0 }} data-role="target-abstained">
+                      A reading, not a recommendation: the platform did not commit to this target.
+                    </p>
+                  )}
+                  <TargetTicketFacts intake={intake} />
                   {intake.ticket.contradiction !== null && (
                     <p className="hint" role="alert" style={{ margin: 0 }}>
                       Heads up: {intake.ticket.contradiction}.
@@ -3220,12 +3422,41 @@ export function WorkbenchScreen() {
                     No target detected in your objective. Type one into the target field above, or
                     explore without one.
                   </p>
+                  {/* An abstention is an ANSWER, not a blank: the catalog's own outcome labels and
+                      nearest proxies are what makes it one. Same block as the confirm branch. */}
+                  <TargetTicketFacts intake={intake} />
                   <div>
                     <button
                       type="button" className="btn" disabled={intakeBusy}
                       onClick={() => answerIntake('exploring')}
                     >
                       No target — just exploring
+                    </button>
+                  </div>
+                </div>
+              )}
+              {/* T7 (c) — THE ACKNOWLEDGMENT. The server's per-tier sentence, verbatim, with the
+                  control that re-sends the SAME decision and the SAME ref carrying the person's
+                  acknowledgment. Nothing here is composed: the three tiers say three different
+                  things, and the difference between them is the whole point of the gate. */}
+              {intakeAck !== null && (
+                <div
+                  className="hint" role="alert" data-role="intake-not-outcome"
+                  style={{ display: 'grid', gap: 8, margin: '8px 0 0' }}
+                >
+                  <p style={{ margin: 0 }}>{intakeAck.detail}</p>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    <button
+                      type="button" className="btn" disabled={intakeBusy}
+                      onClick={() => answerIntake(intakeAck.decision, intakeAck.ref, true)}
+                    >
+                      I understand — record this target anyway
+                    </button>
+                    <button
+                      type="button" className="btn" disabled={intakeBusy}
+                      onClick={() => { setIntakeAck(null); setIntakeCorrecting(true) }}
+                    >
+                      Pick a different target
                     </button>
                   </div>
                 </div>
