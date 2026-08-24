@@ -76,7 +76,30 @@ scope / catalog             verdict  majority classes (share of eligible recipes
 ``churn`` / ftr             serve    entity_key ✓, event_timestamp ✓
 ``credit.monitoring`` /     serve    entity_key ✓, **measure 71% ✗ — and no readable
 one-recipe fixture                   catalog carries any of the 10 concepts** (sentence 5)
+BROADEN (unscoped) / cib    REFUSE   n=317, floor 158: entity_key 100% ✓,
+                                     event_timestamp 63% ✓, **measure 55% ✗ (175/317)**
+BROADEN (unscoped) / ftr    serve    the same three, all covered
 ==========================  =======  ====================================================
+
+**BROADEN is governed identically — an owner's ruling (2026-08-25), not an oversight.**
+``confirmed_scope.unscoped=true`` reaches the same route path with a scope ``v2_applicability``
+fails OPEN on, so the eligible corpus is the whole registry and the floor is 158. The one law does
+not care how wide the scope is: a mis-aimed catalog refuses with directions whether the human asked
+for one use-case leaf or for everything; clause 5 already protects the nowhere-to-point case; and
+on an exploratory gesture "aim at ftr instead" is MORE useful than a page of setup work, not less.
+
+Two measured cautions about that width, both worth knowing before reading a broaden verdict:
+
+* At n=317 the ``measure`` class asks for ~90 different concepts, so ONE column of almost any
+  magnitude covers it. The floor at broaden width therefore refuses a catalog carrying no magnitude
+  AT ALL — not one that is merely narrow. That is the intended severity, and it is why the refusing
+  fixture has to be a customer master with no numeric measure on it.
+* Consequently the verdict is sensitive to a single column. Measured: the 4-concept cib fixture
+  (``customer_id``, ``event_timestamp``, ``category_code``, ``boolean_flag``) REFUSES a broaden;
+  adding one ``customer_risk_rating`` column makes it SERVE, because some recipe in the 317 asks
+  for ``customer_risk_rating`` as a ``measure``. Both are honest answers to "can anything here be
+  measured?" — but a reader comparing two broaden verdicts must compare the catalogs' concepts, not
+  their column counts.
 
 Three honest readings of that table:
 
@@ -213,25 +236,35 @@ class CatalogSatisfiabilityV1:
         HOW MANY of them it carries (then by name). The head of this tuple is the re-aim the
         operator is being pointed at — ``ftr`` in the audit's arrangement — and the whole tuple is
         served because a scope whose gaps split across two catalogs has no single answer and must
-        not be given one."""
-        counted: dict[str, int] = {}
+        not be given one.
+
+        Counted over DISTINCT concepts, not over class×concept rows: a concept the corpus asks for
+        in two different classes (``account_id`` is an ``entity_key`` in one recipe and a
+        ``dimension`` in another) is one gap this catalog closes, not two, and double-counting it
+        would let a catalog answering one popular concept outrank a catalog answering three."""
+        counted: dict[str, set[str]] = {}
         for unsatisfiable in self.unsatisfiable:
             for concept in unsatisfiable.concepts:
                 for source, _columns in concept.available_in:
-                    counted[source] = counted.get(source, 0) + 1
+                    counted.setdefault(source, set()).add(concept.concept)
         return tuple(source for source, _ in
-                     sorted(counted.items(), key=lambda kv: (-kv[1], kv[0])))
+                     sorted(counted.items(), key=lambda kv: (-len(kv[1]), kv[0])))
 
 
 def _catalog_concepts(conn, *, catalog_source: str, roles) -> frozenset[str]:
     """The concepts this caller can see on this catalog — the SAME predicate
     ``build_generation_semantic_context`` loads its columns with (``kind='column'``, the catalog,
     ``visible_requires <@ allowed``), projected to the concept. So this set IS the key set of the
-    context's ``concept_index``, one aggregate query earlier and without the column bodies."""
+    context's ``concept_index``, one aggregate query earlier and without the column bodies.
+
+    ``concept <> ''`` rides beside ``IS NOT NULL`` because the loader's own filter is the truthiness
+    test ``if col.concept``, which drops the empty string as well as NULL. Without it a column
+    enriched to '' would be a KEY in this set and not in the context's index — a coverage claim the
+    binder could not honour, in the one direction that matters (it would suppress a refusal)."""
     rows = conn.execute(
         "SELECT DISTINCT concept FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s AND concept IS NOT NULL "
-        "AND visible_requires <@ %s",
+        "AND concept <> '' AND visible_requires <@ %s",
         (catalog_source, allowed_sensitivities(tuple(roles)))).fetchall()
     return frozenset(row[0] for row in rows)
 

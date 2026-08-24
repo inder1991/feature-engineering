@@ -159,7 +159,14 @@ def test_a_missing_entity_concept_never_refuses_a_catalog_whose_class_is_covered
     so a CONCEPT-level floor (the first cut) refused it, and it is the catalog the serving suite's
     fixtures plan on and get cards from. Its class ``entity_key`` IS covered, by ``customer_id``.
     "Cannot reach the account-grained recipes" is a grain fact the UOA fold owns and states per
-    card; "has no key at all" is a catalog-aiming fact. Only the second is a refusal."""
+    card; "has no key at all" is a catalog-aiming fact. Only the second is a refusal.
+
+    ▲ ``ftr`` IS LOAD-BEARING HERE, and its absence is what made the first version of this test
+    vacuous. Sentence 5 drops a breaching class the estate cannot answer, so with ``bank`` alone in
+    the store the concept cut and the class cut BOTH returned satisfied and this test — the one
+    that exists to pin the floor's unit — killed neither. Measured with ``ftr`` present: unmutated
+    ``satisfied=True``; with the coverage test mutated to concept level, ``satisfied=False`` and
+    the breach is ``entity_key`` required_by 44."""
     _build(db, BANK, [
         (CanonicalRow(BANK, "accounts", "customer_id", "integer", is_grain=True,
                       entity="Customer"), "customer_id"),
@@ -171,10 +178,14 @@ def test_a_missing_entity_concept_never_refuses_a_catalog_whose_class_is_covered
         (CanonicalRow(BANK, "accounts", "event_ts", "timestamp"), "event_timestamp"),
         (CanonicalRow(BANK, "accounts", "churned", "boolean"), "outcome_label"),
     ])
+    _ftr(db)                                       # carries account_id — so clause 5 CAN answer
     verdict = assess_catalog_satisfiability(
         db, catalog_source=BANK, scope=ConfirmedScope(primary=CHURN))
     assert verdict.eligible_recipes == 44
     assert verdict.satisfied is True
+    # The direction exists — which is precisely why a concept-level cut would refuse here.
+    assert concept_inventory(db, concepts=["account_id"], exclude_catalog_source=BANK,
+                             roles=())["account_id"] == ((FTR, 1),)
 
 
 def test_the_known_status_mapping_gap_sits_under_the_floor_on_every_catalog(db):
@@ -223,25 +234,45 @@ def test_a_class_below_the_majority_never_refuses(db):
     assert verdict.satisfied is True
 
 
-def test_an_exact_tie_serves_rather_than_refuses(db):
-    """▲ SENTENCE 4, at the one arrangement that can prove it. ``customer.clv`` has 5 eligible
-    recipes (floor 2) and EXACTLY 2 of them — ``direct_service_cost`` and ``relationship_revenue``
-    — require a ``measure``, all of it ``monetary_flow``, which cib lacks and ftr carries. So every
-    other clause of the floor is satisfied and only the comparison decides: strictly-more-than-half
-    serves, at-least-half refuses.
+def test_an_exact_fifty_percent_tie_serves_rather_than_refuses(db):
+    """▲ SENTENCE 4, AT ITS ACTUAL BOUNDARY. ``credit.collections.workout`` has EIGHT eligible
+    recipes — an even corpus, so ``//2`` really is half — and EXACTLY FOUR of them
+    (``cost_to_collect_ratio``, ``recovery_rate``, ``write_off_amount_sum``,
+    ``write_off_severity_share``) require a ``measure``. 4 of 8 is 50.0%, the one arrangement where
+    "strictly more than half" and "at least half" give different answers.
 
-    Pinned because the fail-open direction is a decision, not an accident: T2 already guarantees no
-    unbindable candidate becomes a card, so refusing here withholds work rather than preventing
-    junk. Relaxing ``>`` to ``>=`` in ``assess_catalog_satisfiability`` fails this test and nothing
-    else in the T5 scope, which is exactly why it exists."""
+    The even-n fixture matters. An earlier version of this test used ``customer.clv`` (5 eligible,
+    floor ``5//2`` = 2, measure 2/5 = 40%), where a ``>=`` mutant means "at or below half refuses",
+    not "a tie refuses" — it killed the mutant, but it was not measuring the decision it named.
+
+    Everything else about the floor is satisfied here so that only the comparison decides:
+    ``entity_key`` (8/8) is covered by cib's ``customer_id``, ``event_timestamp`` (8/8) by its
+    ``consent_ts``, ``status`` (3/8) and ``dimension`` (2/8) sit below the floor either way, and
+    ``collections`` carries ``write_off_amount`` so clause 5 has a direction and cannot mask the
+    result. Unmutated: satisfied. With ``>`` relaxed to ``>=``: refused, breach ``measure`` 4."""
     _cib(db)
-    _ftr(db)
-    verdict = assess_catalog_satisfiability(
-        db, catalog_source=CIB, scope=ConfirmedScope(primary="customer.clv"))
-    assert verdict.eligible_recipes == 5
-    assert verdict.majority_floor == 2
+    _build(db, "collections", [                    # gives clause 5 something to point at
+        (CanonicalRow("collections", "facility", "fac_ref", "integer", is_grain=True,
+                      entity="Facility"), "facility_id"),
+        (CanonicalRow("collections", "facility", "wo_amt", "numeric", additivity="additive",
+                      currency="USD"), "write_off_amount"),
+    ])
+    scope = ConfirmedScope(primary="credit.collections.workout")
+    verdict = assess_catalog_satisfiability(db, catalog_source=CIB, scope=scope)
+
+    assert verdict.eligible_recipes == 8           # EVEN, so the floor is exactly half
+    assert verdict.majority_floor == 4
+    # The arrangement really is a 50% tie on an UNCOVERED class — without this the pin could pass
+    # because the class was covered, or because it was nowhere near the floor.
+    measure_recipes = {rid for rid in ("cost_to_collect_ratio", "recovery_rate",
+                                       "write_off_amount_sum", "write_off_severity_share")}
+    assert all(any(op.operand_class == "measure" and op.required for op in _operands(rid))
+               for rid in measure_recipes)
+    assert not {"cost_to_collect", "ead", "recovery_amount", "write_off_amount"} & _concepts_on(
+        db, CIB), "cib carries none of the measure concepts this scope asks for"
+
     assert verdict.satisfied is True, (
-        "a class required by exactly half the eligible recipes is a tie, and a tie serves")
+        "a class required by exactly half the eligible recipes is a TIE, and a tie serves")
 
 
 def test_closure_coverage_counts_as_coverage(db):

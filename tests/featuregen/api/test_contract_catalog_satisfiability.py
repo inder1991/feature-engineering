@@ -77,6 +77,17 @@ def _post(client, *, catalog_source: str):
     }, headers=AUTH)
 
 
+def _broaden(client, *, catalog_source: str):
+    """The BROADEN action — the same route, the same confirmed-scope path, with
+    ``unscoped: true``. ``v2_applicability`` fails OPEN on it, so the eligible corpus is the whole
+    317-recipe registry and the floor is 158."""
+    return client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "flag suspicious transaction behaviour",
+        "catalog_source": catalog_source, "contract_version": 2,
+        "confirmed_scope": {"unscoped": True, "confirmation_source": "user_broadened"},
+    }, headers=AUTH)
+
+
 def test_the_aml_brief_on_cib_is_refused_and_the_refusal_names_ftr(make_client, conn):
     """THE pin: the audit's exact arrangement answers with a typed refusal that names the
     unsatisfiable concept, how many eligible recipes need it, and where it lives."""
@@ -138,3 +149,53 @@ def test_no_provider_call_is_spent_on_a_refused_brief(make_client, conn):
     res = _post(make_client(fake), catalog_source=CIB)
     assert res.status_code == 422, res.text
     assert sum(fake._calls.values()) == 0
+
+
+# ── BROADEN is governed identically — the owner's ruling, both directions ───────────────────────
+
+def test_a_broaden_onto_a_mis_aimed_catalog_is_refused_with_the_same_directions(
+        make_client, conn):
+    """▲ THE BROADEN RULING, pinned. ``confirmed_scope.unscoped=true`` reaches this same
+    confirmed-scope path with a scope ``v2_applicability`` fails OPEN on — all 317 recipes, floor
+    158 — and it is governed identically. No exemption.
+
+    The one law does not care how wide the scope is: a mis-aimed catalog refuses with directions
+    whether the human asked for one use-case leaf or for everything. Clause 5 already protects the
+    case with nowhere to point, and on an exploratory gesture "aim at ftr instead" is MORE useful
+    than a page of setup work, not less.
+
+    Measured: at broaden width the ``measure`` class is required by 175 of the 317 (55%), above
+    the 158 floor, and this customer master carries nothing that can serve one."""
+    _two_catalogs(conn)
+    res = _broaden(make_client(_fake()), catalog_source=CIB)
+
+    assert res.status_code == 422, res.text
+    detail = res.json()["detail"]
+    assert detail["code"] == "CATALOG_CANNOT_SATISFY_SCOPE"
+    assert detail["eligible_recipes"] == 317          # the whole registry: broaden fails open
+    assert detail["majority_floor"] == 158
+    (unsatisfiable,) = detail["unsatisfiable_classes"]
+    assert unsatisfiable["operand_class"] == "measure"
+    assert unsatisfiable["required_by"] == 175
+    assert detail["satisfying_catalog_sources"] == [FTR]
+
+    # Same law as the scoped refusal: nothing durable is written for a refused broaden.
+    assert conn.execute("SELECT count(*) FROM feature_generation_run").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT count(*) FROM confirmed_generation_scope").fetchone()[0] == 0
+
+
+def test_a_broaden_onto_a_satisfying_catalog_is_served(make_client, conn):
+    """The other direction, and the one that keeps the ruling from being a ban on broadening: the
+    identical exploratory gesture aimed at the catalog that carries the semantics is planned.
+
+    ▲ At broaden width the floor is genuinely hard to breach — the ``measure`` class asks for
+    ~90 different concepts across the 317 recipes, so ONE column of almost any magnitude covers
+    it. That is the floor behaving as designed (it refuses a catalog that carries no magnitude at
+    all, not one that is merely narrow), and it is why the refusal above needs a customer master
+    with no numeric measure on it."""
+    _two_catalogs(conn)
+    res = _broaden(make_client(_fake()), catalog_source=FTR)
+    assert res.status_code == 200, res.text
+    assert conn.execute(
+        "SELECT count(*) FROM feature_generation_run").fetchone()[0] == 1

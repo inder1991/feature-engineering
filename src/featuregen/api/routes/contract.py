@@ -818,9 +818,21 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # gate) so an unhealthy deployment gets the more accurate answer; BEFORE the mint and every
     # durable write, so a refused request leaves no orphan run/scope pair that reads like a
     # generation which produced nothing; and before any provider call, so a mis-aimed brief costs
-    # nothing. Only the CONFIRMED-SCOPE path reaches here: the legacy unscoped route has no
-    # eligible-recipe set to measure a catalog against, and the per-table suggestions page has no
-    # brief to be wrong about.
+    # nothing.
+    #
+    # ▲ BROADEN IS GOVERNED IDENTICALLY, and that is a ruling rather than an oversight. This is
+    # the confirmed-scope path, and `confirmed_scope.unscoped=true` (the broaden action) reaches
+    # it with a scope `v2_applicability` fails OPEN on — all 317 recipes, floor 158. The one law
+    # does not care how wide the scope is: a mis-aimed catalog refuses with directions whether the
+    # human asked for one use-case leaf or for everything. Clause 5 already protects the case with
+    # nowhere to point, and on an exploratory gesture "aim at ftr instead" is MORE useful than a
+    # page of setup work, not less. Both directions are pinned in
+    # `tests/featuregen/api/test_contract_catalog_satisfiability.py`.
+    #
+    # Two surfaces genuinely do NOT reach here, and neither is an exemption: the LEGACY unscoped
+    # route (a request carrying no `confirmed_scope` at all — a different function, and it has no
+    # eligible-recipe set to measure a catalog against), and the per-table suggestions page, which
+    # has no brief to be wrong about.
     satisfiability = assess_catalog_satisfiability(
         conn, catalog_source=body.catalog_source, scope=scope, roles=identity.role_claims)
     if not satisfiability.satisfied:
