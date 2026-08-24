@@ -4555,12 +4555,17 @@ export function WorkbenchScreen() {
                           ))}
                         </p>
                       )}
-                      {/* Governed mark, parallel to the registered one: a minted, versioned,
-                          design-checked contract. Its own state, so no checkbox and no feedback. */}
+                      {/* Governed mark, parallel to the registered one: a minted, versioned
+                          contract. Its own state, so no checkbox and no feedback.
+
+                          It used to append a hardcoded "· DESIGN-CHECKED". /contract/confirm's
+                          response carries no verification field, so that word was this screen's
+                          own — and since T3 derived the stamp from the recipe's readiness it is
+                          false for essentially every card (3 of 317 registry recipes can earn it).
+                          The card's REAL stamp is already on this row, from the server. */}
                       {gov && (
                         <p style={{ color: 'var(--ok)', fontWeight: 500 }}>
                           Governed <span className="mono">{gov.contractId}</span> v{gov.version}
-                          {' · DESIGN-CHECKED'}
                         </p>
                       )}
                     </div>

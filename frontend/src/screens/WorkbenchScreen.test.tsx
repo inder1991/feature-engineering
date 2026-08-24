@@ -2019,11 +2019,12 @@ describe('per-candidate feedback', () => {
 })
 
 describe('govern', () => {
-  // The ROW's governed mark ("Governed <contract> v<n> · DESIGN-CHECKED"), matched precisely
-  // rather than by a bare /governed/i: the gates strip also says the word (cell 4 promises
-  // nothing is saved or governed without your click), and a matcher that cannot tell the promise
-  // from the minted contract would pass whether or not a contract was ever written.
-  const GOVERNED_MARK = /Governed .*DESIGN-CHECKED/i
+  // The ROW's governed mark ("Governed <contract> v<n>"), matched precisely rather than by a bare
+  // /governed/i: the gates strip also says the word (cell 4 promises nothing is saved or governed
+  // without your click), and a matcher that cannot tell the promise from the minted contract would
+  // pass whether or not a contract was ever written. The version number is the discriminator —
+  // it was the hardcoded "· DESIGN-CHECKED" until T9 removed that claim (see the pin below).
+  const GOVERNED_MARK = /Governed .*v\d+/i
 
   // A ContractDraft for avg_balance, mirroring IDEA. contractDraft returns it wrapped; the
   // server-side intent from the considered-set mock is 'int_1' (see `considered`).
@@ -2063,6 +2064,30 @@ describe('govern', () => {
     // Govern is a parallel path: it never registers, and the governed row is done (no checkbox).
     expect(registerFeature).not.toHaveBeenCalled()
     expect(screen.queryByRole('checkbox', { name: 'Select avg_balance' })).not.toBeInTheDocument()
+  })
+
+  // T9 item 5. The governed mark used to append a hardcoded "· DESIGN-CHECKED" to every contract
+  // it minted. /contract/confirm's response carries no verification field at all, so that word was
+  // the screen's own — and since T3 it is false for essentially every card (3 of 317 registry
+  // recipes can earn the stamp). The card's real stamp is already on the row, from the server.
+  it('the governed mark states the contract, and claims no design check of its own', async () => {
+    const unverified: api.FeatureIdea = { ...IDEA, verification: 'UNVERIFIED' }
+    contractDraft.mockResolvedValue({
+      draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1', choice_id: 'g1c_1',
+    })
+    contractConfirm.mockResolvedValue({
+      contract_id: 'contract_1', feature_id: 'feat_1', feature_name: 'avg_balance', version: 1,
+    })
+    await renderAndGenerate([unverified])
+    await screen.findByText('avg_balance')
+    await selectCandidate('avg_balance')
+    await userEvent.click(screen.getByRole('button', { name: 'Select and draft 1' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
+    const mark = await screen.findByText(GOVERNED_MARK)
+    expect(mark).toHaveTextContent('contract_1')
+    expect(mark).not.toHaveTextContent(/DESIGN-CHECKED/i)
+    // …and the stamp the SERVER did put on this card is still the one on screen.
+    expect(screen.getByText('unverified')).toBeInTheDocument()
   })
 
   it('a whole-round feedback refreshes the intent; kept candidates are not governable, fresh ones are', async () => {
