@@ -44,9 +44,10 @@ def _considered_revision_exists(db):
 
 def _request(conn, *, draft_id="fd-ret-1", config="cfg-1", **over):
     facts = {**CANDIDATE, **over}
-    return request_draft(
+    draft_id_out, created, _ride = request_draft(
         conn, formula_draft_id=draft_id, authoring_config_hash=config,
         requested_by="user:sam", requested_at="t", **facts)
+    return draft_id_out, created
 
 
 def _identity(config="cfg-1", **over) -> str:

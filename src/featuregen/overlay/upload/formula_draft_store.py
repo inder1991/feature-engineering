@@ -344,10 +344,13 @@ def request_draft(
     provider_contract_hash: str | None = None,
     strategy_identity_hash: str | None = None,
     now=None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str | None]:
     """Create the draft request, or return the EXISTING one for this identity.
 
-    Returns ``(formula_draft_id, created)``. ``created=False`` is the double-click answer: the same
+    Returns ``(formula_draft_id, created, coupon_spend_authorization_id)``. The third element is
+    the money of the coupon this mint CONSUMED (whole-branch C1: the mint rides exactly that),
+    or ``None`` when no coupon was consumed — a fresh identity, the reviewed lane, or the
+    double-click return of an existing draft. ``created=False`` is the double-click answer: the same
     candidate, snapshot and configuration already has a draft, and asking again must not buy a second
     paid authoring run. The caller returns 202 either way — the client's question ("is a draft coming
     for this candidate?") has the same answer.
@@ -374,9 +377,8 @@ def request_draft(
         DraftCeilingExhausted: the approved ceiling this mint would ride cannot cover ONE more
             per-call worst-case reservation, so the coupon must survive for a request that can.
     """
-    from featuregen.overlay.upload.llm_spend import remaining_spend
+    from featuregen.overlay.upload.llm_spend import per_call_worst_case, remaining_spend
     from featuregen.overlay.upload.retirement_scope import (
-        approved_ceiling_for,
         consume_exception,
         covering_tombstones,
         retirement_scope_key,
@@ -408,9 +410,9 @@ def request_draft(
             requested_by=requested_by, requested_at=requested_at,
             provider_contract_hash=provider_contract_hash,
             strategy_identity_hash=strategy_identity_hash, now=now,
-            approved_ceiling_for=approved_ceiling_for,
             consume_exception=consume_exception,
             covering_tombstones=covering_tombstones,
+            per_call_worst_case=per_call_worst_case,
             remaining_spend=remaining_spend,
             valid_exception_for=valid_exception_for)
 
@@ -420,9 +422,9 @@ def _request_draft_locked(
     option_id: str, planning_request_hash: str, catalog_snapshot_hash: str,
     authoring_config_hash: str, definition_revision: str, requested_by: str, requested_at: str,
     provider_contract_hash, strategy_identity_hash, now,
-    approved_ceiling_for, consume_exception, covering_tombstones, remaining_spend,
+    consume_exception, covering_tombstones, per_call_worst_case, remaining_spend,
     valid_exception_for,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str | None]:
     """The request itself, with the retirement scope's lock already held."""
     # ── WHO MUST PRESENT AN EXCEPTION, decided BEFORE anything is spent or written ──────────────
     # ▲ LOCATED first, CONSUMED last — workflow finding W4. An earlier ordering consumed the
@@ -440,16 +442,71 @@ def _request_draft_locked(
     resolved_now = now if now is not None else conn.execute("SELECT now()").fetchone()[0]
     covering = covering_tombstones(
         conn, scope_key=scope_key, formula_identity_hash=identity)
-    located: list[str] = []
-    if provider_contract_hash and strategy_identity_hash:
-        for withdrawal in covering:
+
+    def _coupon_money(coupon_id: str) -> str:
+        return conn.execute(
+            "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception "
+            "WHERE exception_id = %s", (coupon_id,)).fetchone()[0]
+
+    def _money_rides(spend_id: str) -> bool:
+        # ▲ THE DEAD-TICKET BAR (Task 7 review item 1 + whole-branch C1): the money the mint
+        # would ride must cover ONE per-call worst-case reservation — the dispatch seam's own
+        # arithmetic via the ONE shared `per_call_worst_case` — and must not be EXPIRED
+        # (riding the development envelope instead while consuming the coupon would be C1's
+        # burn-one-approval-ride-another defect re-entered by the expiry door).
+        expired = conn.execute(
+            "SELECT expires_at <= %s FROM llm_spend_authorization_revision "
+            "WHERE spend_authorization_id = %s", (resolved_now, spend_id)).fetchone()[0]
+        if expired:
+            return False
+        left = remaining_spend(conn, spend_id, now=resolved_now)
+        max_calls, max_tokens, max_cost = conn.execute(
+            "SELECT max_calls, max_tokens, max_cost FROM llm_spend_authorization_revision "
+            "WHERE spend_authorization_id = %s", (spend_id,)).fetchone()
+        call_tokens, call_cost = per_call_worst_case(max_calls, max_tokens, max_cost)
+        return left.calls >= 1 and left.tokens >= call_tokens and left.cost >= call_cost
+
+    def _pick_ridable(covering_tombstone_id: str | None):
+        # ▲ THE MINT RIDES THE MONEY OF THE COUPON IT CONSUMES (whole-branch C1): the ceiling
+        # pick by RECENCY and the coupon pick by ANTIQUITY could disagree, and the mint then
+        # burned one approval's coupon while riding another's money — the coupon's own NOT
+        # NULL llm_spend_authorization_id was written and read by NOTHING. Corollary, proven
+        # by this file's own dead-ticket journey: a coupon whose money cannot buy a call is
+        # NOT AVAILABLE to the mint — without the skip, a dead-money old coupon would block a
+        # fresh approval for ever (pick-by-antiquity would find it, the bar would refuse it,
+        # and the refusal would prescribe the exact remedy it was blocking).
+        dead: list[str] = []
+        while True:
             coupon = valid_exception_for(
                 conn, target_formula_identity_hash=identity,
                 provider_contract_hash=provider_contract_hash,
                 strategy_identity_hash=strategy_identity_hash,
-                covering_tombstone_id=withdrawal.tombstone_id,
-                now=resolved_now)
+                covering_tombstone_id=covering_tombstone_id,
+                now=resolved_now, excluding=tuple(dead))
             if coupon is None:
+                return None, dead
+            spend_id = _coupon_money(coupon)
+            if _money_rides(spend_id):
+                return (coupon, spend_id), dead
+            dead.append(coupon)
+
+    located: list[tuple[str, str]] = []
+    plain_dead: list[str] = []
+    if provider_contract_hash and strategy_identity_hash:
+        for withdrawal in covering:
+            picked, dead = _pick_ridable(withdrawal.tombstone_id)
+            if picked is None and dead:
+                # ▲ Coupons NAME this withdrawal but none of their money can buy one call —
+                # refusing BEFORE consumption, with the truthful remedy: re-confirm the cost,
+                # never obtain-an-approval (one exists; its money is what died).
+                raise DraftCeilingExhausted(
+                    f"formula identity {identity} is withdrawn by tombstone "
+                    f"{withdrawal.tombstone_id}, and every regeneration exception naming that "
+                    f"withdrawal ({len(dead)}) is bound to money that cannot cover one more "
+                    f"call (expired, or below one per-call reservation). Nothing was consumed "
+                    f"or written; re-confirming the cost under a fresh approval is the remedy "
+                    f"(a same-day re-approval keeps its exact expiry instant)")
+            if picked is None:
                 # ▲ The refusal cites the ACTUAL un-named withdrawal, replacement pointer
                 # included — a refusal naming the wrong tombstone sends the operator to approve
                 # the wrong thing (round-4 NB-2's broken remedy).
@@ -461,17 +518,13 @@ def _request_draft_locked(
                     f", and no valid regeneration exception NAMES that withdrawal. Approving a "
                     f"regeneration binds every covering withdrawal in one act — obtain one, or "
                     f"use the replacement")
-            located.append(coupon)
+            located.append(picked)
         if not covering:
             # No withdrawal covers: the plain retry coupon (tombstone_id NULL) may still gate
             # the not-an-answer path below.
-            plain = valid_exception_for(
-                conn, target_formula_identity_hash=identity,
-                provider_contract_hash=provider_contract_hash,
-                strategy_identity_hash=strategy_identity_hash,
-                covering_tombstone_id=None, now=resolved_now)
-            if plain is not None:
-                located.append(plain)
+            picked, plain_dead = _pick_ridable(None)
+            if picked is not None:
+                located.append(picked)
     elif covering:
         first = covering[0]
         raise DraftRetired(
@@ -481,7 +534,7 @@ def _request_draft_locked(
             f". A new draft id does not change the identity — use the replacement, or change an "
             f"identity-bearing input: the reviewed lane needs no exception and none exists to "
             f"obtain — this identity is WITHDRAWN")
-    exception_id = located[0] if located else None
+    exception_id = located[0][0] if located else None
     if not covering:
         # ▲ A TERMINAL FAILURE holds no slot (migration 1107) but still gates the re-spend. The
         # bounded re-attempt §11.1.2 permits is bounded BY THE EXCEPTION's max_uses — `formula_draft`
@@ -497,6 +550,15 @@ def _request_draft_locked(
                 "SELECT 1 FROM formula_draft WHERE formula_identity_hash = %s "
                 "AND state NOT IN ('FAILED', 'CANCELLED')", (identity,)).fetchone()
             if live is None and provider_contract_hash is not None:
+                if plain_dead:
+                    # ▲ The truthful flavor: a retry coupon EXISTS but its money died — the
+                    # remedy is re-confirming the cost, not obtaining what is already held.
+                    raise DraftCeilingExhausted(
+                        f"formula identity {identity} belongs to draft {failed[0]}, which is "
+                        f"{failed[1]}, and every regeneration exception for it ({len(plain_dead)}) "
+                        f"is bound to money that cannot cover one more call. Nothing was "
+                        f"consumed or written; re-confirming the cost under a fresh approval "
+                        f"is the remedy (a same-day re-approval keeps its exact expiry instant)")
                 # ▲ THE LLM LANE ONLY. Owner ruling 2026-08-23 (Option 2, spec R4.2 gap 3 at the
                 # run-spine's 9a613bfa): DETERMINISTIC retries are FREE BY CONSTRUCTION — a
                 # reviewed-blueprint attempt carries NO provider contract (1104's CHECK), calls
@@ -513,43 +575,11 @@ def _request_draft_locked(
                     f"never happened. Re-attempting needs an approved regeneration exception for "
                     f"this exact identity")
 
-    if located:
-        # ▲ THE DEAD-TICKET GUARD (Task 7 review item 1). Coupons are about to be consumed, so
-        # the ceiling the mint would ride must still cover work — otherwise the draft dies at
-        # the dispatch seam where 1105 reserves per physical call, AFTER the approval is burned.
-        # The ride is the SAME locator the service prefers with (and the run-spine projection
-        # switches to on its side's next round — two callers today, three then). `None` here
-        # means the approval's authorization EXPIRED: the service then rides its bounded
-        # development envelope (or refuses COST_AUTHORIZATION_MISSING on the job path, before
-        # this gate runs), so the mint CAN complete and there is no dead ticket to refuse.
-        ride = approved_ceiling_for(
-            conn, target_formula_identity_hash=identity,
-            provider_contract_hash=provider_contract_hash,
-            strategy_identity_hash=strategy_identity_hash)
-        if ride is not None:
-            # ▲ THE BAR IS ONE PER-CALL WORST-CASE RESERVATION, NOT ZERO (scoped-review item 1:
-            # a zero floor passed a remainder too small for the FIRST dispatch to reserve —
-            # coupon consumed, then refused one seam later). The dispatch seam reserves
-            # calls=1, tokens=ceil(max_tokens/max_calls), cost=max_cost/max_calls
-            # (formula_draft_worker's SpendBindingV1 construction) — the SAME arithmetic here,
-            # so the guard refuses exactly when the seam would.
-            from decimal import Decimal
-
-            left = remaining_spend(conn, ride, now=resolved_now)
-            max_calls, max_tokens, max_cost = conn.execute(
-                "SELECT max_calls, max_tokens, max_cost FROM llm_spend_authorization_revision "
-                "WHERE spend_authorization_id = %s", (ride,)).fetchone()
-            call_tokens = -(-int(max_tokens) // int(max_calls))
-            call_cost = Decimal(str(max_cost)) / int(max_calls)
-            if left.calls < 1 or left.tokens < call_tokens or left.cost < call_cost:
-                raise DraftCeilingExhausted(
-                    f"the approved ceiling {ride} for formula identity {identity} cannot cover "
-                    f"one more call (remaining: calls={left.calls}, tokens={left.tokens}, "
-                    f"cost={left.cost}; one call reserves calls=1, tokens={call_tokens}, "
-                    f"cost={call_cost}) — "
-                    f"minting would consume the regeneration exception to buy a draft that "
-                    f"cannot dispatch. Nothing was consumed or written; re-confirming the cost "
-                    f"under a fresh authorization is the remedy, and it is the approver's")
+    # ▲ Every located coupon's money passed the bar during location, so the ride is simply the
+    # first consumed coupon's own authorization (one approval act binds the whole covering set
+    # to ONE authorization, so the set normally agrees; a mixed-act set rides its first-named
+    # coupon's money — deterministic, and flagged in the owner package).
+    ride: str | None = located[0][1] if located else None
 
     inserted = conn.execute(
         "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
@@ -570,12 +600,12 @@ def _request_draft_locked(
         # consumed before the refusal decision burns uses on refusals. Zero rows back means a
         # concurrent consumer exhausted it first, and the whole transaction — this INSERT included —
         # aborts rather than minting an unapproved draft.
-        for coupon in located:
+        for coupon, _spend in located:
             if not consume_exception(conn, coupon):
                 raise DraftRetired(
                     f"a regeneration exception for formula identity {identity} was exhausted by "
                     f"a concurrent request: max_uses is spent, and this draft is not minted")
-        return inserted[0], True
+        return inserted[0], True, ride
 
     existing = conn.execute(
         "SELECT d.formula_draft_id, d.state, r.reason, r.replacement_draft_id "
@@ -609,7 +639,7 @@ def _request_draft_locked(
 
     # The pre-insert gate owns the failure states now: since 1107 they hold no slot, so an INSERT
     # cannot lose to one and this branch only ever sees an answer or a purchase in flight.
-    return draft_id, False
+    return draft_id, False, None
 
 
 def advance(

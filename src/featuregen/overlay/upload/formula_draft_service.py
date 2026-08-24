@@ -456,42 +456,8 @@ def request_draft_for_candidate(
     # this with a real approval surface (§21's release-readiness list). The alternative —
     # route-dies — would 409 every "Draft formula" click until an approval UI exists, which
     # punishes the user for a surface nobody has built.
-    if decision.strategy is FormulaStrategy.LLM_AUTHORED and spend_authorization_id is None:
-        # ▲ AN APPROVED CEILING OUTRANKS THE DEV ENVELOPE (round-4 acceptance probe 2): a
-        # governed regeneration carries its own cost-confirmed spend authorization, bound to the
-        # exception at approval. Minting an envelope over it would enforce the ceiling nobody
-        # confirmed and leave the approved one decorative. One approval act shares ONE spend
-        # authorization across however many withdrawals it binds — never double-reserved,
-        # because reservation happens per physical call against this ONE id on the plan row.
-        from featuregen.overlay.upload.formula_draft_store import formula_identity
-        from featuregen.overlay.upload.retirement_scope import approved_ceiling_for
-
-        approved = approved_ceiling_for(
-            conn,
-            target_formula_identity_hash=formula_identity(
-                considered_revision_id=candidate.considered_revision_id, option_id=option_id,
-                planning_request_hash=candidate.planning_request_hash,
-                catalog_snapshot_hash=candidate.catalog_snapshot_hash,
-                authoring_config_hash=config_hash,
-                definition_revision=candidate.definition_revision),
-            provider_contract_hash=provider_contract,
-            strategy_identity_hash=decision.strategy_identity_hash)
-        if approved is not None:
-            spend_authorization_id = approved
-    if decision.strategy is FormulaStrategy.LLM_AUTHORED and spend_authorization_id is None:
-        if not mint_development_envelope:
-            # ▲ THE JOB PATH REFUSES, NEVER SUBSTITUTES (Task 5 review 4b): a coordinator member
-            # reaches here with None exactly when the job's cost-confirmed ceiling EXPIRED — and
-            # quietly swapping in a $25 dev envelope would replace the ceiling a person
-            # confirmed with one nobody did. §11.2's posture: refuse by name; re-confirming the
-            # cost is the remedy, and it is the user's.
-            raise AuthoringRefused(("COST_AUTHORIZATION_MISSING",))
-        spend_authorization_id = _development_spend_envelope(
-            conn, actor_subject=requested_by, config_hash=config_hash,
-            provider_contract_hash=provider_contract)
-
     try:
-        draft_id, created = request_draft(
+        draft_id, created, coupon_ride = request_draft(
             conn,
             formula_draft_id=formula_draft_id,
             considered_revision_id=candidate.considered_revision_id,
@@ -516,6 +482,44 @@ def request_draft_for_candidate(
         # already has — the route's 409 (code = first blocker) and the coordinator's member
         # refusal — and the store guarantees the naming coupon was NOT consumed.
         raise AuthoringRefused(("COST_AUTHORIZATION_EXHAUSTED",)) from exc
+
+    if created and decision.strategy is FormulaStrategy.LLM_AUTHORED:
+        # ▲ THE MINT RIDES THE MONEY OF THE COUPON IT CONSUMED (whole-branch C1) — resolved
+        # AFTER the store call because only the store knows which coupon it consumed. Priority:
+        # the consumed coupon's own authorization; else the caller's job ceiling; else the
+        # no-coupon preference (an unexpired approval whose coupon was not part of THIS mint —
+        # the pre-arm-adjacent paths approved_ceiling_for now exclusively serves); else the
+        # bounded development envelope, or the job path's refusal by name. The refusal after
+        # the mint is safe: everything durable is in the caller's transaction, so a raise
+        # unwinds the draft AND the coupon consumption together.
+        if coupon_ride is not None:
+            spend_authorization_id = coupon_ride
+        elif spend_authorization_id is None:
+            from featuregen.overlay.upload.formula_draft_store import formula_identity
+            from featuregen.overlay.upload.retirement_scope import approved_ceiling_for
+
+            spend_authorization_id = approved_ceiling_for(
+                conn,
+                target_formula_identity_hash=formula_identity(
+                    considered_revision_id=candidate.considered_revision_id,
+                    option_id=option_id,
+                    planning_request_hash=candidate.planning_request_hash,
+                    catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+                    authoring_config_hash=config_hash,
+                    definition_revision=candidate.definition_revision),
+                provider_contract_hash=provider_contract,
+                strategy_identity_hash=decision.strategy_identity_hash)
+        if spend_authorization_id is None:
+            if not mint_development_envelope:
+                # ▲ THE JOB PATH REFUSES, NEVER SUBSTITUTES (Task 5 review 4b): a coordinator
+                # member reaches here with None exactly when the job's cost-confirmed ceiling
+                # EXPIRED — and quietly swapping in a $25 dev envelope would replace the
+                # ceiling a person confirmed with one nobody did. §11.2's posture: refuse by
+                # name; re-confirming the cost is the remedy, and it is the user's.
+                raise AuthoringRefused(("COST_AUTHORIZATION_MISSING",))
+            spend_authorization_id = _development_spend_envelope(
+                conn, actor_subject=requested_by, config_hash=config_hash,
+                provider_contract_hash=provider_contract)
 
     if created:
         # ▲ THE PLAN, PERSISTED IN THE SAME TRANSACTION AS THE DRAFT AND ITS QUEUE MESSAGE. The

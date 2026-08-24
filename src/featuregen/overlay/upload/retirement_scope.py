@@ -265,11 +265,13 @@ def approved_ceiling_for(
 ) -> str | None:
     """The cost-confirmed ceiling a draft at this identity would RIDE, or None.
 
-    ▲ ONE QUERY, EVERY DOOR. The service's approved-ceiling preference, the store's dead-ticket
-    guard and the run-spine retry projection must give one answer, so they call this one locator
-    (the run-spine side carried a byte-identical copy while the service file was barred to its
-    implementers — this is the extraction that retires it). Its quirks are LOAD-BEARING and
-    byte-stable by agreement with that side:
+    ▲ ONE QUERY for the NO-COUPON doors (narrowed by whole-branch C1): where a mint CONSUMES a
+    coupon, the ride is that coupon's own `llm_spend_authorization_id` and this locator is not
+    consulted — the recency pick here and the antiquity pick of the coupon could disagree, and
+    the mint then burned one approval's coupon while riding another's money. What remains for
+    this locator: the service's no-coupon preference and the run-spine retry projection's
+    reporting, which must give one answer, so both call this one function. Its quirks are
+    LOAD-BEARING and byte-stable by agreement with that side:
 
     * the expiry filter is on the AUTHORIZATION only (`a.expires_at`) — a coupon's own expiry
       bounds new coupon MINTS, never which ceiling an in-flight regeneration rides;
@@ -294,8 +296,15 @@ def approved_ceiling_for(
 def valid_exception_for(
     conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
     strategy_identity_hash: str, now, covering_tombstone_id: str | None,
+    excluding: tuple[str, ...] = (),
 ) -> str | None:
     """The unexpired, unconsumed exception authorizing THIS exact regeneration, or ``None``.
+
+    ``excluding`` skips named coupons: the request gate passes over a coupon whose bound MONEY
+    cannot buy one call (whole-branch C1 — the mint rides the consumed coupon's money, so a
+    coupon the law forbids consuming is not available to the mint; without the skip, a
+    dead-money old coupon would block a fresh approval FOR EVER, and the refusal would name
+    the exact remedy that cannot work).
 
     ▲ Every binding is checked, not just the scope: an exception authorizes creating **one exact
     identity**, under **one provider contract** and **one strategy**. An earlier design keyed it on
@@ -312,10 +321,10 @@ def valid_exception_for(
         "SELECT exception_id FROM formula_draft_regeneration_exception "
         " WHERE target_formula_identity_hash = %s AND provider_contract_hash = %s "
         "   AND strategy_identity_hash = %s AND expires_at > %s AND uses_consumed < max_uses "
-        "   AND tombstone_id IS NOT DISTINCT FROM %s "
+        "   AND tombstone_id IS NOT DISTINCT FROM %s AND NOT (exception_id = ANY(%s)) "
         " ORDER BY approved_at LIMIT 1",
         (target_formula_identity_hash, provider_contract_hash, strategy_identity_hash,
-         now, covering_tombstone_id)).fetchone()
+         now, covering_tombstone_id, list(excluding))).fetchone()
     return None if row is None else row[0]
 
 

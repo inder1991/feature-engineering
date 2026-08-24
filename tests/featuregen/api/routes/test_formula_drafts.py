@@ -298,7 +298,7 @@ def test_THE_409_NAMES_THE_REPLACEMENT_when_there_is_one(client, conn, engineer_
     # after a retirement produces, since a new draft id alone would collide on the same identity.
     from featuregen.overlay.upload.formula_draft_store import request_draft
 
-    replacement, _created = request_draft(
+    replacement, _created, _ride = request_draft(
         conn, formula_draft_id="fd-replacement", considered_revision_id="crev-1",
         option_id="opt-a", planning_request_hash="p", catalog_snapshot_hash="c",
         authoring_config_hash="a-corrected", definition_revision="",
@@ -859,11 +859,11 @@ def test_a_SPENT_approved_ceiling_refuses_at_the_door_with_the_coupon_unburned(
 
 def test_PRODUCTION_posture_an_EXPIRED_approval_refuses_and_never_rides_the_envelope(
         client, conn):
-    """The dev-posture fall-through's PRODUCTION twin, pinned (Task 7 scoped-review rider):
-    with mint_development_envelope=False — the coordinator's posture — an EXPIRED
-    human-confirmed ceiling must be a typed refusal, not a silent substitution: the locator
-    returns None, and Task 5 review 4b's raise fires BEFORE the store call, so no coupon is
-    consumed, no draft is minted, and no envelope exists for the mint to ride."""
+    """Production posture, an EXPIRED human-confirmed ceiling: a typed refusal, never a silent
+    substitution. Under whole-branch C1 (the mint rides the money of the coupon it consumes)
+    the refusal comes from the STORE's dead-ticket bar — the coupon's own money is expired and
+    unridable — surfacing as COST_AUTHORIZATION_EXHAUSTED on BOTH postures, pre-consumption:
+    no coupon burned, no draft minted, no envelope ever created."""
     import pytest
 
     from featuregen.overlay.upload.formula_draft_service import (
@@ -918,7 +918,7 @@ def test_PRODUCTION_posture_an_EXPIRED_approval_refuses_and_never_rides_the_enve
             conn, revision_id="crev-pexp", option_id="opt-a", formula_draft_id="fd-pexp-2",
             requested_by="user:sam", now="2026-08-24T00:00:00Z",
             mint_development_envelope=False)
-    assert refusal.value.blockers == ("COST_AUTHORIZATION_MISSING",)
+    assert refusal.value.blockers == ("COST_AUTHORIZATION_EXHAUSTED",)
     unburned = conn.execute(
         "SELECT bool_and(uses_consumed = 0) FROM formula_draft_regeneration_exception "
         "WHERE llm_spend_authorization_id = %s", (spend,)).fetchone()
@@ -929,3 +929,60 @@ def test_PRODUCTION_posture_an_EXPIRED_approval_refuses_and_never_rides_the_enve
         "SELECT COUNT(*) FROM llm_spend_authorization_revision "
         "WHERE pricing_version = 'development'").fetchone()
     assert envelopes == (0,), "and no development envelope was ever created to substitute"
+
+
+def test_C1_the_mint_consumes_OLD_and_rides_OLDS_ceiling_the_rich_new_stays_whole(
+        client, conn, engineer_headers):
+    """Whole-branch C1, the inverted probe as the pin: two LIVE approvals for one identity —
+    cheap-OLD and rich-NEW. The coupon pick is by antiquity, so the mint consumes the OLD
+    coupon — and the money it rides must be the OLD approval's ceiling, never the rich new
+    one's: the plan row carries the consumed coupon's own authorization, and the new approval
+    stays whole (coupon unconsumed, its money untouched)."""
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _revision(conn, revision_id="crev-two", snapshot_id="snap-two")
+    candidate = frozen_candidate(conn, "crev-two", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-two', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-two', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    record_tombstone(conn, formula_draft_id="fd-two",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    cheap = client.post("/formula-drafts/fd-two/regeneration-exceptions",
+                        json={**_CEILING, "max_cost": "0.50"}, headers=governance)
+    rich = client.post("/formula-drafts/fd-two/regeneration-exceptions",
+                       json={**_CEILING, "max_cost": "500.00"}, headers=governance)
+    assert cheap.status_code == 201 and rich.status_code == 201
+    cheap_spend = cheap.json()["spend_authorization_id"]
+    rich_spend = rich.json()["spend_authorization_id"]
+    assert cheap_spend != rich_spend
+    # In-test both acts share one frozen transaction now(); real acts are separate
+    # transactions, so the earlier one carries the earlier approved_at the antiquity pick
+    # rides on.
+    conn.execute(
+        "UPDATE formula_draft_regeneration_exception "
+        "SET approved_at = approved_at - interval '1 second' "
+        "WHERE llm_spend_authorization_id = %s", (cheap_spend,))
+
+    minted = client.post(DRAFT_PATH.format(rev="crev-two", opt="opt-a"),
+                         headers=engineer_headers)
+    assert minted.status_code == 202, minted.text
+    plan_spend = conn.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_authoring_plan "
+        "WHERE formula_draft_id = %s", (minted.headers["X-Formula-Draft-Id"],)).fetchone()
+    assert plan_spend == (cheap_spend,), \
+        "the mint rides the money of the coupon it consumed — the CHEAP one it picked"
+    burned = {row[0]: row[1] for row in conn.execute(
+        "SELECT llm_spend_authorization_id, uses_consumed "
+        "FROM formula_draft_regeneration_exception "
+        "WHERE llm_spend_authorization_id IN (%s, %s)",
+        (cheap_spend, rich_spend)).fetchall()}
+    assert burned[cheap_spend] >= 1, "the old coupon was consumed"
+    assert burned[rich_spend] == 0, "the rich new approval stays WHOLE"

@@ -3128,8 +3128,15 @@ premises withdrawn on evidence.
   (`DraftCeilingExhausted` → `AuthoringRefused(COST_AUTHORIZATION_EXHAUSTED)`, refusing BEFORE
   the coupon is consumed; expired-authorization falls through to the dev envelope, pinned) and
   the **ONE ceiling locator** `approved_ceiling_for` in `retirement_scope.py` (byte-stable
-  semantics, three callers; run-spine projection switches when my branch reaches its tree —
-  until then its byte-identical copy + coupling test stands).
+  semantics; the run-spine projection switched to it at their `3aaf90b7`). ▲ Whole-branch C1
+  (2026-08-24) then NARROWED it to the no-coupon doors: **the mint rides the money of the
+  coupon it consumes** (the coupon's own `llm_spend_authorization_id`, ride resolved by the
+  STORE and returned to the service; ride-first, job ceiling, no-coupon preference, envelope,
+  refusal — in that order), the dead-money coupon is SKIPPED by the pick (a coupon the law
+  forbids consuming is not available, else the refusal prescribes the remedy it blocks), and
+  EXPIRED coupon-money refuses on BOTH postures instead of riding the envelope — two earlier
+  pins were INVERTED by this law, deliberately. Shared `per_call_worst_case` in llm_spend.py
+  is the ONE arithmetic (worker + store + their projection).
 * From the round-5 ledger (reviewer's file:line record is the source of truth): the
   201-with-"budget in effect" message over a dead coupon; the spend-preference query's missing
   expiry/exhaustion filters and the refuses-vs-substitutes posture (flagged for the
