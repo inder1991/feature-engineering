@@ -61,7 +61,7 @@ import { Fragment, type FormEvent, type ReactNode, useCallback, useEffect, useRe
 import {
   ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
   type OptionActionsEntry,
-  type IntakeReading, type IntakeResp,
+  type IntakeReading, type IntakeResp, type NeedsSetupCandidate,
   type JoinStep, type RankedRecipe, type Recipe, type RecipeDisposition, type RecognitionCandidate,
   type RecognitionResp, type RefineRejection, type Rejection, type SetRecommendation,
   contractConfirm, contractConsideredSet, contractDraft, contractIntake, contractIntakeTarget,
@@ -679,6 +679,89 @@ function TargetTicketFacts({ intake }: { intake: IntakeResp }) {
             ))}
           </ul>
         </div>
+      )}
+    </div>
+  )
+}
+
+// ------------------------------------------------------------- T2: the needs-setup lane ------
+//
+// A CANDIDATE HELD BACK IS NOT A CANDIDATE THAT FAILED. These carry no card, no computation and no
+// option id, because there is nothing to offer, save or govern until the binding is settled — but
+// there IS work here, it belongs to a named person, and the run knows exactly what it is.
+//
+// The live arrangement this program came from returned ideas=0, actionable=0, needs_setup=114, and
+// the screen answered it with "No grounded candidates for that goal. Rephrase the goal" — a wrong
+// remedy over a hidden fact.
+//
+// EVERY SENTENCE IS THE SERVER'S. `sentence` is worded from the binder's own verdict status, and
+// re-wording it here would re-assert absence over operands the catalog actually carries: on the
+// FTR fixture 36 of 66 unbound required operands are `ambiguous`, meaning SEVERAL columns carry
+// the concept and nobody has adjudicated between them. `tied_refs` names those columns, because
+// they are what a person would be choosing between.
+//
+// It names no OTHER catalog, deliberately: the projection is handed one catalog and holds no
+// cross-catalog inventory, so "monetary_flow lives in ftr" is a claim nothing here can make.
+function NeedsSetupPanel({ entries, open, onToggle }: {
+  entries: NeedsSetupCandidate[]
+  open: boolean
+  onToggle: () => void
+}) {
+  const n = entries.length
+  return (
+    <div className="rej-panel" data-testid="needs-setup">
+      <div className="rej-line">
+        <span className="badge tabular-nums">{n} need setup</span>
+        <span>
+          {n === 1 ? 'One candidate was' : `${n} candidates were`} planned but not served: a
+          required input did not bind to a column in this catalog. This is binding work, not a
+          rejection — nothing about the goal is wrong.
+        </span>
+        <button
+          type="button"
+          className="rej-toggle"
+          aria-expanded={open}
+          aria-controls="wb-needs-setup-list"
+          onClick={onToggle}
+        >
+          {open ? 'Hide' : 'Show'}
+        </button>
+      </div>
+      {open && (
+        <ul className="rej-list" id="wb-needs-setup-list">
+          {entries.map(entry => (
+            <li key={entry.source_definition_id} style={{ display: 'grid', gap: 4 }}>
+              <div>
+                <code>{entry.name}</code>{' '}
+                {/* Status-NEUTRAL by name: what these have in common is that they did not bind,
+                    not that they are absent. What the binder found rides each operand below. */}
+                <span className="hint">
+                  unbound: {entry.unbound_concepts.join(', ')}
+                </span>
+              </div>
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {entry.unbound_operands.map(operand => (
+                  <li key={operand.role}>
+                    <span className="hint">{operand.sentence}</span>
+                    {operand.tied_refs.length > 0 && (
+                      // The columns a human is choosing between, listed so the tie can actually
+                      // be adjudicated. Dropping them turned "adjudicate this" into "onboard
+                      // this data" — the wrong remedy, handed to the wrong owner.
+                      <ul style={{ margin: 0, paddingLeft: 18 }}>
+                        {operand.tied_refs.map(ref => (
+                          <li key={ref}><code>{ref}</code></li>
+                        ))}
+                      </ul>
+                    )}
+                    {operand.resolution && (
+                      <span className="hint"> — {operand.resolution}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   )
@@ -1374,6 +1457,12 @@ export function WorkbenchScreen() {
   const [auditError, setAuditError] = useState('')
   const [rejections, setRejections] = useState<Rejection[]>([])
   const [rejectionsOpen, setRejectionsOpen] = useState(false)
+  // T2's fourth outcome. `[]` is the honest empty lane; the response omitting the key entirely
+  // (a v1/legacy body) reads the same on screen, because in both cases there is nothing to say.
+  const [needsSetup, setNeedsSetup] = useState<NeedsSetupCandidate[]>([])
+  // Open by default: on the arrangement this lane exists for it is the ENTIRE answer, and a
+  // collapsed panel would reproduce the silence it was built to break.
+  const [needsSetupOpen, setNeedsSetupOpen] = useState(true)
   // Which set's features the one detail list shows (multi-set rounds only).
   const [activeLens, setActiveLens] = useState<string | null>(null)
   // Slice 2: narrowing WITHIN the active set. Both are pure view state — they hide rows and
@@ -1812,6 +1901,7 @@ export function WorkbenchScreen() {
     setRecommendation(null)
     setActiveLens(null)
     setRejections([])
+    setNeedsSetup([])
     setRejectionsOpen(false)
     // Drop any stale governance intent: the candidates it governed no longer exist.
     setIntentId(null)
@@ -1970,6 +2060,9 @@ export function WorkbenchScreen() {
           : lenses[0]
         : null)
     setRejections(cs.rejections)
+    // T2: the fourth outcome rides the same round reset as the other three. A v1/legacy body
+    // omits the key; `[]` there is 'nothing to show', which is what an absent key means too.
+    setNeedsSetup(cs.needs_setup ?? [])
     setRejectionsOpen(false)
     clearResultView()
     setScreenedTarget(target.trim() || null)
@@ -2432,6 +2525,7 @@ export function WorkbenchScreen() {
             : lenses[0]
           : null)
       setRejections(round.rejections)
+      setNeedsSetup(cs.needs_setup ?? [])
       setRejectionsOpen(false)
       clearResultView()
       setConfirmingBatch(false)
@@ -3671,10 +3765,24 @@ export function WorkbenchScreen() {
 
       {generated?.length === 0 && (
         <>
-          <div className="empty" role="status">
-            <p>No grounded candidates for that goal.</p>
-            <p className="next">Rephrase the goal, or change the catalog source and generate again.</p>
-          </div>
+          {/* T2: "no cards" and "nothing to say" are different rounds. When the setup lane holds
+              entries it IS the answer, and it states the absence more precisely than this does —
+              so this note stands down entirely rather than adding a sentence that blames the goal
+              ("for that goal") and a remedy that would send a person to rewrite a question which
+              was never the problem. */}
+          {needsSetup.length === 0 && (
+            <div className="empty" role="status">
+              <p>No grounded candidates for that goal.</p>
+              <p className="next">Rephrase the goal, or change the catalog source and generate again.</p>
+            </div>
+          )}
+          {needsSetup.length > 0 && (
+            <NeedsSetupPanel
+              entries={needsSetup}
+              open={needsSetupOpen}
+              onToggle={() => setNeedsSetupOpen(open => !open)}
+            />
+          )}
           {/* An all-rejected round still shows WHY: rejections are never hidden. (When drafts
               exist the candidates block below renders the panel instead.) */}
           {rejections.length > 0 && allCandidates.length === 0 && (
@@ -3735,6 +3843,15 @@ export function WorkbenchScreen() {
                 rejections={rejections}
                 open={rejectionsOpen}
                 onToggle={() => setRejectionsOpen(open => !open)}
+              />
+            )}
+            {/* A round can serve cards AND hold setup work: the lane is not an empty-state, it is
+                the fourth outcome, and it belongs beside the other three whenever it has entries. */}
+            {needsSetup.length > 0 && (
+              <NeedsSetupPanel
+                entries={needsSetup}
+                open={needsSetupOpen}
+                onToggle={() => setNeedsSetupOpen(open => !open)}
               />
             )}
             {/* ── What this run's options are made of ─────────────────────────────────────────────

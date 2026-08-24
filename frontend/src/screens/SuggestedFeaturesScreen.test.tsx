@@ -1004,4 +1004,58 @@ describe('the planning-engine section (contract v4)', () => {
     await screen.findByText('account_balance_trend_90d')
     expect(screen.queryByTestId('semantic-engine')).not.toBeInTheDocument()
   })
+
+  // ── T2: the entry that carries no card says WHY, in the binder's own words ─────────────────────
+  //
+  // The `sentence` strings below are copied from `UnboundOperandV1.sentence` /
+  // `NeedsSetupCandidateV1.sentence` in overlay/upload/semantic_projection.py. The screen renders
+  // them; it does not re-word them — because "did not bind" is three conditions and only ONE of
+  // them is an absence. Asserting absence over an `ambiguous` operand (36 of 66 on the FTR
+  // fixture) tells the wrong owner the wrong remedy: "onboard this data" when the real work is
+  // "adjudicate this tie", between columns the payload actually names.
+  it('an unbound entry renders the binder’s sentence, not a composed absence', async () => {
+    getTableSuggestionsV4.mockResolvedValue({
+      ...v4(),
+      semantic: {
+        ...SEMANTIC,
+        actionable: [{
+          ...SEMANTIC.actionable[0],
+          card: null,
+          needs_setup: {
+            name: 'drawn_exposure_utilisation', source_definition_id: 'recipe:drawn',
+            recipe_id: 'drawn_exposure_utilisation', catalog_source: 'ftr',
+            unbound_concepts: ['monetary_flow', 'credit_limit'],
+            unbound_operands: [
+              {
+                role: 'drawn', concept: 'monetary_flow', operand_class: 'measure',
+                status: 'ambiguous', reason_codes: [], resolution: 'a human adjudicates the tie',
+                tied_refs: ['public.exposure.drawn_amt', 'public.exposure.util_amt'],
+                sentence: '2 columns carry monetary_flow and the tie is unadjudicated: '
+                  + 'public.exposure.drawn_amt, public.exposure.util_amt',
+              },
+              {
+                role: 'limit', concept: 'credit_limit', operand_class: 'measure',
+                status: 'unresolved', reason_codes: [], resolution: '', tied_refs: [],
+                sentence: 'no read-scoped column carries credit_limit',
+              },
+            ],
+            sentence: '2 columns carry monetary_flow and the tie is unadjudicated: '
+              + 'public.exposure.drawn_amt, public.exposure.util_amt; '
+              + 'no read-scoped column carries credit_limit',
+          },
+        }],
+      },
+    })
+    renderScreen()
+    const section = await screen.findByTestId('semantic-engine')
+    // The PRESENCE case, named: the tie's own columns, so it can actually be adjudicated.
+    expect(section).toHaveTextContent(
+      '2 columns carry monetary_flow and the tie is unadjudicated')
+    expect(section).toHaveTextContent('public.exposure.drawn_amt')
+    expect(section).toHaveTextContent('public.exposure.util_amt')
+    // …and the ABSENCE case, which is the only one allowed to speak of absence.
+    expect(section).toHaveTextContent('no read-scoped column carries credit_limit')
+    // The client's own stand-in sentence is gone. It asserted absence over both operands at once.
+    expect(section).not.toHaveTextContent('no eligible binding for every required operand')
+  })
 })

@@ -5,6 +5,7 @@ import {
   type FeatureSuggestionPageV2,
   type JoinNeighbourhood,
   SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+  type SemanticEngineEntry,
   type SuggestionGroupV2,
   type SuggestionOmittedCounts,
   type SuggestionSemanticBlock,
@@ -456,21 +457,47 @@ function SemanticEngineSection({ semantic }: { semantic: SuggestionSemanticBlock
         <>
           <h3>Could be useful if…</h3>
           <ul className="rows" aria-label="recipes needing a decision">
-            {semantic.actionable.map(entry => {
-              const action = entry.verdicts.find(v => v.resolution)?.resolution
-                ?? 'no eligible binding for every required operand'
-              return (
+            {semantic.actionable.map(entry => (
                 <li key={entry.recipe_id}>
                   <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
                   <span className="badge stale">{entry.binding_state}</span>{' '}
-                  <span className="hint">{action}</span>
+                  <EntryAction entry={entry} />
                 </li>
-              )
-            })}
+              ))}
           </ul>
         </>
       )}
     </section>
+  )
+}
+
+// T2: what an entry with no card is waiting on — THE SERVER'S ANSWER, one clause per operand that
+// did not bind, each worded from that operand's own verdict status.
+//
+// What was here before was a client-composed stand-in: "no eligible binding for every required
+// operand", used whenever no verdict carried a resolution. That sentence asserts ABSENCE over
+// every operand at once, and it is false for most of them — `ambiguous` and `blocked` both mean
+// the catalog CARRIES the concept, on columns the payload names in `tied_refs`. On the FTR fixture
+// that was 36 of 66 unbound required operands being told to onboard data they already had.
+//
+// The verdict `resolution` still leads when the server named a human action, because that is the
+// one field that says who acts next; the binder's own sentences follow it.
+function EntryAction({ entry }: { entry: SemanticEngineEntry }) {
+  const resolution = entry.verdicts.find(v => v.resolution)?.resolution ?? ''
+  const setup = entry.needs_setup
+  if (!setup) {
+    // No T2 block on the entry: say only what there is. A pre-T2 deployment and a candidate that
+    // bound everything are different facts, and neither licenses inventing a reason.
+    return resolution ? <span className="hint">{resolution}</span> : null
+  }
+  return (
+    <span className="hint">
+      {resolution && <>{resolution} · </>}
+      {setup.sentence}
+      {setup.unbound_concepts.length > 0 && (
+        <> · unbound: {setup.unbound_concepts.join(', ')}</>
+      )}
+    </span>
   )
 }
 

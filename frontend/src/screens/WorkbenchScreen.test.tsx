@@ -639,6 +639,96 @@ describe('multiple sets', () => {
   })
 })
 
+// ── T2: the needs-setup lane — a shorter list with a reason given ──────────────────────────────
+//
+// The live cib arrangement this program came from returns ideas=0, actionable=0, needs_setup=114.
+// Before this lane the screen answered that with "No grounded candidates for that goal. Rephrase
+// the goal, or change the catalog source" — a wrong REMEDY on top of a hidden fact: 114 candidates
+// were planned, and every one of them is waiting on a binding a person can settle.
+//
+// Every sentence below is copied from `UnboundOperandV1.sentence` in
+// overlay/upload/semantic_projection.py. The lane renders those; it composes nothing — because
+// "did not bind" is three conditions and only `unresolved` is an absence.
+describe('the needs-setup lane', () => {
+  const AMBIGUOUS: api.UnboundOperand = {
+    role: 'flow', concept: 'monetary_flow', operand_class: 'measure', status: 'ambiguous',
+    reason_codes: [], resolution: 'a human adjudicates the tie',
+    tied_refs: ['public.txn.amt_local', 'public.txn.amt_usd'],
+    sentence: '2 columns carry monetary_flow and the tie is unadjudicated: '
+      + 'public.txn.amt_local, public.txn.amt_usd',
+  }
+  const UNRESOLVED: api.UnboundOperand = {
+    role: 'limit', concept: 'credit_limit', operand_class: 'measure', status: 'unresolved',
+    reason_codes: [], resolution: '', tied_refs: [],
+    sentence: 'no read-scoped column carries credit_limit',
+  }
+  const NO_VERDICT: api.UnboundOperand = {
+    role: 'party', concept: 'counterparty_id', operand_class: 'identifier', status: '',
+    reason_codes: [], resolution: '', tied_refs: [],
+    sentence: "the binder returned no verdict for the 'party' operand (counterparty_id)",
+  }
+
+  function needsSetup(
+    name: string, operands: api.UnboundOperand[],
+  ): api.NeedsSetupCandidate {
+    return {
+      name, source_definition_id: `recipe:${name}`, recipe_id: name, catalog_source: 'cib',
+      unbound_concepts: [...new Set(operands.map(o => o.concept))],
+      unbound_operands: operands,
+      sentence: operands.map(o => o.sentence).join('; '),
+    }
+  }
+
+  async function generateWithSetup(entries: api.NeedsSetupCandidate[]) {
+    contractConsideredSet.mockResolvedValue({
+      ...considered(singleSetRound([])), contract_version: 2, needs_setup: entries,
+    })
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+  }
+
+  it('a round with no cards but setup work says so, and names what did not bind', async () => {
+    await generateWithSetup([needsSetup('net_transaction_flow', [AMBIGUOUS, UNRESOLVED])])
+    const lane = await screen.findByTestId('needs-setup')
+    expect(lane).toHaveTextContent('net_transaction_flow')
+    // The AMBIGUOUS operand is a PRESENCE claim, and the tie's own columns are named — that is the
+    // difference between "adjudicate this" and "onboard this data".
+    expect(lane).toHaveTextContent(
+      '2 columns carry monetary_flow and the tie is unadjudicated')
+    expect(within(lane).getByText('public.txn.amt_local')).toBeInTheDocument()
+    expect(within(lane).getByText('public.txn.amt_usd')).toBeInTheDocument()
+    // The UNRESOLVED one is the only absence, and it is the only one worded as one.
+    expect(lane).toHaveTextContent('no read-scoped column carries credit_limit')
+    // The aggregate is status-NEUTRAL: it never says these concepts are missing.
+    expect(lane).toHaveTextContent('monetary_flow')
+    expect(lane).not.toHaveTextContent(/missing concepts/i)
+  })
+
+  it('is setup work, never a failure, and never the rephrase-the-goal remedy', async () => {
+    await generateWithSetup([needsSetup('net_transaction_flow', [UNRESOLVED])])
+    await screen.findByTestId('needs-setup')
+    // The old answer told the human to rewrite a question that was never the problem.
+    expect(screen.queryByText(/Rephrase the goal/i)).toBeNull()
+    expect(screen.queryByText(/no grounded candidates for that goal/i)).toBeNull()
+  })
+
+  it('a role the binder never ruled on says exactly that — honest absence, not a guess',
+    async () => {
+      await generateWithSetup([needsSetup('counterparty_concentration', [NO_VERDICT])])
+      const lane = await screen.findByTestId('needs-setup')
+      expect(lane).toHaveTextContent(
+        "the binder returned no verdict for the 'party' operand (counterparty_id)")
+    })
+
+  it('an empty needs_setup lane renders nothing at all', async () => {
+    await generateWithSetup([])
+    expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
+    expect(screen.queryByTestId('needs-setup')).toBeNull()
+  })
+})
+
 describe('rejections panel', () => {
   const REJECTIONS: api.Rejection[] = [
     { name: 'days_to_churn', reason: 'derives from the target column public.labels.churned', code: 'LEAKAGE' },
