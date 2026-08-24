@@ -77,6 +77,10 @@ where = ["src"]
 # import by featuregen.overlay.upload.taxonomy.recognition_schema — without this the wheel cannot
 # import the enrichment seam at all.
 "featuregen.overlay.upload.taxonomy" = ["*.schema.json"]
+# The reviewed hypothesis corpus (hypothesis_corpus_v1.json), read as a package resource by
+# featuregen.overlay.upload.hypothesis_corpus — without this an installed release has no corpus
+# to measure Stage 1C's generation quality against.
+"featuregen.overlay.upload" = ["*.json"]
 
 [tool.pytest.ini_options]
 # "." so `scripts/` is importable: the migration-ledger verifier guards every deploy,

@@ -1,0 +1,362 @@
+{
+  "schema_version": "hypothesis-corpus-v1",
+  "entries": [
+    {
+      "corpus_id": "retail_salary_anchor_loss",
+      "hypothesis": "A retail customer whose monthly salary credit stops landing in their current account is usually banking somewhere else already; the closure request arrives months later.",
+      "banking_domain": "retail",
+      "expected_recipe_ids": [
+        "salary_credit_amount",
+        "salary_credit_count",
+        "salary_regularity",
+        "salary_anchoring_ceased_flag",
+        "own_transfer_outflow_amount",
+        "external_own_transfer_pattern"
+      ],
+      "expected_intent_themes": [
+        "salary anchoring loss",
+        "primacy erosion",
+        "outbound transfers to an own account at another bank"
+      ],
+      "implied_windows_days": [180],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "customer",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: salary regularity only reads as broken across several pay cycles. Every named recipe carries the window parameter whose primary value is 30 days (ParameterSpecV2.allowed_values[0] == 30), and this hypothesis expects 180 so that six missed or redirected salary credits are inside the window. CROSS-CATALOG: the salary credits are transaction-catalog records while the accounts and product holdings that establish primacy sit in the retail core."
+    },
+    {
+      "corpus_id": "retail_dormancy_before_closure",
+      "hypothesis": "Current accounts go quiet before they are closed: across the quarter before a closure request the balance drifts down and the transaction rate falls away.",
+      "banking_domain": "retail",
+      "expected_recipe_ids": [
+        "dormancy_recency_days",
+        "dormant_day_count",
+        "days_below_threshold",
+        "balance_slope",
+        "txn_count_slope"
+      ],
+      "expected_intent_themes": [
+        "account dormancy",
+        "balance decay ahead of closure",
+        "transaction frequency decline"
+      ],
+      "implied_windows_days": [90],
+      "expects_cross_catalog": false,
+      "expected_target_entity": "account",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: one quiet month is a holiday, a quiet quarter is a decision. The named recipes default to a 30-day window (primary allowed value) and the wording 'across the quarter' expects 90. SINGLE-CATALOG: balances, transactions and mandates for a current account are all held against the account in the retail core, so no bridge is expected."
+    },
+    {
+      "corpus_id": "retail_branch_closure_displacement",
+      "hypothesis": "When the branch a customer habitually uses closes, some customers move to digital and stay, while others quietly drift out of the bank within the year.",
+      "banking_domain": "retail",
+      "expected_recipe_ids": [],
+      "expected_intent_themes": [
+        "branch estate change",
+        "channel displacement after a branch closure",
+        "digital migration versus attrition"
+      ],
+      "implied_windows_days": [365],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "customer",
+      "review_status": "draft",
+      "rationale": "PURE DISCOVERY, deliberately: expected_recipe_ids is empty because the V2 registry holds no branch or ATM recipe at all (no recipe id, family or grain in the 317 mentions a branch), so nothing in the catalogue can answer this. The entry exists to measure whether an LLM proposes the intent regardless of catalogue coverage. CROSS-CATALOG: branch estate reference data is not maintained alongside customer transactions."
+    },
+    {
+      "corpus_id": "cib_covenant_stress_to_refinancing_wall",
+      "hypothesis": "A corporate borrower that trips covenants while a large share of its facilities matures in the same period is heading for a distressed refinancing, not a routine rollover.",
+      "banking_domain": "cib",
+      "expected_recipe_ids": [
+        "covenant_breach_count",
+        "facility_maturity_wall",
+        "refinancing_concentration_share",
+        "stressed_line_count",
+        "obligor_facility_count"
+      ],
+      "expected_intent_themes": [
+        "covenant breach clustering",
+        "maturity wall concentration",
+        "refinancing risk"
+      ],
+      "implied_windows_days": [365],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "obligor",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE, and an unreachable one: a maturity wall is an annual shape. The named recipes default to 30 days and their menu stops at 180, so the expected 365 is a divergence the chooser CANNOT satisfy from the closed allowed_values (30, 90, 180) — that gap is exactly what the measurement should report. CROSS-CATALOG: covenant tests are held in the credit-monitoring catalog while facility and group-exposure records sit in corporate lending."
+    },
+    {
+      "corpus_id": "cib_wallet_share_erosion",
+      "hypothesis": "A CIB client whose fee wallet is shrinking while our cost to serve holds flat is being competed away product by product, long before the mandate itself moves.",
+      "banking_domain": "cib",
+      "expected_recipe_ids": [
+        "revenue_wallet_share_pattern",
+        "direct_service_cost",
+        "raroc_pattern",
+        "treasury_product_adoption_count"
+      ],
+      "expected_intent_themes": [
+        "wallet share erosion",
+        "return on capital deterioration",
+        "product-by-product displacement"
+      ],
+      "implied_windows_days": [180],
+      "expects_cross_catalog": false,
+      "expected_target_entity": "legal_entity",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: wallet share is read over a reporting half, not a month — 180 against the named recipes' 30-day primary window. TARGET ENTITY: the four recipes aggregate to a 'client' output grain, which the closed entity vocabulary spells legal_entity (known_entities() has no 'client' member); naming legal_entity is the honest projection, not a guess. SINGLE-CATALOG: revenue and cost events for a covered client are booked in the same CIB profitability catalog."
+    },
+    {
+      "corpus_id": "payments_rail_migration",
+      "hypothesis": "Customers moving everyday spend off cards and onto instant account-to-account rails show flat total volume, but the revenue mix underneath has already shifted.",
+      "banking_domain": "payments",
+      "expected_recipe_ids": [
+        "rail_txn_count",
+        "rail_txn_amount",
+        "rail_scheme_diversity",
+        "corridor_cross_border_share",
+        "purpose_code_diversity"
+      ],
+      "expected_intent_themes": [
+        "payment rail migration",
+        "scheme mix shift",
+        "interchange revenue displacement"
+      ],
+      "implied_windows_days": [90, 180],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "customer",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: a mix shift needs two comparable periods. The named recipes default to 30 days; this entry expects both 90 and 180 so a genuine trend is separable from one seasonal month. CROSS-CATALOG: card authorisation and interchange records live with the card processor while account-to-account rail traffic lands in the payments hub."
+    },
+    {
+      "corpus_id": "payments_merchant_settlement_deterioration",
+      "hypothesis": "An acquired merchant whose settlements start running late and whose returns tick up is in trouble before the chargebacks arrive.",
+      "banking_domain": "payments",
+      "expected_recipe_ids": [
+        "settlement_lag_avg_days",
+        "return_payment_rate",
+        "authorisation_decline_rate",
+        "chargeback_rate"
+      ],
+      "expected_intent_themes": [
+        "settlement lag",
+        "merchant credit deterioration",
+        "return and chargeback build-up"
+      ],
+      "implied_windows_days": [30],
+      "expects_cross_catalog": false,
+      "expected_target_entity": "merchant",
+      "review_status": "draft",
+      "rationale": "DELIBERATELY NOT A DIVERGENCE, and the corpus needs such entries or the divergence measurement only ever rewards disagreement. Settlement lag and returns are monitored on the monthly acquiring cycle the named recipes already default to (window allowed_values[0] == 30), so the SME expects the recipe default and a chooser that picks 30 here should score correct. SINGLE-CATALOG: settlement, dispute and authorisation records for an acquired merchant sit together in the acquiring catalog."
+    },
+    {
+      "corpus_id": "cards_testing_burst_precedes_fraud",
+      "hypothesis": "A burst of small declining authorisations on one card inside an hour is card testing, and the first authorisation that succeeds afterwards is fraud.",
+      "banking_domain": "cards",
+      "expected_recipe_ids": [
+        "card_testing_velocity",
+        "auth_decline_streak",
+        "amount_just_under_limit",
+        "cnp_transaction_share"
+      ],
+      "expected_intent_themes": [
+        "card testing velocity",
+        "declined authorisation bursts",
+        "card-not-present concentration"
+      ],
+      "implied_windows_days": [],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "card_account",
+      "review_status": "draft",
+      "rationale": "IMPLIED WINDOWS DELIBERATELY EMPTY. The wording implies a minutes-scale window, and the two lead recipes (card_testing_velocity, auth_decline_streak) carry window_minutes with allowed values (15, 60, 240) rather than a day window at all. No day figure represents this hypothesis honestly, and inventing one would manufacture a divergence out of a unit mismatch. TARGET ENTITY: the recipes' output grain is 'card', which the closed vocabulary spells card_account. CROSS-CATALOG: authorisations come from the issuer switch while confirmed-fraud and dispute outcomes come from the fraud case system."
+    },
+    {
+      "corpus_id": "cards_revolver_to_delinquency",
+      "hypothesis": "A cardholder revolving a rising share of the balance while repeatedly touching the credit limit is a delinquency two statements from now.",
+      "banking_domain": "cards",
+      "expected_recipe_ids": [
+        "card_revolve_share",
+        "excess_limit_episode_count",
+        "excess_limit_episode_max_days",
+        "limit_headroom"
+      ],
+      "expected_intent_themes": [
+        "persistent revolving debt",
+        "limit utilisation pressure",
+        "early delinquency warning"
+      ],
+      "implied_windows_days": [180],
+      "expects_cross_catalog": false,
+      "expected_target_entity": "card_account",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: 'persistent' is a supervisory word with a multi-statement meaning. The named recipes default to a 30-day window; this entry expects 180, six statement cycles. SINGLE-CATALOG: revolve share, limit episodes and headroom are all derived from the card account's own billing periods and daily snapshots."
+    },
+    {
+      "corpus_id": "customer_relationship_breadth_decay",
+      "hypothesis": "A customer who stops taking new products and lets the ones they hold go inactive is unwinding the relationship, whatever the headline balance says.",
+      "banking_domain": "customer",
+      "expected_recipe_ids": [
+        "active_product_family_count",
+        "active_account_count",
+        "product_breadth_growth",
+        "relationship_balance",
+        "channel_adoption_depth",
+        "digital_adoption_share"
+      ],
+      "expected_intent_themes": [
+        "product breadth decay",
+        "relationship unwinding",
+        "channel disengagement"
+      ],
+      "implied_windows_days": [180],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "customer",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: product breadth moves slowly and a 30-day view (the recipes' primary window) shows nothing, so the entry expects 180. CROSS-CATALOG: product holdings sit in core banking while the digital channel activity that evidences disengagement is recorded in the digital estate."
+    },
+    {
+      "corpus_id": "customer_household_value_concentration",
+      "hypothesis": "A household where all the value sits with one member is one life event away from leaving, and the members holding nothing of their own are the ones we never see.",
+      "banking_domain": "customer",
+      "expected_recipe_ids": [
+        "verified_household_member_count",
+        "household_relationship_value",
+        "relationship_revenue",
+        "active_product_family_count"
+      ],
+      "expected_intent_themes": [
+        "household value concentration",
+        "single-member dependency",
+        "household members with no products of their own"
+      ],
+      "implied_windows_days": [180],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "household",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: household composition and revenue are planning-cycle facts, so 180 against the named recipes' 30-day primary window. CROSS-CATALOG: household membership is maintained in the customer master while the revenue events that value it are booked per product in the profitability catalog."
+    },
+    {
+      "corpus_id": "accounts_overdraft_dependency",
+      "hypothesis": "An account that lives in its overdraft, in it more days than out and deeper each month, is not a liquidity blip; it is a customer whose income no longer covers their outgoings.",
+      "banking_domain": "accounts",
+      "expected_recipe_ids": [
+        "overdraft_day_count",
+        "maximum_overdraft_depth",
+        "days_below_threshold",
+        "minimum_daily_balance",
+        "fee_burden_ratio"
+      ],
+      "expected_intent_themes": [
+        "persistent overdraft use",
+        "structural income shortfall",
+        "fee burden"
+      ],
+      "implied_windows_days": [90],
+      "expects_cross_catalog": false,
+      "expected_target_entity": "account",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: one month in overdraft is a bad month, a quarter is a pattern — 90 against the recipes' 30-day primary window. SINGLE-CATALOG: daily balance snapshots, overdraft episodes and fees all belong to the account in the retail core."
+    },
+    {
+      "corpus_id": "accounts_deposit_stability_under_rate_moves",
+      "hypothesis": "When rates move, the deposits that leave first are the ones that were never operational: high balances with no salary, no direct debits and no card activity behind them.",
+      "banking_domain": "accounts",
+      "expected_recipe_ids": [
+        "average_daily_balance",
+        "maximum_balance_drawdown",
+        "end_of_day_balance",
+        "interest_paid_amount",
+        "net_transaction_flow",
+        "active_mandate_count"
+      ],
+      "expected_intent_themes": [
+        "deposit stability",
+        "rate-sensitive balances",
+        "operational versus surplus deposits"
+      ],
+      "implied_windows_days": [180, 365],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "account",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE straddling the menu edge on purpose: a deposit beta is read across a full rate cycle. The named recipes default to 30 days and their allowed values stop at 180, so a chooser can meet the 180 half of this expectation and never the 365 half — the honest partial result Stage 1C should record. CROSS-CATALOG: interest paid is posted in the general-ledger and treasury catalog while balances and mandates sit in the deposits system."
+    },
+    {
+      "corpus_id": "servicing_unresolved_complaints_drive_exit",
+      "hypothesis": "It is not the complaint that loses the customer, it is the one still open sixty days later.",
+      "banking_domain": "servicing",
+      "expected_recipe_ids": [
+        "unresolved_complaint_count",
+        "complaint_resolution_days",
+        "complaint_count",
+        "service_failure_count",
+        "service_interaction_count"
+      ],
+      "expected_intent_themes": [
+        "unresolved complaint ageing",
+        "service failure recurrence",
+        "complaint-driven attrition"
+      ],
+      "implied_windows_days": [90],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "customer",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: the hypothesis names sixty days of ageing, which a window must be long enough to contain — 90, against the named recipes' 30-day primary window. CROSS-CATALOG: complaints and service interactions are captured in the servicing and CRM catalogs while the closure outcomes they are measured against sit in the core."
+    },
+    {
+      "corpus_id": "servicing_collections_contact_quality",
+      "hypothesis": "Reaching the right person once beats calling the wrong number ten times: accounts in collections where right-party contact is rare are the ones that roll forward.",
+      "banking_domain": "servicing",
+      "expected_recipe_ids": [
+        "right_party_contact_rate",
+        "contact_attempt_count",
+        "promise_kept_share",
+        "plan_installments_met_streak",
+        "rolled_forward_flag"
+      ],
+      "expected_intent_themes": [
+        "right-party contact rate",
+        "contact strategy effectiveness",
+        "promise-to-pay follow-through"
+      ],
+      "implied_windows_days": [90],
+      "expects_cross_catalog": false,
+      "expected_target_entity": "facility",
+      "review_status": "draft",
+      "rationale": "PARAMETER DIVERGENCE: a contact strategy is judged over a collections cycle rather than a month — 90 against the 30-day primary window the named recipes carry. SINGLE-CATALOG: contact events, promises, arrangements and roll-forward status are all recorded against the facility in the collections system."
+    },
+    {
+      "corpus_id": "customer_bereavement_survivor_retention",
+      "hypothesis": "When a joint holder dies, how the bank handles the following months decides whether the survivor stays: estates settled slowly and clumsily lose the whole remaining relationship.",
+      "banking_domain": "customer",
+      "expected_recipe_ids": [],
+      "expected_intent_themes": [
+        "bereavement case handling",
+        "estate settlement duration",
+        "survivor relationship retention"
+      ],
+      "implied_windows_days": [365],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "customer",
+      "review_status": "draft",
+      "rationale": "PURE DISCOVERY, deliberately: no V2 recipe mentions bereavement, probate, or a deceased holder anywhere in the 317 (verified by search over the recipe packs), so expected_recipe_ids is empty and the entry measures whether the LLM proposes the intent past the catalogue. The 365-day window reflects that estate settlement runs months and survivor attrition is judged across the following year. CROSS-CATALOG: the bereavement case and its milestones are worked in the servicing case system while the survivor's holdings, balances and mandates sit in the core — the retention signal only exists across that join."
+    },
+    {
+      "corpus_id": "servicing_relationship_manager_coverage_gap",
+      "hypothesis": "Books whose relationship manager changed twice in a year quietly lose service quality: reviews slip, calls go unmade, and the client notices before we do.",
+      "banking_domain": "servicing",
+      "expected_recipe_ids": [
+        "advisor_interaction_recency",
+        "suitability_review_overdue_flag"
+      ],
+      "expected_intent_themes": [
+        "relationship manager turnover",
+        "coverage continuity",
+        "review schedule slippage"
+      ],
+      "implied_windows_days": [365],
+      "expects_cross_catalog": true,
+      "expected_target_entity": "customer",
+      "review_status": "draft",
+      "rationale": "PARTIAL COVERAGE, and the corpus should know it: the CONSEQUENCE side of this hypothesis is served — the wealth pack's advisor_interaction_recency carries an advisor dimension keyed relationship_manager_id and measures exactly the unmade calls, and suitability_review_overdue_flag measures the slipped reviews — while the CAUSE, relationship-manager turnover itself, has no recipe anywhere in the 317 and remains an intent-theme expectation only. PARAMETER DIVERGENCE, out of menu: 'changed twice in a year' reads over 365 days while both named recipes carry the shared window menu (30, 90, 180) with a 30-day primary — the chooser cannot satisfy 365 from the closed values, which is the gap the measurement should report. TARGET ENTITY: both recipes aggregate to a 'client' output grain, and wealth clients are people, so the closed vocabulary spells that customer (relationship_manager exists in known_entities() but nothing measurable lands at that grain today). CROSS-CATALOG: coverage assignment is maintained in CRM while the review schedules and service events sit in the servicing and wealth catalogs."
+    }
+  ]
+}
