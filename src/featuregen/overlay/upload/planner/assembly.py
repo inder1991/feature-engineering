@@ -706,12 +706,14 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
                 # fail-closed dead end -> a first-class rejected candidate carrying the evidence
                 # trail it DID accumulate; a completing segment is NEVER fabricated.
                 # S1B-2: the realizers are computed ONCE and used twice — to route the verdict
-                # exactly as before, and to ride out on the typed hop. They are now computed on the
-                # budget-blocked branch too (which used to short-circuit past the probe): a
-                # capacity refusal is still somebody's missing crossing, and the catalog reads are
-                # already cached per run. With no budget (= no evidence collection) the probe
-                # early-exits on the first hit, which is all the verdict has ever needed.
-                realizers = (() if hop is None else _hop_realizers(
+                # exactly as before, and to ride out on the typed hop. The budget-blocked dead end
+                # SKIPS the probe (exactly as the pre-S1B-2 code short-circuited past it): its
+                # verdict is bounded_out_max_bridges regardless of what the probe would find — the
+                # demand is the CAPACITY, not a specific crossing — so paying a first-hit
+                # realization read there would buy nothing the verdict or the queue reads. With no
+                # budget (= no evidence collection) the probe early-exits on the first hit, which
+                # is all the verdict has ever needed.
+                realizers = (() if hop is None or budget_blocked else _hop_realizers(
                     conn, hop, scope, state.position.catalog, realization_cache,
                     first_hit=budget is None))
                 if budget_blocked:

@@ -23,9 +23,10 @@
 --     reclaim after expiry, so a poison item is visible as a rising count rather than a silence.
 --   * status 'queued' (queue spells the same state 'ready') — likewise contract-fixed. The other
 --     three states line up: leased / done / failed.
--- lease_fence is carried even though S1B-1's store surface does not yet fence its completion: a
--- migration is immutable once merged, and adding the column later would mean a second migration to
--- get a guarantee the very first zombie-worker bug will demand.
+-- lease_fence is load-bearing: complete_telemetry_work refuses a completion whose fence is not the
+-- one the caller leased under (fenced since the S1B-1 fix round), and the worker writes a whole
+-- item inside one savepoint that rolls back on that refusal — a zombie worker that lost its lease
+-- can neither finish an item the live worker now owns nor land observations beside its rows.
 
 CREATE TABLE IF NOT EXISTS governed_telemetry_outbox (
     work_item_id      text        PRIMARY KEY,

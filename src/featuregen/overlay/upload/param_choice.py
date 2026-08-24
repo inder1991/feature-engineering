@@ -121,14 +121,31 @@ def choose_parameter(conn, *, llm, hypothesis: str, parameter: str,
                              content_address=address,
                              prompt_version=PARAM_CHOICE_PROMPT_VERSION)
 
-    stored = find_structured_result(
-        conn, result_type=PARAM_CHOICE_RESULT_TYPE,
-        result_version=PARAM_CHOICE_RESULT_VERSION, input_content_hash=address)
+    # The replay read runs in its OWN savepoint and never takes the caller down: without one, a DB
+    # failure here poisons the telemetry item's whole transaction, and "never raises for a store
+    # failure" was only true of the write half. A failed read (or an unparseable stored payload) is
+    # a CACHE MISS — the chooser dispatches normally rather than degrading to `unavailable`,
+    # because the provider was never asked.
+    stored = None
+    try:
+        with conn.transaction():
+            stored = find_structured_result(
+                conn, result_type=PARAM_CHOICE_RESULT_TYPE,
+                result_version=PARAM_CHOICE_RESULT_VERSION, input_content_hash=address)
+    except Exception:  # noqa: BLE001 — fail-soft: a broken replay store must not take the item
+        logger.warning("param-choice replay-store read failed for %s; proceeding as a cache miss",
+                       address, exc_info=True)
     if stored is not None:
-        counters.incr("overlay.param_choice_shadow.replayed")
-        output = dict(stored.output)
-        return _result(str(output.get("pick") or ""),
-                       str(output.get("status") or STATUS_INVALID_PICK))
+        try:
+            output = dict(stored.output)
+            replayed = _result(str(output.get("pick") or ""),
+                               str(output.get("status") or STATUS_INVALID_PICK))
+        except Exception:  # noqa: BLE001 — a corrupt stored payload is a miss, not a failure
+            logger.warning("param-choice stored result for %s does not parse; proceeding as a "
+                           "cache miss", address, exc_info=True)
+        else:
+            counters.incr("overlay.param_choice_shadow.replayed")
+            return replayed
 
     from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
 
@@ -160,13 +177,14 @@ def choose_parameter(conn, *, llm, hypothesis: str, parameter: str,
     else:
         pick, status = "", STATUS_INVALID_PICK
     try:
-        record_structured_result(
-            conn, result_type=PARAM_CHOICE_RESULT_TYPE,
-            result_version=PARAM_CHOICE_RESULT_VERSION, input_content_hash=address,
-            output={"pick": pick, "status": status, "parameter": parameter,
-                    "menu": list(menu)},
-            producer_kind="llm_call",
-            producer_ref=call.llm_call_ref or "param_choice:unrecorded")
+        with conn.transaction():    # same savepoint idiom as the read: a failed DB write caught
+            record_structured_result(  # without one would still poison the caller's transaction
+                conn, result_type=PARAM_CHOICE_RESULT_TYPE,
+                result_version=PARAM_CHOICE_RESULT_VERSION, input_content_hash=address,
+                output={"pick": pick, "status": status, "parameter": parameter,
+                        "menu": list(menu)},
+                producer_kind="llm_call",
+                producer_ref=call.llm_call_ref or "param_choice:unrecorded")
     except Exception:  # noqa: BLE001 — the choice is valid even when the cache write is not
         logger.warning("param-choice replay-store write failed for %s; the choice is returned "
                        "uncached", address, exc_info=True)

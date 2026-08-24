@@ -328,6 +328,26 @@ def test_a_resolved_live_run_records_a_resolved_row_and_no_demand(db):
     assert _demands(db) == []
 
 
+def test_an_envelope_that_cannot_project_is_a_rejection_on_BOTH_surfaces(db, monkeypatch):
+    """Resolved-vs-refused is decided ONCE (``idea is not None``) and handed to the evidence
+    builder. The envelope-None seam is where two predicates used to diverge: the idea builder
+    fails closed when a resolved contract cannot project an envelope (served: rejected), while the
+    evidence's own ``_selected_resolved_plan`` check knew nothing about envelopes and minted a
+    RESOLVED ledger row carrying the real plan hash of a plan the serving refused to serve. One
+    decision, two surfaces, no disagreement possible."""
+    _cross_seed(db)                       # resolves — then the envelope projection is broken
+    monkeypatch.setattr(gate1, "plan_envelope_from_result", lambda result: None)
+    _, cs = _live_build(db, generation_run_id=RUN_ID, templates=(_txn_template(),))
+
+    assert cs.alternatives == []          # served: fail closed, no envelope -> no option
+    (rej,) = [r for r in cs.rejections if r.get("lens") == "governed"]
+    (observation,) = _observations(db)
+    # the ledger row is a REJECTION row: the same reason the served set gave, and the unresolved
+    # sentinel — never "resolved" beside a real plan hash
+    assert observation["resolution_status"] == rej["reason"]
+    assert observation["physical_plan_content_hash"] == "unresolved"
+
+
 def test_the_resolution_rate_over_a_mixed_live_run_is_the_real_one(db):
     """The defect this closes, measured end to end: one run, one resolved recipe and one refused,
     and the summary the panel renders reports 50% rather than 0%."""

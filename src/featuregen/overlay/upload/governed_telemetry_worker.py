@@ -80,7 +80,7 @@ from featuregen.overlay.upload.param_choice import (
     STATUS_CHOSEN,
     choose_parameter,
 )
-from featuregen.overlay.upload.planner.contracts import ReasonCode
+from featuregen.overlay.upload.planner.contracts import PlanResolutionStatus, ReasonCode
 from featuregen.overlay.upload.planner.declarations import CompileBudget
 from featuregen.overlay.upload.planner.shadow import COMPILE_BUDGET, MAX_COMPILES_PER_RUN
 from featuregen.overlay.upload.recipe_contract_v2 import day_window_parameter
@@ -278,7 +278,8 @@ def _process_item(conn: DbConn, item: dict, *, now: datetime | None,
             # invariant shows up as a countable row instead of a missing one.
             logger.error("governed telemetry: request %s produced neither an option nor a "
                          "rejection", entry.request.source_definition_id)
-            rejection = {"reason": ReasonCode.planner_internal_error.value}
+            failure = ReasonCode.planner_internal_error.value
+            rejection = {"reason": failure, "reason_codes": [failure]}
         rows.append(_rejected_row(entry.request, rejection, common=common,
                                   corroborated=corroborated, divergence=divergence,
                                   fallback_anchor=frozen_anchor))
@@ -451,7 +452,7 @@ def _resolved_row(option: GovernedOptionV1, *, common: dict, corroborated: bool,
         "physical_plan_content_hash": option.identity.physical_plan_content_hash,
         **observation_plan_columns(option.plan_facts, envelope=option.idea.plan_envelope),
         "primary_objective": option.request.primary_objective,
-        "resolution_status": "resolved",
+        "resolution_status": PlanResolutionStatus.resolved.value,
         # A resolved row records no refusal. The plan's own observed codes stay on the plan; a
         # reason code beside `resolution_status = resolved` would read as a refusal that resolved.
         "reason_codes": [],
@@ -485,6 +486,11 @@ def _rejected_row(request: FeaturePlanningRequestV1, rejection: dict, *, common:
         **observation_plan_columns(rejection, fallback_anchor=fallback_anchor),
         "primary_objective": request.primary_objective,
         "resolution_status": reason,
+        # The lens always stamps `reason_codes` (headline first — `rejection_evidence`), and the
+        # defensive neither-option-nor-rejection mint in `_process_item` now stamps its own. The
+        # headline fallback stays as defence in depth for any future rejection shape that carries
+        # only a `reason`: a refused row with an empty code list would silently leave every
+        # taxonomy count.
         "reason_codes": list(rejection.get("reason_codes") or ([reason] if reason else [])),
         # Nothing was bound, so nothing was measured. "unmet" would claim a measurement that never
         # happened; "" would be indistinguishable from a column nobody filled.
@@ -546,10 +552,15 @@ def _scope_material_record(conn: DbConn, *, frozen: dict, roles: tuple[str, ...]
     specified.
 
     A read failure records ``replan_matched: null`` — "nobody could ask" is not "they matched".
+    The read runs in its OWN savepoint: without one, a DB failure here poisons the item's whole
+    transaction, so the degraded row could never be written and the item went terminally failed —
+    the documented degradation existed only for non-DB exceptions (the ``_realization_states``
+    idiom, for the same reason).
     """
     frozen_material = dict(frozen.get("catalog_scope_material") or {})
     try:
-        replan = governed_scope_material(conn, roles=roles, target_entity=target_entity)
+        with conn.transaction():
+            replan = governed_scope_material(conn, roles=roles, target_entity=target_entity)
     except Exception:
         logger.warning("governed telemetry: the replan scope could not be read; recorded as "
                        "unknown rather than matched", exc_info=True)

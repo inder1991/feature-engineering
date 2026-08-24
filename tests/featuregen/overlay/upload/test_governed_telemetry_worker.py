@@ -506,6 +506,29 @@ def test_a_scope_read_that_fails_is_recorded_as_unknown_never_as_matched(db, mon
     assert material["frozen"]["authorized_catalog_sources"] == ["ops", "rev"]
 
 
+def test_a_scope_read_that_DB_fails_still_degrades_and_the_item_completes(db, monkeypatch):
+    """The degradation must survive a REAL DB error, not just a Python one. The test above raises
+    a plain RuntimeError, which poisons nothing; a failed SQL statement aborts the item's whole
+    transaction unless the read holds its own savepoint — and without one, the documented
+    ``replan_matched: null`` row could never be written and the item went terminally failed. The
+    read now runs savepointed: the failed statement rolls back to it, the item completes ok, and
+    the row records honest absence."""
+    _two_catalogs(db)
+    intent, run_id = _lineage(db)
+    _enqueue(db, run_id=run_id, intent=intent, recipe_ids=[RECIPE_ID])
+
+    def _bad_sql(conn, **kwargs):
+        conn.execute("SELECT no_such_column FROM governed_planning_observation")
+        raise AssertionError("unreachable — the statement above fails")   # pragma: no cover
+
+    monkeypatch.setattr(worker_module, "governed_scope_material", _bad_sql)
+    summary = run_governed_telemetry_once(db, owner=_OWNER, now=_NOW)
+    assert summary["status"] == "done"                         # the item completed, ok=True
+    material = _by_id(_observations(db, run_id), RECIPE_ID)["catalog_scope_material"]
+    assert material["replan_matched"] is None                  # recorded, not terminally failed
+    assert material["frozen"]["authorized_catalog_sources"] == ["ops", "rev"]
+
+
 # ── the frozen payload's round trip, proven rather than promised ──────────────────────────────
 
 

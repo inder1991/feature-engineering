@@ -654,11 +654,11 @@ def _selected_resolved_plan(result: BindingPlanningResultV1) -> BindingPlanV1 | 
 
 
 def _rejection_reason(result: BindingPlanningResultV1) -> str:
-    """The primary reason this request has no SELECTED RESOLVED governed contract — the same
-    precedence ``gate1._governed_rejection_reason`` applies: the selected plan's contract reason,
-    else the fail-closed source→target REJECT reason, else a result-level assembler reason (the
-    tier-1 selection reasons say nothing about the cross-catalog outcome and are stripped), else
-    the observed contract status."""
+    """The primary reason this request has no SELECTED RESOLVED governed contract — THE one
+    precedence, for both lanes (gate1's live Template lane imports this rather than keeping the
+    copy it once had): the selected plan's contract reason, else the fail-closed source→target
+    REJECT reason, else a result-level assembler reason (the tier-1 selection reasons say nothing
+    about the cross-catalog outcome and are stripped), else the observed contract status."""
     pid = result.selected_contract_physical_plan_id
     if pid is not None:
         plan = next((p for p in result.candidate_plans if p.physical_plan_id == pid), None)

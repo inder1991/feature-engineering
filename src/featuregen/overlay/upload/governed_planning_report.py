@@ -8,11 +8,13 @@ It is the evidence surface Stage-2 entry reads, and it holds two disciplines eve
 * **Reuse, never re-derive.** The per-origin resolution rates are the store's own
   ``resolution_summary``, imported — a second copy of that SQL would drift into a second truth.
   Only aggregations the store does NOT own live here.
-* **Never fake a number.** Every rate ships beside its denominator; a rate whose denominator is
-  zero is ``None``, not ``0.0``; a percentile over fewer than two points is ``None`` with a
-  reason; and ``not_computable_in_stage_1`` enumerates every wave-2 metric with the evidence it
-  lacks — including fan-out-risk, which the plan hoped to compute and the schema honestly cannot
-  (see :data:`NOT_COMPUTABLE_IN_STAGE_1`).
+* **Never fake a number.** Every rate ships beside its denominator; every rate THIS module
+  derives is ``None`` when its denominator is zero, not ``0.0`` (the store's embedded
+  ``resolution_summary`` keeps its own contract and reports ``0.0`` totals over an empty ledger —
+  scoped honestly rather than re-derived to match); a percentile over fewer than two points is
+  ``None`` with a reason; and ``not_computable_in_stage_1`` enumerates every wave-2 metric with
+  the evidence it lacks — including fan-out-risk, which the plan hoped to compute and the schema
+  honestly cannot (see :data:`NOT_COMPUTABLE_IN_STAGE_1`).
 
 Determinism: every data-driven list is sorted (by key, or by count descending then key for
 frequency lists); ``as_of`` filters ``recorded_at <= as_of`` in every ledger section and is echoed
@@ -69,8 +71,10 @@ NOT_COMPUTABLE_IN_STAGE_1: tuple[dict[str, str], ...] = tuple(sorted((
                          "observations are not corpus-keyed (no observation column joins to "
                          "corpus_id), so expectation vs outcome cannot be paired"},
     {"metric": "chooser_accuracy",
-     "missing_evidence": "no chooser shadow rows exist until S1C-3 lands and its shadow "
-                         "decisions accrue"},
+     "missing_evidence": "requires a wired param_chooser accruing shadow rows (S1C-3's chooser "
+                         "ships, but nothing constructs one in production yet) AND a report-side "
+                         "accuracy aggregation over its agrees_with_hypothesis_tokens entries, "
+                         "which does not exist yet"},
     {"metric": "per_query_db_percentiles",
      "missing_evidence": "per-query DB timings are never persisted; the only persisted "
                          "timestamps are the outbox's enqueue/complete pair"},
@@ -207,8 +211,10 @@ def _authority_floor(conn: DbConn, as_of: datetime) -> dict:
 def _bridge_demand(conn: DbConn, as_of: datetime) -> dict:
     """Per-queue totals and distinct demand identities, plus the ``stale_registry`` count as its
     own line. Stale rate divides by RECIPE-origin rows — only the recipe lane can find the
-    registry moved under a frozen work item — and the numerator carries the SAME origin filter,
-    so rate <= 1 holds by construction, not by adjacency."""
+    registry moved under a frozen work item — and BOTH halves carry the SAME filters (origin AND
+    the legacy-template sentinel exclusion: gate1's live Template lane wears ``recipe_v2`` as its
+    least-bad origin and can never go stale, so its rows would only dilute the denominator), so
+    rate <= 1 holds by construction, not by adjacency."""
     queues = {name: {"demand_rows": 0, "distinct_demand_identities": 0}
               for name in _QUEUE_NAMES}
     for queue, demand_rows, identities in conn.execute(
@@ -218,10 +224,13 @@ def _bridge_demand(conn: DbConn, as_of: datetime) -> dict:
         queues[queue] = {"demand_rows": demand_rows, "distinct_demand_identities": identities}
     stale, recipe_origin = conn.execute(
         "SELECT count(*) FILTER (WHERE resolution_status = %s"
-        "                          AND definition_origin = 'recipe_v2'),"
-        "       count(*) FILTER (WHERE definition_origin = 'recipe_v2') "
+        "                          AND definition_origin = 'recipe_v2'"
+        "                          AND planning_request_hash <> %s),"
+        "       count(*) FILTER (WHERE definition_origin = 'recipe_v2'"
+        "                          AND planning_request_hash <> %s) "
         "  FROM governed_planning_observation WHERE recorded_at <= %s",
-        (STALE_REGISTRY, as_of)).fetchone()
+        (STALE_REGISTRY, LEGACY_TEMPLATE_PLANNING_REQUEST_HASH,
+         LEGACY_TEMPLATE_PLANNING_REQUEST_HASH, as_of)).fetchone()
     return {
         "queues": queues,
         "stale_registry": {"stale_observations": stale,
@@ -253,14 +262,20 @@ def _refusal_taxonomy(conn: DbConn, as_of: datetime) -> dict:
 def _param_divergence(conn: DbConn, as_of: datetime) -> dict:
     """Divergent recipe-origin rows over recipe-origin rows. An llm-origin divergence is SHOWN
     beside the rate, never folded into it — mixing lanes would let one inflate the other's
-    numerator past its denominator."""
+    numerator past its denominator. Rows wearing the legacy-template sentinel are excluded from
+    BOTH halves: gate1's live Template lane wears ``recipe_v2`` as its least-bad origin but binds
+    no V2 parameters, so its rows can only dilute a rate about the V2 lane."""
     recipe_origin, divergent_recipe, divergent_llm = conn.execute(
-        "SELECT count(*) FILTER (WHERE definition_origin = 'recipe_v2'),"
+        "SELECT count(*) FILTER (WHERE definition_origin = 'recipe_v2'"
+        "                          AND planning_request_hash <> %s),"
         "       count(*) FILTER (WHERE definition_origin = 'recipe_v2'"
+        "                          AND planning_request_hash <> %s"
         "                          AND jsonb_array_length(param_divergence) > 0),"
         "       count(*) FILTER (WHERE definition_origin = 'llm_intent'"
         "                          AND jsonb_array_length(param_divergence) > 0) "
-        "  FROM governed_planning_observation WHERE recorded_at <= %s", (as_of,)).fetchone()
+        "  FROM governed_planning_observation WHERE recorded_at <= %s",
+        (LEGACY_TEMPLATE_PLANNING_REQUEST_HASH, LEGACY_TEMPLATE_PLANNING_REQUEST_HASH,
+         as_of)).fetchone()
     frequency = conn.execute(
         "SELECT COALESCE(entry->>'parameter', ''), count(*) "
         "  FROM governed_planning_observation,"

@@ -165,28 +165,53 @@ def test_origin_coverage_is_the_stores_resolution_summary_not_a_copy(conn, monke
 def test_a_legacy_template_row_never_inflates_the_recipe_v2_bucket(conn) -> None:
     """The S1B-4 re-review's aggregation caveat, resolved by construction: a row carrying the
     ``legacy_template`` sentinel hash buckets under its own key in the report's split — and in the
-    domain section too, where its recipe_id could otherwise collide with a reused V2 id."""
+    domain section too, where its recipe_id could otherwise collide with a reused V2 id.
+
+    The same sentinel guards the two RECIPE-ORIGIN RATES: a live legacy row wears ``recipe_v2``
+    as its least-bad origin, so without the guard it would dilute the param-divergence rate's
+    denominator and the stale-registry rate's — both are claims about the V2 lane, and the second
+    legacy row seeded here (divergence-bearing, stale-status) must land in NEITHER half of
+    either."""
+    divergence = [{"parameter": "window", "hypothesis_implied": "90d", "primary_value": "30d"}]
     _seed(conn, "origin_v2")
     _seed(conn, "origin_legacy",
           planning_request_hash=LEGACY_TEMPLATE_PLANNING_REQUEST_HASH,
           canonical_definition_id="template:salary_signal", recipe_id="salary_signal",
           resolution_status="resolved")
+    # a legacy row that would pollute BOTH rates if the sentinel guard were missing
+    _seed(conn, "origin_legacy_stale",
+          planning_request_hash=LEGACY_TEMPLATE_PLANNING_REQUEST_HASH,
+          canonical_definition_id="template:salary_signal", recipe_id="salary_signal",
+          resolution_status=STALE_REGISTRY, physical_plan_content_hash="unresolved",
+          param_divergence=divergence)
     _seed(conn, "origin_llm", definition_origin="llm_intent", recipe_id=None,
           canonical_definition_id="intent:x", resolution_status="unresolved",
           physical_plan_content_hash="unresolved")
 
-    coverage = wave1_report(conn)["origin_coverage"]
+    report = wave1_report(conn)
+    coverage = report["origin_coverage"]
     split = {row["bucket"]: row for row in coverage["by_origin_with_legacy_sentinel"]}
-    assert split["recipe_v2"]["observations"] == 1          # the legacy row is NOT in here
-    assert split["legacy_template"] == {"bucket": "legacy_template", "observations": 1,
-                                        "resolved": 1, "resolution_rate": 1.0}
+    assert split["recipe_v2"]["observations"] == 1          # the legacy rows are NOT in here
+    assert split["legacy_template"] == {"bucket": "legacy_template", "observations": 2,
+                                        "resolved": 1, "resolution_rate": 0.5}
     assert split["llm_intent"]["observations"] == 1
-    # the store summary rides along verbatim (it fuses by definition_origin — 2 recipe_v2 rows)
+    # the store summary rides along verbatim (it fuses by definition_origin — 3 recipe_v2 rows)
     by_origin = {row["definition_origin"]: row for row in coverage["by_origin"]}
-    assert by_origin["recipe_v2"]["observations"] == 2
+    assert by_origin["recipe_v2"]["observations"] == 3
 
-    domains = {row["bucket"]: row for row in wave1_report(conn)["resolution_by_domain"]}
-    assert domains["legacy_template"]["observations"] == 1
+    domains = {row["bucket"]: row for row in report["resolution_by_domain"]}
+    assert domains["legacy_template"]["observations"] == 2
+
+    # param-divergence: the legacy divergence row is in NEITHER the numerator NOR the denominator
+    divergence_rate = report["param_divergence_rate"]
+    assert divergence_rate["recipe_origin_observations"] == 1     # origin_v2 alone
+    assert divergence_rate["divergent_recipe_observations"] == 0
+    assert divergence_rate["rate"] == 0.0
+
+    # stale-registry: the legacy stale row is in NEITHER half either
+    stale = report["bridge_demand"]["stale_registry"]
+    assert stale == {"stale_observations": 0, "recipe_origin_observations": 1,
+                     "stale_rate": 0.0}
 
 
 def test_the_legacy_sentinel_is_gate1s_own_spelling() -> None:
@@ -480,10 +505,16 @@ def test_fan_out_risk_names_the_absent_column_not_the_plans_optimism(conn) -> No
     assert "governed_planning_observation" in entry["missing_evidence"]
 
 
-def test_chooser_accuracy_names_its_s1c3_dependency(conn) -> None:
+def test_chooser_accuracy_names_the_true_gap_not_a_landed_milestone(conn) -> None:
+    """S1C-3 LANDED (the shadow chooser ships in ``param_choice.py`` and rides the telemetry
+    worker), so "until S1C-3 lands" stopped being the missing evidence. The honest gap is
+    twofold: nothing constructs a real chooser in production yet, and no report section
+    aggregates its shadow entries into an accuracy number."""
     (entry,) = [row for row in wave1_report(conn)["not_computable_in_stage_1"]
                 if row["metric"] == "chooser_accuracy"]
-    assert "S1C-3" in entry["missing_evidence"]
+    assert "until S1C-3 lands" not in entry["missing_evidence"]
+    assert "param_chooser" in entry["missing_evidence"]
+    assert "aggregation" in entry["missing_evidence"]
 
 
 # ── as_of: filters every section, echoed in the payload ────────────────────────────────────────

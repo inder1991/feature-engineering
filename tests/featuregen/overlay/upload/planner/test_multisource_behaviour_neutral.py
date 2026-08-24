@@ -265,12 +265,12 @@ _MODULE_BODY = "<module-level statements and imports>"
 #     it identically — pinned end-to-end by
 #     `test_plan.py::test_a_caller_with_no_budget_gets_the_same_verdicts_with_leaner_evidence`
 #     (same plans, same ids, same primary reason codes; only the hop's evidence differs).
-#   * ONE REAL COST DELTA, DELIBERATE AND BOUNDED: with a budget present the realizer probe also
-#     runs on the budget-blocked branch, which used to short-circuit past it. A capacity refusal is
-#     still somebody's missing crossing, and the underlying catalog reads are already cached per
-#     run. Nothing here adds a per-column read: the near-side walk is ONE batched
-#     `key_entities_for` query per (catalog, table, entity), pinned by
-#     `test_the_near_side_walk_is_one_batched_read_not_one_per_column`.
+#   * NO COST DELTA ON THE BUDGET-BLOCKED BRANCH: the realizer probe stays skipped there, exactly
+#     as the pre-S1B-2 code short-circuited past it — the verdict is bounded_out_max_bridges
+#     regardless of what the probe would find (the demand is the capacity, not a specific
+#     crossing), so its typed hop honestly carries no realizers. Nothing here adds a per-column
+#     read either: the near-side walk is ONE batched `key_entities_for` query per (catalog, table,
+#     entity), pinned by `test_the_near_side_walk_is_one_batched_read_not_one_per_column`.
 #   * Proof 2 (RUNTIME) compares no value any of this touches, and still passes.
 _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
     "src/featuregen/overlay/upload/planner/assembly.py": frozenset({
@@ -280,8 +280,7 @@ _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
         "NEAR_SIDE_DEADLINE_SKIPPED", "NEAR_SIDE_NOT_COLLECTED", _MODULE_BODY,
     }),
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
-        "_hop_evidence", "CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN", "CompilerContext",
-        "build_compiler_context", "compile_temporal",
+        "compile_temporal",
     }),
     "src/featuregen/overlay/upload/planner/plan.py": frozenset({
         "METADATA_RESOLUTION_MODES", "plan_bindings", "_assemble_rollups",

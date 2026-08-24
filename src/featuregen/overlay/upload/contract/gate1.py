@@ -66,7 +66,7 @@ from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
     BindingPlanV1,
     ContractResolutionStatus,
-    PathResolutionStatus,
+    PlanResolutionStatus,
     ReasonCode,
 )
 from featuregen.overlay.upload.planner.declarations import CompileBudget, build_compiler_context
@@ -513,28 +513,6 @@ def _plan_read_set_pairs(plan: BindingPlanV1) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(pairs))
 
 
-def _governed_rejection_reason(result: BindingPlanningResultV1) -> str:
-    """The primary reason a recipe has no SELECTED RESOLVED governed cross-catalog contract: the best
-    compiled-but-unresolved plan's contract reason, else the fail-closed source→target REJECT reason,
-    else a result-level assembler reason (the tier-1 selection reasons are stripped — they say nothing
-    about the cross-catalog outcome), else the observed contract status."""
-    pid = result.selected_contract_physical_plan_id
-    if pid is not None:
-        plan = next((p for p in result.candidate_plans if p.physical_plan_id == pid), None)
-        if plan is not None and plan.contract_primary_reason_code is not None:
-            return plan.contract_primary_reason_code.value
-    for p in result.candidate_plans:
-        if (p.path_resolution_status is PathResolutionStatus.source_to_target_rejected
-                and p.primary_reason_code is not None):
-            return p.primary_reason_code.value
-    cross = [rc for rc in result.reason_codes
-             if rc not in (ReasonCode.selected_best_single_catalog,
-                           ReasonCode.ambiguous_multiple_equal_plans)]
-    if cross:
-        return cross[0].value
-    return result.contract_result_status.value
-
-
 def _governed_plan_trace(plan: BindingPlanV1, *, roles, pairs: tuple[tuple[str, str], ...],
                          validation_status: str):
     """The cross-catalog candidate's decision trace (Task 2A).
@@ -624,6 +602,10 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
     rejection. The store's whole invariant is that every governed planning request leaves a row
     whatever it did, and a lane that files only its failures makes the resolution rate a ratio of
     refusals to refusals: 0% forever, fused into the same summary as a lane that records both."""
+    # The lens owns the ONE rejection-reason precedence (`_rejection_reason`); imported lazily by
+    # this module's convention for its heavier collaborators — a second copy here drifted once.
+    from featuregen.overlay.upload.contract.governed_lens import _rejection_reason
+
     roles = tuple(roles)
     tmpls = templates if templates is not None else ALL_TEMPLATES
     by_id = {t.id: t for t in tmpls}
@@ -654,27 +636,41 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
             logger.exception("governed cross-catalog planning failed for recipe %s", rid)
             rejections.append({"lens": "governed", "reason": ReasonCode.planner_internal_error.value,
                                "recipe_id": rid})
-            evidence.append(_governed_evidence(rid, tmpl, None, compile_ctx=compile_ctx))
+            evidence.append(_governed_evidence(rid, tmpl, None, compile_ctx=compile_ctx,
+                                               resolved=False))
             continue
         idea = _governed_idea_from_result(result, tmpl, target_entity, roles=roles)
+        # THE resolved-vs-refused decision, made ONCE and handed to both surfaces. The idea builder
+        # fails closed on more than the contract status (an envelope that cannot project is a
+        # rejection), so the evidence builder must never re-decide with a weaker predicate — that is
+        # how the served set and the ledger row once disagreed on the envelope-None seam.
         if idea is not None:
             ideas.append(idea)
-            evidence.append(_governed_evidence(rid, tmpl, result, compile_ctx=compile_ctx))
+            evidence.append(_governed_evidence(rid, tmpl, result, compile_ctx=compile_ctx,
+                                               resolved=True))
         else:
-            rejections.append({"lens": "governed", "reason": _governed_rejection_reason(result),
+            rejections.append({"lens": "governed", "reason": _rejection_reason(result),
                                "recipe_id": rid})
-            evidence.append(_governed_evidence(rid, tmpl, result, compile_ctx=compile_ctx))
+            evidence.append(_governed_evidence(rid, tmpl, result, compile_ctx=compile_ctx,
+                                               resolved=False))
     return ideas, rejections, evidence
 
 
-#: What a live-lane row records when its recipe RESOLVED. Spelled here rather than inline so it is
-#: the same literal the telemetry worker writes and the same one ``RESOLVED_STATUSES`` counts —
-#: a lane whose success spelling drifts is a lane missing from every resolution rate.
-_RESOLVED = "resolved"
+#: What a live-lane row records when its recipe RESOLVED — the planner's OWN spelling, so it can
+#: never drift from what the telemetry worker writes or what ``RESOLVED_STATUSES`` counts: a lane
+#: whose success spelling drifts is a lane missing from every resolution rate.
+_RESOLVED = PlanResolutionStatus.resolved.value
 
 
-def _governed_evidence(recipe_id: str, template: Template, result, *, compile_ctx) -> dict:
+def _governed_evidence(recipe_id: str, template: Template, result, *, compile_ctx,
+                       resolved: bool) -> dict:
     """One PLANNED recipe's SERVER-ONLY evidence, resolved or refused, in one shape.
+
+    ``resolved`` is the caller's ALREADY-MADE serving decision (``idea is not None``), passed in
+    rather than re-derived: the idea builder fails closed on more than the contract status — an
+    envelope that cannot project is a rejection — and a second, weaker predicate here once let the
+    served set say "rejected" while the ledger row said "resolved" with a real plan hash. One
+    decision, two surfaces, no disagreement possible.
 
     The lens's shared derivations do the work: :func:`~governed_lens.resolution_evidence` for a
     selected resolved plan, :func:`~governed_lens.rejection_evidence` otherwise (``result=None`` is
@@ -699,7 +695,7 @@ def _governed_evidence(recipe_id: str, template: Template, result, *, compile_ct
     )
 
     named = {"recipe_id": recipe_id, "primary_objective": template.primary_objective or ""}
-    plan = _selected_resolved_plan(result) if result is not None else None
+    plan = _selected_resolved_plan(result) if resolved and result is not None else None
     if plan is not None:
         return {**named, "resolution_status": _RESOLVED,
                 "physical_plan_content_hash": plan_content_hash(compile_ctx, plan, template),
