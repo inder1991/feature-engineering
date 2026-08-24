@@ -73,9 +73,12 @@ from featuregen.overlay.upload.contract.intake import (
     submit_intent,
 )
 from featuregen.overlay.upload.contract.intake_ticket import (
-    OUTCOME_CLASS,
+    NEAR_LABEL_CLASS,
+    STANDARD_CLASS,
     _use_case_vocabulary,
+    asserts_label_adjacency,
     extract_intake_ticket,
+    is_outcome_family,
     is_readable_column,
     record_target_reading,
     target_leakage_class,
@@ -289,11 +292,17 @@ class IntakeTargetIn(BaseModel):
                                     pattern="^(binary_classification|regression|multiclass)$")
     business_domain: list[str] = []
     catalog_source: str | None = None
-    #: T7 (c) — the PROXY DISCLOSURE. When the signed column's concept is not outcome-family, the
-    #: client must send `true` here, and the refusal below is typed when it does not. This is an
-    #: ACKNOWLEDGMENT, never a classification: the server derives the class from the registry and
-    #: reports its own answer back, so a client cannot relabel a column by claiming one.
-    target_is_proxy: bool = False
+    #: T7 (c) — the DISCLOSURE. Required whenever the registry does not CERTIFY the signed column
+    #: as an outcome label — near_label, standard and unregistered alike — and the refusal below is
+    #: typed when it is absent.
+    #:
+    #: NAMED FOR WHAT IT ASSERTS, and only that: "I know this is not the certified outcome label."
+    #: It was once `target_is_proxy`, which made the client say "this is a proxy for the outcome"
+    #: about 338 of the registry's 359 concepts — a correlation claim nobody measured, on columns
+    #: the registry had positively DEclassified. The narrower claim still rides the RESPONSE, where
+    #: the server derives it (:func:`asserts_label_adjacency`): this is an acknowledgment, never a
+    #: classification, so a client cannot relabel a column by sending it.
+    target_not_outcome_acknowledged: bool = False
 
 
 # ---- routes -------------------------------------------------------------------------------------
@@ -1319,14 +1328,40 @@ def _target_class(conn, ref: str, catalog_source: str | None) -> tuple[str, str 
     return concept_name, target_leakage_class(concept_name)
 
 
+#: The sentence the confirm gate refuses with. ONE gate, THREE claims — because the registry makes
+#: three different statements and a refusal that flattens them is itself an untrue claim.
+_ACKNOWLEDGE = ("Re-send with target_not_outcome_acknowledged: true to record that you know.")
+
+
+def _not_outcome_refusal(ref: str, concept_name: str, leakage_class: str | None) -> str:
+    if asserts_label_adjacency(leakage_class):
+        # near_label — the proxy word is EARNED here, and the registry's own warrant is quoted
+        # rather than paraphrased: `Concept.near_label` is defined as "funnel-tail signals that
+        # BORDER the label", and the concepts that set it say a model trained on them reads its
+        # own answer back.
+        return (f"{ref} carries the concept '{concept_name}', which the registry marks "
+                f"{NEAR_LABEL_CLASS}: a funnel-tail signal that BORDERS the label. Confirming it "
+                "means predicting a PROXY for the outcome, and a model trained on it can read its "
+                f"own answer back. {_ACKNOWLEDGE}")
+    if leakage_class is not None:
+        # standard — the registry LOOKED and declassified it. Withhold certification; claim
+        # nothing about correlation, because nothing here measured any.
+        return (f"{ref} carries the concept '{concept_name}', which the registry classifies as "
+                f"{STANDARD_CLASS}: it does not certify this column as an outcome label, and "
+                f"nothing here asserts it correlates with one. {_ACKNOWLEDGE}")
+    # unregistered — absence is not an assertion, in either direction.
+    return (f"{ref} carries no registered concept, so nothing certifies it as an outcome label — "
+            f"and absence is not an assertion the other way either. {_ACKNOWLEDGE}")
+
+
 @router.post("/contract/intake", dependencies=[Depends(require_feature_generate)])
 def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLLM) -> dict:
     """The mandatory read: persist the intent (per-actor idempotent, the recognitions discipline),
     extract the ticket (ONE cached governed call — replay is free), and return the DRAFT reading
-    for the confirm screen. A literally-typed name is recorded server-side as ``user_typed``
-    immediately (shows-doesn't-gate: human-origin by construction, no click required) — but NEVER
-    over a reading a human already signed. Degrades, never blocks: with no LLM configured the
-    pinned target still lands and everything else honestly abstains."""
+    for the confirm screen. A literally-typed name pinning an OUTCOME-family column is recorded
+    server-side as ``user_typed`` immediately (shows-doesn't-gate: human-origin by construction,
+    no click required) — but NEVER over a reading a human already signed. Degrades, never blocks:
+    with no LLM configured the pinned target still lands and everything else honestly abstains."""
     try:
         intent = submit_intent(hypothesis=body.hypothesis, actor=identity.subject)
     except IntentValidationError as e:
@@ -1350,7 +1385,15 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
     # target on a column the catalog no longer resolves to while the screen showed the new one —
     # review fix 2026-08-10). A HUMAN-signed reading (human_confirmed / exploring) is never
     # clobbered: re-running intake on a decided intent stays a read.
+    #
+    # ▲ T7 FIX ROUND (NB-2) — ONLY ONTO AN OUTCOME-FAMILY COLUMN. Typing a column name in prose
+    # used to write it durably onto the very row the leakage gate reads, undisclosed, while
+    # CLICKING Confirm on that same column was a typed 422: two doors, opposite answers, one user.
+    # The prose door is the one that closes, because it is the one nobody consented at. Nothing is
+    # hidden by it — the ticket still pins, still names the column, still labels its class, and the
+    # screen shows all of it. It simply is not a DECISION until someone acknowledges what it is.
     if (ticket.pinned and ticket.target_column
+            and is_outcome_family(ticket.target_leakage_class)
             and (row is None or row[1] in (None, "user_typed"))
             and (row is None or row[2] != ticket.target_column or row[1] is None)):
         record_target_reading(conn, intent_id=intent.intent_id, provenance="user_typed",
@@ -1379,7 +1422,8 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
                        "confidence": ticket.confidence, "pinned": ticket.pinned,
                        "contradiction": ticket.contradiction,
                        "runners_up": list(ticket.runners_up),
-                       # T7 (a): outcome or proxy, and the ranked fallbacks behind an abstention
+                       # T7 (a): outcome or proxy, and the two catalog-derived lists behind an
+                       # abstention — the nearest proxies, and any label the catalog DOES hold
                        "target_concept": ticket.target_concept,
                        "target_leakage_class": ticket.target_leakage_class,
                        "target_is_proxy": ticket.target_is_proxy,
@@ -1387,6 +1431,10 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
                            {"ref": c.ref, "concept": c.concept,
                             "leakage_class": c.leakage_class}
                            for c in ticket.proxy_candidates],
+                       "outcome_candidates": [
+                           {"ref": c.ref, "concept": c.concept,
+                            "leakage_class": c.leakage_class}
+                           for c in ticket.outcome_candidates],
                        # T7 (b): where the window came from, or why it has none
                        "window_source": ticket.window_source,
                        "window_refusal": None if refusal is None else {
@@ -1399,7 +1447,9 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
                                   if (d := _column_detail(r)) is not None],
             # the abstention answer's own one-liner material, same shape as the menu above
             "proxy_candidate_details": [d for c in ticket.proxy_candidates
-                                        if (d := _column_detail(c.ref)) is not None]}
+                                        if (d := _column_detail(c.ref)) is not None],
+            "outcome_candidate_details": [d for c in ticket.outcome_candidates
+                                          if (d := _column_detail(c.ref)) is not None]}
 
 
 @router.post("/contract/intake/target", dependencies=[Depends(require_feature_generate)])
@@ -1435,14 +1485,10 @@ def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dic
             raise HTTPException(status_code=422,
                                 detail="target_ref is not a readable column in this catalog")
         concept_name, leakage_class = _target_class(conn, body.target_ref, body.catalog_source)
-        if leakage_class is not None and leakage_class != OUTCOME_CLASS \
-                and not body.target_is_proxy:
+        if not is_outcome_family(leakage_class) and not body.target_not_outcome_acknowledged:
             raise HTTPException(
                 status_code=422,
-                detail=(f"{body.target_ref} carries the concept '{concept_name}', which the "
-                        f"registry classifies as '{leakage_class}' — not an outcome-family label. "
-                        "Confirming it means predicting a PROXY for the outcome. Re-send with "
-                        "target_is_proxy: true to record that you know."))
+                detail=_not_outcome_refusal(body.target_ref, concept_name, leakage_class))
     vocabulary = set(_use_case_vocabulary())
     off_vocab = [d for d in body.business_domain if d not in vocabulary]
     if off_vocab:
@@ -1455,21 +1501,23 @@ def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dic
         target_window_days=body.target_window_days, target_type=body.target_type,
         business_domain=tuple(body.business_domain), confirmed_by=identity.subject)
     counters.incr(f"overlay.intake.target_{body.decision}")
-    # THE DISCLOSURE HAS NOWHERE DURABLE TO LIVE. `contract_intent` has no column that can carry
-    # it and no metadata JSON to hide it in (`business_domain` is a closed vocabulary array), and
-    # this program adds no migrations — so the acknowledgment rides the RESPONSE and a logged
-    # record, and the missing column is an owner item, not a silent omission. The 422 above is the
-    # part that actually holds: an undisclosed proxy confirmation cannot be recorded at all.
-    is_proxy = leakage_class is not None and leakage_class != OUTCOME_CLASS
-    if is_proxy:
-        counters.incr("overlay.intake.target_proxy_disclosed")
+    # THE ACKNOWLEDGMENT IS OBSERVABLE, NOT DURABLE — and the difference is stated rather than
+    # blurred. `contract_intent` has no column that can carry it and no metadata JSON to hide it in
+    # (`business_domain` is a closed vocabulary array), and this program adds no migrations, so
+    # what exists is a counter and a log line carrying the class. A durable home is an owner item
+    # on the ledger. What actually HOLDS is the 422 above: an unacknowledged non-outcome
+    # confirmation is never recorded in the first place.
+    if body.decision in ("confirmed", "corrected") and not is_outcome_family(leakage_class):
+        counters.incr("overlay.intake.target_not_outcome_acknowledged")
         logger.info(
-            "proxy target disclosed and confirmed: intent=%s ref=%s concept=%s class=%s by=%s",
-            body.intent_id, body.target_ref, concept_name, leakage_class, identity.subject)
+            "non-outcome target acknowledged and confirmed: intent=%s ref=%s concept=%s class=%s "
+            "by=%s", body.intent_id, body.target_ref, concept_name,
+            leakage_class or "unregistered", identity.subject)
     return {"intent_id": body.intent_id, **(target_reading(conn, body.intent_id) or {}),
             "business_domain": sorted(body.business_domain),
             "target_concept": concept_name, "target_leakage_class": leakage_class,
-            "target_is_proxy": is_proxy}
+            # The narrow claim, SERVER-derived: true only where the registry asserts adjacency.
+            "target_is_proxy": asserts_label_adjacency(leakage_class)}
 
 
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])

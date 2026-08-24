@@ -74,9 +74,19 @@ _AML_GOAL = ("Identify commercial banking customers likely to be flagged for AML
              "next 90 days.")
 
 
-def _cib_catalog(db):
-    build_graph(db, _CIB, [r for r, _ in _CIB_ROWS],
-                concepts={content_hash(r): c for r, c in _CIB_ROWS if c})
+#: The reviewer's probe fixture: the SAME near-label catalog, plus one real outcome-family column.
+#: `fraud_flag` declares `leakage_anchor=True`, so this is the label itself standing right beside
+#: the proxy the run picked.
+_CIB_LABEL = "public.bo_cib_customer.aml_sar_filed_flg"
+_CIB_LABEL_ROW = (CanonicalRow(_CIB, "bo_cib_customer", "aml_sar_filed_flg", "text",
+                               definition="Whether a SAR was filed for this customer."),
+                  "fraud_flag")
+
+
+def _cib_catalog(db, *, with_label: bool = False):
+    rows = [*_CIB_ROWS, _CIB_LABEL_ROW] if with_label else list(_CIB_ROWS)
+    build_graph(db, _CIB, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows if c})
 
 
 def _cib_client(target: str = _CIB_SUSP, window: int = 0, confidence: str = "medium",
@@ -209,6 +219,7 @@ def test_no_outcome_family_concept_in_the_catalog_ABSTAINS_and_names_the_proxies
         (_CIB_STATUS, "customer_relationship_status", "standard"),
     ], "near-label proxies rank above ordinary columns; the model's own order breaks ties"
     assert not any(c.leakage_class == "outcome" for c in ticket.proxy_candidates)
+    assert ticket.outcome_candidates == (), "this catalog genuinely holds no label — say nothing"
 
 
 def test_an_outcome_family_concept_is_the_ONE_thing_that_commits(db):
@@ -368,3 +379,106 @@ def test_the_outcome_family_is_EXACTLY_what_the_registry_already_declares(db):
     assert target_leakage_class(None) is None
     assert set(LEAKAGE_CLASSES) == {"standard", "near_label", "outcome"}, \
         "the class names are the recipe contract's, looked up rather than re-spelled"
+
+
+# ══ FIX ROUND — NB-3/NB-5: when the catalog HOLDS a label, say so ════════════════════════════════
+
+def test_an_outcome_column_in_the_catalog_is_NAMED_and_is_never_listed_as_a_proxy(db):
+    """The reviewer's probe: `cust_susp_flg` (the proxy the run picked) standing beside
+    `aml_sar_filed_flg` (`fraud_flag`, `leakage_anchor=True` — the label itself).
+
+    Abstaining while the answer to the question sits in the same table and goes unmentioned is its
+    own kind of silence. The outcome columns are CATALOG-DERIVED data on their own field: this
+    reports what exists, it never substitutes a target the model did not pick (SELECTION
+    discipline). And a label is never a proxy for itself, so it must appear in exactly one list.
+
+    The model RANKS the real label second here, which is the shape that actually exercises the
+    exclusion: a label reaches the proxy list only by being picked or ranked, so a fixture where
+    nobody ranked it cannot tell the exclusion from its absence.
+    """
+    _cib_catalog(db, with_label=True)
+    ticket, _ = extract_intake_ticket(
+        db, _cib_client(runners=(_CIB_LABEL, _CIB_STATUS)), catalog_source=_CIB,
+        roles=("data_owner",), hypothesis=_AML_GOAL)
+    assert ticket.target_column == _CIB_SUSP and ticket.confidence == "abstain"
+    assert _CIB_LABEL in ticket.runners_up, "the model did rank it — this is not a no-op fixture"
+    assert [(c.ref, c.concept, c.leakage_class) for c in ticket.outcome_candidates] == [
+        (_CIB_LABEL, "fraud_flag", "outcome")]
+    assert _CIB_LABEL not in [c.ref for c in ticket.proxy_candidates], \
+        "a label is not a proxy for itself — even when the model ranked it among the runners-up"
+    assert all(c.leakage_class != "outcome" for c in ticket.proxy_candidates)
+
+
+def test_a_committed_outcome_target_hands_back_neither_list(db):
+    _cib_catalog(db, with_label=True)
+    ticket, _ = extract_intake_ticket(
+        db, _cib_client(target=_CIB_LABEL, confidence="high", runners=()),
+        catalog_source=_CIB, roles=("data_owner",), hypothesis=_AML_GOAL)
+    assert (ticket.confidence, ticket.target_leakage_class) == ("high", "outcome")
+    assert (ticket.proxy_candidates, ticket.outcome_candidates) == ((), ()), \
+        "the target IS the label — there is nothing to fall back to and nothing to point at"
+
+
+# ══ FIX ROUND — NB-1(a): `target_is_proxy` asserts label-adjacency, and only that ═════════════════
+
+def test_a_STANDARD_class_target_is_uncommittable_but_is_NOT_a_proxy(db):
+    """`customer_relationship_status` is `standard`: the registry positively DEclassified it —
+    neither the label nor label-adjacent. Refusing to commit to it is warranted; calling it "a
+    proxy for the AML outcome" is a correlation claim the registry never made."""
+    _cib_catalog(db)
+    ticket, _ = extract_intake_ticket(
+        db, _cib_client(target=_CIB_STATUS, runners=()), catalog_source=_CIB,
+        roles=("data_owner",), hypothesis=_AML_GOAL)
+    assert ticket.target_leakage_class == "standard"
+    assert ticket.confidence == "abstain", "still uncommittable — nothing certifies it as a label"
+    assert ticket.target_is_proxy is False, \
+        "`is_proxy` is true only where the registry ASSERTS label-adjacency (near_label)"
+
+
+# ══ FIX ROUND — NB-4: a degraded ticket still reads the goal text ════════════════════════════════
+
+def test_a_degraded_ticket_still_takes_the_horizon_the_GOAL_states(db):
+    """No client, no model reading — but `stated_horizon` is pure code and never needed one. The
+    old answer said `window_source: "unstated"` against an objective that plainly says 90 days."""
+    _cib_catalog(db)
+    ticket, reason = extract_intake_ticket(
+        db, None, catalog_source=_CIB, roles=("data_owner",), hypothesis=_AML_GOAL)
+    assert reason == "unavailable"
+    assert ticket.target_window_days == 90
+    assert ticket.window_source == "stated"
+    assert ticket.window_refusal is None, \
+        "never a contradiction about a model reading that never happened"
+
+
+def test_a_degraded_ticket_with_an_uncountable_horizon_claims_no_number(db):
+    _cib_catalog(db)
+    ticket, _ = extract_intake_ticket(
+        db, None, catalog_source=_CIB, roles=("data_owner",),
+        hypothesis="Identify customers flagged for AML review in the next 3 months.")
+    assert (ticket.target_window_days, ticket.window_source) == (None, "stated")
+    assert ticket.window_refusal is None
+
+
+def test_a_degraded_ticket_against_a_horizonless_goal_is_still_honest_absence(db):
+    _cib_catalog(db)
+    ticket, _ = extract_intake_ticket(
+        db, None, catalog_source=_CIB, roles=("data_owner",),
+        hypothesis="Identify customers flagged for AML review.")
+    assert (ticket.target_window_days, ticket.window_source) == (None, "unstated")
+
+
+# ══ FIX ROUND — rider: WINDOW_SOURCES was validated by nothing ════════════════════════════════════
+
+def test_every_ticket_window_source_is_a_member_of_the_closed_vocabulary(db):
+    from featuregen.overlay.upload.contract.intake_ticket import WINDOW_SOURCES
+
+    _cib_catalog(db)
+    for hypothesis, window in ((_AML_GOAL, 0), (_AML_GOAL, 90), ("AML review, no horizon", 0),
+                               ("AML review with no horizon at all", 45)):
+        ticket, _ = extract_intake_ticket(
+            db, _cib_client(window=window), catalog_source=_CIB, roles=("data_owner",),
+            hypothesis=hypothesis)
+        assert ticket.window_source in WINDOW_SOURCES
+    degraded, _ = extract_intake_ticket(
+        db, None, catalog_source=_CIB, roles=("data_owner",), hypothesis="a different question")
+    assert degraded.window_source in WINDOW_SOURCES

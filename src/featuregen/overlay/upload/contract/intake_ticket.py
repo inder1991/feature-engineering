@@ -19,11 +19,18 @@ Discipline, in one line each:
 * Failure degrades, never blocks — no client / fault / ceiling yields a ticket with the pinned
   target (if any) and honest abstains everywhere else.
 * OUTCOME OR PROXY, never silently either (T7, 2026-08-24). A proposal COMMITS only when the
-  target's concept is outcome-family; anything else abstains and hands back the nearest proxies,
-  each labelled with the concept it actually carries. See :func:`target_leakage_class`.
+  target's concept is outcome-family; anything else abstains and hands back two catalog-derived
+  lists — the nearest proxies, and any label the catalog actually holds — each entry labelled with
+  the concept it really carries. Neither list ever changes the target: reporting is not choosing.
+* WHAT THE REGISTRY WARRANTS, AND NO MORE (T7 fix round). "Uncommittable" and "a proxy for the
+  outcome" are different claims. Only ``near_label`` earns the second; ``standard`` is the
+  registry's positive denial and an unregistered concept is silence, so both are gated without
+  ever being called proxies. See :func:`is_outcome_family` and :func:`asserts_label_adjacency`.
 * WINDOW OR ABSENCE, never a contradiction (T7). The goal text's stated horizon is extracted
   deterministically and cross-checked against the model's number; a disagreement is a typed
-  refusal that accepts NO window, so the near-label critic abstains for a stated reason.
+  refusal that accepts NO window, so the near-label critic abstains for a stated reason. A
+  DEGRADED ticket still reads the goal — but never manufactures a contradiction with a reading
+  that never happened.
 * The human confirmation gate (B2) consumes this ticket: the ticket is a DRAFT reading,
   `llm/proposed` in spirit, until a person signs the target — and the signed reading lands on
   `contract_intent` via :func:`record_target_reading` (migration 1059), where the existing
@@ -101,8 +108,8 @@ NEAR_LABEL_CLASS = _LEAKAGE_CLASS["near_label"]
 STANDARD_CLASS = _LEAKAGE_CLASS["standard"]
 
 #: How many proxies an abstention hands back. The answer is a shortlist for a person to read, not
-#: the catalog again.
-_PROXY_LIMIT = 5
+#: the catalog again. Applies to each list independently.
+_CANDIDATE_LIMIT = 5
 
 
 def target_leakage_class(concept_name: str | None) -> str | None:
@@ -123,9 +130,30 @@ def target_leakage_class(concept_name: str | None) -> str | None:
     return STANDARD_CLASS
 
 
+def is_outcome_family(leakage_class: str | None) -> bool:
+    """Does the registry CERTIFY this class as the label itself? The one question that licenses a
+    commit — and the one the confirm gate asks. Everything else, including "nothing recorded",
+    answers False, because nothing else carries the warrant."""
+    return leakage_class == OUTCOME_CLASS
+
+
+def asserts_label_adjacency(leakage_class: str | None) -> bool:
+    """Does the registry POSITIVELY assert this class borders the label — i.e. is it a PROXY?
+
+    Only ``near_label`` does. ``standard`` is the opposite claim (the registry looked and
+    declassified the concept), and an unregistered concept makes no claim at all. Both of those are
+    still uncommittable, and both are still gated at confirm — but for LACK OF CERTIFICATION, which
+    is a different sentence from "this borders the answer". Conflating the two let the refusal tell
+    338 of the registry's 359 concepts they were proxies for an outcome nobody measured them
+    against.
+    """
+    return leakage_class == NEAR_LABEL_CLASS
+
+
 @dataclass(frozen=True, slots=True)
-class ProxyCandidateV1:
-    """One row of the abstention answer: a ref, the concept it ACTUALLY carries, and what that
+class TargetCandidateV1:
+    """One row of the abstention answer — used for BOTH lists, because both answer the same
+    question about a different column: a ref, the concept it ACTUALLY carries, and what that
     concept makes it. ``concept`` is "" when the column carries none — the same honest absence
     ``leakage_class = None`` states."""
 
@@ -151,10 +179,14 @@ _HORIZON_PATTERNS = (
 _EXACT_DAYS = {"day": 1, "week": 7}
 
 #: How ``target_window_days`` got its value — or why it has none.
-#: ``stated`` the goal text names this horizon and the reading agrees; ``model_only`` the goal
-#: names none (or names one in months) and the number is the model's reading alone; ``unstated``
-#: nobody stated one, which is honest absence; ``contradicted`` the two disagree, so no window is
-#: accepted and :attr:`IntakeTicketV1.window_refusal` says which numbers disagreed.
+#: ``stated`` the value (or its absence) comes from the GOAL TEXT's own horizon — because the
+#: model's reading agreed with it, or because there was no model reading to disagree (a degraded
+#: ticket still reads the goal: :func:`stated_horizon` is pure code). A month horizon lands here
+#: too, with no number, since it states a horizon this code may not count.
+#: ``model_only`` the goal states no countable horizon and the number is the model's alone;
+#: ``unstated`` nobody stated one, which is honest absence; ``contradicted`` the goal and a real
+#: model reading disagree, so no window is accepted and
+#: :attr:`IntakeTicketV1.window_refusal` says which numbers disagreed.
 WINDOW_SOURCES = ("stated", "model_only", "unstated", "contradicted")
 
 #: The one typed refusal code this seam raises.
@@ -258,13 +290,21 @@ class IntakeTicketV1:
     target_concept: str = ""
     #: ``target_concept``'s :data:`LEAKAGE_CLASSES` member; None when unregistered (nothing said).
     target_leakage_class: str | None = None
-    #: True only when the registry POSITIVELY places the target outside the outcome family. An
-    #: unclassified target is uncommittable but is not a proxy — that would be a claim too.
+    #: True only where the registry ASSERTS label-adjacency (:func:`asserts_label_adjacency`) —
+    #: never merely "not certified as the label". A ``standard`` target is uncommittable and still
+    #: gated at confirm, but the registry declassified it, so calling it a proxy for the outcome
+    #: would be a correlation claim nobody made; an unregistered one makes no claim in either
+    #: direction. Both answer False here and both still require the acknowledgment.
     target_is_proxy: bool = False
     #: The abstention answer as DATA: the nearest proxies, ranked, each labelled with its real
     #: concept. Populated whenever the target is not outcome-family (including when there is no
     #: target at all); () when the target IS the label, because there is nothing to fall back to.
-    proxy_candidates: tuple[ProxyCandidateV1, ...] = ()
+    proxy_candidates: tuple[TargetCandidateV1, ...] = ()
+    #: Every outcome-family column the CATALOG holds, ref-sorted — the other half of an honest
+    #: abstention. Abstaining while the label sits in the same table and goes unmentioned is its
+    #: own silence. This REPORTS what exists; it never substitutes a target (see
+    #: :func:`_proxy_candidates`). () when the target already IS the label.
+    outcome_candidates: tuple[TargetCandidateV1, ...] = ()
 
     # ── T7 (b): a window, or a stated absence, or a named disagreement ───────────────────────────
     #: One of :data:`WINDOW_SOURCES`.
@@ -274,34 +314,55 @@ class IntakeTicketV1:
 
 
 def _proxy_candidates(target: str | None, runners: Sequence[str],
-                      concepts_by_ref: dict[str, str]) -> tuple[ProxyCandidateV1, ...]:
+                      concepts_by_ref: dict[str, str]) -> tuple[TargetCandidateV1, ...]:
     """The ranked proxies behind an abstention.
 
-    Order: near-label concepts first (the registry says they BORDER the label, so they are the
-    nearest honest thing), then the rest — and inside each class the model's own ranking, target
-    then runners-up, since that is the only relevance judgment anyone made. Outcome-family columns
-    are excluded on purpose: a label is not a proxy for itself.
+    TWO SOURCES, deliberately. The model's own ranking (target, then runners-up) is the only
+    relevance judgment anyone made, so it leads. But the list ALSO sweeps in every near-label
+    column the REGISTRY recognises in this catalog, whether or not the model ranked it — the
+    registry's warrant that a column borders the label does not depend on the model having noticed
+    it, and on the run that motivated this the model ranked exactly one of the two.
 
-    NO SUBSTITUTION. This never promotes a column to ``target_column``; the module's first
-    discipline is SELECTION, never generation, and code choosing a target the model did not pick
-    would break it.
+    Order: near-label first (the registry says they BORDER the label, so they are the nearest
+    honest thing), then the rest; the sort is stable, so within each class the model's ranking
+    survives and the registry sweep follows it in ref order. Outcome-family columns are excluded
+    on purpose — a label is not a proxy for itself; they ride
+    :attr:`IntakeTicketV1.outcome_candidates` instead.
+
+    NO SUBSTITUTION. Neither list ever changes ``target_column``; the module's first discipline is
+    SELECTION, never generation, and code choosing a target the model did not pick would break it.
+    Reporting what the catalog contains is not choosing.
     """
     ordered = [ref for ref in (target, *runners) if ref]
     ordered += sorted(ref for ref, name in concepts_by_ref.items()
-                      if target_leakage_class(name) == NEAR_LABEL_CLASS)
-    ranked: list[ProxyCandidateV1] = []
+                      if asserts_label_adjacency(target_leakage_class(name)))
+    ranked: list[TargetCandidateV1] = []
     seen: set[str] = set()
     for ref in ordered:
         if ref in seen or ref not in concepts_by_ref:
             continue
         name = concepts_by_ref[ref]
         klass = target_leakage_class(name)
-        if klass == OUTCOME_CLASS:
+        if is_outcome_family(klass):
             continue
         seen.add(ref)
-        ranked.append(ProxyCandidateV1(ref=ref, concept=name, leakage_class=klass))
-    ranked.sort(key=lambda c: 0 if c.leakage_class == NEAR_LABEL_CLASS else 1)
-    return tuple(ranked[:_PROXY_LIMIT])
+        ranked.append(TargetCandidateV1(ref=ref, concept=name, leakage_class=klass))
+    ranked.sort(key=lambda c: 0 if asserts_label_adjacency(c.leakage_class) else 1)
+    return tuple(ranked[:_CANDIDATE_LIMIT])
+
+
+def _outcome_candidates(concepts_by_ref: dict[str, str]) -> tuple[TargetCandidateV1, ...]:
+    """Every outcome-family column this catalog actually holds, ref-sorted.
+
+    Catalog-derived, not model-derived: the point is exactly to name a label the model did NOT
+    pick. Ref order because there is no relevance judgment to preserve here — the registry
+    certified each of them equally.
+    """
+    return tuple(
+        TargetCandidateV1(ref=ref, concept=name, leakage_class=OUTCOME_CLASS)
+        for ref, name in sorted(concepts_by_ref.items())
+        if is_outcome_family(target_leakage_class(name))
+    )[:_CANDIDATE_LIMIT]
 
 
 def _use_case_vocabulary() -> tuple[str, ...]:
@@ -372,21 +433,37 @@ def _input_hash(*, hypothesis: str, shortlist: Sequence[dict],
     })
 
 
-def _degraded(pin: str | None, concepts_by_ref: dict[str, str] | None = None) -> IntakeTicketV1:
-    """The no-client / fault / ceiling ticket. It still LABELS the pinned target, because the
-    registry read that decides outcome-vs-proxy is pure code and never needed the provider."""
+def _degraded(pin: str | None, concepts_by_ref: dict[str, str] | None = None, *,
+              goal: str = "") -> IntakeTicketV1:
+    """The no-client / fault / ceiling ticket.
+
+    EVERYTHING PURE CODE CAN STILL ANSWER, IT ANSWERS. Two reads never needed the provider: the
+    registry lookup that decides outcome-vs-proxy, and :func:`stated_horizon` over the goal text.
+    A degraded ticket that reported ``window_source: "unstated"`` against an objective plainly
+    saying "in the next 90 days" was making the same kind of false claim this task exists to
+    remove — in the opposite direction.
+
+    And never a REFUSAL: a contradiction needs two readings, and here the model produced none. The
+    goal's horizon simply stands, uncontested — with no number when the unit is months, per
+    :data:`_EXACT_DAYS`.
+    """
     concepts_by_ref = concepts_by_ref or {}
     name = concepts_by_ref.get(pin or "", "")
     klass = target_leakage_class(name)
-    is_outcome = klass == OUTCOME_CLASS
-    return IntakeTicketV1(target_column=pin, target_window_days=None, target_type="abstain",
+    outcome = is_outcome_family(klass)
+    horizon = stated_horizon(goal)
+    window = horizon.days if horizon is not None else None
+    window_source = "stated" if horizon is not None else "unstated"
+    return IntakeTicketV1(target_column=pin, target_window_days=window, target_type="abstain",
                           business_domain=(), confidence="abstain", pinned=pin is not None,
                           contradiction=None, runners_up=(),
                           target_concept=name, target_leakage_class=klass,
-                          target_is_proxy=(pin is not None and klass is not None
-                                           and not is_outcome),
-                          proxy_candidates=(() if is_outcome else
-                                            _proxy_candidates(pin, (), concepts_by_ref)))
+                          target_is_proxy=pin is not None and asserts_label_adjacency(klass),
+                          proxy_candidates=(() if outcome else
+                                            _proxy_candidates(pin, (), concepts_by_ref)),
+                          outcome_candidates=(() if outcome else
+                                              _outcome_candidates(concepts_by_ref)),
+                          window_source=window_source)
 
 
 def _ticket_from_output(output: dict, *, pin: str | None, goal: str,
@@ -432,25 +509,31 @@ def _ticket_from_output(output: dict, *, pin: str | None, goal: str,
         if isinstance(r, str) and r in shortlist_refs and r != target
     ))[:3] if isinstance(raw_runners, list) else ()
     # ABSTAIN-BY-DEFAULT. A proposal may COMMIT only onto an outcome-family concept; everything
-    # else abstains and hands back the ranked proxies instead. A PIN is exempt from the confidence
-    # override — the person literally typed that column name, so the platform is not proposing
-    # anything — but it is labelled exactly the same, and the confirm gate still asks for the
-    # disclosure before the label becomes a decision.
+    # else abstains and hands back the ranked proxies — and the labels the catalog does hold.
+    # A PIN is exempt from the CONFIDENCE override only: the person literally typed that column
+    # name, so the platform is not proposing anything and has nothing to be unconfident about. It
+    # buys the pin nothing else — the ticket labels it identically, the route no longer records it
+    # durably (NB-2), and the confirm gate still asks for the acknowledgment.
     concept_name = concepts_by_ref.get(target or "", "")
     klass = target_leakage_class(concept_name)
-    is_outcome = klass == OUTCOME_CLASS
-    if not is_outcome and pin is None:
+    outcome = is_outcome_family(klass)
+    if not outcome and pin is None:
         confidence = "abstain"
-    return IntakeTicketV1(target_column=target, target_window_days=window,
-                          target_type=target_type, business_domain=domains,
-                          confidence=confidence, pinned=pin is not None,
-                          contradiction=contradiction, runners_up=runners,
-                          target_concept=concept_name, target_leakage_class=klass,
-                          target_is_proxy=(target is not None and klass is not None
-                                           and not is_outcome),
-                          proxy_candidates=(() if is_outcome else
-                                            _proxy_candidates(target, runners, concepts_by_ref)),
-                          window_source=window_source, window_refusal=window_refusal)
+    ticket = IntakeTicketV1(
+        target_column=target, target_window_days=window,
+        target_type=target_type, business_domain=domains,
+        confidence=confidence, pinned=pin is not None,
+        contradiction=contradiction, runners_up=runners,
+        target_concept=concept_name, target_leakage_class=klass,
+        target_is_proxy=target is not None and asserts_label_adjacency(klass),
+        proxy_candidates=(() if outcome else
+                          _proxy_candidates(target, runners, concepts_by_ref)),
+        outcome_candidates=() if outcome else _outcome_candidates(concepts_by_ref),
+        window_source=window_source, window_refusal=window_refusal)
+    # The closed vocabulary, actually closed. It was published and validated by nothing, which is
+    # how a token like "unstated" reaches a consumer that has never heard of it.
+    assert ticket.window_source in WINDOW_SOURCES, ticket.window_source
+    return ticket
 
 
 _PROVENANCES = ("human_confirmed", "user_typed", "exploring")
@@ -564,9 +647,9 @@ def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str 
                                    concepts_by_ref=concepts_by_ref,
                                    vocabulary=set(vocabulary)), "replayed"
     if client is None:
-        return _degraded(pin, concepts_by_ref), "unavailable"
+        return _degraded(pin, concepts_by_ref, goal=hypothesis), "unavailable"
     if call_ledger is not None and not call_ledger.charge():
-        return _degraded(pin, concepts_by_ref), "call_ceiling"
+        return _degraded(pin, concepts_by_ref, goal=hypothesis), "call_ceiling"
 
     from featuregen.overlay.upload.contract.intake import redact_free_text
     from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
@@ -588,9 +671,9 @@ def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str 
     except Exception:  # noqa: BLE001 — mandatory to ATTEMPT, never load-bearing
         logger.warning("intake-ticket extraction failed; degrading to the pinned/abstain ticket",
                        exc_info=True)
-        return _degraded(pin, concepts_by_ref), "unavailable"
+        return _degraded(pin, concepts_by_ref, goal=hypothesis), "unavailable"
     if call.output is None:
-        return _degraded(pin, concepts_by_ref), "unavailable"
+        return _degraded(pin, concepts_by_ref, goal=hypothesis), "unavailable"
     ticket = _ticket_from_output(dict(call.output), pin=pin, goal=hypothesis,
                                  concepts_by_ref=concepts_by_ref, vocabulary=set(vocabulary))
     record_structured_result(

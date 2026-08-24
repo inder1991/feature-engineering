@@ -2694,7 +2694,7 @@ describe('Intake target confirmation', () => {
     confidence: 'high', pinned: false, contradiction: null,
     runners_up: ['public.labels.closed'],
     target_concept: 'outcome_label', target_leakage_class: 'outcome',
-    target_is_proxy: false, proxy_candidates: [],
+    target_is_proxy: false, proxy_candidates: [], outcome_candidates: [],
     window_source: 'stated', window_refusal: null,
   }
 
@@ -2709,6 +2709,7 @@ describe('Intake target confirmation', () => {
       concept: 'outcome_label', ai_summary: 'Whether the account was closed.',
     }],
     proxy_candidate_details: [],
+    outcome_candidate_details: [],
   }
 
   const READING: api.IntakeReading = {
