@@ -3,48 +3,50 @@
 Design system for the FeatureGen catalog UI. Register: product. Theme decision comes from the
 scene, not the category: a data engineer at a bank, mid-afternoon under office light on a 27-inch
 monitor, checking whether yesterday's deposits upload staled any features before a retrain. That
-scene forces a light, high-contrast, glare-friendly instrument. No dark mode in v1.
+scene forces a light, high-contrast, glare-friendly instrument. The Emirates NBD palette uses
+official navy (`#072447`) for structure, vibrant blue (`#2765FF`) for action, and white (`#FFFFFF`)
+for primary surfaces. Supporting blue-grays exist only to make dense analytical screens readable.
+No dark mode in v1.
 
 ## Color
 
-OKLCH throughout. Strategy: **Committed** — the left rail is a deep petrol-ink surface that
-carries the identity (roughly a sixth of every screen), content sits on a distinctly colder gray
-ground with near-white panels lifted by soft shadows, and strong data states speak in solid
-chips. Amplified 2026-07-05 after the first cut read as a wireframe: value separation,
-saturation, and depth were all under-committed. No pure #000/#fff anywhere.
+Strategy: **Emirates NBD blue** — the left rail uses official primary blue, content sits on a quiet
+blue-gray ground with official-white panels, and interactive emphasis uses official accent blue.
+Semantic success, warning, and danger retain green, amber, and red identities; proposal states use
+steel blue instead of violet so status remains distinct without leaving the corporate palette.
 
 ```css
 :root {
-  /* content neutrals: the ground is VISIBLY colder than panels (value separation is the point) */
-  --ground:       oklch(0.955 0.009 215);  /* app background behind panels */
+  --brand-primary:#072447;
+  --brand-accent: #2765ff;
+  --brand-white:  #ffffff;
+
+  --ground:       #f3f6fb;
   --paper:        var(--ground);           /* legacy alias */
-  --surface:      oklch(0.995 0.002 210);  /* panels, rows: near-white, floats on the ground */
-  --surface-2:    oklch(0.975 0.006 212);  /* inset zones inside panels (kv grids, editors) */
-  --ink:          oklch(0.25 0.025 225);
-  --ink-soft:     oklch(0.44 0.02 222);
-  /* tertiary text AND placeholders: 5.89:1 on --surface, 5.56:1 on --surface-2, 5.25:1 on
-     --ground — >= 4.5:1 everywhere it renders. Darkened from an earlier 0.58, which measured
-     4.20:1 on --surface and failed. */
-  --ink-faint:    oklch(0.50 0.015 220);
-  --line:         oklch(0.86 0.012 212);
-  --line-strong:  oklch(0.76 0.018 212);
-  --shadow:       0 1px 2px oklch(0.25 0.025 225 / 0.05), 0 6px 20px oklch(0.25 0.025 225 / 0.07);
+  --surface:      var(--brand-white);
+  --surface-2:    #f7f9fc;
+  --ink:          #102a43;
+  --ink-soft:     #486581;
+  --ink-faint:    #5d7187;
+  --line:         #d9e2ec;
+  --line-strong:  #9fb3c8;
+  --shadow:       0 1px 2px rgb(7 36 71 / 0.045),
+                  0 8px 24px rgb(7 36 71 / 0.08);
 
-  /* the rail: a committed dark petrol surface (identity lives here) */
-  --rail-bg:      oklch(0.27 0.045 215);
-  --rail-bg-2:    oklch(0.23 0.04 215);    /* rail footer / inset */
-  --rail-ink:     oklch(0.93 0.01 210);    /* rail primary text */
-  --rail-ink-soft:oklch(0.72 0.02 212);    /* rail secondary text */
-  --rail-line:    oklch(0.36 0.04 215);
-  --rail-active:  oklch(0.36 0.06 212);    /* active nav fill */
-  --rail-accent:  oklch(0.78 0.09 200);    /* active nav text / logomark on dark */
+  --rail-bg:      var(--brand-primary);
+  --rail-bg-2:    #04182f;
+  --rail-ink:     var(--brand-white);
+  --rail-ink-soft:#b8c7dc;
+  --rail-line:    #244567;
+  --rail-active:  var(--brand-accent);
+  --rail-accent:  var(--brand-white);
 
-  /* accent: petrol, now with real presence */
-  --accent:       oklch(0.46 0.11 210);
-  --accent-hover: oklch(0.39 0.115 210);
-  --accent-soft:  oklch(0.93 0.03 208);
-  --accent-line:  oklch(0.70 0.08 208);
-  --accent-deep:  oklch(0.30 0.06 214);    /* committed hero surfaces (Overview start-here) */
+  --accent:       var(--brand-accent);
+  --accent-hover: #174edb;
+  --accent-solid: #17457a;
+  --accent-soft:  #edf3f9;
+  --accent-line:  #a8bdd3;
+  --accent-deep:  var(--brand-primary);
 
   /* semantic states: -solid fills carry chip text (small caps text needs fill L <= 0.55) */
   --ok:           oklch(0.50 0.115 163);
@@ -56,10 +58,10 @@ saturation, and depth were all under-committed. No pure #000/#fff anywhere.
   --danger:       oklch(0.48 0.15 25);
   --danger-solid: oklch(0.50 0.15 25);
   --danger-soft:  oklch(0.955 0.025 25);
-  --proposal:     oklch(0.46 0.115 300);
-  --proposal-solid: oklch(0.47 0.115 300);
-  --proposal-soft:oklch(0.955 0.025 300);
-  --chip-ink:     oklch(0.985 0.005 210);  /* text on -solid chips */
+  --proposal:     #175d87;
+  --proposal-solid:#124d71;
+  --proposal-soft:#edf5fa;
+  --chip-ink:     var(--brand-white);      /* text on -solid chips */
 }
 ```
 
@@ -106,8 +108,10 @@ packages (no CDN). Engineered, legible, unmistakably a tool; deliberately not In
 
 ## Components
 
-- **Nav item**: 32px row, 8px radius; active = `--accent-soft` fill + `--accent` text + 600 weight
-  (no left-stripe accents, banned). Icon 16px inline SVG, 1.5px stroke.
+- **Navigation accordion**: one group is open at a time and the group containing the current route
+  opens automatically. Group toggles use compact uppercase labels with a rotating chevron. Items
+  are 36px rows with 9px radius; active items use a restrained blue gradient, light text, and a
+  subtle inset line. Icon 16px inline SVG, 1.5px stroke.
 - **Button**: primary = `--accent` fill, paper text, 8px radius, 32px height; secondary = hairline
   border + ink text; destructive/confirm variants use semantic colors. Focus: 2px outline
   `--accent`, 2px offset — 6.43:1 on `--surface`, clearing the 3:1 non-text floor (WCAG 1.4.11).

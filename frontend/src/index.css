@@ -1,43 +1,48 @@
 /* FeatureGen design system. Binding reference: frontend/DESIGN.md.
-   A light, high-contrast instrument: hairlines, not shadows (one subtle shadow on the rail
-   only). Fonts (@fontsource IBM Plex Sans/Mono) are imported in main.tsx. */
+   A light, high-contrast banking workspace built on a restrained blue system. Fonts
+   (@fontsource IBM Plex Sans/Mono) are imported in main.tsx. */
 
 /* ---------------------------------------------------------------- tokens */
 
 :root {
-  /* content neutrals: the ground is VISIBLY colder than panels (value separation is the point) */
-  --ground:       oklch(0.955 0.009 215);  /* app background behind panels */
+  /* Emirates NBD anchors. Supporting tones below are derived for dense application surfaces. */
+  --brand-primary:#072447;
+  --brand-accent: #2765ff;
+  --brand-white:  #ffffff;
+
+  --ground:       #f3f6fb;                /* app background behind panels */
   --paper:        var(--ground);           /* legacy alias */
-  --surface:      oklch(0.995 0.002 210);  /* panels, rows: near-white, floats on the ground */
-  --surface-2:    oklch(0.975 0.006 212);  /* inset zones inside panels (kv grids, editors) */
-  --ink:          oklch(0.25 0.025 225);
-  --ink-soft:     oklch(0.44 0.02 222);
-  /* tertiary text AND placeholders: 5.25:1 on ground, 5.89:1 on surface, 5.56:1 on surface-2,
-     4.90:1 on accent-soft — keep >= 4.5:1 everywhere it renders (WCAG 1.4.3, PRODUCT.md) */
-  --ink-faint:    oklch(0.50 0.015 220);
-  --line:         oklch(0.86 0.012 212);
-  --line-strong:  oklch(0.76 0.018 212);
+  --surface:      var(--brand-white);      /* panels, rows */
+  --surface-2:    #f7f9fc;                /* inset zones inside panels (kv grids, editors) */
+  --ink:          #102a43;
+  --ink-soft:     #486581;
+  /* Tertiary text and placeholders stay deliberately darker than decorative blue-gray. */
+  --ink-faint:    #5d7187;
+  --line:         #d9e2ec;
+  --line-strong:  #9fb3c8;
   /* lineage join-edge stroke: --line-strong is 2.1:1 on --surface (<3:1, fails non-text
      WCAG 1.4.11); this darker line clears it (3.85:1 on surface, 3.43:1 on ground). The
      entity (--warn 5.3:1) and feature (--proposal 7.4:1) strokes already conform. */
-  --ln-join:      oklch(0.60 0.03 212);
-  --shadow:       0 1px 2px oklch(0.25 0.025 225 / 0.05), 0 6px 20px oklch(0.25 0.025 225 / 0.07);
+  --ln-join:      #627d98;
+  --shadow:       0 1px 2px rgb(7 36 71 / 0.045),
+                  0 8px 24px rgb(7 36 71 / 0.08);
 
-  /* the rail: a committed dark petrol surface (identity lives here) */
-  --rail-bg:      oklch(0.27 0.045 215);
-  --rail-bg-2:    oklch(0.23 0.04 215);    /* rail footer / inset */
-  --rail-ink:     oklch(0.93 0.01 210);    /* rail primary text */
-  --rail-ink-soft:oklch(0.72 0.02 212);    /* rail secondary text */
-  --rail-line:    oklch(0.36 0.04 215);
-  --rail-active:  oklch(0.36 0.06 212);    /* active nav fill */
-  --rail-accent:  oklch(0.78 0.09 200);    /* active nav text / logomark on dark */
+  /* Official navy carries navigation; white keeps small rail text accessible. */
+  --rail-bg:      var(--brand-primary);
+  --rail-bg-2:    #04182f;                /* rail footer / inset */
+  --rail-ink:     var(--brand-white);      /* rail primary text */
+  --rail-ink-soft:#b8c7dc;                /* rail secondary text */
+  --rail-line:    #244567;
+  --rail-active:  var(--brand-accent);     /* active nav fill */
+  --rail-accent:  var(--brand-white);      /* active nav text / logomark on dark */
 
-  /* accent: petrol, now with real presence */
-  --accent:       oklch(0.46 0.11 210);
-  --accent-hover: oklch(0.39 0.115 210);
-  --accent-soft:  oklch(0.93 0.03 208);
-  --accent-line:  oklch(0.70 0.08 208);
-  --accent-deep:  oklch(0.30 0.06 214);    /* committed hero surfaces (Overview start-here) */
+  /* Official vibrant blue is shared by actions, focus, graphs, and informational states. */
+  --accent:       var(--brand-accent);
+  --accent-hover: #174edb;
+  --accent-solid: #17457a;                /* large selected/fill surfaces */
+  --accent-soft:  #edf3f9;
+  --accent-line:  #a8bdd3;
+  --accent-deep:  var(--brand-primary);    /* committed hero surfaces (Overview start-here) */
 
   /* semantic states: -solid fills carry chip text (small caps text needs fill L <= 0.55) */
   --ok:           oklch(0.50 0.115 163);
@@ -49,16 +54,17 @@
   --danger:       oklch(0.48 0.15 25);
   --danger-solid: oklch(0.50 0.15 25);
   --danger-soft:  oklch(0.955 0.025 25);
-  --proposal:     oklch(0.46 0.115 300);
-  --proposal-solid: oklch(0.47 0.115 300);
-  --proposal-soft:oklch(0.955 0.025 300);
-  --chip-ink:     oklch(0.985 0.005 210);  /* text on -solid chips */
+  /* Proposals use steel blue, never violet, so the complete product remains one blue family. */
+  --proposal:     #175d87;
+  --proposal-solid:#124d71;
+  --proposal-soft:#edf5fa;
+  --chip-ink:     var(--brand-white);      /* text on -solid chips */
 
   /* primitives */
   --font-sans: 'IBM Plex Sans', system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
-  --radius: 8px;
-  --radius-panel: 10px;
+  --radius: 9px;
+  --radius-panel: 12px;
   --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
   --dur: 160ms;
   --dur-fast: 120ms;
@@ -101,9 +107,8 @@ body {
   background: color-mix(in oklch, var(--accent) 18%, var(--paper));
 }
 
-/* focus ring must hold >= 3:1 against adjacent colors (WCAG 1.4.11): --accent is 5.73:1 on
-   ground, 6.43:1 on surface, 5.35:1 on accent-soft. The dark rail scopes its own ring color
-   (--rail-accent: 7.70:1 on rail-bg, 5.49:1 on rail-active) — see .rail :focus-visible. */
+/* The primary blue is deliberately dark enough for focus visibility on every light surface.
+   The rail scopes its own lighter blue ring against navy. */
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -199,11 +204,17 @@ table,
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--rail-bg);
+  background:
+    linear-gradient(
+      180deg,
+      #0b315d 0%,
+      var(--brand-primary) 48%,
+      var(--rail-bg-2) 100%
+    );
   color: var(--rail-ink);
   border-right: 1px solid var(--rail-line);
   /* the one permitted shadow: lifts the dark rail off the ground */
-  box-shadow: 2px 0 16px oklch(0.2 0.03 220 / 0.12);
+  box-shadow: 4px 0 28px rgb(7 36 71 / 0.20);
 }
 
 /* everything focusable on the rail rings in the rail accent, not the light accent-line */
@@ -219,12 +230,15 @@ table,
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 20px 16px 18px;
+  min-height: 72px;
+  padding: 18px 16px;
+  border-bottom: 1px solid color-mix(in oklch, var(--rail-line) 78%, transparent);
 }
 
 .rail-brand svg {
   flex: none;
   color: var(--rail-accent);
+  filter: drop-shadow(0 0 8px color-mix(in oklch, var(--rail-accent) 28%, transparent));
 }
 
 .rail-brand-text {
@@ -234,24 +248,97 @@ table,
 }
 
 .rail-brand-name {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--rail-accent);
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  color: var(--rail-ink);
 }
 
 .rail-nav {
+  flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
+  gap: 10px;
+  padding: 14px 10px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rail-line) transparent;
+}
+
+.nav-group {
+  display: grid;
   gap: 2px;
-  padding: 4px 8px;
+}
+
+.nav-group-label {
+  margin: 0;
+  font: inherit;
+}
+
+.nav-group-toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--rail-ink-soft);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  line-height: 1.4;
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out-quart),
+    color var(--dur-fast) var(--ease-out-quart);
+}
+
+.nav-group-toggle:hover {
+  background: color-mix(in oklch, var(--rail-active) 24%, transparent);
+  color: var(--rail-ink);
+}
+
+.nav-group-toggle[aria-expanded='true'] {
+  color: var(--rail-accent);
+  background: color-mix(in oklch, var(--rail-active) 18%, transparent);
+}
+
+.nav-group-chevron {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+  transition: transform var(--dur-fast) var(--ease-out-quart);
+}
+
+.nav-group-toggle[aria-expanded='true'] .nav-group-chevron {
+  transform: rotate(90deg);
+}
+
+.nav-group-items {
+  display: grid;
+  gap: 2px;
+}
+
+.nav-group-items[hidden] {
+  display: none;
 }
 
 .nav-item {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 32px;
-  padding: 0 10px;
+  height: 36px;
+  padding: 0 11px;
   border: none;
   border-radius: var(--radius);
   background: transparent;
@@ -269,20 +356,57 @@ table,
 }
 
 .nav-item:hover {
-  background: color-mix(in oklch, var(--rail-active) 45%, transparent);
+  background: color-mix(in oklch, var(--rail-active) 34%, transparent);
   color: var(--rail-ink);
 }
 
 .nav-item.active {
-  background: var(--rail-active);
-  color: var(--rail-accent);
+  background: linear-gradient(
+    100deg,
+    #17457a,
+    #123763
+  );
+  color: var(--rail-ink);
   font-weight: 600;
+  box-shadow: inset 0 0 0 1px rgb(39 101 255 / 0.52),
+    0 4px 12px rgb(4 24 47 / 0.22);
+}
+
+.nav-item:disabled,
+.nav-item:disabled:hover {
+  background: transparent;
+  color: var(--rail-ink-soft);
+  cursor: default;
+  opacity: 0.62;
+}
+
+.nav-item--planned {
+  height: auto;
+  min-height: 32px;
+}
+
+.nav-item--planned > span:first-of-type {
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.nav-item-status {
+  margin-left: auto;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in oklch, var(--rail-accent) 35%, var(--rail-line));
+  background: color-mix(in oklch, var(--rail-active) 22%, transparent);
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1.5;
+  text-transform: uppercase;
 }
 
 .rail-session {
   margin-top: auto;
   padding: 14px 16px 16px;
-  background: var(--rail-bg-2);
+  background: oklch(0.19 0.06 260 / 0.72);
   color: var(--rail-ink);
   border-top: 1px solid var(--rail-line);
 }
@@ -290,7 +414,7 @@ table,
 .shell > main {
   flex: 1;
   min-width: 0;
-  padding: 20px 28px 48px;
+  padding: 28px 36px 56px;
 }
 
 .shell > main > * {
@@ -303,6 +427,8 @@ table,
 
 .page-head {
   margin-bottom: 32px;
+  padding: 2px 0 22px;
+  border-bottom: 1px solid color-mix(in oklch, var(--accent-line) 34%, var(--line));
 }
 
 .page-head p {
@@ -315,8 +441,8 @@ table,
   margin: 0 0 6px;
   font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
+  font-weight: 650;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--accent);
 }
@@ -374,7 +500,7 @@ table,
   outline-offset: 2px;
 }
 
-/* session footer on the dark rail: input + role chips adapted for the petrol surface.
+/* session footer on the dark rail: input + role chips adapted for the navy surface.
    Scoped under .rail so the content-column role chips (Search suggestions) stay light. */
 .rail .session-user {
   background: var(--rail-bg);
@@ -411,7 +537,7 @@ table,
 
 .panel {
   background: var(--surface);
-  border: 1px solid var(--line);
+  border: 1px solid color-mix(in oklch, var(--accent-line) 20%, var(--line));
   border-radius: var(--radius-panel);
   padding: 16px 20px;
   margin-block: 16px;
@@ -430,7 +556,7 @@ table,
   gap: 10px;
   align-items: start;
   padding: 14px 16px;
-  border: 1px solid var(--line);
+  border: 1px solid color-mix(in oklch, var(--accent-line) 18%, var(--line));
   border-radius: var(--radius-panel);
   background: var(--surface);
   margin-block: 16px;
@@ -465,7 +591,7 @@ table,
   color: var(--accent);
 }
 
-/* the one hero moment: Overview's start-here becomes a committed deep-petrol surface with light
+/* the one hero moment: Overview's start-here becomes a committed deep-navy surface with light
    text, code refs that read on dark, and an inverted (light-on-dark) primary button. */
 .callout--hero {
   background: var(--accent-deep);
@@ -612,7 +738,7 @@ button {
 }
 
 .btn,
-button:where(:not(.nav-item)) {
+button:where(:not(.nav-item):not(.nav-group-toggle)) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -631,13 +757,13 @@ button:where(:not(.nav-item)) {
 }
 
 .btn:hover,
-button:where(:not(.nav-item)):hover {
+button:where(:not(.nav-item):not(.nav-group-toggle)):hover {
   border-color: var(--accent-line);
   background: var(--paper);
 }
 
 .btn:active,
-button:where(:not(.nav-item)):active {
+button:where(:not(.nav-item):not(.nav-group-toggle)):active {
   transform: translateY(0.5px);
 }
 
@@ -649,14 +775,20 @@ button:disabled {
 }
 
 .btn--primary {
-  background: var(--accent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklch, var(--accent) 90%, var(--surface)),
+    var(--accent)
+  );
   border-color: var(--accent);
   color: var(--surface);
+  box-shadow: 0 3px 10px oklch(0.35 0.14 255 / 0.18);
 }
 
 .btn--primary:hover {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
+  box-shadow: 0 4px 14px oklch(0.32 0.15 258 / 0.24);
 }
 
 .btn--danger {
@@ -1156,21 +1288,34 @@ section > h2:first-child {
   line-height: 1.45;
 }
 
-/* Path 1: the committed primary. Accent fill + chip-ink text (mirrors .btn--primary). */
+/* Path 1: large committed surfaces use official navy; vibrant blue is too indigo at this scale. */
 .path-generate {
-  background: var(--accent);
-  border: 1px solid var(--accent);
+  background: var(--accent-deep);
+  border: 1px solid #17457a;
   color: var(--chip-ink);
+  box-shadow: 0 8px 20px rgb(7 36 71 / 0.14);
 }
 
 .path-generate .d {
-  /* dimmed against the accent fill, still high-contrast light-on-petrol */
-  color: oklch(0.9 0.02 208);
+  color: #c7d5e5;
 }
 
 .path-generate:hover {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: #0b315d;
+  border-color: var(--brand-accent);
+}
+
+.path-generate:disabled,
+.path-generate:disabled:hover {
+  background: #e8eef5;
+  border-color: #c6d3e1;
+  color: #526b84;
+  box-shadow: none;
+  opacity: 1;
+}
+
+.path-generate:disabled .d {
+  color: #657c92;
 }
 
 /* Path 2: the quiet peer. Surface + hairline; accent border on hover; accent-soft fill when the
@@ -2210,7 +2355,7 @@ section > h2:first-child {
 }
 
 .viewtoggle button[aria-pressed='true'] {
-  background: var(--accent);
+  background: var(--accent-solid);
   color: var(--chip-ink);
 }
 
@@ -3333,24 +3478,23 @@ section > h2:first-child {
 }
 
 .path-conn {
-  background: var(--accent);
-  border: 1px solid var(--accent);
+  background: var(--accent-deep);
+  border: 1px solid #17457a;
   color: var(--chip-ink);
 }
 
 .path-conn .d {
-  /* dimmed against the accent fill, still high-contrast light-on-petrol */
-  color: oklch(0.9 0.02 208);
+  color: #c7d5e5;
 }
 
 .path-conn:hover {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: #0b315d;
+  border-color: var(--brand-accent);
 }
 
 .path-conn[aria-pressed='true'] {
-  background: var(--accent-hover);
-  border-color: var(--accent-deep);
+  background: #0b315d;
+  border-color: var(--brand-accent);
   box-shadow: inset 0 0 0 2px var(--rail-accent);
 }
 
@@ -4008,7 +4152,7 @@ main:has(.ln-wrap) .page-head > p {
 
 /* status chips: strong states are solid per DESIGN.md; proposed takes the accent */
 .badge.gj-proposed {
-  background: var(--accent);
+  background: var(--proposal-solid);
   border-color: transparent;
   color: var(--chip-ink);
 }
@@ -5420,15 +5564,15 @@ button.stat:hover {
    non-visual carrier of "selected", exactly as before. */
 .gq-filters .gj-chip--on,
 .ccq-filter .gj-chip--on {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
   color: var(--chip-ink);
 }
 
 .gq-filters button.gj-chip--on:hover,
 .ccq-filter button.gj-chip--on:hover {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
 }
 
 /* ---- per-kind section ---- */

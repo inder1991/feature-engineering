@@ -62,24 +62,43 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders thirteen nav items in order (Runs after Registry) and lands on Overview by default', () => {
+  it('renders a single-open workflow accordion and lands on Overview by default', async () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
-    expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
-      'Overview',
-      'Discover candidates',
-      'Ask a question',
-      'Registry',
-      'Runs',
-      'Search',
-      'Ingest',
-      'Integrations',
-      'Review queue',
-      'Semantics',
-      'Governance',
-      'Recipe reviews',
-      'Dashboard',
+    expect(nav.getAllByRole('heading').map(h => h.textContent)).toEqual([
+      'Home',
+      'Feature Engineering',
+      'Semantic Foundation',
+      'Model Development',
+      'Review & Governance',
+      'Operations',
     ])
+    expect(nav.getByRole('button', { name: 'Home' })).toHaveAttribute('aria-expanded', 'true')
+    for (const group of [
+      'Feature Engineering', 'Semantic Foundation', 'Model Development', 'Review & Governance', 'Operations',
+    ]) {
+      expect(nav.getByRole('button', { name: group })).toHaveAttribute('aria-expanded', 'false')
+    }
+    expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
+      'Home',
+      'Overview',
+      'Feature Engineering',
+      'Semantic Foundation',
+      'Model Development',
+      'Review & Governance',
+      'Operations',
+    ])
+
+    await userEvent.click(nav.getByRole('button', { name: 'Model Development' }))
+    expect(nav.getByRole('button', { name: 'Home' })).toHaveAttribute('aria-expanded', 'false')
+    expect(nav.getByRole('button', { name: 'Model Development' })).toHaveAttribute(
+      'aria-expanded', 'true',
+    )
+    for (const item of [
+      'Labelled Data Readiness', 'AutoML Experiments', 'Model Validation', 'Model Registry',
+    ]) {
+      expect(nav.getByRole('button', { name: new RegExp(item, 'i') })).toBeDisabled()
+    }
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'The loop' })).toBeInTheDocument()
     expect(
@@ -90,7 +109,8 @@ describe('app shell', () => {
   it('nav click navigates and updates location.hash', async () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
-    await userEvent.click(nav.getByRole('button', { name: 'Discover candidates' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Feature Engineering' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Feature Discovery' }))
     expect(window.location.hash).toBe('#/workbench')
     expect(
       screen.getByRole('heading', { level: 1, name: /feature generation/i }),
@@ -161,7 +181,7 @@ describe('app shell', () => {
     expect(screen.getByText('run-detail-screen for grun_x')).toBeInTheDocument()
     expect(screen.queryByText(/runs-list-screen/)).not.toBeInTheDocument()
     const nav = within(screen.getByRole('navigation'))
-    expect(nav.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page')
+    expect(nav.getByRole('button', { name: 'Generation Runs' })).toHaveAttribute('aria-current', 'page')
     // The detail opens with its own hero (name, id, owner), so the page head drops to the
     // breadcrumb: the list's title and description would restate one run's record at lower
     // quality, and its copy ("Every feature-generation workflow…") describes the wrong surface.
@@ -207,10 +227,11 @@ describe('app shell', () => {
     expect(screen.getByRole('list', { name: /connector path/i })).toBeInTheDocument()
   })
 
-  it('Integrations nav item routes to #/integrations and renders the Integrations screen', async () => {
+  it('Data Connections nav item routes to #/integrations and renders the Integrations screen', async () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
-    await userEvent.click(nav.getByRole('button', { name: 'Integrations' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Semantic Foundation' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Data Connections' }))
     expect(window.location.hash).toBe('#/integrations')
     expect(screen.getByRole('heading', { level: 1, name: 'Integrations' })).toBeInTheDocument()
     expect(screen.getByText('CATALOG · INTEGRATIONS')).toBeInTheDocument()
@@ -274,7 +295,8 @@ describe('review ?source= deep-linking', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     const main = within(screen.getByRole('main'))
-    await userEvent.click(nav.getByRole('button', { name: 'Ingest' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Semantic Foundation' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Data Ingestion' }))
     await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
     await userEvent.upload(
       screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
@@ -289,7 +311,8 @@ describe('review ?source= deep-linking', () => {
 
     // Navigate around, then come back via a different source's deep link (shared URL).
     // The param must win over any leftover handoff state from the deposits upload.
-    await userEvent.click(nav.getByRole('button', { name: 'Search' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Semantic Foundation' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Catalog Search' }))
     arriveAt('#/review?source=cards')
     expect(await screen.findByText('row 7')).toBeInTheDocument()
     expect(listQuarantine).toHaveBeenCalledWith('cards')

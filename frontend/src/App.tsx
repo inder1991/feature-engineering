@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import type { ReactElement } from 'react'
 import {
   entityMapEnabled,
@@ -242,7 +243,7 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'workbench',
-    label: 'Discover candidates',
+    label: 'Feature Discovery',
     eyebrow: 'CATALOG · GENERATE',
     title: 'Feature generation',
     description:
@@ -252,7 +253,7 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'analysis',
-    label: 'Ask a question',
+    label: 'Analysis Workspace',
     eyebrow: 'CATALOG · ANALYSE',
     title: 'Analysis workspace',
     description:
@@ -261,14 +262,14 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'registry',
-    label: 'Registry',
+    label: 'Feature Registry',
     eyebrow: 'CATALOG · REGISTRY',
     title: 'Feature registry',
     description: 'Browse registered features — open one for its hypothesis, lineage, and consumers.',
   },
   {
     route: 'runs',
-    label: 'Runs',
+    label: 'Generation Runs',
     eyebrow: 'CATALOG · RUNS',
     title: 'Feature runs',
     description:
@@ -277,7 +278,7 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'search',
-    label: 'Search',
+    label: 'Catalog Search',
     eyebrow: 'CATALOG · SEARCH',
     title: 'Search',
     description:
@@ -298,14 +299,14 @@ const PAGES: PageHead[] = [
     // The route stays 'upload' (#/upload unchanged — deep links keep working); only the words
     // change: the screen now holds two peer ingest paths (file upload + OpenMetadata connector).
     route: 'upload',
-    label: 'Ingest',
+    label: 'Data Ingestion',
     eyebrow: 'CATALOG · INGEST',
     title: 'Ingest',
     description: 'Bring data maps into the catalog: upload a file, or pull from a configured sync.',
   },
   {
     route: 'integrations',
-    label: 'Integrations',
+    label: 'Data Connections',
     eyebrow: 'CATALOG · INTEGRATIONS',
     title: 'Integrations',
     description:
@@ -313,14 +314,14 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'review',
-    label: 'Review queue',
+    label: 'Data Quality Review',
     eyebrow: 'CATALOG · REVIEW QUEUE',
     title: 'Review queue',
     description: 'Rows the catalog refused to trust',
   },
   {
     route: 'semantics',
-    label: 'Semantics',
+    label: 'Semantic Review',
     eyebrow: 'CATALOG · SEMANTICS',
     title: 'Semantics pending',
     description:
@@ -329,7 +330,7 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'governance',
-    label: 'Governance',
+    label: 'Relationship Review',
     eyebrow: 'CATALOG · GOVERNANCE REVIEW',
     // One cross-catalog decision queue now (it used to be three source-keyed tabs behind a text
     // input): the header names the judgement being asked for, not the fact types it spans.
@@ -342,7 +343,7 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'recipes',
-    label: 'Recipe reviews',
+    label: 'Recipe Approvals',
     eyebrow: 'CATALOG · RECIPE REVIEWS',
     title: 'Recipe reviews',
     description:
@@ -352,7 +353,7 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'dashboard',
-    label: 'Dashboard',
+    label: 'Governance Dashboard',
     eyebrow: 'Governance',
     title: 'Governance dashboard',
     description: 'Pipeline rollups + outcomes.',
@@ -361,12 +362,76 @@ const PAGES: PageHead[] = [
     // Internal, authority-only, behind VITE_INTENT_GATE_CONSOLE — filtered out of the rendered
     // nav in App() when the flag is off (parseHash also refuses the route then).
     route: 'gate',
-    label: 'Gate console',
+    label: 'Gate Evaluation',
     eyebrow: 'INTENT · GATE CONSOLE',
     title: 'Gate evaluation',
     description:
       'Authority-only: run the machine gate over a shadow cohort — verdict, failed conditions, '
       + 'coverage, and the population behind the numbers. Evaluating decides nothing.',
+  },
+]
+
+// The primary rail is organized by user intent rather than implementation order. Detail sheets
+// stay outside these groups, while flag-gated destinations disappear with their page definition.
+const NAV_GROUPS: ReadonlyArray<{ id: string; label: string; routes: readonly Route[] }> = [
+  { id: 'home', label: 'Home', routes: ['overview'] },
+  {
+    id: 'feature-engineering',
+    label: 'Feature Engineering',
+    routes: ['workbench', 'analysis', 'registry', 'runs'],
+  },
+  {
+    id: 'data-catalog',
+    label: 'Semantic Foundation',
+    routes: ['search', 'upload', 'integrations', 'entity-map'],
+  },
+  { id: 'model-development', label: 'Model Development', routes: [] },
+  {
+    id: 'review-governance',
+    label: 'Review & Governance',
+    routes: ['review', 'semantics', 'governance', 'recipes'],
+  },
+  { id: 'operations', label: 'Operations', routes: ['dashboard', 'gate'] },
+]
+
+const PLANNED_MODEL_ITEMS: ReadonlyArray<{ label: string; icon: ReactElement }> = [
+  {
+    label: 'Labelled Data Readiness',
+    icon: (
+      <NavIcon>
+        <path d="M3 3.25h10v9.5H3z" />
+        <path d="M5.25 6.25h5.5M5.25 9h3.5" />
+        <path d="m9.75 10.5 1 1 2-2.25" />
+      </NavIcon>
+    ),
+  },
+  {
+    label: 'AutoML Experiments',
+    icon: (
+      <NavIcon>
+        <path d="M5.5 2.75h5M7 2.75v3l-3.6 6.1a.9.9 0 0 0 .78 1.35h7.64a.9.9 0 0 0 .78-1.35L9 5.75v-3" />
+        <path d="M5.2 9.5h5.6" />
+      </NavIcon>
+    ),
+  },
+  {
+    label: 'Model Validation',
+    icon: (
+      <NavIcon>
+        <path d="M8 2.5 13 4.4v3.7c0 2.55-1.72 4.55-5 5.4-3.28-.85-5-2.85-5-5.4V4.4z" />
+        <path d="m5.5 8 1.6 1.6 3.4-3.4" />
+      </NavIcon>
+    ),
+  },
+  {
+    label: 'Model Registry',
+    icon: (
+      <NavIcon>
+        <ellipse cx="8" cy="4" rx="5" ry="1.75" />
+        <path d="M3 4v4c0 .97 2.24 1.75 5 1.75S13 8.97 13 8V4" />
+        <path d="M3 8v4c0 .97 2.24 1.75 5 1.75s5-.78 5-1.75V8" />
+      </NavIcon>
+    ),
   },
 ]
 
@@ -433,6 +498,16 @@ const DETAIL_PAGES: Partial<Record<Route, PageHead>> = {
 
 export default function App() {
   const { route, navigate, params } = useHashRoute()
+  const activeNavGroupId = NAV_GROUPS.find(group => group.routes.includes(route))?.id
+  const [openNavGroupId, setOpenNavGroupId] = useState<string | null>(
+    () => activeNavGroupId ?? 'home',
+  )
+  // A deep link, browser history navigation, or an action elsewhere in the app must reveal the
+  // destination that became current. Directly collapsing the current group still works because
+  // this effect only runs when the active group actually changes.
+  useEffect(() => {
+    if (activeNavGroupId) setOpenNavGroupId(activeNavGroupId)
+  }, [activeNavGroupId])
   // The upload -> review handoff travels entirely in the URL (?source=). No component state:
   // the hash is the single source of truth, so back/forward and shared deep links always show
   // the queue the address bar names.
@@ -475,18 +550,64 @@ export default function App() {
           </div>
         </div>
         <nav className="rail-nav" aria-label="Primary">
-          {pages.map(p => (
-            <button
-              key={p.route}
-              type="button"
-              className={p.route === route ? 'nav-item active' : 'nav-item'}
-              aria-current={p.route === route ? 'page' : undefined}
-              onClick={() => navigate(p.route)}
-            >
-              {ICONS[p.route]}
-              {p.label}
-            </button>
-          ))}
+          {NAV_GROUPS.map(group => {
+            const groupPages = group.routes
+              .map(groupRoute => pages.find(p => p.route === groupRoute))
+              .filter((p): p is PageHead => p !== undefined)
+            const expanded = openNavGroupId === group.id
+            const toggleId = `nav-group-${group.id}-toggle`
+            const panelId = `nav-group-${group.id}-panel`
+            return (
+              <section className="nav-group" aria-labelledby={toggleId} key={group.id}>
+                <h2 className="nav-group-label">
+                  <button
+                    id={toggleId}
+                    className="nav-group-toggle"
+                    type="button"
+                    aria-expanded={expanded}
+                    aria-controls={panelId}
+                    onClick={() => setOpenNavGroupId(current => current === group.id ? null : group.id)}
+                  >
+                    <span>{group.label}</span>
+                    <svg
+                      className="nav-group-chevron"
+                      viewBox="0 0 12 12"
+                      aria-hidden="true"
+                      focusable="false"
+                    >
+                      <path d="m4 2 4 4-4 4" />
+                    </svg>
+                  </button>
+                </h2>
+                <div className="nav-group-items" id={panelId} hidden={!expanded}>
+                  {groupPages.map(p => (
+                    <button
+                      key={p.route}
+                      type="button"
+                      className={p.route === route ? 'nav-item active' : 'nav-item'}
+                      aria-current={p.route === route ? 'page' : undefined}
+                      onClick={() => navigate(p.route)}
+                    >
+                      {ICONS[p.route]}
+                      {p.label}
+                    </button>
+                  ))}
+                  {group.id === 'model-development' && PLANNED_MODEL_ITEMS.map(item => (
+                    <button
+                      className="nav-item nav-item--planned"
+                      type="button"
+                      disabled
+                      key={item.label}
+                    >
+                      {item.icon}
+                      <span>{item.label}</span>
+                      <span className="nav-item-status">Planned</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )
+          })}
         </nav>
         <div className="rail-session">
           <SessionBar />
