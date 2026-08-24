@@ -21,9 +21,9 @@
 //
 // Multi-set model decisions (documented for the record):
 // - Generation always calls /features/recommend-sets. There is NO silent fallback to
-//   /features/recommend on a 503: that status means no LLM provider is configured on the
-//   deployment, so the plain endpoint would return the same 503; the honest notice renders
-//   instead (never fake capability).
+//   /features/recommend on a 503: both routes stand behind the same generation capability, so a
+//   retry there would only produce a second copy of the same refusal. The server's own sentence
+//   renders instead (never fake capability, and never a cause this screen guessed — see `fail`).
 // - A response with one non-empty set renders the flat list exactly as before, no cards row.
 // - Sets that came back empty are dropped from the compare row (nothing to take or compare);
 //   their gauntlet rejections still show in the rejections panel.
@@ -1644,14 +1644,15 @@ export function WorkbenchScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reviseDrawerOpen])
 
+  // THE SCREEN SAYS WHAT THE SERVER SAID. No status code gets its own sentence here — a 503 used
+  // to be rewritten as "no LLM provider is enabled", which cost an owner a diagnosis on
+  // 2026-08-24: the real `detail` named a governance interlock, and the screen sent them to look
+  // at provider configuration instead. A status word is a class of failure, never its cause, and
+  // the response's own sentence is the only thing on the wire that knows which one this was.
+  // `ApiError.detail` is never blank (the transport falls back to statusText, then `HTTP <n>`),
+  // so there is no empty-banner case to compose around.
   function fail(err: unknown) {
-    setNotice(
-      err instanceof ApiError && err.status === 503
-        ? 'AI assist is not configured on this deployment: no LLM provider is enabled.'
-        : err instanceof ApiError
-          ? err.detail
-          : String(err),
-    )
+    setNotice(err instanceof ApiError ? err.detail : String(err))
   }
 
   // Slice 2: the search box and the facet chips are scoped to ONE round's active set. A new
@@ -2348,7 +2349,8 @@ export function WorkbenchScreen() {
       const live = (generatedRef.current ?? []).some(c => c.key === key)
       if (live && registeredRef.current[key] === undefined) {
         if (err instanceof ApiError && err.status === 503) {
-          // A missing provider is a deployment fact: the one honest top notice, not a row error.
+          // A 503 is a whole-deployment condition, not this row's: it goes to the one top notice
+          // (carrying the server's own sentence) rather than being repeated on every row.
           fail(err)
         } else {
           patchRefine(key, prev => ({
@@ -2421,8 +2423,9 @@ export function WorkbenchScreen() {
         } catch (err) {
           failedLines.push(query)
           if (err instanceof ApiError && err.status === 503) {
-            // A missing provider is a deployment fact, not a per-line problem: it surfaces as
-            // the one honest notice the generate path uses, never as N identical line errors.
+            // A 503 is a whole-deployment condition, not a per-line problem: it surfaces once, in
+            // the server's own words, through the same notice the generate path uses — never as N
+            // identical line errors. The line itself is still kept for retry, below.
             providerErr = err
           } else {
             lineErrors.push(

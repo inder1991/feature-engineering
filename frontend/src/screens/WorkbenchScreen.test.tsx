@@ -442,16 +442,21 @@ describe('generation', () => {
     expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
   })
 
-  it('shows the honest 503 notice and never falls back to the plain recommend endpoint', async () => {
-    // 503 means no LLM provider on the deployment: /features/recommend would fail identically,
-    // so a silent fallback would only fake capability.
-    contractConsideredSet.mockRejectedValue(new api.ApiError(503, 'not configured'))
+  it('renders the server’s own 503 sentence and never falls back to the plain endpoint', async () => {
+    // T9 item 1 — THE MASK THIS TASK EXISTS TO REMOVE. Every 503 used to render one hardcoded
+    // sentence ("no LLM provider is enabled"), so the day a 503 carried a GOVERNANCE INTERLOCK
+    // the screen told the owner to go look at provider configuration. The status word is not a
+    // diagnosis; the response's `detail` is the only thing that knows why.
+    const detail = 'cross-catalog planning is interlocked: no activation ceremony for source ftr'
+    contractConsideredSet.mockRejectedValue(new api.ApiError(503, detail))
     render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(alert).toHaveTextContent(detail)
+    expect(alert).not.toHaveTextContent(/no LLM provider/i)
+    // The no-silent-fallback rule is unchanged: /features/recommend is never tried behind a 503.
     expect(recommendFeatures).not.toHaveBeenCalled()
   })
 
@@ -1076,14 +1081,16 @@ describe('described drafts', () => {
     expect(registerFeature).toHaveBeenCalledTimes(2)
   })
 
-  it('gates the describe path behind the same missing-provider notice', async () => {
-    featureRecipe.mockRejectedValue(new api.ApiError(503, 'not configured'))
+  it('gates the describe path behind the same one notice, in the server’s own words', async () => {
+    const detail = 'the authoring provider rejected the request schema (HTTP 400, keyword=type)'
+    featureRecipe.mockRejectedValue(new api.ApiError(503, detail))
     render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await openDescribe()
     await draftFeature('total spend per customer')
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(alert).toHaveTextContent(detail)
+    expect(alert).not.toHaveTextContent(/no LLM provider/i)
     expect(screen.queryByText('Draft')).not.toBeInTheDocument()
   })
 
@@ -1513,13 +1520,14 @@ describe('whole-round feedback', () => {
     expect(screen.queryByText(/Set feedback round \d of 3 · recorded/)).not.toBeInTheDocument()
   })
 
-  it('surfaces the missing-provider notice and consumes no round on failure', async () => {
+  it('surfaces the server’s 503 sentence and consumes no round on failure', async () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
-    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, 'not configured'))
+    const detail = 'the generation lane is drained for migration 1107'
+    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, detail))
     await submitSetFeedback('one note')
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(alert).toHaveTextContent(detail)
     // The round never ran: candidates stay, the counter holds, nothing is recorded.
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
     expect(screen.getByRole('button', {
@@ -1858,13 +1866,17 @@ describe('per-candidate feedback', () => {
     expect(registerFeature).toHaveBeenCalledWith(IDEA_SPEC)
   })
 
-  it('surfaces the missing-provider notice on refine and consumes no round', async () => {
-    refineCandidate.mockRejectedValue(new api.ApiError(503, 'not configured'))
+  it('surfaces the server’s 503 sentence on refine, once, and consumes no round', async () => {
+    // A 503 goes to the ONE top notice rather than onto the row — and it is the response's own
+    // sentence there, not a cause this screen guessed from the status code.
+    const detail = 'refine is disabled while the shadow chooser holds the write lock'
+    refineCandidate.mockRejectedValue(new api.ApiError(503, detail))
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
     await openRefineAndSend('use a 30 day window')
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(alert).toHaveTextContent(detail)
+    expect(alert).not.toHaveTextContent(/no LLM provider/i)
     expect(screen.getByRole('button', {
       name: 'Send feedback for one revision · round 1 of 3',
     })).toBeInTheDocument()
@@ -3301,12 +3313,13 @@ describe('post-submit workspace shell', () => {
   })
 
   it('error: the notice is the page, and the form the human filled in stays open to retry', async () => {
-    contractConsideredSet.mockRejectedValue(new api.ApiError(503, 'not configured'))
+    const detail = 'catalog ftr has no activated cross-catalog interlock'
+    contractConsideredSet.mockRejectedValue(new api.ApiError(503, detail))
     const { container } = render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
-    expect(await screen.findByRole('alert')).toHaveTextContent(/ai assist is not configured/i)
+    expect(await screen.findByRole('alert')).toHaveTextContent(detail)
     expect(phaseOf(container)).toBe('error')
     // No round was produced, so there is no snapshot to show: the screen does NOT invent a brief
     // card for a run that never landed.
@@ -3980,14 +3993,15 @@ describe('Slice 3: the revise drawer', () => {
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     await selectCandidate('avg_balance')
 
-    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, 'not configured'))
+    const detail = 'the generation lane is drained for migration 1107'
+    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, detail))
     await openRevise()
     await retypeHypothesis(REVISED)
     await userEvent.click(within(drawer()).getByRole('button', { name: /Generate revised round/ }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/ai assist is not configured/i)
-    // Exactly the promise the drawer made before the click. A provider outage must not cost the
-    // human their candidates and their selections.
+    expect(await screen.findByRole('alert')).toHaveTextContent(detail)
+    // Exactly the promise the drawer made before the click. An outage must not cost the human
+    // their candidates and their selections.
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
     expect(screen.getByText('1 selected')).toBeInTheDocument()
     expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
