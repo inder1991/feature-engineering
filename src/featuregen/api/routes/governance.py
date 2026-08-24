@@ -63,6 +63,7 @@ from featuregen.overlay.upload.governed_observation_store import (
     observation_queues,
     resolution_summary,
 )
+from featuregen.overlay.upload.governed_planning_report import wave1_report
 from featuregen.overlay.upload.join_drift import (
     acknowledge_governed_join_divergence,
     list_governed_join_divergences,
@@ -1003,3 +1004,12 @@ def bridge_demand(conn: _Conn,
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {**queues, "resolution_summary": resolution_summary(conn)}
+
+
+# ── S1C-2: the wave-1 quality report ───────────────────────────────────────────────────────────
+
+
+@router.get("/governance/cross-catalog-report", dependencies=[Depends(require_confirmer)])
+def cross_catalog_report(conn: _Conn) -> dict:
+    """Wave-1 offline quality report over the governed observation ledger. Read-only."""
+    return wave1_report(conn)
