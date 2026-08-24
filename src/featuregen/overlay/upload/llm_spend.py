@@ -150,6 +150,19 @@ def remaining_spend(conn, spend_authorization_id: str, *, now) -> SpendRemaining
         cost=Decimal(row[2]) - used_cost)
 
 
+def per_call_worst_case(max_calls, max_tokens, max_cost) -> tuple[int, Decimal]:
+    """The worst case ONE physical call reserves — the approval's own arithmetic, ONE copy.
+
+    ▲ Whole-branch review rider (2026-08-24): three hand-copies of this arithmetic existed
+    (worker binding, store dead-ticket guard, run-spine projection), and a floor-vs-ceil drift
+    between them is exactly one token wide — too small for any journey pin to catch. Reserving
+    ``ceil(max_tokens/max_calls)`` and ``max_cost/max_calls`` per call means the approved call
+    count exactly exhausts the approved totals; every consumer calls THIS.
+    """
+    return (-(-int(max_tokens) // int(max_calls)),
+            Decimal(str(max_cost)) / int(max_calls))
+
+
 def reserve_spend(
     conn, *, spend_authorization_id: str, calls: int, tokens: int, cost, now,
     ttl_seconds: int = DEFAULT_RESERVATION_TTL_SECONDS, dispatch_ref: str | None = None,

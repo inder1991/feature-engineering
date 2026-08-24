@@ -509,9 +509,8 @@ def _spend_binding_for(conn, draft_id: str):
     a price: reserving ceiling/calls per call means the approved call count exactly exhausts the
     approved totals.
     """
-    from decimal import Decimal
-
     from featuregen.overlay.upload.dispatch_audit import SpendBindingV1
+    from featuregen.overlay.upload.llm_spend import per_call_worst_case
 
     row = conn.execute(
         "SELECT a.spend_authorization_id, a.max_calls, a.max_tokens, a.max_cost "
@@ -522,10 +521,10 @@ def _spend_binding_for(conn, draft_id: str):
     if row is None:
         return None
     spend_authorization_id, max_calls, max_tokens, max_cost = row
+    call_tokens, call_cost = per_call_worst_case(max_calls, max_tokens, max_cost)
     return SpendBindingV1(
         spend_authorization_id=spend_authorization_id,
-        call_tokens=-(-int(max_tokens) // int(max_calls)),        # ceil division
-        call_cost=Decimal(str(max_cost)) / int(max_calls))
+        call_tokens=call_tokens, call_cost=call_cost)
 
 
 def _frozen_grounding_context(conn, draft_id: str):

@@ -259,7 +259,7 @@ def test_a_RETIRED_IDENTITY_IS_NOT_HANDED_BACK_AS_A_USABLE_DRAFT(db):
     `created=False`, which reads as "you already have an identical, usable draft"."""
     from featuregen.overlay.upload.formula_draft_store import DraftRetired, request_draft
 
-    first, created = request_draft(
+    first, created, _ride = request_draft(
         db, formula_draft_id="fd-id-1", considered_revision_id="crev-r", option_id="opt-id",
         planning_request_hash="p", catalog_snapshot_hash="c", authoring_config_hash="a",
         definition_revision="", requested_by="ops@bank", requested_at="t")
@@ -278,13 +278,13 @@ def test_CHANGING_AN_IDENTITY_BEARING_INPUT_MINTS_A_NEW_DRAFT(db):
     configuration changes the identity, so the request is genuinely new work."""
     from featuregen.overlay.upload.formula_draft_store import request_draft
 
-    first, _ = request_draft(
+    first, _, _ride = request_draft(
         db, formula_draft_id="fd-cfg-1", considered_revision_id="crev-r", option_id="opt-cfg",
         planning_request_hash="p", catalog_snapshot_hash="c", authoring_config_hash="a-broken",
         definition_revision="", requested_by="ops@bank", requested_at="t")
     retire_formula_draft(db, first, reason="SCHEMA_CONTRACT_MISMATCH", retired_by="ops@bank")
 
-    second, created = request_draft(
+    second, created, _ride = request_draft(
         db, formula_draft_id="fd-cfg-2", considered_revision_id="crev-r", option_id="opt-cfg",
         planning_request_hash="p", catalog_snapshot_hash="c", authoring_config_hash="a-fixed",
         definition_revision="", requested_by="ops@bank", requested_at="t")
@@ -537,12 +537,13 @@ def _request_again(db, *, draft_id: str, option_id: str,
                    provider_contract_hash=None, strategy_identity_hash=None):
     from featuregen.overlay.upload.formula_draft_store import request_draft
 
-    return request_draft(
+    draft_id_out, created, _ride = request_draft(
         db, formula_draft_id=draft_id, considered_revision_id="crev-r", option_id=option_id,
         planning_request_hash="h1", catalog_snapshot_hash="h2", authoring_config_hash="h3",
         definition_revision="", requested_by="user:ops", requested_at="2026-08-23T00:00:00Z",
         provider_contract_hash=provider_contract_hash,
         strategy_identity_hash=strategy_identity_hash)
+    return draft_id_out, created
 
 
 def test_a_FAILED_DETERMINISTIC_draft_re_requests_FREE_no_exception_no_spend(db):
@@ -1115,7 +1116,9 @@ def test_DEAD_TICKET_an_exhausted_ceiling_refuses_BEFORE_the_coupon_is_consumed(
     """Task 7 review item 1 — round-3's dead-ticket shape at the ORIGINAL door: with the
     approved ceiling spent to zero, the request must refuse (typed) BEFORE consuming the naming
     coupon and BEFORE minting a draft that dies at the dispatch seam. And the refusal must be
-    remediable: a fresh cost-confirmed approval makes the same request mint."""
+    remediable: a fresh cost-confirmed approval makes the same request mint — the pick skips
+    the dead-money coupon (whole-branch C1's corollary), so the fresh coupon is consumed and
+    its OWN money is the ride."""
     import pytest
 
     from featuregen.overlay.upload.formula_draft_store import DraftCeilingExhausted
@@ -1146,7 +1149,7 @@ def test_DEAD_TICKET_an_exhausted_ceiling_refuses_BEFORE_the_coupon_is_consumed(
     now = db.execute("SELECT now()").fetchone()[0]
     reserve_spend(db, spend_authorization_id=spend, calls=5, tokens=1000, cost="1.00", now=now)
 
-    with pytest.raises(DraftCeilingExhausted, match="cannot dispatch"):
+    with pytest.raises(DraftCeilingExhausted, match="cannot cover one more call"):
         _request_again(db, draft_id="fd-dead-retry", option_id="opt-fd-dead",
                        provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
     consumed, drafts = db.execute(
@@ -1175,13 +1178,16 @@ def test_DEAD_TICKET_an_exhausted_ceiling_refuses_BEFORE_the_coupon_is_consumed(
         "a fresh cost-confirmed approval is the remedy, and it works"
 
 
-def test_an_EXPIRED_authorization_is_not_a_dead_ticket_the_mint_rides_the_envelope(db):
-    """The guard's None path, pinned: when the approval's authorization has EXPIRED, the
-    preference locator returns None and the service rides its bounded development envelope —
-    the mint CAN complete, so the store must NOT refuse. Exhaustion refuses; expiry falls
-    through to the envelope. (Expired-AND-exhausted is unconstructible in THIS order —
-    `reserve_spend` refuses expired authorizations — but exhaust-then-WAIT reaches it; benign,
-    expiry dominates and the locator filters the row either way, so expiry alone is the pin.)"""
+def test_EXPIRED_coupon_money_refuses_it_never_rides_the_envelope(db):
+    """INVERTED by whole-branch C1 (this test previously pinned the envelope fall-through):
+    the mint rides the money of the coupon it consumes, so a coupon bound to an EXPIRED
+    authorization is a dead ticket — consuming it while riding the development envelope would
+    be C1's burn-one-approval-ride-another defect re-entered by the expiry door. The refusal
+    burns nothing, and the remedy heals same-day (`canonical_approval_expiry` keeps a sub-day
+    re-approval's exact instant)."""
+    import pytest
+
+    from featuregen.overlay.upload.formula_draft_store import DraftCeilingExhausted
     from featuregen.overlay.upload.llm_spend import authorize_spend
     from featuregen.overlay.upload.retirement_scope import (
         approve_regeneration_exception,
@@ -1202,14 +1208,13 @@ def test_an_EXPIRED_authorization_is_not_a_dead_ticket_the_mint_rides_the_envelo
         strategy_identity_hash="sih-llm", actor_subject="user:owner",
         llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
 
-    minted, created = _request_again(db, draft_id="fd-exp-retry", option_id="opt-fd-exp",
-                                     provider_contract_hash="sha256:llm",
-                                     strategy_identity_hash="sih-llm")
-    assert created is True, "expired is the envelope's case, not the dead-ticket refusal's"
+    with pytest.raises(DraftCeilingExhausted, match="cannot cover one more call"):
+        _request_again(db, draft_id="fd-exp-retry", option_id="opt-fd-exp",
+                       provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
     consumed = db.execute(
         "SELECT uses_consumed FROM formula_draft_regeneration_exception "
         "WHERE exception_id = %s", (coupon,)).fetchone()
-    assert consumed == (1,), "the coupon still authorizes THIS mint and is consumed by it"
+    assert consumed == (0,), "the refusal burned nothing — expired money is unridable, period"
 
 
 def test_a_SLIVER_remainder_below_one_call_is_still_a_dead_ticket(db):

@@ -47,9 +47,10 @@ def _request(db, draft_id="fd-1", **overrides):
     # request names has to exist. Seeding only — no assertion in this file depends on it.
     seed_run_chain(db, run_id=f"fds-{kwargs['considered_revision_id']}",
                    considered_revision_id=kwargs["considered_revision_id"])
-    return request_draft(
+    draft_id_out, created, _ride = request_draft(
         db, formula_draft_id=draft_id, requested_by="user:ops",
         requested_at="2026-08-17T00:00:00Z", **kwargs)
+    return draft_id_out, created
 
 
 # ══ THE MONEY GUARD ═════════════════════════════════════════════════════════════════════════════
