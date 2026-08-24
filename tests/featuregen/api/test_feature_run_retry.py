@@ -317,20 +317,39 @@ def test_a_SLIVER_remainder_refuses_on_the_PAGE_and_at_the_DOOR_alike(client, co
     worst-case reservation is exhausted everywhere. The substrate's dead-ticket guard refuses it
     at the seam (its own sliver test), so a page still using the old zero floor would offer a
     Retry the door refuses one click later — the two-answers defect in the permissive direction.
-    With `_CEILING` at 45 calls / 250,000 tokens / $25.00, one call reserves
-    tokens=ceil(250000/45)=5556 and cost=25/45≈0.5556; reserving 44 calls / 249,000 / $24.90
-    leaves 1 call / 1,000 tokens / $0.10 — every axis above zero, two below one call's worth."""
+
+    ▲ THE BAR IS ASSERTED THROUGH `per_call_worst_case`, never re-spelled here. The substrate
+    extracted that function as THE arithmetic precisely because a hand-copy can drift by one token
+    (floor vs ceil) and no journey pin is fine-grained enough to catch it — a test that wrote 5556
+    would agree with a broken copy of the very thing it is pinning. With `_CEILING` at 45 calls /
+    250,000 tokens / $25.00, reserving 44 calls / 249,000 / $24.90 leaves 1 call / 1,000 tokens /
+    $0.10: every axis above zero, and two of them below one call's worth."""
+    from featuregen.overlay.upload.llm_spend import (
+        per_call_worst_case,
+        remaining_spend,
+        reserve_spend,
+        settle_spend,
+    )
+
     chain = _seed(conn, run_id="rty-sliv")
     draft_id = _attempt(client, conn, chain)
     approved = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
                            json=_CEILING, headers=_GOVERNANCE)
     spend_id = approved.json()["spend_authorization_id"]
-    from featuregen.overlay.upload.llm_spend import reserve_spend, settle_spend
 
     now = conn.execute("SELECT now()").fetchone()[0]
     reservation = reserve_spend(conn, spend_authorization_id=spend_id, calls=44, tokens=249_000,
                                 cost="24.90", now=now)
     settle_spend(conn, reservation, actual_calls=44, actual_tokens=249_000, actual_cost="24.90")
+
+    # THE SLIVER, stated in the ONE arithmetic both surfaces now bar against: the remainder is a
+    # real one, and it is below what a single call would reserve on two of its three axes.
+    call_tokens, call_cost = per_call_worst_case(
+        _CEILING["max_calls"], _CEILING["max_tokens"], _CEILING["max_cost"])
+    left = remaining_spend(conn, spend_id, now=now)
+    assert left.calls >= 1 and left.tokens > 0 and left.cost > 0, "a sliver, not an empty ceiling"
+    assert left.tokens < call_tokens and left.cost < call_cost, \
+        "and below one per-call worst-case reservation — which is what both surfaces refuse on"
 
     row = _row(client, "rty-sliv", draft_id)
     assert row["retryable"] is False
@@ -347,17 +366,236 @@ def test_a_SLIVER_remainder_refuses_on_the_PAGE_and_at_the_DOOR_alike(client, co
     assert consumed == (0,), "the sliver refusal must not burn the coupon"
 
 
-def test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO(client, conn):
-    """▲ THE PREFERENCE, pinned on both surfaces (belt-and-braces since the extraction landed).
+def _spend_to_zero(conn, spend_id, *, calls=45, tokens=250_000, cost="25.00"):
+    """This authorization's money, spent to the last call — reserved and settled the way the
+    audited seam does it, so what dies is the LEDGER and not a flag a test invented."""
+    from featuregen.overlay.upload.llm_spend import reserve_spend, settle_spend
 
-    `runs.projection.retry_availability` and `formula_draft_service.request_draft_for_candidate`
-    now read the ceiling a retry would ride through ONE shared locator
-    (`retirement_scope.approved_ceiling_for`), preferences and all: only the AUTHORIZATION's
-    expiry filters, the coupon's own uses and expiry do not, and `approved_at DESC` breaks the
-    tie. This test predates the extraction (it was the sole defender while the projection carried
-    a byte-identical COPY) and stays because it pins the OBSERVABLE agreement — two approvals for
-    one identity is the smallest arrangement where the preference ORDER decides the answer, so if
-    either side ever stops calling the shared locator or the locator's semantics move, this dies.
+    now = conn.execute("SELECT now()").fetchone()[0]
+    settle_spend(conn, reserve_spend(
+        conn, spend_authorization_id=spend_id, calls=calls, tokens=tokens, cost=cost, now=now),
+        actual_calls=calls, actual_tokens=tokens, actual_cost=cost)
+
+
+def _age_back(conn, exception_id):
+    """Make this coupon the OLDER approval act. The store's pick is by ANTIQUITY, so which coupon
+    is older is what decides which one a mint consumes — and therefore whose money it rides."""
+    conn.execute(
+        "UPDATE formula_draft_regeneration_exception "
+        "SET approved_at = approved_at - interval '1 day' WHERE exception_id = %s",
+        (exception_id,))
+
+
+def test_the_page_reports_the_money_OF_THE_COUPON_THE_MINT_WOULD_CONSUME(client, conn):
+    """▲ THE COUPON-MONEY LAW, MIRRORED (whole-branch C1, substrate `9bd720a2`).
+
+    The store now rides the money of the coupon it CONSUMES, and it picks that coupon by
+    ANTIQUITY. `approved_ceiling_for` picks by RECENCY and is narrowed to the no-coupon doors —
+    so a page still reading it answers about an authorization the mint will not touch.
+
+    THE ARRANGEMENT is the smallest one where the two picks disagree: a RICH older approval and a
+    SPENT newer one. Recency finds the newer, whose money is dead, and refuses. Antiquity finds
+    the older, whose money is whole, and mints against it. Page refuses, door accepts — the
+    two-answers defect in the direction that strands a person on a control that would have worked.
+    """
+    chain = _seed(conn, run_id="rty-couponmoney")
+    draft_id = _attempt(client, conn, chain)
+
+    rich = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                       json={**_CEILING, "max_cost": "25.00"}, headers=_GOVERNANCE).json()
+    poor = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                       json={**_CEILING, "max_cost": "9.00"}, headers=_GOVERNANCE).json()
+    assert rich["spend_authorization_id"] != poor["spend_authorization_id"]
+    _age_back(conn, rich["exception_id"])          # rich is the OLDER act: the mint's own pick
+    _spend_to_zero(conn, poor["spend_authorization_id"], cost="9.00")
+
+    # THE ARRANGEMENT, asserted rather than assumed.
+    from featuregen.overlay.upload.llm_spend import remaining_spend
+
+    now = conn.execute("SELECT now()").fetchone()[0]
+    assert remaining_spend(conn, poor["spend_authorization_id"], now=now).calls == 0
+    assert remaining_spend(conn, rich["spend_authorization_id"], now=now).calls > 0
+
+    # THE PAGE offers it, because the money the MINT would ride is whole...
+    row = _row(client, "rty-couponmoney", draft_id)
+    assert row["retryable"] is True, row["retry_blockers"]
+
+    # ...and the seam agrees, riding the CONSUMED coupon's own authorization.
+    response = client.post(RETRY.format(run="rty-couponmoney"),
+                           json={"formula_draft_id": draft_id}, headers=_hdr())
+    assert response.status_code == 202, response.text
+    assert conn.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_authoring_plan "
+        "WHERE formula_draft_id = %s",
+        (response.json()["formula_draft_id"],)).fetchone() \
+        == (rich["spend_authorization_id"],), \
+        "the mint rides the money of the coupon it consumed, not the latest approval's"
+    assert conn.execute(
+        "SELECT uses_consumed FROM formula_draft_regeneration_exception WHERE exception_id = %s",
+        (rich["exception_id"],)).fetchone() == (1,)
+
+
+def test_the_page_LOOPS_PAST_DEAD_MONEY_exactly_as_the_gate_does(client, conn):
+    """▲ THE EXECUTION-DISCOVERED COROLLARY, mirrored: a coupon whose money cannot buy one call is
+    NOT AVAILABLE to the mint, so the pick SKIPS it (`valid_exception_for(excluding=...)`, looped
+    per slot). Without the skip, a dead-money old coupon blocks a fresh approval FOR EVER and the
+    refusal prescribes the exact remedy it is blocking.
+
+    CHEAP-DEAD-OLD + RICH-NEW: the pick passes over the old one and rides the new. A page that
+    mirrored the pick WITHOUT the loop would find the old coupon, see dead money, and report
+    COST_AUTHORIZATION_EXHAUSTED over a door that mints — which is what this pin kills.
+    """
+    chain = _seed(conn, run_id="rty-deadloop")
+    draft_id = _attempt(client, conn, chain)
+
+    cheap = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                        json={**_CEILING, "max_cost": "9.00"}, headers=_GOVERNANCE).json()
+    rich = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                       json={**_CEILING, "max_cost": "25.00"}, headers=_GOVERNANCE).json()
+    _age_back(conn, cheap["exception_id"])         # the dead one is the one the pick meets first
+    _spend_to_zero(conn, cheap["spend_authorization_id"], cost="9.00")
+
+    row = _row(client, "rty-deadloop", draft_id)
+    assert row["retryable"] is True, row["retry_blockers"]
+    assert row["retry_blockers"] == []
+
+    response = client.post(RETRY.format(run="rty-deadloop"),
+                           json={"formula_draft_id": draft_id}, headers=_hdr())
+    assert response.status_code == 202, response.text
+    assert conn.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_authoring_plan "
+        "WHERE formula_draft_id = %s",
+        (response.json()["formula_draft_id"],)).fetchone() \
+        == (rich["spend_authorization_id"],), \
+        "the pick looped past the dead coupon and rode the live one's money"
+    # The dead coupon was NOT burned on the way past: it is skipped, not spent.
+    assert conn.execute(
+        "SELECT uses_consumed FROM formula_draft_regeneration_exception WHERE exception_id = %s",
+        (cheap["exception_id"],)).fetchone() == (0,)
+
+
+def test_EXPIRED_COUPON_MONEY_refuses_on_the_PAGE_as_it_now_does_at_the_DOOR(client, conn):
+    """▲ THE PIN THE LAW INVERTED, on this side. Expired coupon money used to fall through to the
+    development envelope; under C1 that is the burn-one-approval-ride-another defect re-entered by
+    the expiry door, so the store REFUSES instead.
+
+    `approved_ceiling_for` filters expired authorizations OUT, so a page reading it saw `None`,
+    found no ceiling to check, and offered the Retry — while the door raised
+    `DraftCeilingExhausted`. Page says go, door refuses: the permissive direction, which costs a
+    person a click into a refusal nobody warned them about.
+    """
+    chain = _seed(conn, run_id="rty-expmoney")
+    draft_id = _attempt(client, conn, chain)
+    approved = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=_GOVERNANCE).json()
+    # ▲ THE MONEY EXPIRES, NOT THE COUPON — and it is built the way the substrate's own twin of
+    # this pin builds it (`test_PRODUCTION_posture_an_EXPIRED_approval_refuses...`): a separate
+    # expired authorization, with the coupon re-pointed at it. `llm_spend_authorization_revision`
+    # is append-only (a trigger refuses the UPDATE), and the shipped approval route hands ONE
+    # canonical expiry to both halves — so this state is reachable only through a caller that
+    # passes them independently, which `approve_regeneration_exception`'s signature permits and
+    # which is exactly why both sides pin it.
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+
+    dead_money = authorize_spend(
+        conn, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-rty-expmoney",
+        member_identities=["ident-rty-expmoney"], provider_contract_hash="sha256:llm",
+        max_calls=5, max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2020-01-01T00:00:00Z")
+    conn.execute(
+        "UPDATE formula_draft_regeneration_exception SET llm_spend_authorization_id = %s "
+        "WHERE exception_id = %s", (dead_money, approved["exception_id"]))
+
+    row = _row(client, "rty-expmoney", draft_id)
+    assert row["retryable"] is False, "the door refuses this; the page must not offer it"
+    assert "COST_AUTHORIZATION_EXHAUSTED" in [b["code"] for b in row["retry_blockers"]]
+
+    response = client.post(RETRY.format(run="rty-expmoney"),
+                           json={"formula_draft_id": draft_id}, headers=_hdr())
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "COST_AUTHORIZATION_EXHAUSTED"
+    # ...and the refusal burned nothing: the coupon survives for a request that can ride.
+    assert conn.execute(
+        "SELECT uses_consumed FROM formula_draft_regeneration_exception WHERE exception_id = %s",
+        (approved["exception_id"],)).fetchone() == (0,)
+    _assert_page_and_entrance_agree(client, "rty-expmoney", draft_id, response)
+
+
+def test_the_bar_is_the_SHARED_arithmetic_down_to_the_LAST_TOKEN(client, conn):
+    """▲ THE ONE-TOKEN DRIFT, made observable — because the ordinary sliver test cannot see it.
+
+    The substrate extracted `per_call_worst_case` saying a floor-vs-ceil drift between hand-copies
+    "is exactly one token wide — too small for any journey pin to catch", and that was measured:
+    with the sliver arrangement leaving 1,000 tokens against a 5,556-token call, a floor-drifted
+    copy (5,555) reaches the SAME verdict, and a mutant of the arithmetic passes the whole file.
+
+    So this arrangement puts the remainder exactly ON the seam. `_CEILING` is 250,000 tokens over
+    45 calls, which does not divide: floor is 5,555 and ceil is 5,556. Leaving EXACTLY 5,555 tokens
+    is the one remainder where the two answers differ — ceil refuses (5,555 < 5,556, and the
+    dispatch seam would reserve 5,556 and fail), floor admits. Every other axis is left with room,
+    so tokens alone decide.
+
+    A page that carried its own copy of the arithmetic — the third hand-copy this wave deleted —
+    would offer a Retry that dies at the seam's first reservation, one token short.
+    """
+    from featuregen.overlay.upload.llm_spend import (
+        per_call_worst_case,
+        remaining_spend,
+        reserve_spend,
+        settle_spend,
+    )
+
+    call_tokens, call_cost = per_call_worst_case(
+        _CEILING["max_calls"], _CEILING["max_tokens"], _CEILING["max_cost"])
+    floor_tokens = _CEILING["max_tokens"] // _CEILING["max_calls"]
+    assert floor_tokens == call_tokens - 1, \
+        "the arrangement needs a ceiling whose tokens do not divide by its calls, or it pins nothing"
+
+    chain = _seed(conn, run_id="rty-token")
+    draft_id = _attempt(client, conn, chain)
+    approved = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=_GOVERNANCE).json()
+    spend_id = approved["spend_authorization_id"]
+
+    now = conn.execute("SELECT now()").fetchone()[0]
+    # Leave exactly `floor_tokens` — one token below what ONE call actually reserves — with a
+    # whole call and ample cost still on the ledger, so nothing but the token axis can decide.
+    settle_spend(conn, reserve_spend(
+        conn, spend_authorization_id=spend_id, calls=44,
+        tokens=_CEILING["max_tokens"] - floor_tokens, cost="24.00", now=now),
+        actual_calls=44, actual_tokens=_CEILING["max_tokens"] - floor_tokens, actual_cost="24.00")
+
+    left = remaining_spend(conn, spend_id, now=now)
+    assert left.tokens == floor_tokens == call_tokens - 1, "exactly one token short of a call"
+    assert left.calls >= 1 and left.cost >= call_cost, "and short on NOTHING else"
+
+    row = _row(client, "rty-token", draft_id)
+    assert row["retryable"] is False, \
+        "one token short is short: the seam would reserve the full per-call worst case and fail"
+    assert "COST_AUTHORIZATION_EXHAUSTED" in [b["code"] for b in row["retry_blockers"]]
+
+    response = client.post(RETRY.format(run="rty-token"), json={"formula_draft_id": draft_id},
+                           headers=_hdr())
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "COST_AUTHORIZATION_EXHAUSTED"
+
+
+def test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO(client, conn):
+    """▲ THE PICK, pinned on both surfaces — and RE-ANCHORED to the law that now decides it.
+
+    ▲ **THE STATED REASON WAS OVERTAKEN BY WHOLE-BRANCH C1** (substrate `9bd720a2`). This docstring
+    used to say both sides read one shared locator, `approved_ceiling_for`, "preferences and all:
+    `approved_at DESC` breaks the tie" — and the OUTCOME it asserts still holds, which is exactly
+    why the stale explanation was dangerous. It no longer holds for that reason. The mint now rides
+    the money of the coupon it CONSUMES, and it picks that coupon by ANTIQUITY, so recency-DESC
+    decides nothing here: the newer ceiling wins because the pick meets the OLDER coupon first,
+    finds its money spent to the last call, and LOOPS PAST it (`valid_exception_for(excluding=...)`).
+    `approved_ceiling_for` is not consulted by either side on this path any more.
+
+    The arrangement is unchanged and still the smallest one where the pick decides the answer; what
+    changed is which rule it is exercising. Its siblings above take the cases this one cannot:
+    `..._COUPON_THE_MINT_WOULD_CONSUME` inverts the ages so ANTIQUITY and RECENCY disagree, and
+    `..._LOOPS_PAST_DEAD_MONEY` asserts the skipped coupon is passed over rather than burned.
     """
     from featuregen.overlay.upload.llm_spend import remaining_spend, reserve_spend, settle_spend
 
@@ -371,8 +609,8 @@ def test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO(client, conn):
     newer = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
                         json={**_CEILING, "max_cost": "9.00"}, headers=_GOVERNANCE).json()
     assert older["spend_authorization_id"] != newer["spend_authorization_id"]
-    # The older one is aged back a day and then spent to the last call: a ceiling that authorizes
-    # nothing any more, which is exactly what a wrong pick would report on.
+    # The older one is aged back a day and then spent to the last call — so it is the coupon the
+    # pick meets FIRST and the one whose dead money makes it skip.
     conn.execute(
         "UPDATE formula_draft_regeneration_exception "
         "SET approved_at = approved_at - interval '1 day' WHERE exception_id = %s",
@@ -387,7 +625,7 @@ def test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO(client, conn):
     assert remaining_spend(conn, older["spend_authorization_id"], now=now).calls == 0
     assert remaining_spend(conn, newer["spend_authorization_id"], now=now).calls > 0
 
-    # THE PAGE picks the NEWER ceiling, so it offers the retry...
+    # THE PAGE loops past the dead older coupon to the newer's money, so it offers the retry...
     row = _row(client, "rty-two", draft_id)
     assert row["retryable"] is True, row["retry_blockers"]
     assert row["retry_blockers"] == []
@@ -401,7 +639,7 @@ def test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO(client, conn):
         "SELECT llm_spend_authorization_id FROM formula_draft_authoring_plan "
         "WHERE formula_draft_id = %s",
         (response.json()["formula_draft_id"],)).fetchone() == (newer["spend_authorization_id"],), \
-        "the draft rides the ceiling the page believed in, not the spent one"
+        "the draft rides the money of the coupon it consumed — the page believed in the same one"
 
 
 def test_a_RACE_LOST_AT_THE_SEAM_IS_A_REFUSAL_NOT_A_REPORTED_PURCHASE(client, conn, monkeypatch):
@@ -509,6 +747,10 @@ def test_a_GOVERNED_OVERRIDE_IS_OFFERED_AND_SAYS_WHAT_IT_IS_OVERRIDING(client, c
         "a WARN disposition's whole content is that the caller must be told"
     assert "withdrew" in offered["retry_warnings"][0]["detail"], \
         "a code with no sentence is a dead end — and this one is not a refusal, so it must say so"
+    # ▲ AND THE SENTENCE PROMISES NO OUTCOME. It owns one fact (the withdrawal is named); whether
+    # anything proceeds is the blockers' to say, and an arrangement where both stand is reachable
+    # — see `..._A_NAMED_WITHDRAWAL_WHOSE_MONEY_DIED_...` below.
+    assert "will proceed" not in offered["retry_warnings"][0]["detail"]
 
     # ── AND THE ENTRANCE AGREES, AND THE COUPON IS SPENT BY THE MINT IT AUTHORIZED ──────────────
     response = client.post(RETRY.format(run="rty-ovr"), json={"formula_draft_id": draft_id},
@@ -520,6 +762,53 @@ def test_a_GOVERNED_OVERRIDE_IS_OFFERED_AND_SAYS_WHAT_IT_IS_OVERRIDING(client, c
     assert conn.execute(
         "SELECT uses_consumed, max_uses FROM formula_draft_regeneration_exception "
         "WHERE exception_id = %s", (approved.json()["exception_id"],)).fetchone() == (1, 1)
+
+
+def test_A_NAMED_WITHDRAWAL_WHOSE_MONEY_DIED_refuses_and_says_which_half_died(client, conn):
+    """▲ THE ARRANGEMENT THE COUPON-MONEY LAW MADE REACHABLE, and the one where a careless surface
+    contradicts itself: a covering withdrawal that IS named by an approved regeneration, whose
+    money can no longer buy a call.
+
+    `candidate_governance_blockers` reads the withdrawal law WITHOUT the money bar — correctly, it
+    is a different question — so it reports `RETIREMENT_OVERRIDDEN`. The store, reading the same
+    coupons through the money bar, raises `DraftCeilingExhausted`. Both are true at once, and the
+    page has to carry both WITHOUT the warning promising a click the blocker refuses.
+
+    The remedy has to be the truthful one, too: an approval EXISTS. Telling this person to obtain
+    one sends them to re-do the thing they are already holding — the dead-end the substrate's own
+    loop was added to kill, and this pin keeps this side out of it.
+    """
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    chain = _seed(conn, run_id="rty-namedead")
+    draft_id = _attempt(client, conn, chain)
+    record_tombstone(conn, formula_draft_id=draft_id,
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    approved = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=_GOVERNANCE).json()
+    _spend_to_zero(conn, approved["spend_authorization_id"])
+
+    row = _row(client, "rty-namedead", draft_id)
+    # The withdrawal IS named — that half is reported, and it is not a refusal...
+    assert [w["code"] for w in row["retry_warnings"]] == ["RETIREMENT_OVERRIDDEN"]
+    assert "will proceed" not in row["retry_warnings"][0]["detail"], \
+        "a warning that promises the click would sit directly above the blocker refusing it"
+    # ...and the MONEY is what died, which is the half that refuses.
+    assert row["retryable"] is False
+    assert [b["code"] for b in row["retry_blockers"]] == ["COST_AUTHORIZATION_EXHAUSTED"]
+    detail = row["retry_blockers"][0]["detail"]
+    assert "re-confirming the cost" in detail, "the remedy is the cost, not the approval"
+    assert "EXISTS" in detail, "and the sentence has to say the approval is already held"
+
+    response = client.post(RETRY.format(run="rty-namedead"),
+                           json={"formula_draft_id": draft_id}, headers=_hdr())
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "COST_AUTHORIZATION_EXHAUSTED"
+    assert conn.execute(
+        "SELECT uses_consumed FROM formula_draft_regeneration_exception WHERE exception_id = %s",
+        (approved["exception_id"],)).fetchone() == (0,), "the refusal burned no coupon"
+    _assert_page_and_entrance_agree(client, "rty-namedead", draft_id, response)
 
 
 def test_an_APPROVAL_CEILING_THAT_IS_NOT_A_POSITIVE_AMOUNT_is_a_422_not_a_500(client, conn):

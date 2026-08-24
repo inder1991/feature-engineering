@@ -188,6 +188,18 @@ _RETRY_BLOCKER_DETAIL = {
         "nothing a person does to this run can produce them",
 }
 
+#: `COST_AUTHORIZATION_EXHAUSTED` when a coupon EXISTS and its MONEY is what died — the store's own
+#: second flavour of that refusal (whole-branch C1's corollary), and a DIFFERENT remedy from the
+#: generic one above. The generic sentence says "a fresh approval is the remedy", which here would
+#: send a person to obtain the approval they are already holding; what actually unblocks them is
+#: re-confirming the COST. Naming the wrong remedy is the defect the substrate's dead-money loop
+#: exists to prevent, and a page that named it would re-open it on this side.
+_DEAD_COUPON_MONEY_DETAIL = (
+    "an approved regeneration for this candidate EXISTS, and the money it is bound to can no "
+    "longer cover a single provider call — it is spent, or its authorization has expired. The "
+    "approval is not what is missing: re-confirming the cost under a fresh authorization is the "
+    "remedy, and it is a governance act. Nothing has been consumed, and the coupon survives")
+
 #: For a strategy the resolver refused: the same sentence `POST .../formula-drafts` answers with,
 #: because it is the same refusal reached from a second door.
 #:
@@ -207,11 +219,17 @@ _UNNAMED_BLOCKER_DETAIL = (
 #: disposition. A warning is a proceed-with-knowledge (`action_dispositions` maps
 #: `RETIREMENT_OVERRIDDEN` to WARN, whose whole meaning is that the caller MUST be told), so the
 #: sentence says what is true and what it does NOT stop.
+#:
+#: ▲ THE SENTENCE MAY NOT PROMISE AN OUTCOME. It said "the retry is admissible and will proceed",
+#: which is false in an arrangement the coupon-money law made reachable: a withdrawal NAMED by a
+#: coupon whose money has died reports this warning AND a `COST_AUTHORIZATION_EXHAUSTED` blocker,
+#: and a line promising the click will proceed would sit directly above the line refusing it. The
+#: warning owns one fact — the withdrawal is named — and the blockers own whether anything proceeds.
 _RETRY_WARNING_DETAIL = {
     "RETIREMENT_OVERRIDDEN":
         "somebody withdrew this candidate, and an approved regeneration NAMES that withdrawal — so "
-        "the retry is admissible and will proceed over a deliberate withdrawal. Nothing here "
-        "refuses it; you are being told what the coupon is overriding",
+        "the withdrawal is no longer what stands between this candidate and a retry. Nothing on "
+        "this line refuses anything; you are being told what an approved retry would override",
 }
 
 #: For a warning the substrate names that this surface has no sentence for. Same discipline as
@@ -639,6 +657,84 @@ def _covering_withdrawals(conn, drafts) -> dict[str, tuple]:
     return covering
 
 
+def _money_rides(conn, spend_authorization_id: str, *, now) -> bool:
+    """Whether this authorization's money can still buy ONE physical call.
+
+    A MIRROR of `formula_draft_store._request_draft_locked._money_rides`, and the mirror is
+    structural rather than optional: that function is a CLOSURE over the locked request — it is not
+    importable, and there is no exported "would this money ride" locator to ask. What keeps the two
+    honest is that both call `llm_spend.per_call_worst_case`, the ONE arithmetic (the substrate
+    extracted it precisely because three hand-copies existed and a floor-vs-ceil drift between them
+    is one token wide — too small for any journey pin to catch), and that the page/door agreement
+    is pinned end to end on every arrangement this predicate decides.
+
+    BOTH HALVES, in the store's own order. EXPIRY first: expired money is unridable, and under
+    whole-branch C1 the mint may NOT fall through to the development envelope while consuming the
+    coupon — that is the burn-one-approval-ride-another defect re-entered by the expiry door. Then
+    the BAR: one per-call worst-case reservation, not zero, because the dispatch seam reserves
+    exactly that and a zero floor offers a Retry the seam refuses one click later.
+    """
+    from featuregen.overlay.upload.llm_spend import per_call_worst_case, remaining_spend
+
+    expired = conn.execute(
+        "SELECT expires_at <= %s FROM llm_spend_authorization_revision "
+        "WHERE spend_authorization_id = %s", (now, spend_authorization_id)).fetchone()[0]
+    if expired:
+        return False
+    left = remaining_spend(conn, spend_authorization_id, now=now)
+    max_calls, max_tokens, max_cost = conn.execute(
+        "SELECT max_calls, max_tokens, max_cost FROM llm_spend_authorization_revision "
+        "WHERE spend_authorization_id = %s", (spend_authorization_id,)).fetchone()
+    call_tokens, call_cost = per_call_worst_case(max_calls, max_tokens, max_cost)
+    return left.calls >= 1 and left.tokens >= call_tokens and left.cost >= call_cost
+
+
+def _ridable_coupon(conn, *, identity: str, provider_contract: str,
+                    strategy_identity_hash: str, covering_tombstone_id: str | None,
+                    now) -> tuple[str | None, tuple[str, ...]]:
+    """The MONEY the mint would ride for this slot, and the coupons its pick passed over as dead.
+
+    Returns ``(spend_authorization_id | None, dead_coupon_ids)``.
+
+    ▲ **THE MINT RIDES THE MONEY OF THE COUPON IT CONSUMES** (whole-branch C1, substrate
+    `9bd720a2`). `approved_ceiling_for` picks a ceiling by RECENCY; the store picks the coupon by
+    ANTIQUITY and then rides *that coupon's own* `llm_spend_authorization_id`. The two picks
+    disagree the moment two approvals exist, and the page reading the recency one answered about an
+    authorization the mint would never touch — refusing over a door that mints, and offering over a
+    door that refuses, on the same branch. `approved_ceiling_for` is now narrowed, by its own
+    docstring, to the NO-COUPON doors; where a coupon is consumed this is the question.
+
+    ▲ **AND THE PICK SKIPS DEAD MONEY** — the corollary the substrate discovered in execution.
+    Pick-by-antiquity plus ride-the-consumed-coupon's-money let one dead-money old coupon block a
+    fresh approval FOR EVER, with the refusal prescribing the exact remedy it was blocking. So the
+    pick loops, excluding each coupon whose money cannot ride (`valid_exception_for`'s `excluding`),
+    until it finds one that can or runs out. The `dead` list is not bookkeeping: it is what
+    separates "a coupon exists and its money died" (re-confirm the cost) from "no coupon names this
+    at all" (obtain an approval), and the store raises a different refusal for each.
+
+    A MIRROR of `_request_draft_locked._pick_ridable`, for that function's own reason: it is a
+    closure over the locked request and the substrate exports no shared locator for it. Documented
+    as a mirror, like this module's two others, so the day one moves the other is found by name.
+    """
+    from featuregen.overlay.upload.retirement_scope import valid_exception_for
+
+    dead: list[str] = []
+    while True:
+        coupon = valid_exception_for(
+            conn, target_formula_identity_hash=identity,
+            provider_contract_hash=provider_contract,
+            strategy_identity_hash=strategy_identity_hash,
+            covering_tombstone_id=covering_tombstone_id, now=now, excluding=tuple(dead))
+        if coupon is None:
+            return None, tuple(dead)
+        spend_id = conn.execute(
+            "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception "
+            "WHERE exception_id = %s", (coupon,)).fetchone()[0]
+        if _money_rides(conn, spend_id, now=now):
+            return spend_id, tuple(dead)
+        dead.append(coupon)
+
+
 def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> dict:
     """Whether a bought-nothing attempt on this candidate may be bought AGAIN, why not, and what a
     person proceeding is entitled to know (spec §R4.2). Returns
@@ -688,12 +784,9 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
     from featuregen.overlay.upload.formula_draft_store import formula_identity
     from featuregen.overlay.upload.formula_strategy import resolve_formula_strategy
     from featuregen.overlay.upload.formula_strategy_facts import assemble_strategy_facts
-    from featuregen.overlay.upload.llm_spend import remaining_spend
     from featuregen.overlay.upload.retirement_scope import (
-        approved_ceiling_for,
         covering_tombstones,
         retirement_scope_key,
-        valid_exception_for,
     )
 
     # ▲ THE IDENTITY A RETRY WOULD MINT IS TODAY'S, not the failed row's — the candidate's frozen
@@ -767,51 +860,61 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
         (identity, list(_BOUGHT_NOTHING))).fetchone()
 
     covering = covering_tombstones(conn, scope_key=scope_key, formula_identity_hash=identity)
-    if provider_contract is not None and not covering and live is None:
-        # `_request_draft_locked`'s not-an-answer gate, asked in the same order it asks it: with
-        # nothing covering and a recorded failure at THIS identity, the LLM lane needs the plain
-        # retry coupon. Where a withdrawal DOES cover, the coupons that name it are the approval,
-        # and the block above has already reported whether they exist.
-        bought_nothing = conn.execute(
-            "SELECT formula_draft_id FROM formula_draft "
-            " WHERE formula_identity_hash = %s AND state = ANY(%s) LIMIT 1",
-            (identity, list(_BOUGHT_NOTHING))).fetchone()
-        if bought_nothing is not None and valid_exception_for(
-                conn, target_formula_identity_hash=identity,
-                provider_contract_hash=provider_contract,
-                strategy_identity_hash=decision.strategy_identity_hash,
-                covering_tombstone_id=None, now=now) is None:
-            blockers.append(_blocker(FORMULA_DRAFT_NOT_AN_ANSWER))
+    # ▲ THE MONEY THE MINT WOULD RIDE, asked slot by slot in `_request_draft_locked`'s own order
+    # (whole-branch C1). The LLM lane only: the reviewed lane folds no provider contract, consumes
+    # no coupon and rides no money, so none of this applies to it by construction.
+    if provider_contract is not None:
+        if covering:
+            # ONE SLOT PER COVERING WITHDRAWAL — the one law's shape, and the gate's own loop.
+            for withdrawal in covering:
+                ride, dead = _ridable_coupon(
+                    conn, identity=identity, provider_contract=provider_contract,
+                    strategy_identity_hash=decision.strategy_identity_hash,
+                    covering_tombstone_id=withdrawal.tombstone_id, now=now)
+                if ride is None and dead:
+                    # Coupons NAME this withdrawal and every one of them is bound to money that
+                    # cannot ride. The store refuses BEFORE consuming, and the remedy is truthful:
+                    # re-confirm the cost, never "obtain an approval" — one is already held.
+                    blockers.append(_blocker(COST_AUTHORIZATION_EXHAUSTED,
+                                             _DEAD_COUPON_MONEY_DETAIL))
+                    break
+                # `ride is None` with nothing dead is "no coupon names this withdrawal", which
+                # `candidate_governance_blockers` has ALREADY reported as FORMULA_DRAFT_RETIRED —
+                # reporting it twice under a second code would be this surface inventing a refusal.
+        elif live is None:
+            # `_request_draft_locked`'s not-an-answer gate, asked in the same order it asks it:
+            # with nothing covering and a recorded failure at THIS identity, the LLM lane needs a
+            # plain retry coupon whose money can ride.
+            bought_nothing = conn.execute(
+                "SELECT formula_draft_id FROM formula_draft "
+                " WHERE formula_identity_hash = %s AND state = ANY(%s) LIMIT 1",
+                (identity, list(_BOUGHT_NOTHING))).fetchone()
+            if bought_nothing is not None:
+                ride, dead = _ridable_coupon(
+                    conn, identity=identity, provider_contract=provider_contract,
+                    strategy_identity_hash=decision.strategy_identity_hash,
+                    covering_tombstone_id=None, now=now)
+                if ride is None and dead:
+                    # The truthful flavour, and the store's own branch order: a coupon EXISTS and
+                    # its money died. Naming this FORMULA_DRAFT_NOT_AN_ANSWER would send a person
+                    # to obtain the approval they are already holding.
+                    blockers.append(_blocker(COST_AUTHORIZATION_EXHAUSTED,
+                                             _DEAD_COUPON_MONEY_DETAIL))
+                elif ride is None:
+                    blockers.append(_blocker(FORMULA_DRAFT_NOT_AN_ANSWER))
     if live is not None:
         blockers.append(_blocker(
             RETRY_ATTEMPT_ALREADY_LIVE,
             f"draft {live[0]} already holds this formula identity — it is an answer, or a purchase "
             f"still in flight — so a retry would mint nothing (migration 1107's money guard covers "
             f"exactly these). Watch that attempt; retry becomes the question again if it fails"))
-    if provider_contract is not None:
-        # ▲ THE CEILING THE RETRY WOULD ACTUALLY RIDE, read with the ONE locator every consumer
-        # shares (`approved_ceiling_for` — the service's preference read and the store's
-        # dead-ticket guard call the same function, so the page cannot report a ceiling the mint
-        # does not use). The BAR mirrors the guard's exactly: one per-call worst-case reservation
-        # (the dispatch seam's own arithmetic), not zero — a zero floor here would offer a Retry
-        # the seam refuses one click later. The coupling test
-        # (`test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO`) is belt-and-braces now
-        # that both sides call one function; the sliver test pins the bar.
-        ride = approved_ceiling_for(
-            conn, target_formula_identity_hash=identity,
-            provider_contract_hash=provider_contract,
-            strategy_identity_hash=decision.strategy_identity_hash)
-        if ride is not None:
-            from decimal import Decimal
-
-            left = remaining_spend(conn, ride, now=now)
-            max_calls, max_tokens, max_cost = conn.execute(
-                "SELECT max_calls, max_tokens, max_cost FROM llm_spend_authorization_revision "
-                "WHERE spend_authorization_id = %s", (ride,)).fetchone()
-            call_tokens = -(-int(max_tokens) // int(max_calls))
-            call_cost = Decimal(str(max_cost)) / int(max_calls)
-            if left.calls < 1 or left.tokens < call_tokens or left.cost < call_cost:
-                blockers.append(_blocker(COST_AUTHORIZATION_EXHAUSTED))
+    # ▲ NO SECOND CEILING READ HERE. This is where `approved_ceiling_for` used to be consulted,
+    # with a third hand-copy of the per-call arithmetic beside it. Both are gone: under whole-branch
+    # C1 the ride is the CONSUMED COUPON's own money, resolved above by the same pick the gate makes,
+    # and the arithmetic is `llm_spend.per_call_worst_case`. `approved_ceiling_for` remains the
+    # locator for the NO-COUPON doors — which this surface, whose whole subject is a coupon-gated
+    # retry, is not one of.
+    #
     # `retryable` folds the BLOCKERS alone: a warning that refused would be a blocker under a
     # gentler name, and the entrance would then answer 202 over a control the page had greyed out.
     return {"retryable": not blockers, "retry_blockers": blockers, "retry_warnings": warnings}

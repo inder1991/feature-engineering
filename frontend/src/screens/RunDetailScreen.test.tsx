@@ -732,7 +732,7 @@ const OVERRIDDEN: api.RunAuthoringRow = {
   retry_warnings: [{
     code: 'RETIREMENT_OVERRIDDEN',
     detail: 'somebody withdrew this candidate, and an approved regeneration NAMES that withdrawal '
-      + '— so the retry is admissible and will proceed over a deliberate withdrawal',
+      + '— so the withdrawal is no longer what stands between this candidate and a retry',
   }],
 }
 
@@ -754,7 +754,8 @@ it('says what a governed override overrides, beside a control it does NOT disabl
   const row = rowOf('d0')
   // Verbatim, code and sentence — this screen owns no vocabulary for a governed decision.
   expect(within(row).getByText('RETIREMENT_OVERRIDDEN')).toBeInTheDocument()
-  expect(within(row).getByText(/will proceed over a deliberate withdrawal/)).toBeInTheDocument()
+  expect(within(row).getByText(/no longer what stands between this candidate and a retry/))
+    .toBeInTheDocument()
   // ...and it is a WARNING, not a blocker: it lives in its own element, and the button is ENABLED.
   expect(within(row).getByTestId('retry-warning')).toBeInTheDocument()
   expect(within(row).getByRole('button', { name: /Retry attempt d0/ })).toBeEnabled()
