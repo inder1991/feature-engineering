@@ -92,7 +92,12 @@ def _source_anchor(request: FeaturePlanningRequestV1) -> tuple[str | None, str |
        row's own anchor (`own_transfer_outflow_amount`'s payee, `first_time_payee_high_value`'s).
 
     Every one of them is a recipe declaration; nothing here reads a column, a role name or an
-    operand's tuple position."""
+    operand's tuple position.
+    OUT-OF-MODULE CONSUMER: recipe_operand_policy.population_anchor_and_distinct_roles
+    imports this deliberately so the binder and the planner can never disagree about
+    who the population is (T8). Reshaping this function must move that caller too.
+
+    """
     candidates = [op for op in request.operands
                   if op.operand_class == "entity_key"
                   and _entity_link(op) is not None

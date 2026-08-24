@@ -733,7 +733,7 @@ def test_the_distinct_from_population_set_is_DERIVED_from_the_contract_not_autho
     DO NOT just paste a new expected set. This asserts that the structural derivation — an
     operand that is not the population anchor and whose concept IDENTIFIES the same entity the
     anchor identifies — selects exactly the counterparty legs and NOTHING else. Measured
-    2026-08-24 over 317 recipes: 6 slots, 5 recipes. Dropping the same-entity condition takes
+    2026-08-24 over 317 recipes: 6 slots, 4 recipes. Dropping the same-entity condition takes
     it to 66 slots (`original_txn`, `account`, `product`, `invoice`, …) — which is why that
     condition is the rule and not a decoration. A new entry here means a new recipe declares a
     second instance of its own population's entity; check it really is a counterparty leg."""
