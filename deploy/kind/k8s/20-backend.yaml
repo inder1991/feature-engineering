@@ -8,6 +8,10 @@ data:
   FEATUREGEN_AUDIT_HMAC_KEY: "local-dev-not-a-real-secret"
   # Dev auth stub: routes read X-User / X-Roles headers instead of a real session.
   FEATUREGEN_AUTH_STUB: "1"
+  # V2 generation lane ON (owner's instruction, 2026-08-24): the run page's prepare-code gesture
+  # and the AUTHOR_FORMULA journey route through the governed job coordinator. Spend stays gated
+  # per-act behind cost-confirmed approvals — this switch opens the SURFACE, never the wallet.
+  FEATUREGEN_GENERATION_V2_ENABLED: "1"
   # Belt-and-braces: the initContainer already migrates; the app also auto-applies on boot (idempotent).
   FEATUREGEN_AUTO_MIGRATE: "1"
   # LLM provider ON: enables concept enrichment + Pass B synthesis. The ANTHROPIC_API_KEY itself is
