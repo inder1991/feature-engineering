@@ -3137,10 +3137,19 @@ premises withdrawn on evidence.
   EXPIRED coupon-money refuses on BOTH postures instead of riding the envelope — two earlier
   pins were INVERTED by this law, deliberately. Shared `per_call_worst_case` in llm_spend.py
   is the ONE arithmetic (worker + store + their projection).
+* ▲ STAGE I CLOSED (2026-08-24): comprehensive verify over both waves PASSED — "nothing
+  blocking stands"; suite 13,597/20/0 at the peer's HEAD; owner package with GO went to the
+  user. Merge-to-main and deploy are the OWNER's gestures.
+* From the comprehensive verify (post-merge, owner-gated): F3 `per_call_worst_case` missing
+  from llm_spend.py `__all__`; F4 lane-guard expression drift (store truthiness vs page
+  `is not None` — unreachable while the value is a jcs hash, align when touched); F5
+  `retry_substrate_exists` implicitly guards the tombstone table without naming it; ▲ 28
+  hard-coded `expires_at="2026-12-31T00:00:00Z"` sites in direct-service substrate tests
+  EXPIRE ON 2027-01-01 — a New Year's time bomb; sweep to relative windows before then.
 * From the round-5 ledger (reviewer's file:line record is the source of truth): the
   201-with-"budget in effect" message over a dead coupon; the spend-preference query's missing
-  expiry/exhaustion filters and the refuses-vs-substitutes posture (flagged for the
-  whole-branch review); the fence naming query's reliance on the 1107 one-live invariant; the
+  expiry/exhaustion filters and the refuses-vs-substitutes posture (NOW IN THE OWNER'S
+  DECISION LIST); the fence naming query's reliance on the 1107 one-live invariant; the
   deterministic refusal citing `covering[0]`; one-ceiling-across-N-bindings and
   expired-unexhausted pins; coupon stacking when differing only in `max_cost`.
 
