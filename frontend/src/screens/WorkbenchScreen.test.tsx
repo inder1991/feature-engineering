@@ -442,16 +442,21 @@ describe('generation', () => {
     expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
   })
 
-  it('shows the honest 503 notice and never falls back to the plain recommend endpoint', async () => {
-    // 503 means no LLM provider on the deployment: /features/recommend would fail identically,
-    // so a silent fallback would only fake capability.
-    contractConsideredSet.mockRejectedValue(new api.ApiError(503, 'not configured'))
+  it('renders the server’s own 503 sentence and never falls back to the plain endpoint', async () => {
+    // T9 item 1 — THE MASK THIS TASK EXISTS TO REMOVE. Every 503 used to render one hardcoded
+    // sentence ("no LLM provider is enabled"), so the day a 503 carried a GOVERNANCE INTERLOCK
+    // the screen told the owner to go look at provider configuration. The status word is not a
+    // diagnosis; the response's `detail` is the only thing that knows why.
+    const detail = 'cross-catalog planning is interlocked: no activation ceremony for source ftr'
+    contractConsideredSet.mockRejectedValue(new api.ApiError(503, detail))
     render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(alert).toHaveTextContent(detail)
+    expect(alert).not.toHaveTextContent(/no LLM provider/i)
+    // The no-silent-fallback rule is unchanged: /features/recommend is never tried behind a 503.
     expect(recommendFeatures).not.toHaveBeenCalled()
   })
 
@@ -477,12 +482,42 @@ describe('multiple sets', () => {
     expect(screen.getByRole('heading', { name: 'Proposed feature sets' })).toBeInTheDocument()
     // Exactly one Recommended chip, on the advisory pick.
     expect(screen.getAllByText('Recommended')).toHaveLength(1)
-    // Both cards carry the honest all-design-checked meta line.
-    expect(screen.getAllByText(/2 features · all design-checked/)).toHaveLength(2)
+    // The meta line counts what the SERVER stamped. This fixture's cards all read DESIGN-CHECKED.
+    expect(screen.getAllByText(/2 features · 2 design-checked/)).toHaveLength(2)
     // Advisory panel: the pick, the reasoning, and the backend caveat verbatim.
     expect(screen.getByText(/Engine's pick: Temporal\./)).toBeInTheDocument()
     expect(screen.getByText(/recency signals move earliest for a churn horizon/)).toBeInTheDocument()
     expect(screen.getByText(new RegExp(CAVEAT.slice(0, 40)))).toBeInTheDocument()
+  })
+
+  // T9 item 5. The set card said "all design-checked" unconditionally. Since T3 the server derives
+  // the stamp from the recipe's readiness as well as the gauntlet, and 3 of 317 registry recipes
+  // can earn it — so on a real round that clause is false for essentially every card in the set,
+  // and it sits directly above the per-card chips that say UNVERIFIED.
+  it('the set card counts the stamps the server gave, and claims none it did not', async () => {
+    await renderAndGenerateSets({
+      // The temporal set holds one stamped card and one UNVERIFIED; the ratio set holds neither.
+      sets: [
+        { lens: 'temporal', features: [TEMPORAL_ONLY, { ...SHARED, verification: 'UNVERIFIED' }] },
+        {
+          lens: 'ratio',
+          features: [
+            { ...RATIO_ONLY, verification: 'UNVERIFIED' },
+            { ...SHARED_RECIPE, verification: 'UNVERIFIED' },
+          ],
+        },
+      ],
+      recommendation: null,
+      rejections: [],
+    })
+    await screen.findByText('Temporal set')
+    const cards = document.querySelector('.sets') as HTMLElement
+    // One of the temporal set's two earned the stamp. The card says one, never "all".
+    expect(within(cards).getByText(/2 features · 1 design-checked/)).toBeInTheDocument()
+    expect(within(cards).queryByText(/all design-checked/)).toBeNull()
+    // The ratio set earned none, so it claims nothing at all rather than reporting a zero.
+    expect(within(cards).getByText(/^2 features$/)).toBeInTheDocument()
+    expect(within(cards).queryAllByText(/design-checked/)).toHaveLength(1)
   })
 
   it('opens on the recommended set and switches the detail list per card', async () => {
@@ -631,6 +666,96 @@ describe('multiple sets', () => {
     expect(screen.getByText('1 rejected')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Show' }))
     expect(screen.getByText('nps_score_avg')).toBeInTheDocument()
+  })
+})
+
+// ── T2: the needs-setup lane — a shorter list with a reason given ──────────────────────────────
+//
+// The live cib arrangement this program came from returns ideas=0, actionable=0, needs_setup=114.
+// Before this lane the screen answered that with "No grounded candidates for that goal. Rephrase
+// the goal, or change the catalog source" — a wrong REMEDY on top of a hidden fact: 114 candidates
+// were planned, and every one of them is waiting on a binding a person can settle.
+//
+// Every sentence below is copied from `UnboundOperandV1.sentence` in
+// overlay/upload/semantic_projection.py. The lane renders those; it composes nothing — because
+// "did not bind" is three conditions and only `unresolved` is an absence.
+describe('the needs-setup lane', () => {
+  const AMBIGUOUS: api.UnboundOperand = {
+    role: 'flow', concept: 'monetary_flow', operand_class: 'measure', status: 'ambiguous',
+    reason_codes: [], resolution: 'a human adjudicates the tie',
+    tied_refs: ['public.txn.amt_local', 'public.txn.amt_usd'],
+    sentence: '2 columns carry monetary_flow and the tie is unadjudicated: '
+      + 'public.txn.amt_local, public.txn.amt_usd',
+  }
+  const UNRESOLVED: api.UnboundOperand = {
+    role: 'limit', concept: 'credit_limit', operand_class: 'measure', status: 'unresolved',
+    reason_codes: [], resolution: '', tied_refs: [],
+    sentence: 'no read-scoped column carries credit_limit',
+  }
+  const NO_VERDICT: api.UnboundOperand = {
+    role: 'party', concept: 'counterparty_id', operand_class: 'identifier', status: '',
+    reason_codes: [], resolution: '', tied_refs: [],
+    sentence: "the binder returned no verdict for the 'party' operand (counterparty_id)",
+  }
+
+  function needsSetup(
+    name: string, operands: api.UnboundOperand[],
+  ): api.NeedsSetupCandidate {
+    return {
+      name, source_definition_id: `recipe:${name}`, recipe_id: name, catalog_source: 'cib',
+      unbound_concepts: [...new Set(operands.map(o => o.concept))],
+      unbound_operands: operands,
+      sentence: operands.map(o => o.sentence).join('; '),
+    }
+  }
+
+  async function generateWithSetup(entries: api.NeedsSetupCandidate[]) {
+    contractConsideredSet.mockResolvedValue({
+      ...considered(singleSetRound([])), contract_version: 2, needs_setup: entries,
+    })
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+  }
+
+  it('a round with no cards but setup work says so, and names what did not bind', async () => {
+    await generateWithSetup([needsSetup('net_transaction_flow', [AMBIGUOUS, UNRESOLVED])])
+    const lane = await screen.findByTestId('needs-setup')
+    expect(lane).toHaveTextContent('net_transaction_flow')
+    // The AMBIGUOUS operand is a PRESENCE claim, and the tie's own columns are named — that is the
+    // difference between "adjudicate this" and "onboard this data".
+    expect(lane).toHaveTextContent(
+      '2 columns carry monetary_flow and the tie is unadjudicated')
+    expect(within(lane).getByText('public.txn.amt_local')).toBeInTheDocument()
+    expect(within(lane).getByText('public.txn.amt_usd')).toBeInTheDocument()
+    // The UNRESOLVED one is the only absence, and it is the only one worded as one.
+    expect(lane).toHaveTextContent('no read-scoped column carries credit_limit')
+    // The aggregate is status-NEUTRAL: it never says these concepts are missing.
+    expect(lane).toHaveTextContent('monetary_flow')
+    expect(lane).not.toHaveTextContent(/missing concepts/i)
+  })
+
+  it('is setup work, never a failure, and never the rephrase-the-goal remedy', async () => {
+    await generateWithSetup([needsSetup('net_transaction_flow', [UNRESOLVED])])
+    await screen.findByTestId('needs-setup')
+    // The old answer told the human to rewrite a question that was never the problem.
+    expect(screen.queryByText(/Rephrase the goal/i)).toBeNull()
+    expect(screen.queryByText(/no grounded candidates for that goal/i)).toBeNull()
+  })
+
+  it('a role the binder never ruled on says exactly that — honest absence, not a guess',
+    async () => {
+      await generateWithSetup([needsSetup('counterparty_concentration', [NO_VERDICT])])
+      const lane = await screen.findByTestId('needs-setup')
+      expect(lane).toHaveTextContent(
+        "the binder returned no verdict for the 'party' operand (counterparty_id)")
+    })
+
+  it('an empty needs_setup lane renders nothing at all', async () => {
+    await generateWithSetup([])
+    expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
+    expect(screen.queryByTestId('needs-setup')).toBeNull()
   })
 })
 
@@ -1076,14 +1201,16 @@ describe('described drafts', () => {
     expect(registerFeature).toHaveBeenCalledTimes(2)
   })
 
-  it('gates the describe path behind the same missing-provider notice', async () => {
-    featureRecipe.mockRejectedValue(new api.ApiError(503, 'not configured'))
+  it('gates the describe path behind the same one notice, in the server’s own words', async () => {
+    const detail = 'the authoring provider rejected the request schema (HTTP 400, keyword=type)'
+    featureRecipe.mockRejectedValue(new api.ApiError(503, detail))
     render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await openDescribe()
     await draftFeature('total spend per customer')
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(alert).toHaveTextContent(detail)
+    expect(alert).not.toHaveTextContent(/no LLM provider/i)
     expect(screen.queryByText('Draft')).not.toBeInTheDocument()
   })
 
@@ -1513,13 +1640,14 @@ describe('whole-round feedback', () => {
     expect(screen.queryByText(/Set feedback round \d of 3 · recorded/)).not.toBeInTheDocument()
   })
 
-  it('surfaces the missing-provider notice and consumes no round on failure', async () => {
+  it('surfaces the server’s 503 sentence and consumes no round on failure', async () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
-    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, 'not configured'))
+    const detail = 'the generation lane is drained for migration 1107'
+    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, detail))
     await submitSetFeedback('one note')
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(alert).toHaveTextContent(detail)
     // The round never ran: candidates stay, the counter holds, nothing is recorded.
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
     expect(screen.getByRole('button', {
@@ -1756,21 +1884,59 @@ describe('per-candidate feedback', () => {
     expect(row).toHaveFocus()
   })
 
-  it('renders a gauntlet rejection as a danger line, consuming the round, changing nothing', async () => {
+  it('renders a refusal as a danger line, consuming the round, changing nothing', async () => {
     refineCandidate.mockResolvedValue({
       rejected: { reason: 'leaks target', code: 'LEAKAGE' },
     })
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
     await openRefineAndSend('use the churn label')
-    expect(await screen.findByText(
-      /rejected this revision: leaks target \(leakage\)\. The round is consumed/,
-    )).toBeInTheDocument()
+    const line = await screen.findByText(
+      /refused: leaks target \(leakage\)\. The round is consumed/)
+    expect(line).toBeInTheDocument()
+    // T9: the line used to open "The safety gauntlet rejected this revision". Most arms of
+    // /features/refine-candidate are not the gauntlet at all — an intent-parse rejection, a
+    // scope rejection, or (since T2) an operand that did not bind — so the attribution was a
+    // cause this screen invented for whatever the server refused with.
+    expect(line).not.toHaveTextContent(/safety gauntlet/i)
     expect(screen.queryByRole('button', { name: 'Approve revision' })).not.toBeInTheDocument()
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
     expect(screen.getByRole('button', {
       name: 'Send feedback for one revision · round 2 of 3',
     })).toBeInTheDocument()
+  })
+
+  // T2 reaches the refine seam too: /features/refine-candidate answers a revision whose required
+  // operand did not bind with a `needs_setup` envelope and a 200 — "data the reviewer acts on, not
+  // an error", in the route's own words. Rendering it in danger styling under a gauntlet heading
+  // made setup work look like a safety failure.
+  it('a revision that did not BIND is setup work, not a refusal', async () => {
+    refineCandidate.mockResolvedValue({
+      rejected: {
+        reason: 'the revision did not bind: no read-scoped column carries credit_limit',
+        code: 'SEMANTIC_NOT_BINDABLE',
+        needs_setup: [{
+          name: 'drawn_utilisation', source_definition_id: 'intent:1', recipe_id: null,
+          catalog_source: 'cib', unbound_concepts: ['credit_limit'],
+          unbound_operands: [{
+            role: 'limit', concept: 'credit_limit', operand_class: 'measure',
+            status: 'unresolved', reason_codes: [], resolution: '', tied_refs: [],
+            sentence: 'no read-scoped column carries credit_limit',
+          }],
+          sentence: 'no read-scoped column carries credit_limit',
+        }],
+      },
+    })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use the utilisation ratio')
+    const line = await screen.findByText(/no read-scoped column carries credit_limit/)
+    // The server's sentence, and no cause the screen made up.
+    expect(line).not.toHaveTextContent(/safety gauntlet/i)
+    expect(line).not.toHaveTextContent(/refused/i)
+    // Setup work is not a failure: it does not wear the danger class or announce as an alert.
+    expect(line).not.toHaveClass('error')
+    expect(line.getAttribute('role')).not.toBe('alert')
   })
 
   it('disables per-candidate feedback after three rounds', async () => {
@@ -1787,7 +1953,7 @@ describe('per-candidate feedback', () => {
       await userEvent.click(screen.getByRole('button', {
         name: `Send feedback for one revision · round ${round} of 3`,
       }))
-      expect(await screen.findByText(/rejected this revision/)).toBeInTheDocument()
+      expect(await screen.findByText(/This revision was refused/)).toBeInTheDocument()
     }
     expect(screen.getByRole('button', { name: 'Rounds exhausted' })).toBeDisabled()
     expect(screen.getByLabelText('What should change')).toBeDisabled()
@@ -1858,13 +2024,17 @@ describe('per-candidate feedback', () => {
     expect(registerFeature).toHaveBeenCalledWith(IDEA_SPEC)
   })
 
-  it('surfaces the missing-provider notice on refine and consumes no round', async () => {
-    refineCandidate.mockRejectedValue(new api.ApiError(503, 'not configured'))
+  it('surfaces the server’s 503 sentence on refine, once, and consumes no round', async () => {
+    // A 503 goes to the ONE top notice rather than onto the row — and it is the response's own
+    // sentence there, not a cause this screen guessed from the status code.
+    const detail = 'refine is disabled while the shadow chooser holds the write lock'
+    refineCandidate.mockRejectedValue(new api.ApiError(503, detail))
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
     await openRefineAndSend('use a 30 day window')
     const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(alert).toHaveTextContent(detail)
+    expect(alert).not.toHaveTextContent(/no LLM provider/i)
     expect(screen.getByRole('button', {
       name: 'Send feedback for one revision · round 1 of 3',
     })).toBeInTheDocument()
@@ -1878,7 +2048,7 @@ describe('per-candidate feedback', () => {
     await screen.findByText('avg_balance')
     await selectCandidate('avg_balance')
     await openRefineAndSend('use the churn label')
-    expect(await screen.findByText(/rejected this revision/)).toBeInTheDocument()
+    expect(await screen.findByText(/This revision was refused/)).toBeInTheDocument()
     contractConsideredSet.mockResolvedValueOnce(
       considered(singleSetRound([idea('inactivity_days')])))
     await userEvent.type(
@@ -1917,11 +2087,12 @@ describe('per-candidate feedback', () => {
 })
 
 describe('govern', () => {
-  // The ROW's governed mark ("Governed <contract> v<n> · DESIGN-CHECKED"), matched precisely
-  // rather than by a bare /governed/i: the gates strip also says the word (cell 4 promises
-  // nothing is saved or governed without your click), and a matcher that cannot tell the promise
-  // from the minted contract would pass whether or not a contract was ever written.
-  const GOVERNED_MARK = /Governed .*DESIGN-CHECKED/i
+  // The ROW's governed mark ("Governed <contract> v<n>"), matched precisely rather than by a bare
+  // /governed/i: the gates strip also says the word (cell 4 promises nothing is saved or governed
+  // without your click), and a matcher that cannot tell the promise from the minted contract would
+  // pass whether or not a contract was ever written. The version number is the discriminator —
+  // it was the hardcoded "· DESIGN-CHECKED" until T9 removed that claim (see the pin below).
+  const GOVERNED_MARK = /Governed .*v\d+/i
 
   // A ContractDraft for avg_balance, mirroring IDEA. contractDraft returns it wrapped; the
   // server-side intent from the considered-set mock is 'int_1' (see `considered`).
@@ -1961,6 +2132,30 @@ describe('govern', () => {
     // Govern is a parallel path: it never registers, and the governed row is done (no checkbox).
     expect(registerFeature).not.toHaveBeenCalled()
     expect(screen.queryByRole('checkbox', { name: 'Select avg_balance' })).not.toBeInTheDocument()
+  })
+
+  // T9 item 5. The governed mark used to append a hardcoded "· DESIGN-CHECKED" to every contract
+  // it minted. /contract/confirm's response carries no verification field at all, so that word was
+  // the screen's own — and since T3 it is false for essentially every card (3 of 317 registry
+  // recipes can earn the stamp). The card's real stamp is already on the row, from the server.
+  it('the governed mark states the contract, and claims no design check of its own', async () => {
+    const unverified: api.FeatureIdea = { ...IDEA, verification: 'UNVERIFIED' }
+    contractDraft.mockResolvedValue({
+      draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1', choice_id: 'g1c_1',
+    })
+    contractConfirm.mockResolvedValue({
+      contract_id: 'contract_1', feature_id: 'feat_1', feature_name: 'avg_balance', version: 1,
+    })
+    await renderAndGenerate([unverified])
+    await screen.findByText('avg_balance')
+    await selectCandidate('avg_balance')
+    await userEvent.click(screen.getByRole('button', { name: 'Select and draft 1' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
+    const mark = await screen.findByText(GOVERNED_MARK)
+    expect(mark).toHaveTextContent('contract_1')
+    expect(mark).not.toHaveTextContent(/DESIGN-CHECKED/i)
+    // …and the stamp the SERVER did put on this card is still the one on screen.
+    expect(screen.getByText('unverified')).toBeInTheDocument()
   })
 
   it('a whole-round feedback refreshes the intent; kept candidates are not governable, fresh ones are', async () => {
@@ -2774,15 +2969,20 @@ describe('Intake target confirmation', () => {
     // the draft reading renders with the summary one-liner and the window
     expect(await screen.findByText(/I understood your target as/)).toBeInTheDocument()
     expect(screen.getByText('Whether the customer churned in the window.')).toBeInTheDocument()
-    expect(screen.getByText(/label window: 90 days/)).toBeInTheDocument()
+    // T7 (b): the window now says WHERE it came from as well as what it is. This fixture's
+    // window_source is 'stated', so the goal's own horizon is what the 90 is.
+    expect(screen.getByText(/Label window: 90 days — the horizon your goal states/))
+      .toBeInTheDocument()
     // a DRAFT is not a decision: nothing was recorded yet
     expect(contractIntakeTarget).not.toHaveBeenCalled()
 
     await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+    // T7 (c): the acknowledgment is stated on EVERY call, and its default is false. This target's
+    // concept is outcome-family, so the gate never fires and the false rides through untouched.
     expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'confirmed', {
       targetRef: 'public.labels.churned', targetWindowDays: 90,
       targetType: 'binary_classification', businessDomain: ['retail_churn'],
-      catalogSource: undefined,
+      catalogSource: undefined, targetNotOutcomeAcknowledged: false,
     })
     expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
     // the signed target threads into the considered-set request
@@ -2889,6 +3089,239 @@ describe('Intake target confirmation', () => {
     // generation is unimpeded
     await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
     expect(contractConsideredSet).toHaveBeenCalled()
+  })
+
+  // ── T7 (c): THE NON-OUTCOME ACKNOWLEDGMENT ────────────────────────────────────────────────────
+  //
+  // Every sentence below is COPIED, byte for byte, from `_not_outcome_refusal` in
+  // src/featuregen/api/routes/contract.py. That is the point of these three pins: the backend's own
+  // pins (mutation V) hold the wording where it is written, and these hold the screen to rendering
+  // it VERBATIM. Should the two ever drift, one side or the other goes red — which is exactly the
+  // property a single shared banner could not have had.
+  //
+  // Three tiers, three DIFFERENT claims — and the difference is the defect the backend just
+  // removed. `near_label` earns the word PROXY because the registry asserts label-adjacency;
+  // `standard` is the OPPOSITE claim (the registry looked and declassified); an unregistered
+  // concept asserts nothing in either direction. One banner for all three would have re-created
+  // NB-1 in the UI, telling 338 of the registry's 359 concepts they were proxies.
+  describe('the non-outcome acknowledgment', () => {
+    const NEAR_LABEL_REFUSAL =
+      "public.aml.cust_susp_flg carries the concept 'restriction_status', which the registry "
+      + 'marks near_label: a funnel-tail signal that BORDERS the label. Confirming it means '
+      + 'predicting a PROXY for the outcome, and a model trained on it can read its own answer '
+      + 'back. Re-send with target_not_outcome_acknowledged: true to record that you know.'
+    const STANDARD_REFUSAL =
+      "public.aml.cust_susp_flg carries the concept 'account_status', which the registry "
+      + 'classifies as standard: it does not certify this column as an outcome label, and nothing '
+      + 'here asserts it correlates with one. Re-send with target_not_outcome_acknowledged: true '
+      + 'to record that you know.'
+    const UNREGISTERED_REFUSAL =
+      'public.aml.cust_susp_flg carries no registered concept, so nothing certifies it as an '
+      + 'outcome label — and absence is not an assertion the other way either. Re-send with '
+      + 'target_not_outcome_acknowledged: true to record that you know.'
+
+    function banner() {
+      return document.querySelector('[data-role="intake-not-outcome"]') as HTMLElement
+    }
+
+    async function refuseThenRead(detail: string) {
+      contractIntake.mockResolvedValue(INTAKE)
+      contractIntakeTarget.mockRejectedValueOnce(new api.ApiError(422, detail))
+      await generateConfirmOn()
+      await screen.findByText(/I understood your target as/)
+      await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+      return await screen.findByText(detail)
+    }
+
+    it('renders the near_label tier’s sentence verbatim — the PROXY claim the registry earns',
+      async () => {
+        await refuseThenRead(NEAR_LABEL_REFUSAL)
+        expect(banner()).toHaveTextContent(NEAR_LABEL_REFUSAL)
+      })
+
+    it('renders the standard tier’s sentence verbatim — and it claims NO proxy', async () => {
+      await refuseThenRead(STANDARD_REFUSAL)
+      expect(banner()).toHaveTextContent(STANDARD_REFUSAL)
+      // The tier-flattening check: the standard sentence must not pick up the near_label one's
+      // word. This is the assertion a single shared banner could not pass.
+      expect(banner()).not.toHaveTextContent(/PROXY/)
+      expect(banner()).not.toHaveTextContent(/BORDERS the label/)
+    })
+
+    it('renders the unregistered tier’s sentence verbatim — silence, in both directions',
+      async () => {
+        await refuseThenRead(UNREGISTERED_REFUSAL)
+        expect(banner()).toHaveTextContent(UNREGISTERED_REFUSAL)
+        expect(banner()).not.toHaveTextContent(/PROXY/)
+      })
+
+    it('the first attempt never acknowledges; the control re-sends the SAME decision and ref',
+      async () => {
+        contractIntake.mockResolvedValue(INTAKE)
+        contractIntakeTarget.mockRejectedValueOnce(new api.ApiError(422, NEAR_LABEL_REFUSAL))
+        contractIntakeTarget.mockResolvedValueOnce({
+          ...READING, target_concept: 'restriction_status',
+          target_leakage_class: 'near_label', target_is_proxy: true,
+        })
+        await generateConfirmOn()
+        await screen.findByText(/I understood your target as/)
+        await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+        // THE ACKNOWLEDGMENT IS THE PERSON'S. The attempt that earns the sentence must not carry
+        // it — sending it by default is the undisclosed commit this gate exists to stop.
+        expect(contractIntakeTarget).toHaveBeenNthCalledWith(1, 'int_1', 'confirmed',
+          expect.objectContaining({ targetNotOutcomeAcknowledged: false }))
+        await screen.findByText(NEAR_LABEL_REFUSAL)
+
+        await userEvent.click(
+          screen.getByRole('button', { name: /I understand — record this target anyway/i }))
+        expect(contractIntakeTarget).toHaveBeenNthCalledWith(2, 'int_1', 'confirmed',
+          expect.objectContaining({
+            targetRef: 'public.labels.churned', targetNotOutcomeAcknowledged: true,
+          }))
+        expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
+        // The SERVER's echoed class, and the sentence the person actually read — not a
+        // reconstruction of it from the class afterwards.
+        expect(screen.getByText(/registry class:/)).toHaveTextContent('near_label')
+        expect(screen.getByText(/You acknowledged:/)).toHaveTextContent(NEAR_LABEL_REFUSAL)
+      })
+
+    it('a 422 this screen cannot identify stays an error, never an offer to acknowledge',
+      async () => {
+        // The vocabulary refusal from the same route. Turning any 422 into an acknowledge button
+        // would make the control an answer to questions it was never asked.
+        const other = "business_domain outside the use-case vocabulary: ['not_a_use_case']"
+        contractIntake.mockResolvedValue(INTAKE)
+        contractIntakeTarget.mockRejectedValueOnce(new api.ApiError(422, other))
+        await generateConfirmOn()
+        await screen.findByText(/I understood your target as/)
+        await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+        expect(await screen.findByText(other)).toBeInTheDocument()
+        expect(banner()).toBeNull()
+        expect(screen.queryByRole('button', { name: /record this target anyway/i })).toBeNull()
+      })
+
+    // THE BOUNDARY. The discriminator matches the refusal's whole closing INSTRUCTION, not the
+    // bare field name — because the field name also appears in bodies that are not this refusal.
+    // The realizable one is FastAPI's own type failure, caught before the handler runs: its native
+    // list-`detail` reaches this component already flattened by the transport (api.ts renders
+    // `[{loc, msg}]` as "loc.joined: msg"), and it names the field without ever having asked for
+    // an acknowledgment. Offering the control there would re-send a body FastAPI already refused
+    // to parse — and would put the word "acknowledge" in front of a person who was never told
+    // anything to acknowledge.
+    it('a 422 that merely MENTIONS the field is an error, not an acknowledge offer', async () => {
+      const typeFailure =
+        'body.target_not_outcome_acknowledged: Input should be a valid boolean'
+      contractIntake.mockResolvedValue(INTAKE)
+      contractIntakeTarget.mockRejectedValueOnce(new api.ApiError(422, typeFailure))
+      await generateConfirmOn()
+      await screen.findByText(/I understood your target as/)
+      await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+      expect(await screen.findByText(typeFailure)).toBeInTheDocument()
+      expect(banner()).toBeNull()
+      expect(screen.queryByRole('button', { name: /record this target anyway/i })).toBeNull()
+    })
+  })
+
+  // ── T7 (a)/(b): the ticket's own facts, which nobody was shown on the AML run ─────────────────
+  describe('what the ticket says about the target', () => {
+    it('a contradicted window renders the server’s refusal, naming both numbers', async () => {
+      // Copied from WindowRefusalV1's `detail` in overlay/upload/contract/intake_ticket.py.
+      const detail = 'the objective states a horizon of 90 days; the intake reading returned '
+        + 'target_window_days=0. The two disagree, so no label window is accepted — state the '
+        + 'horizon on the confirm screen.'
+      contractIntake.mockResolvedValue({
+        ...INTAKE,
+        ticket: {
+          ...TICKET, target_window_days: null, window_source: 'contradicted',
+          window_refusal: {
+            code: 'WINDOW_CONTRADICTS_GOAL', stated_text: '90 days', stated_days: 90,
+            ticket_days: 0, detail,
+          },
+        },
+      })
+      await generateConfirmOn()
+      expect(await screen.findByText(detail)).toBeInTheDocument()
+    })
+
+    it('a stated horizon with no day count says so, and invents no number', async () => {
+      // The degraded month-horizon shape: `_degraded` reads the goal with pure code, so a month
+      // horizon lands as source='stated' with days=null. 28, 29, 30 and 31 are all months —
+      // converting one would manufacture the false precision T7 exists to remove.
+      contractIntake.mockResolvedValue({
+        ...INTAKE,
+        ticket: { ...TICKET, target_window_days: null, window_source: 'stated' },
+      })
+      await generateConfirmOn()
+      const line = await screen.findByText(/Label window:/)
+      expect(line).toHaveTextContent('your goal states a horizon, but not one that can be counted')
+      expect(line.textContent).not.toMatch(/\d/)
+    })
+
+    it('an unstated horizon is honest absence, not a default', async () => {
+      contractIntake.mockResolvedValue({
+        ...INTAKE,
+        ticket: { ...TICKET, target_window_days: null, window_source: 'unstated' },
+      })
+      await generateConfirmOn()
+      expect(await screen.findByText(/no horizon stated, and none was read/)).toBeInTheDocument()
+    })
+
+    it('an abstention is an ANSWER: the true labels the catalog holds, and the nearest proxies',
+      async () => {
+        contractIntake.mockResolvedValue({
+          ...INTAKE,
+          ticket: {
+            ...TICKET, target_column: null, confidence: 'abstain',
+            target_concept: '', target_leakage_class: null, target_is_proxy: false,
+            proxy_candidates: [
+              { ref: 'public.aml.cust_susp_flg', concept: 'restriction_status',
+                leakage_class: 'near_label' },
+              { ref: 'public.aml.acct_status', concept: 'account_status',
+                leakage_class: 'standard' },
+            ],
+            outcome_candidates: [
+              { ref: 'public.aml.sar_filed', concept: 'outcome_label', leakage_class: 'outcome' },
+            ],
+          },
+          target_detail: null,
+          proxy_candidate_details: [
+            { ref: 'public.aml.cust_susp_flg', catalog_source: 'cib',
+              concept: 'restriction_status', ai_summary: 'Whether the customer is restricted.' },
+            { ref: 'public.aml.acct_status', catalog_source: 'cib',
+              concept: 'account_status', ai_summary: 'The account lifecycle state.' },
+          ],
+          outcome_candidate_details: [
+            { ref: 'public.aml.sar_filed', catalog_source: 'cib', concept: 'outcome_label',
+              ai_summary: 'Whether a SAR was filed for this customer.' },
+          ],
+        })
+        await generateConfirmOn()
+        // THE LABEL THE MODEL DID NOT PICK — named, because the catalog holds it.
+        expect(await screen.findByText(/The catalog holds a true label:/)).toBeInTheDocument()
+        expect(screen.getByText('public.aml.sar_filed')).toBeInTheDocument()
+        // …and each proxy carries the registry's OWN class beside it, not one shared word.
+        const proxies = document.querySelector('[data-role="proxy-candidates"]') as HTMLElement
+        expect(within(proxies).getByText('near_label')).toBeInTheDocument()
+        expect(within(proxies).getByText('standard')).toBeInTheDocument()
+      })
+
+    it('a pinned NON-outcome column no longer claims to be recorded', async () => {
+      // ▲ NB-2: the server's pin door is outcome-family only now, so "you named it, already
+      // recorded" would be false here — the confirm gate is the one door, and it asks out loud.
+      contractIntake.mockResolvedValue({
+        ...INTAKE,
+        ticket: {
+          ...TICKET, pinned: true, target_concept: 'restriction_status',
+          target_leakage_class: 'near_label', target_is_proxy: true, confidence: 'abstain',
+        },
+      })
+      await generateConfirmOn()
+      await screen.findByText(/I understood your target as/)
+      expect(screen.queryByText(/you named it/)).toBeNull()
+      expect(screen.getByRole('button', { name: /yes, that's my target/i })).toBeInTheDocument()
+      // and the registry's own reading of the column is on screen before anyone signs it
+      expect(screen.getByText(/borders the outcome label/)).toBeInTheDocument()
+    })
   })
 })
 
@@ -3301,12 +3734,13 @@ describe('post-submit workspace shell', () => {
   })
 
   it('error: the notice is the page, and the form the human filled in stays open to retry', async () => {
-    contractConsideredSet.mockRejectedValue(new api.ApiError(503, 'not configured'))
+    const detail = 'catalog ftr has no activated cross-catalog interlock'
+    contractConsideredSet.mockRejectedValue(new api.ApiError(503, detail))
     const { container } = render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
-    expect(await screen.findByRole('alert')).toHaveTextContent(/ai assist is not configured/i)
+    expect(await screen.findByRole('alert')).toHaveTextContent(detail)
     expect(phaseOf(container)).toBe('error')
     // No round was produced, so there is no snapshot to show: the screen does NOT invent a brief
     // card for a run that never landed.
@@ -3530,9 +3964,10 @@ describe('Slice 2: the decision workspace', () => {
     expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
     expect(screen.getByText(/Showing 1 of 2 candidates in the Temporal set\./))
       .toBeInTheDocument()
-    // The SETS are untouched: a search is not a claim about the round.
-    expect(screen.getByText(/2 features · all design-checked/)).toBeInTheDocument()
-    expect(screen.getByText(/1 feature · all design-checked/)).toBeInTheDocument()
+    // The SETS are untouched: a search is not a claim about the round. (The counts are the
+    // server's stamps, tallied per set — this workspace fixture's cards all carry one.)
+    expect(screen.getByText(/2 features · 2 design-checked/)).toBeInTheDocument()
+    expect(screen.getByText(/1 feature · 1 design-checked/)).toBeInTheDocument()
     // and searching cannot reach into the set the human is not looking at.
     expect(screen.queryByText('debit_to_credit_ratio_30d')).toBeNull()
   })
@@ -3980,14 +4415,17 @@ describe('Slice 3: the revise drawer', () => {
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     await selectCandidate('avg_balance')
 
-    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, 'not configured'))
+    // Distinct from every other 503 fixture in this file on purpose: each of the six re-aimed
+    // pins must prove verbatim rendering on its OWN sentence, not on one shared between two.
+    const detail = 'the planner pool is saturated; no worker took the revised round'
+    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, detail))
     await openRevise()
     await retypeHypothesis(REVISED)
     await userEvent.click(within(drawer()).getByRole('button', { name: /Generate revised round/ }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/ai assist is not configured/i)
-    // Exactly the promise the drawer made before the click. A provider outage must not cost the
-    // human their candidates and their selections.
+    expect(await screen.findByRole('alert')).toHaveTextContent(detail)
+    // Exactly the promise the drawer made before the click. An outage must not cost the human
+    // their candidates and their selections.
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
     expect(screen.getByText('1 selected')).toBeInTheDocument()
     expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()

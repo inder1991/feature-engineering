@@ -444,6 +444,12 @@ export interface RefineCandidate {
 export interface RefineRejection {
   reason: string
   code: string
+  // T2: present exactly when the revision did not BIND — a required operand found no column, so
+  // there is no card to return. The route answers this with a 200 on purpose ("data the reviewer
+  // acts on, not an error"), and its presence is the honest discriminator between setup work and
+  // a genuine refusal: the two carry different remedies and different owners. `reason` already
+  // carries the entry's own sentence; this carries the per-operand detail behind it.
+  needs_setup?: NeedsSetupCandidate[]
 }
 
 // Both refine outcomes arrive as 200 data: a gauntlet rejection of the revision is something
@@ -1412,6 +1418,51 @@ export interface OptionActionsEntry {
   blocked_actions: Record<string, OptionActionBlocker[]>
 }
 
+// ── T2: the fourth outcome — setup work, which is not a failure ─────────────────────────────────
+//
+// A candidate whose REQUIRED operands did not bind is not recommended, not actionable and not
+// rejected: there is nothing to offer, save or govern until the binding is settled, so it mints no
+// option id and carries no card. It used to be dropped silently, which is how one arrangement
+// served 0 cards with no reason given while 114 candidates sat behind the drop.
+//
+// EVERY SENTENCE HERE IS THE SERVER'S. `sentence` is built from the binder's own verdict status,
+// and the client renders it rather than re-wording it — because "did not bind" is THREE different
+// conditions and only one of them is an absence.
+export interface UnboundOperand {
+  role: string
+  concept: string
+  operand_class: string
+  // The binder's verdict status for this role; '' when it emitted no verdict at all (honest
+  // absence — a role nobody ruled on has certainly not bound). `unresolved` is the ONLY status
+  // that means the concept is absent: `ambiguous` and `blocked` both mean the catalog CARRIES it.
+  status: string
+  reason_codes: string[]
+  resolution: string
+  // The columns the verdict was looking at — the tie's members, or the blocked candidates. These
+  // are what a human would be choosing between, so dropping them turns "adjudicate this tie" into
+  // "onboard this data": the wrong remedy, given to the wrong owner. Empty for a true absence.
+  tied_refs: string[]
+  // The operand's own answer, worded from its status. Render it; never compose over it.
+  sentence: string
+}
+
+export interface NeedsSetupCandidate {
+  name: string
+  source_definition_id: string
+  recipe_id: string | null
+  // The catalog this was PLANNED over, and no other. The projection holds no cross-catalog
+  // inventory, so it never claims another catalog has the concept — that refusal-with-directions
+  // belongs to the satisfiability check, which plans with the inventory in hand.
+  catalog_source: string
+  // Status-NEUTRAL, and deliberately not named "missing": what these concepts have in common is
+  // that they did not bind, not that they are absent (on the FTR fixture 36 of 66 unbound required
+  // operands are ambiguous — the catalog carries the concept on several columns).
+  unbound_concepts: string[]
+  unbound_operands: UnboundOperand[]
+  // One clause per unbound operand, each in the words its own status earns.
+  sentence: string
+}
+
 export interface ConsideredSetResp {
   intent_id: string
   anchor: FeatureIdea | null
@@ -1434,6 +1485,9 @@ export interface ConsideredSetResp {
   recommended_options?: OptionActionsEntry[]
   actionable_options?: OptionActionsEntry[]
   rejected_outputs?: Rejection[]
+  // T2's fourth outcome, on the v2 response only. Absent on a v1/legacy body; `[]` is the honest
+  // "every candidate bound", which is a different fact from "the server never said".
+  needs_setup?: NeedsSetupCandidate[]
   // Phase 2A — deterministic presentation-priority ranking of the ELIGIBLE recipes, present ONLY
   // when the backend ranking flag is on. Distinct from `recommendation` (the LLM starting-set pick)
   // and from `dispositions` (the per-recipe lens). `ranking_version` stamps the mapping/taxonomy
@@ -3587,6 +3641,10 @@ export interface SemanticEngineEntry {
   // D4 (UI-05): the PROJECTED card — the same FeatureIdea carrier the Workbench renders,
   // serialized by the same function server-side. Absent on pre-D4 deployments.
   card?: FeatureIdea | null
+  // T2: present (non-null) exactly when `card` is null for T2's reason — the two are the two
+  // halves of one answer, and an entry never carries both. Its `sentence` is why this entry has
+  // no card, in the binder's own words.
+  needs_setup?: NeedsSetupCandidate | null
   recipe_id: string
   binding_state: string          // bound | ambiguous | missing | blocked
   readiness: string              // the authored RECIPE_READINESS value
