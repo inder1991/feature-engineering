@@ -1698,6 +1698,37 @@ export interface IntakeTicket {
   // The Change-it menu (prompt v2): ranked next-best readings, subset of the catalog shortlist,
   // never the chosen target. [] on older-backend replays and honest nothing-else-comes-close.
   runners_up: string[]
+  // T7 (a) — OUTCOME OR PROXY, said out loud. `target_leakage_class` is the concept registry's own
+  // three-way split; only 'outcome' is the label itself, so anything else means the proposal
+  // ABSTAINED (`confidence: 'abstain'`). `null` = the column carries no registered concept, which
+  // asserts nothing in either direction.
+  //
+  // `target_is_proxy` is NARROWER than "not the outcome": it is true only for 'near_label', where
+  // the registry positively asserts the column borders the label. A 'standard' concept is one the
+  // registry LOOKED AT and declassified, and an unregistered one is silence — neither may be
+  // rendered as "a proxy for the outcome". Both are still uncommittable, and both still require
+  // the confirm acknowledgment; render that as withheld certification, not as adjacency.
+  target_concept: string
+  target_leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  target_is_proxy: boolean
+  // The two halves of an honest abstention, both catalog-derived: the nearest proxies (ranked,
+  // near-label first), and every outcome-family column this catalog actually HOLDS — the label
+  // the model did not pick. Neither ever changes the target; they report, they do not choose.
+  proxy_candidates: {
+    ref: string; concept: string
+    leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  }[]
+  outcome_candidates: {
+    ref: string; concept: string; leakage_class: 'outcome'
+  }[]
+  // T7 (b) — where the window came from, or why it has none. 'contradicted' means the objective's
+  // own stated horizon and the model's number disagreed: NO window was accepted and
+  // `window_refusal` names both numbers.
+  window_source: 'stated' | 'model_only' | 'unstated' | 'contradicted'
+  window_refusal: {
+    code: 'WINDOW_CONTRADICTS_GOAL'; stated_text: string; stated_days: number | null
+    ticket_days: number; detail: string
+  } | null
 }
 
 export interface IntakeResp {
@@ -1712,6 +1743,14 @@ export interface IntakeResp {
   } | null
   // The runners-up with the same one-liner material — the Change-it panel's one-click buttons.
   runner_up_details: { ref: string; catalog_source: string; concept: string; ai_summary: string }[]
+  // The abstention answer's one-liner material, same shape, in `proxy_candidates` order.
+  proxy_candidate_details: {
+    ref: string; catalog_source: string; concept: string; ai_summary: string
+  }[]
+  // ...and the same for the labels the catalog holds, in `outcome_candidates` order.
+  outcome_candidate_details: {
+    ref: string; catalog_source: string; concept: string; ai_summary: string
+  }[]
 }
 
 // One hypothesis in, one draft reading out. Cached server-side by content (hypothesis + shortlist
@@ -1736,17 +1775,33 @@ export interface IntakeReading {
   business_domain: string[]
   target_provenance: string | null
   target_confirmed_by: string | null
+  // T7 (c) — the disclosure echoed back. The SERVER's own derivation from the concept registry,
+  // never the flag the client sent: a client cannot relabel a column by acknowledging one.
+  // `target_is_proxy` is near-label ONLY — see the note on IntakeTicket.
+  target_concept: string
+  target_leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  target_is_proxy: boolean
 }
 
 // Record the human's answer to the confirm screen. Author-only (403 otherwise); the signed ref is
 // validated against the read-scoped catalog server-side — a column you cannot see cannot be your
 // target; off-vocabulary domain tokens are refused, never silently dropped.
+//
+// T7 (c): confirming a target the registry does not CERTIFY as an outcome label — near_label,
+// standard or unregistered — is a 422 unless `targetNotOutcomeAcknowledged` is sent. The refusal's
+// `detail` is written per tier and is the sentence to render: it says "proxy" only where the
+// registry actually asserts label-adjacency, and withholds certification otherwise. Show the
+// server's words rather than composing your own.
+//
+// The acknowledgment is the PERSON's, so send it only once they have actually been shown that
+// sentence — passing it by default is the undisclosed commit this gate exists to stop.
 export function contractIntakeTarget(
   intentId: string,
   decision: 'confirmed' | 'corrected' | 'exploring',
   opts: {
     targetRef?: string; targetWindowDays?: number; targetType?: string
     businessDomain?: string[]; catalogSource?: string
+    targetNotOutcomeAcknowledged?: boolean
   } = {},
 ): Promise<IntakeReading> {
   return post('/contract/intake/target', {
@@ -1757,6 +1812,7 @@ export function contractIntakeTarget(
     target_type: opts.targetType ?? null,
     business_domain: opts.businessDomain ?? [],
     catalog_source: opts.catalogSource ?? null,
+    target_not_outcome_acknowledged: opts.targetNotOutcomeAcknowledged ?? false,
   })
 }
 

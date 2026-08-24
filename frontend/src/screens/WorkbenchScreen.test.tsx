@@ -2714,29 +2714,37 @@ describe('Phase 2A ranking', () => {
 describe('Intake target confirmation', () => {
   const RECOGNITION: api.RecognitionResp = recognitionResp()
 
+  // T7: the fixture is the COMMITTED case — `outcome_label` is the registry's own outcome-family
+  // concept, so this target is the label itself: no abstention, no proxy list, no disclosure.
   const TICKET: api.IntakeTicket = {
     target_column: 'public.labels.churned', target_window_days: 90,
     target_type: 'binary_classification', business_domain: ['retail_churn'],
     confidence: 'high', pinned: false, contradiction: null,
     runners_up: ['public.labels.closed'],
+    target_concept: 'outcome_label', target_leakage_class: 'outcome',
+    target_is_proxy: false, proxy_candidates: [], outcome_candidates: [],
+    window_source: 'stated', window_refusal: null,
   }
 
   const INTAKE: api.IntakeResp = {
     intent_id: 'int_1', reason: 'extracted', ticket: TICKET,
     target_detail: {
       ref: 'public.labels.churned', catalog_source: 'deposits',
-      concept: 'label', ai_summary: 'Whether the customer churned in the window.',
+      concept: 'outcome_label', ai_summary: 'Whether the customer churned in the window.',
     },
     runner_up_details: [{
       ref: 'public.labels.closed', catalog_source: 'deposits',
-      concept: 'label', ai_summary: 'Whether the account was closed.',
+      concept: 'outcome_label', ai_summary: 'Whether the account was closed.',
     }],
+    proxy_candidate_details: [],
+    outcome_candidate_details: [],
   }
 
   const READING: api.IntakeReading = {
     intent_id: 'int_1', target_ref: 'public.labels.churned', target_window_days: 90,
     target_type: 'binary_classification', business_domain: ['retail_churn'],
     target_provenance: 'human_confirmed', target_confirmed_by: 'user:tester',
+    target_concept: 'outcome_label', target_leakage_class: 'outcome', target_is_proxy: false,
   }
 
   function scoped(): api.ConsideredSetResp {
