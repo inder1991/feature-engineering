@@ -1462,11 +1462,14 @@ def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dic
     The existing server-side leakage path (``intent_target_ref``) reads the same row, so the veto
     downstream runs on the signed value with no further wiring.
 
-    T7 (c) — THE PROXY DISCLOSURE. Signing a target whose concept is not outcome-family is signing
-    a PROXY, and on the 2026-08-24 AML run nobody was ever told that. Such a confirmation now
-    requires ``target_is_proxy: true`` in the body and is a typed 422 without it. The class is the
-    SERVER's derivation from the concept registry (:func:`target_leakage_class`) — the client only
-    acknowledges it — and an unregistered concept asserts nothing, so it is never called a proxy.
+    T7 (c) — THE NON-OUTCOME ACKNOWLEDGMENT. Signing a target the registry does not certify as an
+    outcome label — near_label, standard, or unregistered — requires
+    ``target_not_outcome_acknowledged: true`` in the body and is a typed 422 without it, with a
+    per-tier sentence that says only what the registry warrants: near_label earns the word PROXY
+    (the registry asserts label-adjacency), standard claims no correlation either way, and an
+    unregistered concept asserts nothing in either direction. The class is the SERVER's derivation
+    from the concept registry (:func:`target_leakage_class`) — the client only acknowledges it.
+    On the 2026-08-24 AML run nobody was ever told any of this.
     """
     row = _intent_row(conn, body.intent_id)
     if row is None:

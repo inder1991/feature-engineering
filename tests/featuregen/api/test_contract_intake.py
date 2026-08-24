@@ -346,7 +346,7 @@ def test_the_STANDARD_refusal_claims_NO_correlation_it_only_withholds_certificat
     assert "customer_relationship_status" in detail and "standard" in detail
     assert "does not certify" in detail
     assert "nothing here asserts it correlates" in detail
-    assert "PROXY" not in detail and "proxy" not in detail, \
+    assert "proxy" not in detail.lower() and "proxies" not in detail.lower(), \
         "the registry never said this borders the label — the refusal must not say so either"
     assert "target_not_outcome_acknowledged" in detail
     assert _reading(conn, intent_id)[3] is None
@@ -363,7 +363,7 @@ def test_the_UNREGISTERED_refusal_says_absence_is_not_an_assertion(make_client, 
     detail = res.json()["detail"]
     assert "no registered concept" in detail
     assert "absence is not an assertion" in detail
-    assert "PROXY" not in detail and "proxy" not in detail
+    assert "proxy" not in detail.lower() and "proxies" not in detail.lower()
     assert "target_not_outcome_acknowledged" in detail
     assert _reading(conn, intent_id)[3] is None
 
