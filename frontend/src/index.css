@@ -8247,3 +8247,19 @@ button.stat:hover {
 .attempt-earlier > td {
   color: var(--ink-soft);
 }
+
+/* ---------------------------------------------------------------- run authoring: governed warning
+   Appended for the Retry cell's `retry_warnings` (spec §R4.2). A WARN disposition is a
+   proceed-with-knowledge, never a refusal, so it must NOT read like the blockers stacked above it:
+   those are muted `.stage-detail` explaining a control that is OFF, and this sits beside a control
+   that is ON. Ink and a soft warn ground only — the existing `.badge.held` chip carries the code,
+   so colour never works alone. Composes the existing token / .badge / .mono vocabulary; nothing
+   above this line is modified. */
+.retry-warning {
+  margin-top: 4px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12px;
+}

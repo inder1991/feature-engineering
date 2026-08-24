@@ -37,7 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import get_conn, get_identity, require_permission
-from featuregen.api.routes.code_generation_jobs import MoneyCeiling
+from featuregen.api.routes.code_generation_jobs import ExpiryWindow, MoneyCeiling
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.formula_draft_service import (
     FORMULA_DRAFT_HANDLER,
@@ -287,7 +287,11 @@ class RegenerationApprovalIn(BaseModel):
     max_cost: MoneyCeiling
     currency: str = Field(min_length=3, max_length=3)
     pricing_version: str = Field(min_length=1)
-    expires_at: str = Field(min_length=1)
+    #: THE one declaration of when a confirmed ceiling stops authorizing, from the same body types
+    #: `max_cost` comes from. Unvalidated, this field minted coupons dead on arrival behind a 201
+    #: "cost-confirmed", and accepted a 74-year window against the 1..168-hour rule the override
+    #: body three classes up states for the same kind of approval.
+    expires_at: ExpiryWindow
     max_uses: int = Field(default=1, ge=1, le=10)
 
 

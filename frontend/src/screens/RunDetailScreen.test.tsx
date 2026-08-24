@@ -24,8 +24,9 @@ const retryRunAuthoring = vi.mocked(api.retryRunAuthoring)
 const RUN_ID = 'grun_01M02SAZQQQQ'
 
 // The retry answer for a row where the question is not asked at all — an attempt that bought
-// something, or one still in flight. Absence, never a refusal, so there is nothing to explain.
-const NO_RETRY = { retryable: false, retry_blockers: [] }
+// something, or one still in flight. Absence, never a refusal, so there is nothing to explain,
+// and nothing to warn about either.
+const NO_RETRY = { retryable: false, retry_blockers: [], retry_warnings: [] }
 
 // A run whose only draft SUCCEEDED and was then withdrawn (the §6.7 two-axis case), and a rail
 // carrying one worked stage plus two sockets with their reasons. One attempt, so it is also its
@@ -33,7 +34,7 @@ const NO_RETRY = { retryable: false, retry_blockers: [] }
 const DRAFT_1: api.RunAuthoringRow = {
   formula_draft_id: 'd1', considered_revision_id: 'c', option_id: 'o1', state: 'READY',
   rail_state: 'SUCCEEDED', eligibility: 'withdrawn', retirement_reason: 'CANDIDATE_SUPERSEDED',
-  ...NO_RETRY,
+  retirement_replacement_draft_id: null, ...NO_RETRY,
 }
 
 const DETAIL: api.FeatureRunDetail = {
@@ -132,7 +133,8 @@ it('keeps the outcome axis intact on a draft the eligibility axis calls withdraw
 // a second draft against it). Both attempts are real rows; only one is where the candidate stands.
 const ATTEMPT_FAILED: api.RunAuthoringRow = {
   formula_draft_id: 'd0', considered_revision_id: 'c', option_id: 'o1', state: 'FAILED',
-  rail_state: 'FAILED', eligibility: 'current', retirement_reason: null, ...NO_RETRY,
+  rail_state: 'FAILED', eligibility: 'current', retirement_reason: null,
+  retirement_replacement_draft_id: null, ...NO_RETRY,
 }
 const ATTEMPT_READY: api.RunAuthoringRow = {
   ...DRAFT_1, formula_draft_id: 'd2', eligibility: 'current', retirement_reason: null,
@@ -198,6 +200,25 @@ it('renders a pre-spine run as an honest gap in the record, not as a failure', a
   expect(screen.getByText(/No candidates are recorded/i)).toBeInTheDocument()
   expect(screen.getByText(/No formula drafts are recorded/i)).toBeInTheDocument()
   expect(screen.queryByText(/failed/i)).toBeNull()
+  // ▲ AND THE PREPARE SECTION SAYS THE SAME KIND OF NOTHING. It used to answer this exact run —
+  // zero chosen candidates — with "every candidate this run chose already has a formula attempt",
+  // a claim about a record that is simply empty. This test had the run in front of it and asserted
+  // only the OTHER absences, so the invented one stood unread.
+  expect(screen.getByTestId('prepare-nothing-chosen'))
+    .toHaveTextContent(/Nothing has been chosen for this run yet/i)
+  expect(screen.queryByText(/already has a formula attempt/i)).toBeNull()
+})
+
+it('still says every chosen candidate has an attempt when that is what happened', async () => {
+  // The OTHER absence, and it is a different fact: this run DID choose a candidate (o1) and that
+  // candidate DOES have an answer. The sentence is true here — which is why it was the only one on
+  // offer, and why the zero-chosen run inherited a claim about choices nobody made.
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('Retail churn')).toBeInTheDocument())
+
+  expect(screen.getByTestId('prepare-nothing-waiting'))
+    .toHaveTextContent(/already has a formula attempt/i)
+  expect(screen.queryByTestId('prepare-nothing-chosen')).toBeNull()
 })
 
 it('states the missing hypothesis of a dangling intent id while still showing the id', async () => {
@@ -581,6 +602,31 @@ it('never lands a prepare answer under a run the screen has since moved to', asy
   expect(screen.queryByTestId('prepare-status')).toBeNull()
 })
 
+it('does not leave the new run’s controls greyed out by the previous run’s request', async () => {
+  // ▲ `busy` was the ONE piece of gesture state missing from the run-change reset list. A deep
+  // link away while a POST is still in flight left the NEW run's checkbox and its one button
+  // disabled by a request belonging to a run this screen has left — and with nothing on screen to
+  // explain it, because the only sentence that ever explains a disabled control here is the
+  // server's, and the server refused nothing.
+  getFeatureRunDetail.mockResolvedValue(THREE_CHOSEN)
+  prepareRunCode.mockImplementation(() => new Promise(() => {}) as never)   // never lands
+  const { rerender } = render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+  // In flight, and correctly disabled WHILE this run is the one on screen.
+  expect(screen.getByRole('button', { name: /Prepare formulas/ })).toBeDisabled()
+
+  getFeatureRunDetail.mockResolvedValue({ ...THREE_CHOSEN, generation_run_id: 'grun_other' })
+  rerender(<RunDetailScreen runId="grun_other" />)
+  await waitFor(() => expect(getFeatureRunDetail).toHaveBeenCalledWith('grun_other'))
+
+  // The new run is usable: nothing here is waiting on anything.
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeEnabled())
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  expect(screen.getByRole('button', { name: /Prepare formulas/ })).toBeEnabled()
+})
+
 // ▲ AND THE ERROR BRANCH, which the success case above does not cover (carried from Task 4). A
 // refusal of the PREVIOUS run's gesture landing here would paint an alert about work this run
 // never asked for — and the reader has no way to tell whose refusal they are reading.
@@ -675,6 +721,51 @@ it('offers no retry control where the question is not asked at all', async () =>
   await waitFor(() => expect(screen.getByText('d1')).toBeInTheDocument())
 
   expect(within(rowOf('d1')).queryByRole('button')).toBeNull()
+})
+
+// A candidate somebody WITHDREW, whose retry an approved regeneration nevertheless names. The
+// server offers the click and attaches the governed WARN that says what it overrides.
+const OVERRIDDEN: api.RunAuthoringRow = {
+  ...ATTEMPT_FAILED,
+  retryable: true,
+  retry_blockers: [],
+  retry_warnings: [{
+    code: 'RETIREMENT_OVERRIDDEN',
+    detail: 'somebody withdrew this candidate, and an approved regeneration NAMES that withdrawal '
+      + '— so the retry is admissible and will proceed over a deliberate withdrawal',
+  }],
+}
+
+it('says what a governed override overrides, beside a control it does NOT disable', async () => {
+  // ▲ THE WARN DISPOSITION, RENDERED. `RETIREMENT_OVERRIDDEN` reached nobody: the server kept only
+  // the blockers half of its own (blockers, warnings) answer, so a retryable candidate under a
+  // governance override looked exactly like one nobody had ever withdrawn. It must render — and it
+  // must NOT render as a refusal: the whole content of a WARN is proceed-with-knowledge.
+  getFeatureRunDetail.mockResolvedValue(detailWith(OVERRIDDEN))
+  retryRunAuthoring.mockResolvedValue({
+    formula_draft_id: 'd9', created: true, formula_strategy: 'LLM_AUTHORED',
+    strategy_warnings: ['RETIREMENT_OVERRIDDEN'],
+    detail: 'the retry was recorded; a worker authors it',
+    run: detailWith({ ...ATTEMPT_FAILED, ...NO_RETRY }),
+  })
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByText('d0')).toBeInTheDocument())
+
+  const row = rowOf('d0')
+  // Verbatim, code and sentence — this screen owns no vocabulary for a governed decision.
+  expect(within(row).getByText('RETIREMENT_OVERRIDDEN')).toBeInTheDocument()
+  expect(within(row).getByText(/will proceed over a deliberate withdrawal/)).toBeInTheDocument()
+  // ...and it is a WARNING, not a blocker: it lives in its own element, and the button is ENABLED.
+  expect(within(row).getByTestId('retry-warning')).toBeInTheDocument()
+  expect(within(row).getByRole('button', { name: /Retry attempt d0/ })).toBeEnabled()
+
+  // ▲ AND THE ACT'S OWN WARNINGS SURVIVE THE ANSWER. The 202 carries `strategy_warnings`, which
+  // were computed, sent, and thrown away here — indistinguishable from never having been derived,
+  // for the one person entitled to know a governance override just fired.
+  await userEvent.click(within(row).getByRole('button', { name: /Retry attempt d0/ }))
+  await waitFor(() =>
+    expect(screen.getByTestId('retry-status')).toHaveTextContent('RETIREMENT_OVERRIDDEN'))
+  expect(screen.getByTestId('retry-status')).toHaveTextContent('d9')
 })
 
 it('shows a retry refusal in the server’s words and records nothing of its own', async () => {

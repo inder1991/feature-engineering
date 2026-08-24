@@ -18,6 +18,7 @@ The rules under test are the ones that leak, cost money, or lie:
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.api._helpers import APPROVAL_EXPIRES_AT
 from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
 from tests.featuregen.runs._chain import considered_json as _considered_json
 from tests.featuregen.runs._chain import feature_idea as _idea
@@ -30,9 +31,11 @@ PREPARE = "/feature-runs/{run}/prepare-code"
 JOBS = "/code-generation-jobs"
 
 #: The six approval keys the code-generation screen sends, unchanged: this route accepts the SAME
-#: confirmation, because it is the same act of agreeing to a cost.
+#: confirmation, because it is the same act of agreeing to a cost. The expiry is the shared
+#: fixture window — `ExpiryWindow` bounds it to 168 hours, so a fixed date here would be a fixture
+#: that expires (see `_helpers.APPROVAL_EXPIRES_AT`).
 _APPROVAL = {"max_calls": 90, "max_tokens": 200_000, "max_cost": "12.50", "currency": "USD",
-             "pricing_version": "pricing@1", "expires_at": "2026-12-31T00:00:00Z"}
+             "pricing_version": "pricing@1", "expires_at": APPROVAL_EXPIRES_AT}
 
 
 @pytest.fixture
@@ -291,6 +294,36 @@ def test_LLM_WORK_WITHOUT_A_CONFIRMED_CEILING_IS_REFUSED_VERBATIM(client, conn, 
     assert conn.execute("SELECT COUNT(*) FROM code_generation_job").fetchone() == (1,)
 
 
+def test_THE_QUOTE_IS_PER_MEMBER_and_a_TWO_DRAFT_BUILD_says_so(client, conn, enabled):
+    """▲ THE MULTIPLICATION, pinned at n=2 — where it is the only n at which it is visible.
+
+    The quote is `llm_members × PER_DRAFT_CALL_ENVELOPE`, and every assertion of it stood at ONE
+    member: at n=1 the product and the constant are the same number, so dropping the
+    multiplication altogether passed. That is not an abstract mutant. The run page echoes this
+    quote straight back as the CONFIRMED `max_calls` (`RunDetailScreen`'s confirm dialog sends
+    `quote.estimated_provider_calls` verbatim), so a two-draft build would have recorded a
+    45-call ceiling for 90 calls of work — and the second draft would die mid-authoring at the
+    dispatch seam, against a ceiling its own approver believed covered it.
+
+    The constant is IMPORTED, never spelled: a test that wrote `90` would pass on the day the
+    envelope moved and the arithmetic broke.
+    """
+    from featuregen.overlay.upload.formula_draft_service import PER_DRAFT_CALL_ENVELOPE
+
+    run = _seed_run(conn, run_id="trg-money2")
+    _declare(client, run)
+
+    response = client.post(PREPARE.format(run="trg-money2"),
+                           json={"option_ids": ["opt-a", "opt-b"]}, headers=_hdr())
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "COST_AUTHORIZATION_MISSING"
+    assert detail["llm_members"] == 2, "the arrangement is TWO LLM members or it proves nothing"
+    assert detail["estimated_provider_calls"] == 2 * PER_DRAFT_CALL_ENVELOPE, \
+        "the quote budgets every member's envelope — a per-JOB constant would under-fund the rest"
+
+
 # ══ the candidates a caller names ═══════════════════════════════════════════════════════════════
 def test_a_candidate_with_no_selection_is_refused_by_name(client, conn, enabled):
     run = _seed_run(conn, run_id="trg-nosel")
@@ -320,6 +353,41 @@ def test_a_CEILING_THAT_IS_NOT_A_POSITIVE_AMOUNT_is_a_422_not_a_500(client, conn
                            headers=_hdr())
 
     assert response.status_code == 422, response.text
+    assert conn.execute("SELECT COUNT(*) FROM code_generation_job").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("typed,why", [
+    ("2020-01-01T00:00:00Z", "already in the past — a ceiling dead on arrival"),
+    ("soon", "not a timestamp at all — the raw-500 at the ::timestamptz cast"),
+    ("2100-01-01T00:00:00Z", "74 years out, against the platform's own 168-hour rule"),
+    (None, "one hour past the triage window"),
+])
+def test_a_CEILING_EXPIRY_OUTSIDE_THE_TRIAGE_WINDOW_is_a_TYPED_422(client, conn, enabled,
+                                                                   typed, why):
+    """The same hole as `max_cost`'s, in the field beside it — see the regeneration route's twin
+    of this test for the three failure modes. Both approval bodies carry `expires_at` and both
+    reach it through the one `ExpiryWindow` declaration, so neither can be validated a second way.
+
+    `None` stands for "computed at run time": 169 hours must stay one hour OUTSIDE the bound for
+    ever, and a literal date cannot promise that.
+    """
+    from tests.featuregen.api._helpers import hours_from_now
+
+    run = _seed_run(conn, run_id=f"trg-exp-{abs(hash(why))}")
+    _declare(client, run)
+
+    response = client.post(
+        PREPARE.format(run=run["run_id"]),
+        json={"option_ids": ["opt-a"],
+              "spend_approval": {**_APPROVAL,
+                                 "expires_at": typed if typed is not None
+                                 else hours_from_now(169)}},
+        headers=_hdr())
+
+    assert response.status_code == 422, f"{why}: {response.text}"
+    assert response.json()["detail"][0]["loc"][-1] == "expires_at", \
+        "a typed 422 names the field a person typed into, never a bare string three layers down"
+    # The DECLARING job stands and nothing else was recorded — the refusal bought nothing.
     assert conn.execute("SELECT COUNT(*) FROM code_generation_job").fetchone() == (1,)
 
 

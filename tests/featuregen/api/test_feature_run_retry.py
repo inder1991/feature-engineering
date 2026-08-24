@@ -26,6 +26,7 @@ different subject with a different seeding chain.
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.api._helpers import APPROVAL_EXPIRES_AT
 from tests.featuregen.runs._chain import considered_json, feature_idea, seed_run_chain
 
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -34,9 +35,10 @@ RETRY = "/feature-runs/{run}/authoring-retries"
 DRAFT = "/considered-revisions/{rev}/options/{opt}/formula-drafts"
 
 #: The approver's cost confirmation — the six keys `RegenerationApprovalIn` demands, and the ONE
-#: per-draft envelope the enforcement itself quotes.
+#: per-draft envelope the enforcement itself quotes. The expiry is the shared fixture window:
+#: `ExpiryWindow` bounds it to 168 hours, so a fixed date here would be a fixture that expires.
 _CEILING = {"max_calls": 45, "max_tokens": 250_000, "max_cost": "25.00", "currency": "USD",
-            "pricing_version": "regen@1", "expires_at": "2026-12-31T09:00:00Z"}
+            "pricing_version": "regen@1", "expires_at": APPROVAL_EXPIRES_AT}
 
 #: Approving a re-spend after a recorded failure is somebody taking responsibility for buying the
 #: answer again, so it is a governance act and not the engineer's own click.
@@ -459,6 +461,67 @@ def test_a_DATABASE_WITHOUT_THE_GOVERNED_RETRY_SUBSTRATE_DEGRADES_INSTEAD_OF_500
     assert response.json()["detail"]["code"] == "RETRY_SUBSTRATE_ABSENT"
 
 
+def test_a_GOVERNED_OVERRIDE_IS_OFFERED_AND_SAYS_WHAT_IT_IS_OVERRIDING(client, conn):
+    """▲ THE WHOLE GOVERNED-OVERRIDE JOURNEY, which had no run-page test at all — and two separate
+    defects lived in the gap.
+
+    THE ARRANGEMENT: a candidate is withdrawn (a decision), and a governance actor then approves a
+    regeneration through the production route. Under Task 6 round-4's one law that approval NAMES
+    the covering withdrawal, so the store will mint — and the page must agree, because a page that
+    refused here would strand a PAID coupon behind a 409 the drafts door accepts.
+
+    1. **`not covering` at `retry_availability`'s not-an-answer gate is load-bearing.** Delete it
+       and the FAILED row is asked for a plain no-tombstone retry coupon, which does not exist:
+       the coupons that were minted NAME the withdrawal. The page then says
+       `FORMULA_DRAFT_NOT_AN_ANSWER` and refuses the click while `POST .../formula-drafts` mints
+       happily — the two-answers-by-route class, in the direction that costs somebody their money.
+    2. **The WARN disposition reached nobody.** `candidate_governance_blockers` returns
+       `(blockers, warnings)` and the projection kept `[0]`, so `RETIREMENT_OVERRIDDEN` — the fact
+       that this retry is about to proceed OVER a deliberate withdrawal — was dropped on the floor.
+       A retryable candidate under a governed override was indistinguishable from one nobody had
+       ever withdrawn. It is a WARN precisely because the caller must be told.
+    """
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    chain = _seed(conn, run_id="rty-ovr")
+    draft_id = _attempt(client, conn, chain)
+    record_tombstone(conn, formula_draft_id=draft_id,
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    # Withdrawn and unapproved, the page refuses — the arrangement's own premise, asserted rather
+    # than assumed, so a test that silently stopped being about an override cannot pass anyway.
+    assert "FORMULA_DRAFT_RETIRED" in [
+        b["code"] for b in _row(client, "rty-ovr", draft_id)["retry_blockers"]]
+
+    approved = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=_GOVERNANCE)
+    assert approved.status_code == 201, approved.text
+    # The one law: the approval named the withdrawal it overrides, rather than existing beside it.
+    assert conn.execute(
+        "SELECT overrides_tombstone FROM formula_draft_regeneration_exception "
+        "WHERE exception_id = %s", (approved.json()["exception_id"],)).fetchone() == (True,)
+
+    # ── THE PAGE OFFERS IT, AND SAYS WHAT IT OVERRIDES ──────────────────────────────────────────
+    offered = _row(client, "rty-ovr", draft_id)
+    assert offered["retryable"] is True, offered["retry_blockers"]
+    assert offered["retry_blockers"] == []
+    assert [w["code"] for w in offered["retry_warnings"]] == ["RETIREMENT_OVERRIDDEN"], \
+        "a WARN disposition's whole content is that the caller must be told"
+    assert "withdrew" in offered["retry_warnings"][0]["detail"], \
+        "a code with no sentence is a dead end — and this one is not a refusal, so it must say so"
+
+    # ── AND THE ENTRANCE AGREES, AND THE COUPON IS SPENT BY THE MINT IT AUTHORIZED ──────────────
+    response = client.post(RETRY.format(run="rty-ovr"), json={"formula_draft_id": draft_id},
+                           headers=_hdr())
+    assert response.status_code == 202, response.text
+    assert response.json()["created"] is True
+    # The 202 carries the same warning the page did — one answer, both surfaces.
+    assert "RETIREMENT_OVERRIDDEN" in response.json()["strategy_warnings"]
+    assert conn.execute(
+        "SELECT uses_consumed, max_uses FROM formula_draft_regeneration_exception "
+        "WHERE exception_id = %s", (approved.json()["exception_id"],)).fetchone() == (1, 1)
+
+
 def test_an_APPROVAL_CEILING_THAT_IS_NOT_A_POSITIVE_AMOUNT_is_a_422_not_a_500(client, conn):
     """The approval this gesture rides carries the same string-into-`numeric` field, and it had the
     same raw-500 hole: refused now at the one declaration both approval bodies share."""
@@ -471,6 +534,51 @@ def test_an_APPROVAL_CEILING_THAT_IS_NOT_A_POSITIVE_AMOUNT_is_a_422_not_a_500(cl
     assert response.status_code == 422, response.text
     assert conn.execute(
         "SELECT COUNT(*) FROM formula_draft_regeneration_exception").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("typed,why", [
+    ("2020-01-01T00:00:00Z", "already in the past — a coupon dead on arrival"),
+    ("soon", "not a timestamp at all — the raw-500 at the ::timestamptz cast"),
+    ("2100-01-01T00:00:00Z", "74 years out, against the platform's own 168-hour rule"),
+    (None, "one hour past the triage window"),
+])
+def test_an_APPROVAL_EXPIRY_OUTSIDE_THE_TRIAGE_WINDOW_is_a_TYPED_422(client, conn, typed, why):
+    """▲ `expires_at` WAS AN UNVALIDATED STRING, and all three failure modes were live.
+
+    A PAST instant minted a coupon dead on arrival behind a `201` that said "cost-confirmed": the
+    approver was told the spend was authorized, and every consumer then read an expired row — the
+    money-guard equivalent of a modal that dismisses itself. A 74-year window was accepted against
+    the 1..168-hour rule this platform states ONE BODY OVER, for the same kind of approval
+    (`MethodOverrideIn.expires_in_hours`, and its comment: "an approval given inside a triage
+    window must not still authorize an LLM retry weeks later"). And a malformed non-special string
+    never failed until the driver's cast — `max_cost: "twelve"`'s raw-500 hole, in the field beside
+    it, which is why this is validated at the `MoneyCeiling` precedent's own seam.
+
+    `None` stands for "computed at run time": 169 hours has to stay one hour OUTSIDE the bound for
+    ever, and a literal date cannot promise that.
+    """
+    from tests.featuregen.api._helpers import hours_from_now
+
+    chain = _seed(conn, run_id=f"rty-exp-{abs(hash(why))}")
+    draft_id = _attempt(client, conn, chain)
+    # The first attempt's own dev envelope is already on the ledger; what must not move is what
+    # THIS approval would have added.
+    ceilings_before = conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision").fetchone()
+
+    response = client.post(
+        f"/formula-drafts/{draft_id}/regeneration-exceptions",
+        json={**_CEILING, "expires_at": typed if typed is not None else hours_from_now(169)},
+        headers=_GOVERNANCE)
+
+    assert response.status_code == 422, f"{why}: {response.text}"
+    assert response.json()["detail"][0]["loc"][-1] == "expires_at", \
+        "a typed 422 names the field a person typed into, never a bare string three layers down"
+    # A refusal, not a quiet one: nothing was approved and no ceiling was confirmed.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM formula_draft_regeneration_exception").fetchone() == (0,)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision").fetchone() == ceilings_before
 
 
 # ══ the deterministic lane: free by construction (owner ruling, Option 2) ═══════════════════════

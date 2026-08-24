@@ -98,6 +98,62 @@ def _positive_money(value: str) -> str:
 #: cannot be validated two different ways.
 MoneyCeiling = Annotated[str, Field(min_length=1), AfterValidator(_positive_money)]
 
+#: The triage window an approval may live inside, in hours — THE SAME BOUND the platform already
+#: states for the other approval a person gives (`MethodOverrideIn.expires_in_hours`, `ge=1, le=168`,
+#: and its comment: "an approval given inside a triage window must not still authorize an LLM retry
+#: weeks later"). Named once here so the rule cannot be 168 on one body and unbounded on the two
+#: that carry an instant instead of a duration.
+MAX_APPROVAL_WINDOW_HOURS = 168
+
+
+def _triage_window(value: str) -> str:
+    """A cost confirmation expires at a REAL instant, in the future, inside the triage window.
+
+    ▲ `expires_at` travelled as an unvalidated string into a `::timestamptz` cast, and all three
+    failure modes were live. A PAST instant minted a coupon dead on arrival behind a 201
+    "cost-confirmed" — the approver was told the spend was authorized and every consumer then read
+    an expired row. A 74-year window was accepted against the platform's OWN 1..168-hour rule, which
+    it states one field over for the same kind of approval. And a malformed non-special string
+    (`'soon'`) never failed until the driver's cast, three layers below the person who typed it —
+    the `max_cost: "twelve"` raw-500 hole, in the field beside it.
+
+    The `MoneyCeiling` precedent, applied to time: refused HERE, as a typed 422 naming the field,
+    or nowhere.
+
+    Naive input is read as UTC rather than refused: every writer on these paths stores UTC, and a
+    missing offset is a client's omission and not a different moment. The bound is checked against
+    the APPLICATION clock — the value is compared to the database's `now()` everywhere it is later
+    read, and the two are the same machine here and NTP-synced in every deployment this ships to.
+    A window this generous cannot be made wrong by a second of skew.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(
+            "expires_at must be an ISO-8601 timestamp, for example '2026-08-25T09:00:00Z'"
+        ) from None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
+    if moment <= now:
+        raise ValueError(
+            "expires_at must be in the future: an approval that has already expired authorizes "
+            "nothing, and recording one would report a confirmed ceiling nobody can spend against")
+    if moment > now + timedelta(hours=MAX_APPROVAL_WINDOW_HOURS):
+        raise ValueError(
+            f"expires_at must be at most {MAX_APPROVAL_WINDOW_HOURS} hours away: an approval given "
+            f"inside a triage window must not still authorize an LLM spend weeks later — the same "
+            f"bound the method-override approval states as ge=1, le=168")
+    return value
+
+
+#: The one declaration of "when a confirmed ceiling stops authorizing", so the two approval bodies
+#: that carry one cannot be validated two different ways — `MoneyCeiling`'s rule, for the field
+#: beside it.
+ExpiryWindow = Annotated[str, Field(min_length=1), AfterValidator(_triage_window)]
+
 
 class SpendApprovalIn(BaseModel):
     """The user's cost confirmation, DURABLY recorded — never just a dismissed modal (§11.2)."""
@@ -109,7 +165,10 @@ class SpendApprovalIn(BaseModel):
     max_cost: MoneyCeiling
     currency: str = Field(min_length=3, max_length=3)
     pricing_version: str = Field(min_length=1)
-    expires_at: str = Field(min_length=1)
+    #: THE one declaration of when a confirmed ceiling stops authorizing. An unvalidated string here
+    #: minted coupons dead on arrival behind a 201, accepted 74-year windows against the platform's
+    #: own 168-hour rule, and raw-500'd on a typo at the `::timestamptz` cast.
+    expires_at: ExpiryWindow
 
 
 class JobRequestIn(BaseModel):

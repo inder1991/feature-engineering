@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from tests.featuregen.api._helpers import APPROVAL_EXPIRES_AT, APPROVAL_EXPIRES_AT_SAME_DAY
 
 DRAFT_PATH = "/considered-revisions/{rev}/options/{opt}/formula-drafts"
 
@@ -540,8 +541,10 @@ def test_A_RETIRED_CANDIDATE_IS_REFUSED_BY_THE_DECISION_before_the_money_guard(
 
 
 # ══ Stage I Task 6 — Option 2: deterministic retries are FREE; LLM retries are APPROVED ═════════
+#: The expiry is the shared fixture window — `ExpiryWindow` bounds a confirmation to 168 hours, so
+#: a fixed calendar date here would be a fixture that expires.
 _CEILING = {"max_calls": 45, "max_tokens": 250_000, "max_cost": "25.00", "currency": "USD",
-            "pricing_version": "regen@1", "expires_at": "2026-12-31T09:00:00Z"}
+            "pricing_version": "regen@1", "expires_at": APPROVAL_EXPIRES_AT}
 
 
 def _first_draft(client, conn, headers, *, revision: str) -> str:
@@ -599,7 +602,7 @@ def test_a_REPLAYED_APPROVAL_is_one_coupon_not_a_stack(client, conn, engineer_he
     first = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
                         json=_CEILING, headers=governance)
     replay = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
-                         json={**_CEILING, "expires_at": "2026-12-31T17:00:00Z"},
+                         json={**_CEILING, "expires_at": APPROVAL_EXPIRES_AT_SAME_DAY},
                          headers=governance)
     assert first.json()["exception_id"] == replay.json()["exception_id"]
     assert replay.json()["created"] is False, \

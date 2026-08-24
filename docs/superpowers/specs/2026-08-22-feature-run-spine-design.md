@@ -850,7 +850,7 @@ domain store uses.
 | Action | The truthful act |
 |---|---|
 | `AUTHOR_FORMULA` | **Reuse existing formula** — a READ; never an attempt |
-| `AUTHOR_FORMULA` | **Retry after FAILED/CANCELLED — OFFERED**, admissible only when BOTH gates hold: a regeneration exception bound to the exact formula identity (1103; one-time consumption; carries its own NOT NULL spend authorization) AND spend enforced per physical call at the audited seam (1105). Typed refusals: `DraftRetired` / `DraftNotAnAnswer` / `SpendExhausted` |
+| `AUTHOR_FORMULA` | **Retry after FAILED/CANCELLED — OFFERED, and the gates are LANE-AWARE** (owner ruling 2026-08-23, Option 2, stated sixteen lines below and shipped). **LLM lane:** a regeneration exception bound to the exact formula identity (1103; one-time consumption; carries its own NOT NULL spend authorization) AND spend enforced per physical call at the audited seam (1105) — the store gates on `provider_contract_hash is not None`. **Deterministic lane:** free by construction — no provider contract is folded, no call is dispatched, nothing is spent, so no exception exists to require (1103's NOT NULL columns make one unrepresentable). **Both lanes:** a covering tombstone refuses, because withdrawal is a decision rather than a cost. Typed refusals: `DraftRetired` / `DraftNotAnAnswer` / `SpendExhausted` / `DraftCeilingExhausted` (the request seam's pre-consumption check that an approved ceiling can cover ONE per-call worst-case reservation → 409 `COST_AUTHORIZATION_EXHAUSTED`) |
 | `AUTHOR_FORMULA` | "Request another opinion" on a LIVE draft — still deferred (identity must move; a live draft's slot is held) |
 
 Three unreachability gaps stood between the blessing and a working button. (1) CLOSED (Task 6,
@@ -910,8 +910,10 @@ governance to this increment). Stage I therefore is:
    open, still ceiling-less) becomes an adapter or dies. Ownership of these files is coordinated
    with the substrate session before execution.
 4. **The retry chain** per R4.2's three gaps, including the owner ruling request for (3).
-5. **Corrections carried**: `§15`'s two stale fact rows; migration numbering (1117 free, 1118
-   taken — Stage I expects ZERO new migrations; Stage II re-reserves).
+5. **Corrections carried**: `§15`'s two stale fact rows; migration numbering (1117 free; 1118
+   taken by the compiler-certification programme and 1119 taken by
+   `formula_draft_authoring_decision`, shipped by Stage I Task 5 — Stage I expected ZERO new
+   migrations and shipped one; Stage II re-reserves from 1120).
 
 Everything else in the frozen NO-GO plan (`2026-08-23-run-spine-actionable-stage1.md`) that
 described invocation tables, CAS-minted headers, or migration 1117 content is dead; that document

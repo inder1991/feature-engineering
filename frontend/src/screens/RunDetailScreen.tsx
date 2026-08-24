@@ -26,7 +26,8 @@
 // way here and another way in the corpus report.
 //
 // **TWO AXES, NEVER ONE** (spec §6.7). A draft's `state`/`rail_state` is the immutable historical
-// outcome; `eligibility` is derived at read time from the retirement row. The rail's AUTHOR_FORMULA
+// outcome; `eligibility` is derived at read time from BOTH withdrawal stores — 1096's per-draft
+// retirement row and 1103's tombstones, which key on what a withdrawal COVERS. The rail's AUTHOR_FORMULA
 // stage folds the OUTCOME axis only — a READY-then-withdrawn run reads SUCCEEDED up there — so the
 // authoring table below is the one place both axes are visible, and it renders each row's stored
 // tokens as they are rather than rewriting a withdrawn draft into a failure it never was.
@@ -160,6 +161,12 @@ export function RunDetailScreen({ runId }: { runId: string }) {
     setRetrying('')
     setRetryError('')
     setRetryNotice('')
+    // `busy` rides the reset list too. It is the PREPARE gesture's in-flight flag, and a POST that
+    // was still in flight when the prop changed resolves against the OLD run — `pointedAt` already
+    // discards that answer, and `.finally` clears the flag, but only when it lands. Leaving it out
+    // meant a run -> run deep link could render the new run with its checkbox and its one button
+    // disabled by the previous run's request, with nothing on screen explaining why.
+    setBusy(false)
     getFeatureRunDetail(runId).then(
       detail => {
         if (live) setRun(detail)
@@ -254,7 +261,17 @@ export function RunDetailScreen({ runId }: { runId: string }) {
         // READ back from the store: the attempt table now carries both rows, and the server's fold
         // decides which is the candidate's current answer.
         setRun(response.run)
-        setRetryNotice(`${response.detail} (draft ${response.formula_draft_id})`)
+        // ▲ THE WARNINGS THE SERVER ATTACHED TO THE ACT IT PERFORMED, verbatim and never dropped.
+        // The 202 carries `strategy_warnings` — `RETIREMENT_OVERRIDDEN` above all, which says this
+        // retry just proceeded OVER a deliberate withdrawal because an approved regeneration named
+        // it. They were computed, sent, and thrown away here, which is indistinguishable from
+        // never having been derived: the one person who needs to know a governance override just
+        // fired is the person who fired it.
+        setRetryNotice(
+          `${response.detail} (draft ${response.formula_draft_id})`
+          + (response.strategy_warnings.length > 0
+            ? ` — ${response.strategy_warnings.join(', ')}`
+            : ''))
       },
       err => {
         if (pointedAt.current !== runId) return
@@ -474,8 +491,18 @@ export function RunDetailScreen({ runId }: { runId: string }) {
           <span className="mono">{run.prepare_code.reason_code}</span> — {run.prepare_code.detail}
         </p>
       )}
-      {waiting.length === 0 ? (
-        <p className="hint">
+      {/* ▲ TWO ABSENCES, NOT ONE SENTENCE FOR BOTH. `waiting` is empty for two entirely different
+          reasons, and one of them used to be reported as the other: a run that chose NOTHING was
+          told "every candidate this run chose already has a formula attempt", which is a claim
+          about a record that is simply empty — the invented-fact defect the milestones list four
+          screens up already avoids. The chosen set is what tells them apart, so it decides which
+          sentence is true. */}
+      {run.milestones.choose_candidates.length === 0 ? (
+        <p className="hint" data-testid="prepare-nothing-chosen">
+          Nothing has been chosen for this run yet, so there is nothing to prepare.
+        </p>
+      ) : waiting.length === 0 ? (
+        <p className="hint" data-testid="prepare-nothing-waiting">
           Every candidate this run chose already has a formula attempt; there is nothing left to
           prepare.
         </p>
@@ -663,11 +690,20 @@ function AuthoringRow(
       <td className="mono">{row.rail_state}</td>
       <td>
         {row.eligibility === 'withdrawn' ? (
-          // The reason is the retirement row's own word — the same verbatim rule the rail follows.
-          // A withdrawal with no reason recorded says only that it was withdrawn.
-          <span className="badge held">
-            {row.retirement_reason ? `Withdrawn — ${row.retirement_reason}` : 'Withdrawn'}
-          </span>
+          // The reason is the withdrawal's own word, from whichever of the two stores recorded it
+          // — the same verbatim rule the rail follows. A withdrawal with no reason recorded says
+          // only that it was withdrawn, and one that NAMED a successor says which, because
+          // "withdrawn" with an onward answer is a different thing to read than a dead end.
+          <>
+            <span className="badge held">
+              {row.retirement_reason ? `Withdrawn — ${row.retirement_reason}` : 'Withdrawn'}
+            </span>
+            {row.retirement_replacement_draft_id && (
+              <div className="stage-detail">
+                replaced by <span className="mono">{row.retirement_replacement_draft_id}</span>
+              </div>
+            )}
+          </>
         ) : (
           <span className="badge ok">Current</span>
         )}
@@ -706,6 +742,18 @@ function AuthoringRow(
             {row.retry_blockers.map(blocker => (
               <div key={blocker.code} className="stage-detail">
                 <span className="mono">{blocker.code}</span> — {blocker.detail}
+              </div>
+            ))}
+            {/* ▲ WHAT PROCEEDING MEANS — a governed WARN, and DELIBERATELY not styled as a refusal.
+                `RETIREMENT_OVERRIDDEN` says this retry will proceed OVER a deliberate withdrawal
+                because an approved regeneration names it: the control above is ENABLED, and the
+                reader is being told what their click overrides. Rendering it among the blockers
+                would say the opposite of what it means — the server keeps the two lists apart for
+                exactly this reason, and this screen keeps them apart too. Verbatim, like every
+                other server sentence here. */}
+            {row.retry_warnings.map(warning => (
+              <div key={warning.code} className="retry-warning" data-testid="retry-warning">
+                <span className="badge held">{warning.code}</span> {warning.detail}
               </div>
             ))}
           </>

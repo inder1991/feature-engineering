@@ -354,11 +354,14 @@ def retry_run_authoring(run_id: str, body: RetryAuthoringIn, conn: _Conn,
     pre-flight is an advisory that agrees by construction: same locator
     (`approved_ceiling_for`), same bar (the dispatch seam's own per-call arithmetic).
 
-    Two REPORTING differences remain, both reports rather than purchases and both in the
+    THREE REPORTING differences remain, all reports rather than purchases and all in the
     conservative direction: on a database without the 1103/1105 substrate this door degrades to
-    `RETRY_SUBSTRATE_ABSENT` where the legacy door would raise; and where a live draft holds the
+    `RETRY_SUBSTRATE_ABSENT` where the legacy door would raise; where a live draft holds the
     identity this door answers 409 `RETRY_ATTEMPT_ALREADY_LIVE` where the legacy door answers
-    202 with `created: false`. Neither mints, consumes, or writes anything on either side.
+    202 with `created: false`; and where the frozen record can no longer name the candidate this
+    door answers 409 `RETRY_CANDIDATE_UNRESOLVABLE` where the legacy door raises
+    `CandidateUnavailable` into a 422 with a bare-string body. None mints, consumes, or writes
+    anything on either side.
 
     THE ORDER OF THE GATES, and why each is where it is:
 

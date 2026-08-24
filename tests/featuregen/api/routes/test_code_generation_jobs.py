@@ -13,6 +13,11 @@ from __future__ import annotations
 import json
 
 import pytest
+from tests.featuregen.api._helpers import (
+    APPROVAL_EXPIRES_AT,
+    APPROVAL_EXPIRES_AT_SAME_DAY,
+    APPROVAL_EXPIRY_FLOOR,
+)
 from tests.featuregen.api.routes.test_formula_drafts import _revision
 from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
 
@@ -63,8 +68,10 @@ def _seed(conn, *, tag: str) -> dict:
     }
 
 
+#: The expiry is the shared fixture window — `ExpiryWindow` bounds a confirmation to 168 hours, so
+#: a fixed calendar date here would be a fixture that expires.
 _APPROVAL = {"max_calls": 5, "max_tokens": 200_000, "max_cost": "12.50", "currency": "USD",
-             "pricing_version": "pricing@1", "expires_at": "2026-12-31T00:00:00Z"}
+             "pricing_version": "pricing@1", "expires_at": APPROVAL_EXPIRES_AT}
 
 
 # ══ the plan is a QUESTION ══════════════════════════════════════════════════════════════════════
@@ -295,10 +302,10 @@ def test_A_REPLAYED_CONFIRM_cannot_reset_the_budget(client, conn, enabled, engin
     past what was approved)."""
     body = _seed(conn, tag="rp")
     first = client.post(JOBS, json={
-        **body, "spend_approval": {**_APPROVAL, "expires_at": "2026-12-31T09:15:00Z"}},
+        **body, "spend_approval": {**_APPROVAL, "expires_at": APPROVAL_EXPIRES_AT}},
         headers=engineer_headers)
     replay = client.post(JOBS, json={
-        **body, "spend_approval": {**_APPROVAL, "expires_at": "2026-12-31T17:45:00Z"}},
+        **body, "spend_approval": {**_APPROVAL, "expires_at": APPROVAL_EXPIRES_AT_SAME_DAY}},
         headers=engineer_headers)
 
     assert first.status_code == 202 and replay.status_code == 202
@@ -308,5 +315,5 @@ def test_A_REPLAYED_CONFIRM_cannot_reset_the_budget(client, conn, enabled, engin
         "FROM llm_spend_authorization_revision "
         "WHERE pricing_version = %s", (_APPROVAL["pricing_version"],)).fetchall()
     assert len(rows) == 1, "two same-day expiries, ONE approval — the replay bought nothing"
-    assert rows[0][0] == "2026-12-31 00:00:00", \
+    assert rows[0][0] == APPROVAL_EXPIRY_FLOOR, \
         "floored to the requested instant's UTC midnight — never extended"

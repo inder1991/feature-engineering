@@ -150,6 +150,99 @@ def test_rail_mapping_is_total_over_1090s_check():
     assert set(_AUTHOR_SEVERITY) == set(RAIL_FROM_DRAFT_STATE.values())
 
 
+@pytest.mark.parametrize("scope", ["CANDIDATE_ACROSS_CONFIGURATIONS", "EXACT_DRAFT"])
+def test_a_withdrawal_recorded_in_1103s_TOMBSTONE_STORE_reads_as_withdrawn(db, scope):
+    """▲ THE ELIGIBILITY AXIS HAS TWO STORES, AND THE PAGE READ ONE.
+
+    1096's `formula_draft_retirement` keys on the DRAFT id. 1103's tombstones key on what a
+    withdrawal COVERS — one exact identity, or the candidate across every configuration — and
+    `retirement_scope.record_tombstone` is the writer every governed surface actually calls. This
+    projection LEFT JOINed 1096 alone, so a READY candidate somebody had withdrawn rendered
+    `eligibility: current` in a green badge while the drafts door, the plan preview and the retry
+    derivation all refused it: §6.7's read-time axis reporting the exact opposite of the truth, to
+    the one reader who has no way to check.
+
+    BOTH SCOPES, because a reader that consulted only one would be the same defect narrowed:
+    candidate-wide covers every identity at the candidate, EXACT covers its own.
+    """
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    c = seed_run_chain(db, run_id=f"rd-tomb-{scope[:4].lower()}")
+    _seed_draft(db, c["considered_revision_id"], "rd-tomb-d1", "o1", "READY")
+    _seed_draft(db, c["considered_revision_id"], "rd-tomb-d2", "o1", "READY",
+                identity="fih-replacement", at="2026-08-23T00:00:02Z")
+    record_tombstone(db, formula_draft_id="rd-tomb-d1", scope=RetirementScope(scope),
+                     reason="superseded by the corrected definition", retired_by="u:owner",
+                     replacement_draft_id="rd-tomb-d2")
+
+    row = run_detail(db, _ADMIN, c["run_id"])["authoring"]["history"][0]
+    assert row["formula_draft_id"] == "rd-tomb-d1"
+    assert row["eligibility"] == "withdrawn"
+    assert row["retirement_reason"] == "superseded by the corrected definition"
+    # The withdrawal NAMED a successor, so the page says which one — a "withdrawn" with an onward
+    # answer sends nobody hunting for a draft the record already names.
+    assert row["retirement_replacement_draft_id"] == "rd-tomb-d2"
+    # ...and the OUTCOME axis is untouched. Two axes, never one (§6.7): what happened does not
+    # change because somebody later decided the answer may not be used.
+    assert row["state"] == "READY" and row["rail_state"] == "SUCCEEDED"
+
+
+def test_the_LEGACY_retirement_store_still_answers_for_the_rows_it_holds(db):
+    """The 1096 path, unmoved by the 1103 read beside it: a draft withdrawn the old way still reads
+    `withdrawn` with its own reason, and one with no withdrawal in EITHER store reads `current`."""
+    c = _seed_retired_ready_draft(db, "rd-legacy")
+    _seed_draft(db, c["considered_revision_id"], "rd-legacy-d2", "o2", "READY")
+
+    history = run_detail(db, _ADMIN, "rd-legacy")["authoring"]["history"]
+    assert [(r["formula_draft_id"], r["eligibility"], r["retirement_reason"]) for r in history] == [
+        ("rd-legacy-d1", "withdrawn", "CANDIDATE_SUPERSEDED"),
+        ("rd-legacy-d2", "current", None)]
+
+
+def test_the_page_renders_when_1103_HAS_NOT_LANDED_instead_of_500ing(db):
+    """`pin_exists`'s rule, for the withdrawal store. The live ledger stands at 1099, so a run page
+    that read `formula_draft_retirement_tombstone` unprobed would raise `UndefinedTable` out of a
+    read-only projection on the first database it met. The store is dropped inside the test
+    transaction, which rolls back."""
+    c = _seed_retired_ready_draft(db, "rd-nostore")
+    db.execute("DROP TABLE formula_draft_retirement_tombstone CASCADE")
+
+    row = run_detail(db, _ADMIN, c["run_id"])["authoring"]["history"][0]
+    # 1096 is the whole truth on such a database — honestly, because no tombstone can exist there.
+    assert row["eligibility"] == "withdrawn"
+    assert row["retirement_reason"] == "CANDIDATE_SUPERSEDED"
+
+
+def test_an_ANSWER_outranks_a_LATER_bought_nothing_attempt_at_a_SECOND_identity(db):
+    """▲ THE FOLD GUARD, pinned. `_current_by_candidate` keeps a held row unless the new one is an
+    ANSWER or the held one bought nothing — and NOTHING pinned that until now: an unconditional
+    `current[key] = ...` survived the entire suite.
+
+    ONE candidate, TWO identities (an identity folds the authoring configuration, so a model or
+    prompt move mints a second one for the same candidate), and the FAILED attempt at the second
+    identity is the LATER row. 1107's guard is per-IDENTITY, so both rows are legal at once.
+
+    Under the mutant the run reports its AUTHOR_FORMULA stage FAILED and its current answer as a
+    failure, over a candidate that holds a formula — the §R4.4.1 defect the two-readings split
+    exists to prevent, arriving from the other direction.
+    """
+    c = seed_run_chain(db, run_id="rd-fold")
+    _seed_draft(db, c["considered_revision_id"], "rd-fold-d1", "o1", "READY",
+                identity="rd-fold-identity-A", at="2026-08-23T00:00:01Z")
+    _seed_draft(db, c["considered_revision_id"], "rd-fold-d2", "o1", "FAILED",
+                identity="rd-fold-identity-B", at="2026-08-23T00:00:02Z")
+
+    out = run_detail(db, _ADMIN, "rd-fold")
+
+    # Both attempts are on the record — history hides nothing, and the failure is the later one.
+    assert [r["formula_draft_id"] for r in out["authoring"]["history"]] == [
+        "rd-fold-d1", "rd-fold-d2"]
+    # ...and the candidate's CURRENT answer is the formula, not the failure that followed it.
+    assert [(r["formula_draft_id"], r["state"], r["resolved"])
+            for r in out["authoring"]["current"]] == [("rd-fold-d1", "READY", True)]
+    assert _rail(out)["AUTHOR_FORMULA"]["state"] == "SUCCEEDED"
+
+
 def test_detail_shows_sockets_and_two_axes(db, generation_on, sandbox_switches_off):
     _seed_retired_ready_draft(db, "rd-a")
     _drop_the_pin(db)
@@ -563,8 +656,9 @@ def test_a_failed_attempt_is_history_and_the_retry_is_the_current_answer(db):
     assert out["authoring"]["current"] == [{
         "formula_draft_id": "rd-h-d2", "considered_revision_id": c["considered_revision_id"],
         "option_id": "o1", "state": "READY", "rail_state": "SUCCEEDED",
-        "eligibility": "current", "retirement_reason": None, "resolved": True,
-        "retryable": False, "retry_blockers": []}]
+        "eligibility": "current", "retirement_reason": None,
+        "retirement_replacement_draft_id": None, "resolved": True,
+        "retryable": False, "retry_blockers": [], "retry_warnings": []}]
     assert _rail(out)["AUTHOR_FORMULA"]["state"] == "SUCCEEDED"
     # `resolved` belongs to the CURRENT reading only. Stamping it onto every history row would
     # invite a reader to ask of a superseded attempt a question only the latest one answers.

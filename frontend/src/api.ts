@@ -4614,8 +4614,13 @@ export interface RunAuthoringRow {
   // is derived at read time from the retirement row.
   state: string
   rail_state: string
+  // Derived from BOTH withdrawal stores: 1096's per-draft retirement row and 1103's tombstones,
+  // which key on what a withdrawal COVERS (one exact identity, or the candidate across every
+  // configuration). Reading one alone showed a withdrawn candidate as `current`.
   eligibility: 'current' | 'withdrawn'
   retirement_reason: string | null
+  // The successor the withdrawal named, when it named one — a "withdrawn" with an onward answer.
+  retirement_replacement_draft_id: string | null
   // Whether this attempt may be bought AGAIN (spec §R4.2), derived SERVER-side from the approval,
   // the ceiling, the withdrawals and the money guard. The question is only asked of an attempt that
   // bought nothing — a FAILED or CANCELLED draft — so an answered or in-flight row reads `false`
@@ -4625,6 +4630,11 @@ export interface RunAuthoringRow {
   // the run surface's; both render verbatim, because the greyed-out control and the entrance's 409
   // are one refusal and a client that re-worded either would be a second policy.
   retry_blockers: { code: string; detail: string }[]
+  // What a person clicking Retry is entitled to know — a governed WARN, never a refusal.
+  // `RETIREMENT_OVERRIDDEN` says this retry proceeds OVER a deliberate withdrawal because an
+  // approved regeneration NAMES it. Kept apart from the blockers because it does not stop the
+  // click: folding the two lists would make a proceed-with-knowledge read as a reason it is off.
+  retry_warnings: { code: string; detail: string }[]
 }
 
 // One candidate's CURRENT answer — an attempt row plus the one thing only the latest attempt can

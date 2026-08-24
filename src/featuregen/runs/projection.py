@@ -1,6 +1,8 @@
 """Run projections (spec §12): DERIVED from existing stores — the spine records no lifecycle."""
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.materialize.action_authorization import ActionV1, action_available
 from featuregen.materialize.generation_lane import generation_enabled
@@ -188,14 +190,34 @@ _RETRY_BLOCKER_DETAIL = {
 
 #: For a strategy the resolver refused: the same sentence `POST .../formula-drafts` answers with,
 #: because it is the same refusal reached from a second door.
-_STRATEGY_REFUSAL_DETAIL = (
-    "the authoring strategy could not be resolved for this candidate, so there is no attempt to "
-    "buy again")
+#:
+#: ▲ BYTE-IDENTICAL TO THE ROUTE'S, and it was not: this copy carried a trailing ", so there is no
+#: attempt to buy again" that the 409 never said, so `_assert_page_and_entrance_agree`'s whole
+#: premise — one refusal, one sentence, two doors — held for every OTHER code and quietly failed for
+#: this one. The route's spelling is the one that wins, because the route is where a person meets
+#: the refusal after clicking.
+_STRATEGY_REFUSAL_DETAIL = "the authoring strategy could not be resolved for this candidate"
 
 #: For anything else the substrate names. Deliberately does NOT explain the code: this surface does
 #: not own it, and a sentence invented here could contradict the one that does.
 _UNNAMED_BLOCKER_DETAIL = (
     "the authoring decision refuses this candidate by this name; nothing was recorded or spent")
+
+#: The sentence each governed WARNING renders with — the blocker map's rule for the other
+#: disposition. A warning is a proceed-with-knowledge (`action_dispositions` maps
+#: `RETIREMENT_OVERRIDDEN` to WARN, whose whole meaning is that the caller MUST be told), so the
+#: sentence says what is true and what it does NOT stop.
+_RETRY_WARNING_DETAIL = {
+    "RETIREMENT_OVERRIDDEN":
+        "somebody withdrew this candidate, and an approved regeneration NAMES that withdrawal — so "
+        "the retry is admissible and will proceed over a deliberate withdrawal. Nothing here "
+        "refuses it; you are being told what the coupon is overriding",
+}
+
+#: For a warning the substrate names that this surface has no sentence for. Same discipline as
+#: `_UNNAMED_BLOCKER_DETAIL`: name the CLASS, never invent an explanation of somebody else's code.
+_UNNAMED_WARNING_DETAIL = (
+    "the authoring decision admits this candidate WITH this warning; it does not refuse it")
 
 
 def _static_socket(stage: str) -> dict:
@@ -527,19 +549,135 @@ def retry_substrate_exists(conn) -> bool:
     return row[0] is not None and row[1] is not None
 
 
-def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> dict:
-    """Whether a bought-nothing attempt on this candidate may be bought AGAIN, and why not
-    (spec §R4.2). Returns ``{"retryable": bool, "retry_blockers": [{code, detail}]}``.
+class _DraftRow(NamedTuple):
+    """One `formula_draft` row as the run detail reads it, NAMED rather than unpacked.
 
-    ▲ **THIS PROJECTION RE-DERIVES NOTHING.** Every verdict below is ASKED of the substrate's own
-    locators — `candidate_governance_blockers` (the ONE composition the plan preview and the
-    AUTHOR_FORMULA decision both consult), `covering_tombstones`, `valid_exception_for`,
-    `remaining_spend` — and reported. A parallel judgement of "is this coupon valid" would be a
-    second answer to a question the store already answers, and the two would disagree on the day
-    one of them changed.
+    The SELECT carries ten columns since the eligibility axis learned to read both withdrawal
+    stores, and positional unpacking at that width is precisely where a column quietly changes
+    meaning under an edit. The two `legacy_*` fields are 1096's — an absent row is the honest "no
+    withdrawal recorded HERE", never a missing value.
+    """
+
+    formula_draft_id: str
+    considered_revision_id: str
+    option_id: str
+    state: str
+    legacy_reason: str | None
+    legacy_replacement_draft_id: str | None
+    planning_request_hash: str
+    catalog_snapshot_hash: str
+    definition_revision: str
+    formula_identity_hash: str
+
+
+def withdrawal_store_exists(conn) -> bool:
+    """Whether migration 1103's `formula_draft_retirement_tombstone` has landed in THIS database.
+
+    `pin_exists`'s rule, applied to the store the ELIGIBILITY axis must now read. Separate from
+    `retry_substrate_exists` because it answers a different question: that one probes the approval
+    and ceiling stores a governed RETRY needs, and this one probes the withdrawal store every draft
+    row's eligibility is read from — a database can have the tombstones and not the ceilings (1103
+    applied, 1105 not), and the existing degradation test drops exactly those two ceilings tables
+    while the tombstones stand.
+
+    Self-retiring, like the pin: the day 1103 applies, `to_regclass` answers and this is True for
+    ever after with no code change. Where it answers False the legacy 1096 row is the whole truth —
+    honestly, because on such a database no tombstone can exist to be missed.
+    """
+    return conn.execute(
+        "SELECT to_regclass('formula_draft_retirement_tombstone')").fetchone()[0] is not None
+
+
+def _covering_withdrawals(conn, drafts) -> dict[str, tuple]:
+    """The 1103 withdrawals covering each of these drafts, keyed by draft id.
+
+    ▲ **THE ELIGIBILITY AXIS HAS TWO STORES, AND THE PAGE READ ONE.** 1096's
+    `formula_draft_retirement` keys on the DRAFT id; 1103's tombstones key on what a withdrawal
+    COVERS — one exact formula identity, or the candidate across every configuration — and
+    `retirement_scope.record_tombstone` is the only writer the governed surfaces call. A page
+    reading 1096 alone rendered a withdrawn READY candidate as `current`, in a green badge, while
+    every governed gate refused it: §6.7's eligibility axis reporting the exact opposite of the
+    truth to the one reader who cannot check.
+
+    ASKED OF THE SUBSTRATE'S OWN SET READ (`covering_tombstones` — the read Task 6 round-4 made THE
+    law, after the single-pick `tombstone_covering` generated a hole in three consecutive rounds),
+    never re-spelled as a query here.
+
+    ▲ **KEYED ON THE DRAFT'S OWN STORED COLUMNS, not on the frozen candidate.** Eligibility is a
+    fact about the recorded output — "is this still usable" — so the scope key is computed from the
+    five columns 1090 stores on the row itself, which is exactly what `record_tombstone` reads when
+    it writes one. Going through `frozen_candidate` (as the RETRY derivation must, because it asks
+    about the identity a retry would MINT) would both answer a different question and raise
+    `CandidateUnavailable` on the legacy revisions this projection exists to keep rendering.
+
+    ONE READ PER DISTINCT (scope key, identity), not one per row and not one per surface: a
+    candidate's attempts share a scope key, so a run with five attempts on one candidate pays one
+    query. The retry derivation's own covering read stays where it is — it asks about a different
+    identity, and collapsing two different questions into one answer is the failure mode this whole
+    wave is about, not the fix for it.
+    """
+    if not withdrawal_store_exists(conn):
+        return {}
+    from featuregen.overlay.upload.retirement_scope import (
+        covering_tombstones,
+        retirement_scope_key,
+    )
+
+    asked: dict[tuple[str, str], tuple] = {}
+    covering: dict[str, tuple] = {}
+    for row in drafts:
+        key = (retirement_scope_key(
+            considered_revision_id=row.considered_revision_id, option_id=row.option_id,
+            planning_request_hash=row.planning_request_hash,
+            catalog_snapshot_hash=row.catalog_snapshot_hash,
+            definition_revision=row.definition_revision), row.formula_identity_hash)
+        if key not in asked:
+            asked[key] = covering_tombstones(
+                conn, scope_key=key[0], formula_identity_hash=key[1])
+        if asked[key]:
+            covering[row.formula_draft_id] = asked[key]
+    return covering
+
+
+def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> dict:
+    """Whether a bought-nothing attempt on this candidate may be bought AGAIN, why not, and what a
+    person proceeding is entitled to know (spec §R4.2). Returns
+    ``{"retryable": bool, "retry_blockers": [{code, detail}], "retry_warnings": [{code, detail}]}``.
+
+    ▲ **EVERY VERDICT BELOW IS THE SUBSTRATE'S OWN.** `candidate_governance_blockers` (the ONE
+    composition the plan preview and the AUTHOR_FORMULA decision both consult), `covering_tombstones`,
+    `valid_exception_for`, `approved_ceiling_for`, `remaining_spend` — asked and reported. A parallel
+    judgement of "is this coupon valid" would be a second answer to a question the store already
+    answers, and the two would disagree on the day one of them changed.
+
+    ▲ **TWO LOCAL MIRRORS ARE DELIBERATE, and neither is a second opinion.** This docstring used to
+    claim the function "re-derives NOTHING", which was not true of the code beneath it:
+
+    * **1107's index predicate** is spelled here as `NOT (state = ANY(_BOUGHT_NOTHING))`. The store
+      has no "would this INSERT land on a live row" locator to ask, and the migration's own partial
+      index is the authority — so the mirror is spelled FROM `_BOUGHT_NOTHING`, the single constant
+      the money guard, the history fold and the run-detail loop all read. What defends it is the
+      constant, not this comment: change the index and the constant moves, and every mirror moves
+      with it.
+    * **The per-call worst-case arithmetic** (`ceil(max_tokens/max_calls)`, `max_cost/max_calls`) is
+      the dispatch seam's own bar, re-spelled because the seam applies it inside a reservation this
+      read must not make. What defends it is a coupling test the substrate side owns: the sliver
+      test (`test_a_SLIVER_remainder_refuses_on_the_PAGE_and_at_the_DOOR_alike`) puts a remainder
+      above zero and below one call's worth in front of BOTH surfaces and requires the same answer,
+      so a page that drifted back to a zero floor dies there rather than in production.
+
+    Everything else — the withdrawal law, the coupon validity, the ceiling PICK — is a call.
+
+    **BLOCKERS REFUSE; WARNINGS DO NOT.** `candidate_governance_blockers` returns both, and this
+    used to keep only `[0]`: a candidate retryable under a governed override was indistinguishable
+    from one nobody ever withdrew. `RETIREMENT_OVERRIDDEN` is dispositioned WARN precisely because
+    the caller MUST be told, so it rides the answer beside the blockers rather than being dropped on
+    the floor — and `retryable` still folds the BLOCKERS alone, because a warning that refused
+    would be a blocker under a gentler name.
     """
     if not retry_substrate_exists(conn):
-        return {"retryable": False, "retry_blockers": [_blocker(RETRY_SUBSTRATE_ABSENT)]}
+        return {"retryable": False, "retry_warnings": [],
+                "retry_blockers": [_blocker(RETRY_SUBSTRATE_ABSENT)]}
 
     from featuregen.overlay.upload.formula_draft_service import (
         CandidateUnavailable,
@@ -568,7 +706,7 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
     except CandidateUnavailable as exc:
         # The one refusal a read-only projection MUST absorb: legacy revisions cannot name their
         # options, and a run page that 500s on one of them shows nothing at all.
-        return {"retryable": False,
+        return {"retryable": False, "retry_warnings": [],
                 "retry_blockers": [_blocker(RETRY_CANDIDATE_UNRESOLVABLE, exc.detail)]}
 
     assembled = assemble_strategy_facts(
@@ -579,7 +717,7 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
         # A conceptual pattern, a governed model output, or a genuine bind failure — the service
         # raises on each of these before any draft exists, so the retry cannot be offered and the
         # resolver's own codes say which.
-        return {"retryable": False,
+        return {"retryable": False, "retry_warnings": [],
                 "retry_blockers": [_blocker(code, _STRATEGY_REFUSAL_DETAIL)
                                    for code in decision.blockers]}
 
@@ -604,11 +742,20 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
     # THE ONE LAW's read (Task 6 round-4), borrowed whole rather than re-implemented: RETIRED iff
     # some covering withdrawal lacks a valid naming coupon, and a warning where every one is named.
     # The run page, the plan preview and the store therefore give ONE answer by construction.
-    blockers = [_blocker(code) for code in candidate_governance_blockers(
+    #
+    # ▲ BOTH HALVES OF THE ANSWER, not `[0]`. The composition returns `(blockers, warnings)` and
+    # this kept the blockers alone, so `RETIREMENT_OVERRIDDEN` — the fact that this retry is about
+    # to proceed OVER a deliberate withdrawal — reached nobody. A WARN disposition's whole content
+    # is that the caller must be told; dropping it made a governed override look like a candidate
+    # nobody had ever withdrawn.
+    governed_blockers, governed_warnings = candidate_governance_blockers(
         conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
         strategy_identity_hash=decision.strategy_identity_hash,
         provider_contract_hash=provider_contract, config_hash=config_hash,
-        scope_key=scope_key)[0]]
+        scope_key=scope_key)
+    blockers = [_blocker(code) for code in governed_blockers]
+    warnings = [_blocker(code, _RETRY_WARNING_DETAIL.get(code, _UNNAMED_WARNING_DETAIL))
+                for code in governed_warnings]
 
     now = conn.execute("SELECT now()").fetchone()[0]
     # The 1107 index's own predicate, spelled from the constant that already states it. A FAILED or
@@ -665,7 +812,9 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
             call_cost = Decimal(str(max_cost)) / int(max_calls)
             if left.calls < 1 or left.tokens < call_tokens or left.cost < call_cost:
                 blockers.append(_blocker(COST_AUTHORIZATION_EXHAUSTED))
-    return {"retryable": not blockers, "retry_blockers": blockers}
+    # `retryable` folds the BLOCKERS alone: a warning that refused would be a blocker under a
+    # gentler name, and the entrance would then answer 202 over a control the page had greyed out.
+    return {"retryable": not blockers, "retry_blockers": blockers, "retry_warnings": warnings}
 
 
 def _current_by_candidate(history: list[dict]) -> list[dict]:
@@ -756,8 +905,10 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
         "ORDER BY chosen_at", (run_id,)).fetchall()
     # Drafts reach the run through their CANDIDATE: `formula_draft` carries no run id, and the
     # considered revision is what ties one to this run (1090's subject is a candidate, parent
-    # §0.1.4). The LEFT JOIN to the retirement is the eligibility axis — an absent row is the
-    # honest "still current", not a missing value.
+    # §0.1.4). The LEFT JOIN to 1096's retirement is HALF the eligibility axis — an absent row is
+    # the honest "no withdrawal recorded on this draft id", and the other half (1103's tombstones,
+    # which key on what a withdrawal COVERS rather than on a draft id) is read by
+    # `_covering_withdrawals` from the five scope columns selected below.
     #
     # ORDERED BY `requested_at`, which is the ATTEMPT order — the order a person lived through and
     # the order `_current_by_candidate` folds. It was `formula_draft_id` while one identity meant
@@ -766,15 +917,22 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     # the database's own clock (`str(SELECT now())`) — a cast to timestamptz would be the wrong
     # kind of strict here, raising out of a read-only projection on one malformed legacy value.
     # The draft id tie-breaks, so the order is total and stable rather than the planner's whim.
-    drafts = conn.execute(
-        """SELECT d.formula_draft_id, d.considered_revision_id, d.option_id, d.state, r.reason
+    drafts = [_DraftRow(*row) for row in conn.execute(
+        """SELECT d.formula_draft_id, d.considered_revision_id, d.option_id, d.state,
+                  r.reason, r.replacement_draft_id,
+                  d.planning_request_hash, d.catalog_snapshot_hash, d.definition_revision,
+                  d.formula_identity_hash
            FROM formula_draft d
            JOIN contract_considered_revision ccr
              ON ccr.considered_revision_id = d.considered_revision_id
            LEFT JOIN formula_draft_retirement r USING (formula_draft_id)
            WHERE ccr.generation_run_id = %s
            ORDER BY d.requested_at, d.formula_draft_id""",
-        (run_id,)).fetchall()
+        (run_id,)).fetchall()]
+    # The OTHER withdrawal store, read once per distinct candidate scope — see
+    # `_covering_withdrawals` for why the page had to learn to read it and why it is keyed on the
+    # draft's own columns rather than on the frozen candidate.
+    covering_withdrawals = _covering_withdrawals(conn, drafts)
     # Two axes, never one field (spec §6.7): `state`/`rail_state` is the immutable historical
     # outcome, `eligibility` is derived at read time. Rewriting a succeeded-then-retired draft to
     # BLOCKED would destroy the history; dropping the retirement would leave an unusable output
@@ -797,19 +955,40 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     # and a per-row derivation would pay for it twice and could report it two ways.
     retry: dict[tuple[str, str], dict] = {}
     history = []
-    for fid, ccr_of, opt, state, reason in drafts:
-        if state not in _BOUGHT_NOTHING:
-            answer = {"retryable": False, "retry_blockers": []}
+    for row in drafts:
+        candidate_key = (row.considered_revision_id, row.option_id)
+        if row.state not in _BOUGHT_NOTHING:
+            answer = {"retryable": False, "retry_blockers": [], "retry_warnings": []}
         else:
-            if (ccr_of, opt) not in retry:
-                retry[(ccr_of, opt)] = retry_availability(
-                    conn, considered_revision_id=ccr_of, option_id=opt)
-            answer = retry[(ccr_of, opt)]
+            if candidate_key not in retry:
+                retry[candidate_key] = retry_availability(
+                    conn, considered_revision_id=row.considered_revision_id,
+                    option_id=row.option_id)
+            answer = retry[candidate_key]
+        # BOTH WITHDRAWAL STORES, ONE ANSWER. 1096's row is the draft's own record and answers
+        # first where it exists; 1103's covering set answers where it does not. Where several
+        # tombstones cover, `covering_tombstones` already orders the CANDIDATE-WIDE one first —
+        # reporting the narrower withdrawal would understate what was refused (`tombstone_covering`'s
+        # own words), so the strongest is the one whose reason a person reads.
+        withdrawn_by = covering_withdrawals.get(row.formula_draft_id)
+        if row.legacy_reason is not None:
+            eligibility = "withdrawn"
+            reason, replacement = row.legacy_reason, row.legacy_replacement_draft_id
+        elif withdrawn_by:
+            eligibility = "withdrawn"
+            reason, replacement = withdrawn_by[0].reason, withdrawn_by[0].replacement_draft_id
+        else:
+            eligibility, reason, replacement = "current", None, None
         history.append({
-            "formula_draft_id": fid, "considered_revision_id": ccr_of, "option_id": opt,
-            "state": state, "rail_state": RAIL_FROM_DRAFT_STATE[state],
-            "eligibility": "withdrawn" if reason else "current",
-            "retirement_reason": reason, **answer,
+            "formula_draft_id": row.formula_draft_id,
+            "considered_revision_id": row.considered_revision_id, "option_id": row.option_id,
+            "state": row.state, "rail_state": RAIL_FROM_DRAFT_STATE[row.state],
+            "eligibility": eligibility,
+            "retirement_reason": reason,
+            # The replacement the withdrawal NAMED, from whichever store recorded it. A withdrawal
+            # that points at a successor is the one case where "withdrawn" has an onward answer,
+            # and dropping it sent the reader hunting for a draft the record already names.
+            "retirement_replacement_draft_id": replacement, **answer,
         })
     current = _current_by_candidate(history)
     # ONE derivation, two surfaces: the rail entry and the milestone's own rows are the same
