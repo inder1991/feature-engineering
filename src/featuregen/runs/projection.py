@@ -552,6 +552,7 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
     from featuregen.overlay.upload.formula_strategy_facts import assemble_strategy_facts
     from featuregen.overlay.upload.llm_spend import remaining_spend
     from featuregen.overlay.upload.retirement_scope import (
+        approved_ceiling_for,
         covering_tombstones,
         retirement_scope_key,
         valid_exception_for,
@@ -641,35 +642,28 @@ def retry_availability(conn, *, considered_revision_id: str, option_id: str) -> 
             f"still in flight — so a retry would mint nothing (migration 1107's money guard covers "
             f"exactly these). Watch that attempt; retry becomes the question again if it fails"))
     if provider_contract is not None:
-        # ▲ THE CEILING THE RETRY WOULD ACTUALLY RIDE, read with the SAME query the service picks
-        # it with: an approved regeneration carries its own cost-confirmed authorization, and
-        # offering a retry over a spent one sends a person into `SpendExhausted` at the dispatch
-        # seam. With no approved ceiling the service mints its bounded development envelope, so
-        # there is nothing here to be exhausted and nothing to report.
-        #
-        # ▲ **THIS IS A COPY, AND IT IS NAMED AS ONE.** The original is
-        # `formula_draft_service.request_draft_for_candidate`'s approved-ceiling read (the
-        # `SELECT llm_spend_authorization_id ...` inside its `spend_authorization_id is None`
-        # branch). Byte-identical DELIBERATELY, preferences included: only the AUTHORIZATION's
-        # expiry filters here, the coupon's own uses and expiry do not, and `approved_at DESC`
-        # breaks the tie — a projection that "improved" any of those would report a ceiling the
-        # mint does not use, which is the two-answers-by-route defect this whole surface is built
-        # to avoid. Extracting the shared read is the SUBSTRATE session's (this session may not
-        # edit that file); until it lands, the copy is defended by
-        # `tests/featuregen/api/test_feature_run_retry.py::
-        # test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO`, which is the only test in
-        # the suite that dies if these two drift. Change one, change the other, and run that test.
-        approved = conn.execute(
-            "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception e "
-            "  JOIN llm_spend_authorization_revision a "
-            "    ON a.spend_authorization_id = e.llm_spend_authorization_id "
-            " WHERE e.target_formula_identity_hash = %s AND e.provider_contract_hash = %s "
-            "   AND e.strategy_identity_hash = %s AND a.expires_at > now() "
-            " ORDER BY e.approved_at DESC LIMIT 1",
-            (identity, provider_contract, decision.strategy_identity_hash)).fetchone()
-        if approved is not None:
-            left = remaining_spend(conn, approved[0], now=now)
-            if left.calls <= 0 or left.tokens <= 0 or left.cost <= 0:
+        # ▲ THE CEILING THE RETRY WOULD ACTUALLY RIDE, read with the ONE locator every consumer
+        # shares (`approved_ceiling_for` — the service's preference read and the store's
+        # dead-ticket guard call the same function, so the page cannot report a ceiling the mint
+        # does not use). The BAR mirrors the guard's exactly: one per-call worst-case reservation
+        # (the dispatch seam's own arithmetic), not zero — a zero floor here would offer a Retry
+        # the seam refuses one click later. The coupling test
+        # (`test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO`) is belt-and-braces now
+        # that both sides call one function; the sliver test pins the bar.
+        ride = approved_ceiling_for(
+            conn, target_formula_identity_hash=identity,
+            provider_contract_hash=provider_contract,
+            strategy_identity_hash=decision.strategy_identity_hash)
+        if ride is not None:
+            from decimal import Decimal
+
+            left = remaining_spend(conn, ride, now=now)
+            max_calls, max_tokens, max_cost = conn.execute(
+                "SELECT max_calls, max_tokens, max_cost FROM llm_spend_authorization_revision "
+                "WHERE spend_authorization_id = %s", (ride,)).fetchone()
+            call_tokens = -(-int(max_tokens) // int(max_calls))
+            call_cost = Decimal(str(max_cost)) / int(max_calls)
+            if left.calls < 1 or left.tokens < call_tokens or left.cost < call_cost:
                 blockers.append(_blocker(COST_AUTHORIZATION_EXHAUSTED))
     return {"retryable": not blockers, "retry_blockers": blockers}
 

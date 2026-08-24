@@ -310,19 +310,52 @@ def test_an_EXHAUSTED_CEILING_refuses_in_the_spend_guards_own_word(client, conn)
     assert response.json()["detail"]["code"] == "COST_AUTHORIZATION_EXHAUSTED"
 
 
+def test_a_SLIVER_remainder_refuses_on_the_PAGE_and_at_the_DOOR_alike(client, conn):
+    """▲ THE BAR, pinned on both surfaces: a remainder above ZERO but below ONE per-call
+    worst-case reservation is exhausted everywhere. The substrate's dead-ticket guard refuses it
+    at the seam (its own sliver test), so a page still using the old zero floor would offer a
+    Retry the door refuses one click later — the two-answers defect in the permissive direction.
+    With `_CEILING` at 45 calls / 250,000 tokens / $25.00, one call reserves
+    tokens=ceil(250000/45)=5556 and cost=25/45≈0.5556; reserving 44 calls / 249,000 / $24.90
+    leaves 1 call / 1,000 tokens / $0.10 — every axis above zero, two below one call's worth."""
+    chain = _seed(conn, run_id="rty-sliv")
+    draft_id = _attempt(client, conn, chain)
+    approved = client.post(f"/formula-drafts/{draft_id}/regeneration-exceptions",
+                           json=_CEILING, headers=_GOVERNANCE)
+    spend_id = approved.json()["spend_authorization_id"]
+    from featuregen.overlay.upload.llm_spend import reserve_spend, settle_spend
+
+    now = conn.execute("SELECT now()").fetchone()[0]
+    reservation = reserve_spend(conn, spend_authorization_id=spend_id, calls=44, tokens=249_000,
+                                cost="24.90", now=now)
+    settle_spend(conn, reservation, actual_calls=44, actual_tokens=249_000, actual_cost="24.90")
+
+    row = _row(client, "rty-sliv", draft_id)
+    assert row["retryable"] is False
+    assert "COST_AUTHORIZATION_EXHAUSTED" in [b["code"] for b in row["retry_blockers"]]
+
+    response = client.post(RETRY.format(run="rty-sliv"), json={"formula_draft_id": draft_id},
+                           headers=_hdr())
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "COST_AUTHORIZATION_EXHAUSTED"
+    # The refusal bought nothing on either surface: the coupon survives for a request that can.
+    consumed = conn.execute(
+        "SELECT uses_consumed FROM formula_draft_regeneration_exception "
+        "WHERE llm_spend_authorization_id = %s", (spend_id,)).fetchone()
+    assert consumed == (0,), "the sliver refusal must not burn the coupon"
+
+
 def test_THE_PAGE_AND_THE_SEAM_PICK_THE_SAME_CEILING_OUT_OF_TWO(client, conn):
-    """▲ THE DRIFT-KILLER for the one query this projection COPIES.
+    """▲ THE PREFERENCE, pinned on both surfaces (belt-and-braces since the extraction landed).
 
-    `runs.projection.retry_availability` reads the ceiling a retry would ride with a query that is
-    byte-identical to `formula_draft_service.request_draft_for_candidate`'s — including its
-    preferences: only the AUTHORIZATION's expiry filters, the coupon's own uses and expiry do not,
-    and `ORDER BY e.approved_at DESC` breaks the tie. Copies do not stay identical on their own, and
-    nothing else in the suite notices a divergence: two approvals for one identity is the smallest
-    arrangement where the preference ORDER decides the answer, so it is the arrangement that
-    defends it. Flip the copy's DESC to ASC and this dies; every other test stays green.
-
-    The extraction of the shared read belongs to the substrate session (`formula_draft_service` is
-    not this session's to edit); until it lands, this test is what stands between the two copies.
+    `runs.projection.retry_availability` and `formula_draft_service.request_draft_for_candidate`
+    now read the ceiling a retry would ride through ONE shared locator
+    (`retirement_scope.approved_ceiling_for`), preferences and all: only the AUTHORIZATION's
+    expiry filters, the coupon's own uses and expiry do not, and `approved_at DESC` breaks the
+    tie. This test predates the extraction (it was the sole defender while the projection carried
+    a byte-identical COPY) and stays because it pins the OBSERVABLE agreement — two approvals for
+    one identity is the smallest arrangement where the preference ORDER decides the answer, so if
+    either side ever stops calling the shared locator or the locator's semantics move, this dies.
     """
     from featuregen.overlay.upload.llm_spend import remaining_spend, reserve_spend, settle_spend
 

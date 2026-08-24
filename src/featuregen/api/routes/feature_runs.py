@@ -347,16 +347,18 @@ def retry_run_authoring(run_id: str, body: RetryAuthoringIn, conn: _Conn,
     calls — and its typed refusals are re-raised here with the statuses that route already answers
     with.
 
-    ▲ **ONE KNOWN DIVERGENCE FROM THAT OTHER DOOR, STATED RATHER THAN CLAIMED AWAY.** This route
-    adds a PRE-FLIGHT the legacy door does not have: `retry_availability` refuses
-    `COST_AUTHORIZATION_EXHAUSTED` before the seam is called. The legacy door mints and CONSUMES
-    the coupon, because 1105 enforces spend per physical call at the DISPATCH seam and not at
-    request time — so a draft bought there against a spent ceiling dies at its first provider call
-    with the one-use approval already burnt. The divergence is deliberate and it runs in the
-    conservative direction: refusing protects the coupon, and the two doors agree on every other
-    refusal. It closes when the exhaustion check moves into the shared request seam (queued with
-    the substrate session, whose file this is); the correct behaviour is this one, so the gate
-    below does not soften in the meantime.
+    ▲ **THE EXHAUSTED-CEILING DIVERGENCE THIS PARAGRAPH ONCE STATED IS RETIRED.** The request
+    seam now refuses a mint whose approved ceiling cannot cover ONE per-call worst-case
+    reservation (`DraftCeilingExhausted` → 409 `COST_AUTHORIZATION_EXHAUSTED`) BEFORE consuming
+    the coupon — so both doors refuse the same case with the same code, and this route's
+    pre-flight is an advisory that agrees by construction: same locator
+    (`approved_ceiling_for`), same bar (the dispatch seam's own per-call arithmetic).
+
+    Two REPORTING differences remain, both reports rather than purchases and both in the
+    conservative direction: on a database without the 1103/1105 substrate this door degrades to
+    `RETRY_SUBSTRATE_ABSENT` where the legacy door would raise; and where a live draft holds the
+    identity this door answers 409 `RETRY_ATTEMPT_ALREADY_LIVE` where the legacy door answers
+    202 with `created: false`. Neither mints, consumes, or writes anything on either side.
 
     THE ORDER OF THE GATES, and why each is where it is:
 
