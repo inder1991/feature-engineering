@@ -358,6 +358,27 @@ describe('where the answer comes from', () => {
     expect(within(block).queryByRole('alert')).not.toBeInTheDocument()
   })
 
+  // T9: an unrecognised family used to fall back to FAMILY_WORDS.undecided, so a newer backend's
+  // family arrived under the heading "Nobody has decided this yet" AND the line "nothing is wrong
+  // with the data" — a positive assertion about data health manufactured by a missing map entry.
+  // The refusal's own `detail` is still the answer; the family line simply says nothing.
+  it('a family this screen has never heard of asserts nothing about the data', async () => {
+    planAnalysis.mockResolvedValue(response({
+      selection: selection({
+        resolved: false,
+        refusals: [{ code: 'SOME_NEWER_REFUSAL', subjects: ['ftr::dpl_eib.tran_repos'],
+                     subjects_withheld: 0, detail: 'the newer backend explained it here',
+                     family: 'awaiting_operator' }],
+      }) }))
+    await ask()
+    const block = await screen.findByRole('region', { name: /where this answer comes from/i })
+    // The server's own sentence still lands.
+    expect(within(block).getByText('the newer backend explained it here')).toBeInTheDocument()
+    // …and nothing is claimed on top of it.
+    expect(within(block).queryByText(/nobody has decided this yet/i)).toBeNull()
+    expect(within(block).queryByText(/nothing is wrong with the data/i)).toBeNull()
+  })
+
   it('separates a data check from a decision nobody has made', async () => {
     planAnalysis.mockResolvedValue(response({
       selection: selection({

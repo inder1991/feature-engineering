@@ -822,7 +822,12 @@ describe('SuggestedFeaturesScreen', () => {
     }, [NEEDS_VALIDATION]))
     renderScreen()
     expect(await screen.findByText(/7 features are blocked/i)).toBeInTheDocument()
-    expect(screen.getByText(/no confirmed as-of column/i)).toBeInTheDocument()
+    // T9: the server's own `explanation` for these rejections. It used to be replaced here by a
+    // paraphrase, AND these rejections are filtered out of "Not offered" below — so the sentence
+    // the backend wrote for them appeared nowhere on the page.
+    expect(screen.getByText(/future-leakage risk: no point-in-time column/))
+      .toBeInTheDocument()
+    // The named next action stays: it is this screen's own knowledge of where the control lives.
     expect(screen.getByText(/under as-of date/i)).toBeInTheDocument()
   })
 

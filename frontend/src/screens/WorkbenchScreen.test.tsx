@@ -482,12 +482,42 @@ describe('multiple sets', () => {
     expect(screen.getByRole('heading', { name: 'Proposed feature sets' })).toBeInTheDocument()
     // Exactly one Recommended chip, on the advisory pick.
     expect(screen.getAllByText('Recommended')).toHaveLength(1)
-    // Both cards carry the honest all-design-checked meta line.
-    expect(screen.getAllByText(/2 features · all design-checked/)).toHaveLength(2)
+    // The meta line counts what the SERVER stamped. This fixture's cards all read DESIGN-CHECKED.
+    expect(screen.getAllByText(/2 features · 2 design-checked/)).toHaveLength(2)
     // Advisory panel: the pick, the reasoning, and the backend caveat verbatim.
     expect(screen.getByText(/Engine's pick: Temporal\./)).toBeInTheDocument()
     expect(screen.getByText(/recency signals move earliest for a churn horizon/)).toBeInTheDocument()
     expect(screen.getByText(new RegExp(CAVEAT.slice(0, 40)))).toBeInTheDocument()
+  })
+
+  // T9 item 5. The set card said "all design-checked" unconditionally. Since T3 the server derives
+  // the stamp from the recipe's readiness as well as the gauntlet, and 3 of 317 registry recipes
+  // can earn it — so on a real round that clause is false for essentially every card in the set,
+  // and it sits directly above the per-card chips that say UNVERIFIED.
+  it('the set card counts the stamps the server gave, and claims none it did not', async () => {
+    await renderAndGenerateSets({
+      // The temporal set holds one stamped card and one UNVERIFIED; the ratio set holds neither.
+      sets: [
+        { lens: 'temporal', features: [TEMPORAL_ONLY, { ...SHARED, verification: 'UNVERIFIED' }] },
+        {
+          lens: 'ratio',
+          features: [
+            { ...RATIO_ONLY, verification: 'UNVERIFIED' },
+            { ...SHARED_RECIPE, verification: 'UNVERIFIED' },
+          ],
+        },
+      ],
+      recommendation: null,
+      rejections: [],
+    })
+    await screen.findByText('Temporal set')
+    const cards = document.querySelector('.sets') as HTMLElement
+    // One of the temporal set's two earned the stamp. The card says one, never "all".
+    expect(within(cards).getByText(/2 features · 1 design-checked/)).toBeInTheDocument()
+    expect(within(cards).queryByText(/all design-checked/)).toBeNull()
+    // The ratio set earned none, so it claims nothing at all rather than reporting a zero.
+    expect(within(cards).getByText(/^2 features$/)).toBeInTheDocument()
+    expect(within(cards).queryAllByText(/design-checked/)).toHaveLength(1)
   })
 
   it('opens on the recommended set and switches the detail list per card', async () => {
@@ -3913,9 +3943,10 @@ describe('Slice 2: the decision workspace', () => {
     expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
     expect(screen.getByText(/Showing 1 of 2 candidates in the Temporal set\./))
       .toBeInTheDocument()
-    // The SETS are untouched: a search is not a claim about the round.
-    expect(screen.getByText(/2 features · all design-checked/)).toBeInTheDocument()
-    expect(screen.getByText(/1 feature · all design-checked/)).toBeInTheDocument()
+    // The SETS are untouched: a search is not a claim about the round. (The counts are the
+    // server's stamps, tallied per set — this workspace fixture's cards all carry one.)
+    expect(screen.getByText(/2 features · 2 design-checked/)).toBeInTheDocument()
+    expect(screen.getByText(/1 feature · 1 design-checked/)).toBeInTheDocument()
     // and searching cannot reach into the set the human is not looking at.
     expect(screen.queryByText('debit_to_credit_ratio_30d')).toBeNull()
   })

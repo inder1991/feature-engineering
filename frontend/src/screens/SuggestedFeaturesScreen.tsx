@@ -335,8 +335,11 @@ export function SuggestedFeaturesScreen({
                 {noPointInTime.length} {noPointInTime.length === 1 ? 'feature is' : 'features are'}
                 {' '}blocked
               </strong>
-              : this table has no confirmed as-of column, so every windowed feature would risk
-              future leakage.
+              {/* THE SERVER'S OWN EXPLANATION FOR THESE REJECTIONS. It used to be replaced by a
+                  paraphrase here — and because these rejections are filtered out of "Not offered"
+                  below, the sentence the backend actually wrote for them appeared nowhere on the
+                  page. Taken from the first: they share a code, so they share an explanation. */}
+              : {noPointInTime[0].explanation}.
             </p>
             <p className="hint">
               Confirm the table’s as-of column on Governance review — it waits there under As-of
@@ -458,12 +461,12 @@ function SemanticEngineSection({ semantic }: { semantic: SuggestionSemanticBlock
           <h3>Could be useful if…</h3>
           <ul className="rows" aria-label="recipes needing a decision">
             {semantic.actionable.map(entry => (
-                <li key={entry.recipe_id}>
-                  <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
-                  <span className="badge stale">{entry.binding_state}</span>{' '}
-                  <EntryAction entry={entry} />
-                </li>
-              ))}
+              <li key={entry.recipe_id}>
+                <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
+                <span className="badge stale">{entry.binding_state}</span>{' '}
+                <EntryAction entry={entry} />
+              </li>
+            ))}
           </ul>
         </>
       )}

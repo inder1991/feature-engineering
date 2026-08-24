@@ -252,6 +252,12 @@ function windowLine(source: string, days: number | null): string {
   return 'Label window: no horizon stated, and none was read. Nothing is assumed.'
 }
 
+// How many of a set's cards the SERVER actually stamped DESIGN-CHECKED. Counted, never assumed:
+// the set card used to assert "all design-checked" over whatever it held.
+function designCheckedIn(candidates: GeneratedCandidate[]): number {
+  return candidates.filter(c => c.idea.verification === 'DESIGN-CHECKED').length
+}
+
 // The disposition lens, in render order: each final_disposition mapped to its human heading.
 const DISPOSITION_GROUPS: { key: RecipeDisposition['final_disposition']; heading: string }[] = [
   { key: 'eligible', heading: 'Recommended' },
@@ -3933,9 +3939,17 @@ export function WorkbenchScreen() {
                           </span>
                           <span className="set-name">{lensLabel(lens)} set</span>
                           {thesis !== undefined && <span className="set-thesis">{thesis}</span>}
+                          {/* THE CARD COUNTS WHAT THE SERVER STAMPED. This said "all
+                              design-checked" unconditionally; since T3 derived the stamp from the
+                              recipe's readiness (3 of 317 registry recipes can earn it) that
+                              clause was false for essentially every set — and it sat directly
+                              above per-card chips reading UNVERIFIED. Zero earned stamps claims
+                              nothing at all rather than reporting a zero nobody asked about. */}
                           <span className="set-meta tabular-nums">
-                            {feats.length} {feats.length === 1 ? 'feature' : 'features'} · all
-                            design-checked
+                            {feats.length} {feats.length === 1 ? 'feature' : 'features'}
+                            {designCheckedIn(feats) > 0
+                              ? ` · ${designCheckedIn(feats)} design-checked`
+                              : ''}
                             {inTray > 0 ? ` · ${inTray} in your tray` : ''}
                           </span>
                         </button>
