@@ -254,10 +254,15 @@ def test_the_needs_setup_lane_names_no_catalog_it_cannot_see(db):
 # ── T3 — the badge tells the corpus's truth ────────────────────────────────────────────────────
 
 def _clean_candidate(*, readiness: str, recipe_id: str = "recipe:proj_probe",
-                     origin_recipe=None):
+                     origin_recipe=None, registry_id: str = ""):
     """A candidate the typed gauntlet passes with NOTHING outstanding — one measure operand, a
     folded dataset story, a non-ratio output — so `verification` is decided by READINESS alone
-    and not by an incidental requirement."""
+    and not by an incidental requirement.
+
+    ``origin_recipe`` uses the REAL recipe's request (which brings its own requirements, so the
+    gauntlet lands on needs_external_validation); ``registry_id`` keeps the clean operand set
+    but points a recipe_v2-origin request at a real registry id, which is what makes "the
+    registry row is read" testable while the gauntlet still says design_checked."""
     from featuregen.overlay.upload.recipe_contract_v2 import OutputSpecV2
     from featuregen.overlay.upload.recipe_planning_lens import DatasetStoryV1
 
@@ -273,6 +278,20 @@ def _clean_candidate(*, readiness: str, recipe_id: str = "recipe:proj_probe",
         )
 
         request = planning_request_from_recipe(origin_recipe)
+    elif registry_id:
+        from featuregen.overlay.upload.feature_planning_contracts import (
+            FeaturePlanningRequestV1,
+        )
+        from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+        registered = v2_recipe_by_id(registry_id)
+        request = FeaturePlanningRequestV1(
+            origin="recipe_v2", source_definition_id=registry_id,
+            source_revision="1", source_content_hash=f"hash:{registry_id}",
+            primary_objective=registered.primary_objective, output=output,
+            operands=operands, source_grain="transaction", output_grain="customer",
+            temporal=EXEMPLAR.temporal, computation_kind="deterministic_formula",
+            formula=registered.formula)
     else:
         request = planning_request_from_user_definition(
             definition_id=recipe_id, primary_objective=EXEMPLAR.primary_objective,
@@ -333,16 +352,24 @@ def test_the_readiness_to_verification_map_is_total_and_never_promotes():
 
 def test_the_corpus_row_is_read_not_just_the_candidate_s_own_rung():
     """A candidate may carry any rung its lens folded; the REGISTRY's word about the recipe is
-    read too, so a fold that lost the blocker cannot re-mint the badge."""
+    read too, so a fold that lost the blocker cannot re-mint the badge.
+
+    The candidate is deliberately CLEAN (the gauntlet says design_checked) and its own rung is
+    the top of the ladder — so if the registry row were not read, this card would be stamped.
+    The first cut of this test used the real recipe's request, whose entity-key operand mints
+    an IDENTIFIER_UNIQUENESS requirement; it passed for that reason instead of this one, and a
+    mutation that stopped reading readiness entirely left it green."""
     from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 
     corpus_blocked = next(r for r in V2_RECIPES if r.readiness == "FORMULA_BLOCKED")
     spoofed = _clean_candidate(readiness="MATERIALIZATION_READY",
                                recipe_id=corpus_blocked.recipe_id,
-                               origin_recipe=corpus_blocked)
-    idea = _project([spoofed]).ideas[0]
+                               registry_id=corpus_blocked.recipe_id)
+    projection = _project([spoofed])
+    idea = projection.ideas[0]
     assert idea.recipe_id == corpus_blocked.recipe_id
-    assert idea.verification == "UNVERIFIED"
+    assert idea.validation_status == "DESIGN_CHECKED"   # the gauntlet really did pass it
+    assert idea.verification == "UNVERIFIED"            # and the registry still says no
 
 
 def test_every_blocked_recipe_in_the_corpus_maps_to_unverified():

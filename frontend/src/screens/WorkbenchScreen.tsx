@@ -3843,7 +3843,14 @@ export function WorkbenchScreen() {
                         )}
                         {c.kind === 'generated' && c.idea.verification
                           && c.idea.validation_status !== 'NEEDS_EXTERNAL_VALIDATION' && (
-                          <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
+                          /* The tone follows the STAMP. Since T2/T3 the server derives this
+                             from the recipe's readiness as well as the gauntlet, so a card can
+                             legitimately say UNVERIFIED — and a soft-ok chip over that word is
+                             the same confidence-without-warrant the stamp exists to remove. */
+                          <span className={c.idea.verification === 'UNVERIFIED'
+                            ? 'badge stale' : 'badge ok'}>
+                            {c.idea.verification.toLowerCase()}
+                          </span>
                         )}
                         {reviewNotCurrent && (
                           <span className="badge stale">review not current</span>
