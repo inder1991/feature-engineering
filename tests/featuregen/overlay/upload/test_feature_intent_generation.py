@@ -178,9 +178,55 @@ def test_a_recorded_misspelling_is_repaired_and_the_repair_is_recorded(db):
     result, _ = _run(db, {"intents": [recorded]})
     assert result.rejections == (), result.rejections
     assert result.intents[0].output.unit_kind == "duration_days"
-    assert result.normalizations == ({"index": 0, "field": "unit_kind", "from": "days",
+    assert result.normalizations == ({"index": 0, "field": "output.unit_kind", "from": "days",
                                       "to": "duration_days",
                                       "reason": "the governed spelling of this unit"},)
+
+
+def test_the_lens_hands_the_repairs_on_beside_the_rejections(db):
+    """The trace must LEAVE the seam. `llm_intent_candidates` is what gate1 and assist call, so
+    if the repairs stop here nobody downstream can ever say a served card's wording was edited.
+    Rendering it is T9's call; being ABLE to is this one's."""
+    from featuregen.overlay.upload.recipe_planning_lens import llm_intent_candidates
+
+    _seed(db)
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    recorded = _wire_intent(output={
+        "output_id": "tenure", "display_label": "Relationship tenure", "output_type": "numeric",
+        "additivity": "non_additive", "unit_kind": "days",
+        "null_input_policy": "unknown origination returns null",
+        "empty_population_policy": "no relationship history returns null",
+    }, operation_class="recency")
+    client = FakeLLM(script={
+        "overlay.feature.intents": FakeResponse(output={"intents": [recorded]})})
+    candidates, rejections, normalizations = llm_intent_candidates(
+        db, client, context=context, scope_leaves=SCOPE,
+        confirmed_scope_hash="scope-hash-test",
+        redacted_hypothesis="declining activity precedes dormancy")
+    assert rejections == [], rejections
+    assert len(candidates) == 1
+    assert [(n["index"], n["field"], n["from"], n["to"]) for n in normalizations] == [
+        (0, "output.unit_kind", "days", "duration_days")]
+
+
+def test_a_repair_is_logged_where_an_operator_watching_a_live_run_can_see_it(db, caplog):
+    """The trace on the result is for callers; this line is for whoever is reading logs while the
+    run happens. Both, because a repair nobody can see is a silent edit of the model's answer."""
+    import logging
+
+    recorded = _wire_intent(output={
+        "output_id": "tenure", "display_label": "Relationship tenure", "output_type": "numeric",
+        "additivity": "non_additive", "unit_kind": "days",
+        "null_input_policy": "unknown origination returns null",
+        "empty_population_policy": "no relationship history returns null",
+    }, operation_class="recency")
+    with caplog.at_level(logging.INFO,
+                         logger="featuregen.overlay.upload.feature_intent_generation"):
+        _run(db, {"intents": [recorded]})
+    logged = [r.getMessage() for r in caplog.records if "vocabulary repair" in r.getMessage()]
+    assert len(logged) == 1, logged
+    assert "output.unit_kind" in logged[0]
+    assert "'days'" in logged[0] and "'duration_days'" in logged[0]
 
 
 def test_a_vocabulary_gap_is_named_per_item_never_filed_as_malformed(db):

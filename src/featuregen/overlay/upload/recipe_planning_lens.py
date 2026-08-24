@@ -524,11 +524,17 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
     """SE-6 wire-up — LLM intents through the SAME engine as recipes: one audited structured
     call proposes ABSTRACT intents (concepts, operand classes, temporal contracts — never
     physical refs), each adapts to the neutral planning request, and the SHARED capability
-    binder decides WHICH columns serve. Returns (candidates, rejections): candidates in the
-    same V2RecipeCandidateV1 carrier the recipe lens emits, so assembly merges recipe/LLM
-    twins by semantic signature and the projection serves both origin-blind. Deterministic
-    intents project as conceptual_pattern ("formula pending") — the structural readiness
-    ceiling; no temporal PIT text is claimed (nothing was compiled from an authored recipe)."""
+    binder decides WHICH columns serve. Returns (candidates, rejections, normalizations):
+    candidates in the same V2RecipeCandidateV1 carrier the recipe lens emits, so assembly merges
+    recipe/LLM twins by semantic signature and the projection serves both origin-blind.
+    Deterministic intents project as conceptual_pattern ("formula pending") — the structural
+    readiness ceiling; no temporal PIT text is claimed (nothing was compiled from an authored
+    recipe).
+
+    ``normalizations`` rides beside ``rejections`` for the reason rejections do: the seam repaired
+    a served intent's vocabulary and the caller must be ABLE to say so. What a caller does with
+    it is the caller's (today: nothing renders it — that is T9's call, not a licence for the
+    generator to edit an answer invisibly)."""
     from featuregen.overlay.upload.feature_intent_generation import generate_feature_intents
     from featuregen.overlay.upload.feature_planning_contracts import (
         planning_request_from_feature_intent,
@@ -577,7 +583,7 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
             plan_refusals=iplan[1],
             display_definition=intent.business_definition,
             variant_key=request.source_definition_id))
-    return tuple(candidates), rejections
+    return tuple(candidates), rejections, [dict(n) for n in result.normalizations]
 
 
 __all__ = [

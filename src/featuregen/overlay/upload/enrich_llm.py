@@ -74,6 +74,18 @@ from featuregen.overlay.upload.enrich_batch import (
     BatchItemOutcome,
     validate_batch_results,
 )
+
+# A NEW module-import edge, deliberately: this pulls `recipe_contract_v2` — and through it
+# `formula.schema_v3` — into every import of this module, where neither was loaded before. It is
+# top-level rather than lazy because the `feature_intents` v2 body must exist in `_SCHEMAS` at
+# import time: `register_enrichment_schemas` sweeps the dict, and the provider-compatibility
+# ratchet (tests/featuregen/intake/test_schema_projection.py) iterates it directly, so a body
+# registered on first use would be SILENTLY skipped by the sweep meant to protect it. A
+# function-level import called from module scope would look lazy while changing nothing.
+# The bargain: a broken `recipe_contract_v2`/`schema_v3` now fails enrichment-schema registration
+# too. That is a widening, not a new class of exposure — this module already loads ten
+# `featuregen.formula.*` modules transitively — but it is the reason to keep this import narrow:
+# vocabularies only, never behaviour.
 from featuregen.overlay.upload.recipe_contract_v2 import (
     ADDITIVITY,
     CUTOFF_INCLUSIVITY,

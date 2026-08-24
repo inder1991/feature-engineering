@@ -972,7 +972,7 @@ def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_contex
     if client is None or semantic_context is None:
         return []
     try:
-        candidates, _rejections = llm_intent_candidates(
+        candidates, _rejections, _normalizations = llm_intent_candidates(
             conn, client, context=semantic_context,
             scope_leaves=_intent_scope_leaves(scope),
             actor=actor_envelope,
@@ -1181,6 +1181,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
         # the recipe's card, never a duplicate. Fail-soft: an intent-generation failure serves
         # the recipe lens alone (logged), because the engine's recipes never depend on a model.
         intent_rejections: list = []
+        # Vocabulary repairs the generation seam applied to intents that WERE served. Carried
+        # here beside the rejections so this gate CAN say a served card's wording was repaired;
+        # rendering it is T9's call. Empty on the fail-soft path, honestly.
+        intent_normalizations: list = []
         all_candidates = list(v2_candidates)
         if client is not None and semantic_context is not None:
             try:
@@ -1188,7 +1192,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                     llm_intent_candidates,
                 )
 
-                intent_cands, intent_rejections = llm_intent_candidates(
+                intent_cands, intent_rejections, intent_normalizations = llm_intent_candidates(
                     conn, client, context=semantic_context,
                     scope_leaves=_intent_scope_leaves(scope),
                     redacted_hypothesis=(

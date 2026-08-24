@@ -140,7 +140,9 @@ def _refine_as_intent_revision(conn, body, client, identity) -> dict:
     from featuregen.overlay.field_evidence import canonical_hash
     from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
 
-    candidates, rejections = llm_intent_candidates(
+    # `_normalizations`: vocabulary repairs applied to the revision that IS served. Available
+    # here on purpose (a repair nobody can see is a silent edit); rendering it is T9's.
+    candidates, rejections, _normalizations = llm_intent_candidates(
         conn, client, context=context, scope_leaves=selectable_leaves(),
         redacted_hypothesis=seed, actor=identity,
         confirmed_scope_hash=canonical_hash({"unscoped": True, "route": "refine"}))
