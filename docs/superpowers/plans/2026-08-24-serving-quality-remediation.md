@@ -101,6 +101,80 @@ Pin: the audit's exact arrangement (AML brief + catalog_source=cib) → typed re
 `param_alternatives` (already computed at :309-316) as a card control, never as sibling cards.
 Pin: the run's arrangement yields ≤ recipe-count cards.
 
+#### T5 OPERATOR CONSEQUENCES — the floor's third clause (written down 2026-08-24)
+
+**The floor took three measured cuts.** Its rationale, its numbers and its accepted costs live in
+`catalog_satisfiability.py`'s module docstring, which is the authority; the two facts an operator
+needs are here.
+
+* **A mis-aimed brief now 422s before the run is minted.** `CATALOG_CANNOT_SATISFY_SCOPE` names the
+  operand class, the eligible recipes that require it, the concepts the corpus asks for in it with
+  per-concept counts, and the catalogs that carry them. No run row, no scope row, no intent row, no
+  provider call — the same "leave no trace" law `SEMANTIC_REQUIRES_CATALOG_SOURCE` follows, and for
+  the same reason.
+* **▲ The refusal fires ONLY when it can give directions.** No pre-planning statistic separates a
+  mis-aimed catalog from a genuinely narrow one — measured, the audit's `cib` (5 columns, 1 of 15
+  eligible recipes structurally servable) and the four-objective coverage fixtures (6 columns, 1 of
+  17) are the same object by every number this seam can see. What separates them is whether another
+  readable catalog carries the missing concepts. Without that clause the four-objective journeys
+  were refused outright, losing the hero recipe each of them governs end to end. **Operator
+  consequence: a deployment whose whole estate lacks a concept is never refused for it** — the run
+  proceeds and T2's `needs_setup` lane reports the absence per card. That is deliberate, and it is
+  the reason the refusal is worded as directions rather than as a verdict on the catalog.
+
+#### T6 OPERATOR CONSEQUENCES — the third identity move (written down 2026-08-24)
+
+**▲ The collapse re-mints OPTION identity WITHOUT changing a single field on the card.**
+`gate1._candidate_identity` hashes `path` alongside the feature, and `path` is POSITIONAL
+(`alternative:<set>:<index>`, from `_option_positions`). Removing the siblings changes which
+candidates exist, so every survivor's INDEX moves — and `canonical_candidate_identity_hash` →
+`option_id` → `considered_content_hash` move with it, while `_idea_json` is byte-identical to what
+that same variant served before. This is a different mechanism from T2-T4's (which moved the FIELDS)
+and worth naming: **an ordering change is an identity change here.**
+
+Measured by execution at both ends of the task, same construction, whole engine lens on the v2bank
+fixture with a "90 days" hypothesis:
+
+| | position | identity hash |
+| --- | --- | --- |
+| `net_transaction_flow@window=90` before | 2 | `910f5dc6…` |
+| `net_transaction_flow@window=90` after | 0 | `6ae4bdb2…` |
+| `inflow_outflow_ratio@window=90` before | 5 | `2fc6c115…` |
+| `inflow_outflow_ratio@window=90` after | 1 | `809bdab2…` |
+
+Both values are pinned in `tests/featuregen/overlay/upload/test_recipe_planning_lens.py` with a
+do-not-just-paste docstring, so the next such edit must be a conscious act, and this note must be
+updated with it. The T2-T4 pin does NOT move: it constructs one candidate at a fixed
+`alternative:0:0`, so it measures the FIELDS and this one measures the ORDER.
+
+Consequences traced, and they are BENIGN for the same two reasons T2-T4's were — option ids are
+minted per generation run at revision-persist time and never span runs; every considered-revision
+check compares a STORED identity against the same stored identity, never against a recomputation.
+`considered_content_hash` moves for NEW runs only. Formula/authoring identity is untouched (no
+`_idea_json` field feeds `authoring_config_hash`).
+
+**Every consumer of the multi-variant stream, decided and measured** (v2bank fixture, 7 eligible
+recipes; candidates 21 → 7):
+
+| Consumer | Decision |
+| --- | --- |
+| Served lanes (`ideas` / `actionable_ideas`) | 6 → 2. One card per recipe; the siblings ride `param_alternatives` on it. **This is the task.** |
+| `needs_setup` (T2's lane) | 15 → 5 — **yes, one entry per recipe too.** On the audit's arrangement that is 45 → 15. The lane reports which CONCEPTS did not bind, and the binder chooses columns per role rather than per parameter, so the sibling entries were near-duplicates of one answer (see the C9 caveat in the row below for the one axis on which they can genuinely differ). |
+| Dispositions (`grounded_ids` / `rejected_ids`) | 2 → 2 and 5 → 5: **unchanged**, because both are keyed on `recipe_id`, never on `variant_key`. ▲ One real narrowing: a recipe's disposition is now its PRIMARY variant's, not a union over its parameterizations. The binder is variant-invariant except for C9's history-depth law (which reads `window_days`), so a recipe whose 30-day variant bound and whose 180-day variant did not now reports the 30-day answer alone. That is the answer belonging to the card that is served. |
+| Workbench SQL budget | **391 → 198 measured** (non-replay SELECTs 14 against the 40 ceiling). The per-candidate observation writes and the tie-break replay lookups both fall with the candidate count. `SQL_BUDGET` stays 600: it is a ceiling that exists to catch a per-candidate read coming back. |
+| `semantic_candidate_store` observations / option-decision rows | One per served candidate, so they fall with it. Nothing keyed on `variant_key` breaks: the surviving variant keeps its exact key. |
+| `_engine_recipe_contexts` (formula-shadow capture, private revision) | Its leading-variant fold is now trivially satisfied for the recipe lens. **Kept**, because it folds over every served idea including LLM intents, and its docstring now says so instead of describing B5. |
+| `suggestions.semantic_parity_block` (per-table page) | One entry per recipe instead of one per parameterization — the same collapse, on the surface that shares the lens by construction. |
+
+**The product-visible change, and its one honest limitation.** The 43-recipe AML arrangement can no
+longer produce 135 cards; it produces at most 43. Each surviving card names its alternatives
+(`param_alternatives`, e.g. `window: 30/[90]/180`). **Choosing a different one is not yet an
+action** — the primary is picked by the deterministic hypothesis token match, so an operator gets
+the 180-day variant by saying "180 days" in the hypothesis and re-running, not by clicking the
+control. Making that control actionable is a route+frontend change nobody has chartered; it is
+listed here rather than done, because inventing a parameter-override seam is a bigger decision than
+this task.
+
 ### T7 — Target intake honesty
 (a) abstain-by-default when no outcome-family concept exists — answer names the nearest proxies;
 (b) deterministic goal-text window extraction; a ticket whose `target_window_days` contradicts

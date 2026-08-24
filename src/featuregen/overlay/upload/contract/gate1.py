@@ -1017,15 +1017,18 @@ def _engine_recipe_contexts(
     freezes it, and nowhere else.
 
     ONE context per served RECIPE, at its LEADING variant. Both consuming maps are keyed by
-    ``recipe_id`` — the key the dispositions and the ranking use — while B5 serves one card per
-    authored parameterization, so a three-window recipe offers three candidates for one ranked row.
-    The leading variant is the answer: ``variant_primary`` is the deterministic hypothesis match
-    (or the authored-first default), i.e. the parameterization that fronts this recipe, which is
-    precisely what the retired legacy pass captured when ``choose_params`` picked one window per
-    template. Recording all three instead would resolve AMBIGUOUS and capture nothing — a
-    regression wearing a different reason code. The bindings are variant-INVARIANT (the binder
-    chooses columns per role, never per parameter), so only the captured window differs, and it
-    differs to the one the human is shown first.
+    ``recipe_id`` — the key the dispositions and the ranking use.
+
+    ▲ Since T6 (2026-08-24) the lens emits ONE candidate per recipe (its primary variant; the
+    siblings ride ``param_alternatives`` on the card), so for the recipe lens this fold is now
+    trivially satisfied — there is nothing to choose between. It is kept because the map is built
+    over EVERY served idea, recipe and LLM-intent alike, and nothing guarantees the intent lens
+    will never propose two candidates that assemble onto one recipe id; the fold is what makes
+    that arrive as "the leading one wins" rather than "whichever came last". Under B5, which
+    served one card per authored parameterization, it was doing real work: a three-window recipe
+    offered three candidates for one ranked row, and recording all three would have resolved
+    AMBIGUOUS and captured nothing. The bindings are variant-INVARIANT either way (the binder
+    chooses columns per role, never per parameter), so only the captured window ever differed.
 
     The logical refs come from the frozen context's own index (schema-preserving, exactly as
     ``logical_ref_of`` rebuilds them), so no per-binding query is issued.
@@ -1284,6 +1287,12 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
         # `rejections` — a rejection says "this candidate is wrong"; this says "this catalog
         # does not carry what the candidate needs", which has a different remedy and a
         # different owner.
+        #
+        # T6: and it is now ONE entry per recipe, like the served lanes, because the lens emits
+        # one candidate per recipe. It was one per authored parameterization — measured on the
+        # audit's arrangement, 15 eligible AML recipes produced 45 setup entries. The lane reports
+        # which CONCEPTS did not bind, and the binder chooses columns per role rather than per
+        # parameter, so those were near-duplicates of one answer rather than 45 pieces of work.
         needs_setup = projection.needs_setup
         engine_served = True
         logger.info(

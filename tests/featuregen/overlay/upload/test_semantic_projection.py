@@ -331,9 +331,21 @@ def test_each_status_earns_its_own_sentence_and_only_absence_may_claim_absence()
     silent = _unbound("")
     assert silent.sentence() == (
         "the binder returned no verdict for the 'who' operand (customer_id)")
-    # Not one of the four may be mistaken for another, and none of them invents a catalog.
-    said = {o.sentence() for o in (absent, tied, blocked, silent)}
-    assert len(said) == 4
+
+    # ▲ THE FOURTH VERDICT STATUS, added 2026-08-24 as a FORWARD GUARD — hardening, not a bug
+    # fixed: nothing reaches it on today's binder. The absence sentence used to be the
+    # FALL-THROUGH, so any status outside ""/ambiguous/blocked claimed absence — and
+    # `unbound_required_operands` admits a `bound` verdict with no `selected_ref`, which is
+    # exactly that shape. It would have said "no read-scoped column carries customer_id" over a
+    # verdict the binder had called BOUND.
+    contradictory = _unbound("bound")             # bound, no selected_ref: unbound by definition
+    assert contradictory.sentence() == (
+        "the binder reported 'bound' with no column selected for the 'who' operand (customer_id)")
+    assert "no read-scoped column" not in contradictory.sentence()
+
+    # Not one of the five may be mistaken for another, and none of them invents a catalog.
+    said = {o.sentence() for o in (absent, tied, blocked, silent, contradictory)}
+    assert len(said) == 5
     assert not any("ftr" in sentence for sentence in said)
 
 

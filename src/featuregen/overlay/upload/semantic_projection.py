@@ -153,8 +153,18 @@ class UnboundOperandV1:
             return (f"{concept} is carried by {listed} and the binding is blocked ({codes})"
                     if self.tied_refs else
                     f"{concept} matched and the binding is blocked ({codes})")
-        # `unresolved` — the ONE condition that is genuinely an absence.
-        return f"no read-scoped column carries {concept}"
+        if self.status == "unresolved":
+            # The ONE condition that is genuinely an absence, and the only one allowed to say so.
+            return f"no read-scoped column carries {concept}"
+        # T6's rider (hardening, not a bug fixed — nothing reaches this today). The absence
+        # sentence above used to be the FALL-THROUGH, so any status outside ""/ambiguous/blocked
+        # claimed absence. `unbound_required_operands` admits a `bound` verdict carrying no
+        # `selected_ref` — that is its definition of unbound — and such a verdict would have been
+        # reported as "no read-scoped column carries X" while the binder had, in its own words,
+        # BOUND the operand. The four verdict statuses are closed today and all four are handled
+        # above; a fifth would arrive here and say only what this seam can support.
+        return (f"the binder reported {self.status!r} with no column selected for the "
+                f"{self.role!r} operand ({concept})")
 
 
 @dataclass(frozen=True, slots=True)

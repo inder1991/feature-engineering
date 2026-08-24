@@ -404,10 +404,12 @@ def test_a_full_unscoped_run_is_two_queries_with_a_prebuilt_context(db):
             context=context)
     finally:
         db.execute = original
-    # B5: one candidate per authored VARIANT (~940) — and the query count is STILL a
-    # constant 3 (capability evidence + C1's revalidation read + review_events_all):
-    # variant expansion multiplies folds, never reads (the whole point of B6-before-B5).
-    assert len(candidates) > len(V2_RECIPES)
+    # T6: ONE candidate per recipe — exactly 317, the primary variant of each. (Under B5 this was
+    # one per authored VARIANT, ~940; the siblings now ride `param_alternatives` on the card.) The
+    # query count is unmoved at a constant 3 (capability evidence + C1's revalidation read +
+    # review_events_all), which is the point of this pin and the reason collapsing candidates
+    # could never have been a way to buy queries back: there were none to buy.
+    assert len(candidates) == len(V2_RECIPES)
     assert len({c.recipe_id for c in candidates}) == len(V2_RECIPES)
     assert len(calls) == 3, calls
 
@@ -440,21 +442,103 @@ def test_the_batched_fold_is_byte_identical_to_the_per_request_path(db):
 # ── B5: parameter variants — enumerated, hypothesis-matched, honestly labeled ───────────────────
 
 def test_a_90_day_hypothesis_leads_with_the_90_day_variant(db):
-    """GEN-03 closed: the exemplar authors window ∈ (30, 90, 180). A hypothesis naming
-    "90 days" makes the 90-day variant PRIMARY (deterministic token match, no LLM); all three
-    variants exist as distinct candidates with distinct keys and hashes; the card names its
-    alternatives with the chosen value bracketed."""
+    """GEN-03 closed: the exemplar authors window ∈ (30, 90, 180). A hypothesis naming "90 days"
+    makes the 90-day variant PRIMARY — a deterministic token match, no LLM.
+
+    T6 (2026-08-24) narrowed WHICH variants survive, never HOW the primary is chosen: the search
+    over the authored combinations is unchanged, only the losers stop being minted. So this test
+    keeps its subject and asserts the choice, and the parameter values are still IDENTITY — the
+    hash below differs from the authored-first variant's, which is what makes "the hypothesis
+    chose this one" a fact about the request and not a label on it."""
     _catalog(db)
     candidates = v2_recipe_candidates(
         db, catalog_source=SOURCE, scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
         redacted_hypothesis="balances decline over 90 days before churn")
-    block = [c for c in candidates if c.recipe_id == EXEMPLAR.recipe_id]
-    assert len(block) == 3
-    primary = next(c for c in block if c.variant_primary)
+    (primary,) = [c for c in candidates if c.recipe_id == EXEMPLAR.recipe_id]
     assert dict(primary.planning_request.parameter_values)["window"] == 90
     assert primary.variant_key == f"{EXEMPLAR.recipe_id}@window=90"
     assert "30/[90]/180" in primary.param_alternatives
-    assert len({c.planning_request_hash for c in block}) == 3   # variants are IDENTITY
+
+    default = v2_recipe_candidates(
+        db, catalog_source=SOURCE, scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
+        redacted_hypothesis="balances decline before churn")
+    (authored_first,) = [c for c in default if c.recipe_id == EXEMPLAR.recipe_id]
+    assert dict(authored_first.planning_request.parameter_values)["window"] == 30
+    assert authored_first.planning_request_hash != primary.planning_request_hash
+
+
+def test_one_card_per_recipe_and_the_siblings_ride_it(db):
+    """T6 — VARIANT COLLAPSE. The exemplar authors window ∈ (30, 90, 180) and used to become three
+    candidates: three cards, three option ids, three decision rows, three rows in every store —
+    for one feature parameterized three ways. The live AML run turned 43 eligible recipes into 135
+    cards that way, and `transaction_amount_percentile` alone contributed 9.
+
+    The lens now assembles the PRIMARY variant only. The siblings are not lost and were never
+    computed twice: `param_alternatives` was already rendering the whole axis with the chosen value
+    bracketed, and it rides the one card as a control."""
+    _catalog(db)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE, scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
+        redacted_hypothesis="balances decline over 90 days before churn")
+
+    block = [c for c in candidates if c.recipe_id == EXEMPLAR.recipe_id]
+    assert len(block) == 1, "one recipe, one candidate — the siblings ride the card"
+    (only,) = block
+    assert only.variant_primary is True
+    assert dict(only.planning_request.parameter_values)["window"] == 90   # the hypothesis's
+    assert only.variant_key == f"{EXEMPLAR.recipe_id}@window=90"
+    assert only.param_alternatives == "window: 30/[90]/180"               # all three, chosen boxed
+
+    # And the whole run: never more candidates than eligible recipes — the 43→135 shape, closed.
+    eligible = v2_applicability(
+        ConfirmedScope(primary=EXEMPLAR.primary_objective)).eligible_ids
+    assert len(candidates) == len(eligible)
+    assert len({c.recipe_id for c in candidates}) == len(candidates)
+
+
+def test_the_collapse_moved_option_identity_and_that_was_a_conscious_act(db):
+    """▲ T6's IDENTITY MOVE — the third in this programme, and the first that moves a hash without
+    changing a single field on the card it belongs to.
+
+    ``gate1._candidate_identity`` hashes ``path`` alongside the feature, and ``path`` is POSITIONAL
+    (``alternative:<set>:<index>``, from ``_option_positions``). Collapsing the siblings changes
+    which candidates exist, so every survivor's INDEX moves — and its
+    ``canonical_candidate_identity_hash`` → ``option_id`` → ``considered_content_hash`` with it,
+    while ``_idea_json`` is byte-identical to what the same variant served before.
+
+    Measured by execution at both ends of this task on this fixture, same construction — the whole
+    engine lens, not a hand-built candidate, because the position IS the thing under test:
+
+        net_transaction_flow@window=90   pos 2 -> 0   910f5dc6… -> 6ae4bdb2…
+        inflow_outflow_ratio@window=90   pos 5 -> 1   2fc6c115… -> 809bdab2…
+
+    ▲ DO NOT JUST PASTE A NEW VALUE. If this fails, either a card field changed (see
+    ``test_the_card_edit_moved_option_identity_and_that_was_a_conscious_act``) or the lens's
+    ORDER/MEMBERSHIP changed. Decide which, trace what it moves, write it into the plan doc's T6
+    OPERATOR CONSEQUENCES section as this change did, and only then update the literal.
+    """
+    from featuregen.overlay.field_evidence import canonical_hash
+    from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+    from featuregen.overlay.upload.contract.gate1 import _candidate_identity
+    from featuregen.overlay.upload.semantic_projection import project_assembled_set
+
+    _catalog(db)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE, scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
+        redacted_hypothesis="money moves over 90 days")
+    projection = project_assembled_set(
+        assemble_candidates(list(candidates)), catalog_source=SOURCE)
+
+    served = [idea.source_definition_id for idea in projection.ideas]
+    assert served == [f"{EXEMPLAR.recipe_id}@window=90", "inflow_outflow_ratio@window=90"], (
+        "the served set is the primary variant of each recipe, in the assembly's order")
+    identities = [
+        canonical_hash(_candidate_identity(path=f"alternative:0:{index}", source="alternative",
+                                           lens="engine", feature=idea))
+        for index, idea in enumerate(projection.ideas)]
+    assert identities == [
+        "6ae4bdb2e9857fc09273f5d19a6def4109eb749615469afc31cac5237bb715e8",
+        "809bdab28c761766767bcbd7231fa06530b1190fcfe6edfec217260922e61c35"]
 
 
 def test_no_window_token_leads_with_the_authored_first_value(db):

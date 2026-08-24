@@ -201,10 +201,28 @@ def _variant_axes(recipe):
 
 
 def _enumerate_variant_requests(ordered, redacted_hypothesis: str):
-    """B5 (GEN-03 closed): every authored parameterization is its OWN planning request —
-    bounded by the registry's authoring (≈940 total). The PRIMARY variant per recipe is the
-    deterministic hypothesis match (a "90 day" hypothesis leads with the 90-day variant) or
-    the authored-first values when nothing matches. Binding cost is folds, not queries (B6)."""
+    """T6 — ONE planning request per recipe: the PRIMARY variant, chosen exactly as B5 chose it
+    (the deterministic hypothesis match — a "90 day" hypothesis leads with the 90-day variant —
+    or the authored-first values when nothing matches).
+
+    B5 (GEN-03) made every authored parameterization its own candidate, ≈940 across the registry,
+    and the 2026-08-24 audit measured what that costs a human: 43 eligible recipes became 135
+    cards, ``transaction_amount_percentile`` alone contributing 9, and the SME kept 0 of them.
+    Three cards differing only in a window are not three offers — they are one offer with a dial,
+    and the dial was ALREADY being computed and rendered: ``_param_alternatives_text`` writes the
+    whole axis with the chosen value bracketed, and rides the surviving card as
+    ``param_alternatives``. So this stops MINTING the siblings; it does not stop showing them.
+
+    The combination is still enumerated, because the hypothesis match is a search over it, and the
+    ordering of that search decides which variant is primary. What changed is that only the winner
+    leaves. ``variant_primary`` is therefore True for every candidate the lens now emits — kept on
+    the carrier because it is what a reader checks to know a card is not a sibling, and it must
+    stay TRUE rather than quietly disappear.
+
+    ▲ The primary's own identity does not move. Same recipe, same chosen combo, same
+    ``planning_request_hash`` and ``variant_key`` as before; what changes is which candidates
+    EXIST. See the T6 OPERATOR CONSEQUENCES section of
+    ``docs/superpowers/plans/2026-08-24-serving-quality-remediation.md``."""
     from itertools import product
 
     tokens = _hypothesis_window_tokens(redacted_hypothesis)
@@ -221,9 +239,8 @@ def _enumerate_variant_requests(ordered, redacted_hypothesis: str):
             if any(isinstance(v, int) and v in tokens for v in combo.values()):
                 primary = combo
                 break
-        for combo in combos:
-            out.append((recipe, planning_request_from_recipe(recipe, parameter_values=combo),
-                        combo, combo == primary))
+        out.append((recipe, planning_request_from_recipe(recipe, parameter_values=primary),
+                    primary, True))
     return out
 
 

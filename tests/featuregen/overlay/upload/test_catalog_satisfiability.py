@@ -223,6 +223,27 @@ def test_a_class_below_the_majority_never_refuses(db):
     assert verdict.satisfied is True
 
 
+def test_an_exact_tie_serves_rather_than_refuses(db):
+    """▲ SENTENCE 4, at the one arrangement that can prove it. ``customer.clv`` has 5 eligible
+    recipes (floor 2) and EXACTLY 2 of them — ``direct_service_cost`` and ``relationship_revenue``
+    — require a ``measure``, all of it ``monetary_flow``, which cib lacks and ftr carries. So every
+    other clause of the floor is satisfied and only the comparison decides: strictly-more-than-half
+    serves, at-least-half refuses.
+
+    Pinned because the fail-open direction is a decision, not an accident: T2 already guarantees no
+    unbindable candidate becomes a card, so refusing here withholds work rather than preventing
+    junk. Relaxing ``>`` to ``>=`` in ``assess_catalog_satisfiability`` fails this test and nothing
+    else in the T5 scope, which is exactly why it exists."""
+    _cib(db)
+    _ftr(db)
+    verdict = assess_catalog_satisfiability(
+        db, catalog_source=CIB, scope=ConfirmedScope(primary="customer.clv"))
+    assert verdict.eligible_recipes == 5
+    assert verdict.majority_floor == 2
+    assert verdict.satisfied is True, (
+        "a class required by exactly half the eligible recipes is a tie, and a tie serves")
+
+
 def test_closure_coverage_counts_as_coverage(db):
     """The local test is deliberately GENEROUS — it is the binder's own retrieval law, so a
     catalog is refused only for a class the binder could not even have looked at a column for. A
@@ -242,9 +263,21 @@ def test_closure_coverage_counts_as_coverage(db):
         (CanonicalRow(CIB, "customer", "flow_like", "numeric", additivity="additive",
                       currency="USD"), reaching),
     ])
-    verdict = assess_catalog_satisfiability(
-        db, catalog_source=CIB, scope=ConfirmedScope(primary=AML))
-    assert "measure" not in {c.operand_class for c in verdict.unsatisfiable}
+    # ftr must exist, or sentence 5 would drop the class for want of directions and this test
+    # would pass whatever `_covered` did — the coverage law has to be the thing being measured.
+    _ftr(db)
+    assert assess_catalog_satisfiability(
+        db, catalog_source=CIB, scope=ConfirmedScope(primary=AML)).satisfied is True
+    # And the control: the SAME catalog with a concept whose closure does NOT reach the operand's
+    # is refused, so the pass above is the widening and not the fixture.
+    _build(db, "narrow", [
+        (CanonicalRow("narrow", "customer", "cust_num", "integer", is_grain=True,
+                      entity="Customer"), "customer_id"),
+        (CanonicalRow("narrow", "customer", "consent_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow("narrow", "customer", "segment_code", "text"), "category_code"),
+    ])
+    assert assess_catalog_satisfiability(
+        db, catalog_source="narrow", scope=ConfirmedScope(primary=AML)).satisfied is False
 
 
 def test_an_empty_eligible_set_is_a_scope_problem_not_a_catalog_one(db):
