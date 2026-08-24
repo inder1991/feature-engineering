@@ -174,6 +174,13 @@ class ConsideredSet:
     # from the candidate that folded it to the formula-shadow work item that freezes it, so the
     # plan the human was shown is the plan compilation will be held to.
     binding_plan_by_candidate_key: dict[str, dict] = field(default_factory=dict)
+    # T2: the candidates the engine held OUT of every served lane because a REQUIRED operand
+    # never bound, each naming the concepts this catalog would have to carry
+    # (`semantic_projection.NeedsSetupCandidateV1`). In memory only, for the same reason the
+    # plan envelope above is: a needs-setup entry mints no option and carries no computation, so
+    # serializing it into the considered revision would move `considered_content_hash` for
+    # essentially every run without a governed artifact behind the move.
+    needs_setup: tuple = ()
     option_ids_by_path: dict[str, str] = field(default_factory=dict)
     # A1b: per-served-definition frozen facts captured at the semantic branch, written as
     # immutable semantic_option_decision rows once option ids mint at revision-persist time.
@@ -1153,6 +1160,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
     recipe_candidate_keys_by_recipe_id: dict[str, tuple[str, ...]] = {}
     binding_plan_by_candidate_key: dict[str, dict] = {}
     semantic_decision_facts: dict[str, dict] = {}
+    needs_setup: tuple = ()               # T2's lane (empty on a no-catalog run, honestly)
     # S1B-3: the engine arm's own inputs to the telemetry work item. `engine_served` is what gates
     # the enqueue — telemetry describes what the ONE engine did, and no other arm runs it.
     engine_served = False
@@ -1272,10 +1280,16 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
             alternatives.append(FeatureSet(lens="actionable",
                                            features=projection.actionable_ideas))
         rejections.extend(projection.rejections)
+        # T2: the candidates that never became cards, kept BY NAME. Not folded into
+        # `rejections` — a rejection says "this candidate is wrong"; this says "this catalog
+        # does not carry what the candidate needs", which has a different remedy and a
+        # different owner.
+        needs_setup = projection.needs_setup
         engine_served = True
         logger.info(
-            "engine served: ideas=%d rejections=%d grounded=%s",
-            len(projection.ideas), len(projection.rejections),
+            "engine served: ideas=%d actionable=%d needs_setup=%d rejections=%d grounded=%s",
+            len(projection.ideas), len(projection.actionable_ideas),
+            len(projection.needs_setup), len(projection.rejections),
             ",".join(sorted(projection.grounded_ids)) or "-")
     elif catalog_source is not None:
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
@@ -1402,6 +1416,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                        ),
                        recipe_candidate_keys_by_recipe_id=recipe_candidate_keys_by_recipe_id,
                        binding_plan_by_candidate_key=binding_plan_by_candidate_key,
+                       needs_setup=needs_setup,
                        semantic_decision_facts_by_definition_id=semantic_decision_facts)
     logger.info("considered-set built: intent=%s catalog=%s roles=%s → lenses=%s, %d rejected, "
                 "anchor=%s, recommended_lens=%s",
