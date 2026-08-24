@@ -34,6 +34,11 @@ SOURCE = "budget_cib"
 #: distinct meanings), ~60 idempotent registry upserts, and ~20 fixed reads (the B6/C1
 #: batched compile: capability evidence + revalidations + reviews + licences, constant in
 #: candidate count).
+#: T2 (2026-08-24) moved that composition DOWN, to 391 measured on this fixture: no candidate
+#: on the cib shape binds all of its required operands, so no option id and no decision row is
+#: minted for one. The budget is a ceiling and is deliberately NOT lowered to match — it exists
+#: to catch a per-candidate read coming back, and a catalog that does serve cards must still
+#: fit under it.
 SQL_BUDGET = 600
 PROVIDER_CALL_BUDGET = 2
 LATENCY_BUDGET_SECONDS = 20.0
@@ -109,7 +114,14 @@ def test_the_considered_set_stays_inside_its_budgets(make_client, conn, monkeypa
     elapsed = time.monotonic() - started
     assert res.status_code == 200, res.text
     body = res.json()
-    assert body["alternatives"], "the engine served candidates on the CIB-sized shape"
+    # T2: this fixture rebuilds the LIVE cib shape, and on that shape no candidate binds all
+    # of its required operands — which is the finding the 2026-08-24 audit made against the
+    # real thing (135 cards served, SME-keep 0/135). So "the engine served candidates" is not
+    # the guard any more; it was the defect, asserted. The guard that keeps the budgets below
+    # non-vacuous is that the engine DID the work and answered for every candidate it saw.
+    assert body["needs_setup"], "the engine answered on the CIB-sized shape"
+    assert not body["alternatives"], (
+        "nothing on this catalog can compute — a card here would be the audited defect")
 
     provider_calls = sum(fake._calls.values())
     assert provider_calls <= PROVIDER_CALL_BUDGET, (

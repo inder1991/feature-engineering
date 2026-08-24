@@ -1222,6 +1222,34 @@ describe('verification stamp and rationale', () => {
     expect(screen.getAllByText(/structurally safe against leakage/i)).toHaveLength(1)
   })
 
+  it('renders an UNVERIFIED stamp quietly and drops the design-checked help line', async () => {
+    // T3: the server now derives `verification` from the recipe's READINESS as well as the
+    // gauntlet's verdict, so a generated card legitimately arrives UNVERIFIED (on today's
+    // registry, 3 of 317 recipes can earn DESIGN-CHECKED — so this is the common case).
+    // Two things must follow, and neither did before: the chip must not be the soft-OK tone
+    // that reads as a pass, and the page-level sentence explaining DESIGN-CHECKED must not
+    // appear over a list where no card wears it.
+    const unverified: api.FeatureIdea = { ...IDEA, verification: 'UNVERIFIED' }
+    await renderAndGenerate([unverified])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    const chip = screen.getByText('unverified')
+    expect(chip).toBeInTheDocument()
+    expect(chip.className).toContain('stale')
+    expect(chip.className).not.toContain('ok')
+    expect(screen.queryByText(/structurally safe against leakage/i)).not.toBeInTheDocument()
+  })
+
+  it('keeps the design-checked help line when at least one card still earns the stamp',
+    async () => {
+      const unverified: api.FeatureIdea = { ...OTHER_IDEA, verification: 'UNVERIFIED' }
+      await renderAndGenerate([IDEA, unverified])
+      expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+      expect(screen.getAllByText('design-checked')).toHaveLength(1)
+      expect(screen.getAllByText('unverified')).toHaveLength(1)
+      // Scoped, not suppressed: the sentence explains the stamp that IS present.
+      expect(screen.getAllByText(/structurally safe against leakage/i)).toHaveLength(1)
+    })
+
   it('never stamps drafts and hides the help line on a drafts-only list', async () => {
     // renderAndDraft never generates, so no candidate passed the gauntlet.
     await renderAndDraft()

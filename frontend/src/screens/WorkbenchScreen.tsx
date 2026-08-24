@@ -1498,6 +1498,14 @@ export function WorkbenchScreen() {
   // Only generated candidates pass the design gauntlet, so the design-checked explanation
   // appears only when the list holds at least one generated candidate.
   const hasGenerated = (generated?.length ?? 0) > 0
+  // …and only while one of them actually WEARS that stamp. Since T3 the server derives
+  // `verification` from the recipe's readiness as well as the gauntlet's verdict, so a
+  // generated card legitimately reads UNVERIFIED — and on today's registry that is almost all
+  // of them (3 of 317 recipes can earn DESIGN-CHECKED). Gating the sentence on "there are
+  // candidates" would leave the page explaining a badge none of its cards carry, which is the
+  // page-level version of the badge lie T3 removed from the cards.
+  const hasDesignChecked = (generated ?? []).some(
+    c => c.idea.verification === 'DESIGN-CHECKED')
   // Selection is the intersection of the map and the live candidate list: keys from cleared
   // rounds are inert, and registered candidates can never re-enter a batch.
   const selectedCandidates = allCandidates.filter(
@@ -3479,7 +3487,7 @@ export function WorkbenchScreen() {
               <strong style={{ color: 'var(--ink)' }}>
                 Nothing below enters the catalog without your approval.
               </strong>
-              {hasGenerated &&
+              {hasDesignChecked &&
                 ' Design-checked: structurally safe against leakage, staleness, and double-counting. Predictive value is proven later by backtests.'}
             </p>
             {screenedTarget && (
@@ -3843,7 +3851,14 @@ export function WorkbenchScreen() {
                         )}
                         {c.kind === 'generated' && c.idea.verification
                           && c.idea.validation_status !== 'NEEDS_EXTERNAL_VALIDATION' && (
-                          <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
+                          /* The tone follows the STAMP. Since T2/T3 the server derives this
+                             from the recipe's readiness as well as the gauntlet, so a card can
+                             legitimately say UNVERIFIED — and a soft-ok chip over that word is
+                             the same confidence-without-warrant the stamp exists to remove. */
+                          <span className={c.idea.verification === 'UNVERIFIED'
+                            ? 'badge stale' : 'badge ok'}>
+                            {c.idea.verification.toLowerCase()}
+                          </span>
                         )}
                         {reviewNotCurrent && (
                           <span className="badge stale">review not current</span>

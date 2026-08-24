@@ -44,6 +44,52 @@ populated) + `decision_context`; `aggregation` derived from `formula.result_clas
 `operation_kind`. Never read `conceptual_reason` (0/43, forbidden on executables).
 Pin: a served card carries non-empty rationale byte-derived from the recipe.
 
+#### T2-T4 OPERATOR CONSEQUENCES — the second identity move (written down 2026-08-24, post-review)
+
+**▲ The card edit re-mints OPTION identity.** Every field on a served card rides
+`gate1._idea_json` into `canonical_candidate_identity_hash` → `option_id` →
+`considered_content_hash`. T2/T3/T4 change four of them (`verification`, `aggregation`,
+`rationale`, `operation_kind`, plus the typed operand refs), so the hash moves for **every
+engine-served card**. Measured by execution at both ends of the task, same construction, for
+`net_transaction_flow`:
+
+| | identity hash | verification | aggregation | rationale |
+| --- | --- | --- | --- | --- |
+| parent `d27cae66` | `85bdaca3…` | `DESIGN-CHECKED` | `None` | *(empty)* |
+| after T2-T4 | `dffc17d1…` | `UNVERIFIED` | `sum` | the business definition |
+
+The value is pinned in `tests/featuregen/overlay/upload/test_semantic_projection.py` with a
+do-not-just-paste docstring, so the next such edit must be a conscious act, and this note must be
+updated with it.
+
+Consequences traced, and they are BENIGN — unlike T11's, which re-minted AUTHORING identity:
+
+| Surface | Consequence |
+| --- | --- |
+| Option ids | Minted per generation run at revision-persist time; they never span runs, so nothing in flight is invalidated. |
+| Considered-revision verification | Every check compares a STORED identity against the same stored identity (revision → its own options map), never against a recomputation, so old revisions keep verifying. |
+| `considered_content_hash` | Moves for NEW runs only. It addresses the revision it was minted with; no reader recomputes it for an old one. |
+| Formula/authoring identity | **Untouched.** No `_idea_json` field feeds `authoring_config_hash` — that chain runs off the planning request and the provider contract. |
+| Sealed shadow work items / coupons / tombstones | Untouched, same reason. |
+
+**The product-visible change is the point, and it is large.** `DESIGN-CHECKED` is now reachable
+for exactly **3 of 317** registry recipes (the three the registry marks `FORMULA_AUTHORABLE`), so
+essentially every engine card now reads `UNVERIFIED` — 12 of 12 on the enriched bank fixture. That
+is the audit's finding rendered honestly, not a regression: the 132 `DESIGN-CHECKED` badges over
+`FORMULA_BLOCKED` recipes were the defect. **The badge moves back on its own** the moment a recipe
+earns a reviewed formula expectation; nothing here needs re-running to restore it.
+
+**Two further consequences worth an owner's eye:**
+* **A3's saveable-undecided-option lane no longer exists in practice.** Every candidate that used
+  to populate it had an unbound REQUIRED operand, so `actionable_ideas` now holds only the
+  bound-but-planless (UOA-mismatch) case. Undecided work is still visible — as `needs_setup` — but
+  it is no longer *save_idea*-able, because it mints no option id.
+* **The A6 readiness literal is re-admitted as a second opinion.** `card_verification` reads the
+  registry's authored `readiness` alongside the lens's fold. A6's law is that the fold is the
+  answer and the literal is an assertion the fold must not contradict; reading both here is a
+  DEFENCE AGAINST A FOLD BUG (weakest-wins can only withhold a badge, never grant one), not a
+  restoration of the literal's authority.
+
 ### T5 — Catalog satisfiability: refuse with directions, never serve junk
 Before planning: intersect eligible recipes' required concepts with the context's concept index.
 Below a floor (e.g. zero `monetary_flow` against amount-requiring recipes), a typed refusal that

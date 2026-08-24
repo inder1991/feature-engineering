@@ -987,6 +987,12 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         response["recommended_options"] = recommended
         response["actionable_options"] = actionable
         response["rejected_outputs"] = cs.rejections
+        # T2: the fourth outcome, which the response could not previously express. A candidate
+        # whose REQUIRED operands did not bind is not recommended, not actionable and not
+        # rejected — it is work on the CATALOG, and it mints no option id because there is no
+        # option to mint. Emitted here rather than left in memory because the alternative is
+        # the failure this program exists to remove: a shorter list with no reason given.
+        response["needs_setup"] = [entry.to_json() for entry in cs.needs_setup]
     # 9. Phase-2A: deterministic presentation-priority ranking over the PRECOMPUTED rankable set. The
     # rankable set (the ONLY FinalDisposition read) is decided first; the ranker then orders it, staying
     # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering
