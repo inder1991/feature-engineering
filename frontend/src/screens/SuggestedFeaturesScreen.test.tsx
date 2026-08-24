@@ -807,28 +807,83 @@ describe('SuggestedFeaturesScreen', () => {
     expect(screen.queryByTestId('neighbourhood')).not.toBeInTheDocument()
   })
 
-  it('names the missing as-of cause and counts the features it blocks', async () => {
-    const blocked = (n: number) => Array.from({ length: n }, (_unused, i) => ({
-      template_id: `t${i}`, candidate_name: `blocked_${i}`,
-      explanation: 'future-leakage risk: no point-in-time column', code: 'NO_POINT_IN_TIME',
-    }))
-    getTableSuggestionsV4.mockResolvedValue(page({
+  // ── The as-of cause: ONE count, N sentences ──────────────────────────────────────────────────
+  //
+  // The explanation is built PER REJECTION and names THAT candidate's own column ref —
+  // overlay/upload/feature_assist.py:2476-2477:
+  //
+  //     return _reject(RejectCode.NO_POINT_IN_TIME,
+  //                    f"no point-in-time basis for {d} (future-leakage risk)")
+  //
+  // …where `d` is the derives-pair destination. So N rejections carry N different sentences, and
+  // the fixtures below are cut from that f-string rather than written to suit the screen.
+  const blockedOn = (ref: string) => ({
+    template_id: `t_${ref}`, candidate_name: `avg_${ref.split('.').pop()}`,
+    explanation: `no point-in-time basis for ${ref} (future-leakage risk)`,
+    code: 'NO_POINT_IN_TIME',
+  })
+
+  function blockedPage(refs: string[]) {
+    return page({
       summary: { suggested: 1, design_checked: 0, needs_external_validation: 1, groups: 1 },
       groups: [{
         entity: label({ id: 'account', display_name: 'account' }), contextual_entity_terms: [],
         grain_refs: [[SOURCE, 'public.comp_fin_tran.acct_id']], suggestion_ids: ['sug-2'],
       }],
-      rejections: blocked(7),
-    }, [NEEDS_VALIDATION]))
+      rejections: refs.map(blockedOn),
+    }, [NEEDS_VALIDATION])
+  }
+
+  it('names the missing as-of cause and counts the features it blocks', async () => {
+    getTableSuggestionsV4.mockResolvedValue(blockedPage(
+      Array.from({ length: 7 }, (_unused, i) => `public.comp_fin_tran.amt_${i}`)))
     renderScreen()
     expect(await screen.findByText(/7 features are blocked/i)).toBeInTheDocument()
-    // T9: the server's own `explanation` for these rejections. It used to be replaced here by a
-    // paraphrase, AND these rejections are filtered out of "Not offered" below — so the sentence
-    // the backend wrote for them appeared nowhere on the page.
-    expect(screen.getByText(/future-leakage risk: no point-in-time column/))
-      .toBeInTheDocument()
+    // The count line COUNTS. It quotes no single rejection's sentence, because it stands for
+    // seven of them and none of the seven speaks for the others.
+    expect(screen.getByText(/no confirmed as-of column/i)).toBeInTheDocument()
     // The named next action stays: it is this screen's own knowledge of where the control lives.
     expect(screen.getByText(/under as-of date/i)).toBeInTheDocument()
+  })
+
+  // F1. The callout used to render `noPointInTime[0].explanation` for the whole group, under the
+  // comment "they share a code, so they share an explanation" — false: they share a code and each
+  // names its OWN column. With two rejections that presented one column's ref as the reason for
+  // both. The sentences also had nowhere else to go, because these rejections were filtered out
+  // of "Not offered" — which is why the fix is to stop filtering them, not to quote one of them.
+  it('N blocked features speak N sentences, each naming its own column', async () => {
+    getTableSuggestionsV4.mockResolvedValue(blockedPage([
+      'public.comp_fin_tran.txn_amt', 'public.comp_fin_tran.fee_amt',
+    ]))
+    renderScreen()
+    await screen.findByText(/2 features are blocked/i)
+    const notOffered = document.querySelector('.sug-rejections') as HTMLElement
+    expect(notOffered).not.toBeNull()
+    expect(within(notOffered).getByText(
+      'no point-in-time basis for public.comp_fin_tran.txn_amt (future-leakage risk)'))
+      .toBeInTheDocument()
+    expect(within(notOffered).getByText(
+      'no point-in-time basis for public.comp_fin_tran.fee_amt (future-leakage risk)'))
+      .toBeInTheDocument()
+    // …and each sits against the candidate it actually belongs to.
+    expect(within(notOffered).getByText('avg_txn_amt')).toBeInTheDocument()
+    expect(within(notOffered).getByText('avg_fee_amt')).toBeInTheDocument()
+    // Document scope, deliberately: one column's ref standing for the whole group is the defect,
+    // and the place it stood was the count line ABOVE this section. Scoping this to the list
+    // would let the callout quote a rejection again without anything going red.
+    expect(screen.queryAllByText(/txn_amt \(future-leakage risk\)/)).toHaveLength(1)
+    expect(screen.queryAllByText(/fee_amt \(future-leakage risk\)/)).toHaveLength(1)
+  })
+
+  it('a lone blocked feature is still listed, not summarised away', async () => {
+    // The old "Not offered" gate was `rejections.length > noPointInTime.length`, so a page whose
+    // ONLY rejections were as-of ones rendered no list at all.
+    getTableSuggestionsV4.mockResolvedValue(blockedPage(['public.comp_fin_tran.txn_amt']))
+    renderScreen()
+    await screen.findByText(/1 feature is blocked/i)
+    expect(await screen.findByText(
+      'no point-in-time basis for public.comp_fin_tran.txn_amt (future-leakage risk)'))
+      .toBeInTheDocument()
   })
 
   it('treats zero design checked with cards present as the honest normal state, not an error',

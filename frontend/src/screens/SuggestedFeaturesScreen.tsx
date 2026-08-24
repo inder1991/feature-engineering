@@ -335,11 +335,16 @@ export function SuggestedFeaturesScreen({
                 {noPointInTime.length} {noPointInTime.length === 1 ? 'feature is' : 'features are'}
                 {' '}blocked
               </strong>
-              {/* THE SERVER'S OWN EXPLANATION FOR THESE REJECTIONS. It used to be replaced by a
-                  paraphrase here — and because these rejections are filtered out of "Not offered"
-                  below, the sentence the backend actually wrote for them appeared nowhere on the
-                  page. Taken from the first: they share a code, so they share an explanation. */}
-              : {noPointInTime[0].explanation}.
+              {/* A COUNT LINE COUNTS. It states the table-level fact these N rejections share —
+                  the callout is scoped to one table, and NO_POINT_IN_TIME is minted where that
+                  table's as-of lookup came back empty — and it quotes none of their sentences,
+                  because the backend writes one PER REJECTION naming that candidate's own column
+                  (feature_assist.py:2477). Quoting the first presented one column's ref as the
+                  reason for all N. Each sentence now lands in "Not offered" below, against the
+                  candidate it belongs to; the filter that used to hold them out of that list is
+                  why they had nowhere to be said in the first place. */}
+              : this table has no confirmed as-of column, so every windowed feature would risk
+              future leakage.
             </p>
             <p className="hint">
               Confirm the table’s as-of column on Governance review — it waits there under As-of
@@ -376,18 +381,21 @@ export function SuggestedFeaturesScreen({
         </section>
       )}
 
-      {rejections.length > noPointInTime.length && (
+      {/* EVERY REJECTION SPEAKS ITS OWN SENTENCE, HERE, ONCE. The as-of ones used to be filtered
+          out — the callout above summarised them and this list withheld them, so the sentence the
+          backend wrote for each named candidate appeared nowhere on the page. The gate widened
+          with the filter: it was `> noPointInTime.length`, which hid the whole list on a page
+          whose only rejections were as-of ones. */}
+      {rejections.length > 0 && (
         <section className="panel sug-rejections">
           <h2>Not offered</h2>
           <ul className="rows">
-            {rejections
-              .filter(r => r.code !== 'NO_POINT_IN_TIME')
-              .map(r => (
-                <li className="row" key={`${r.code}:${r.candidate_name}`}>
-                  <span className="mono">{r.candidate_name}</span>{' '}
-                  <span className="hint">{r.explanation}</span>
-                </li>
-              ))}
+            {rejections.map(r => (
+              <li className="row" key={`${r.code}:${r.candidate_name}`}>
+                <span className="mono">{r.candidate_name}</span>{' '}
+                <span className="hint">{r.explanation}</span>
+              </li>
+            ))}
           </ul>
         </section>
       )}

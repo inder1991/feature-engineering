@@ -208,11 +208,19 @@ function qualityNotice(rec: RecognitionResp): string | null {
 // three would re-create in the UI exactly the over-claim the backend removed (it had been telling
 // 338 of 359 concepts they were proxies for an outcome nobody measured them against).
 //
-// The refusal carries no error_code, so the discriminator is the server's own closing instruction,
-// which names the field to re-send. Deliberately fail-closed: if that wording ever moves, the
-// sentence still renders verbatim and the acknowledge control simply does not appear — the flow
-// degrades to "read this and pick another target", never to a silent acknowledgment.
-const NOT_OUTCOME_ACK_FIELD = 'target_not_outcome_acknowledged'
+// The refusal carries no error_code, so the discriminator is the server's own closing INSTRUCTION
+// — byte-copied from `_ACKNOWLEDGE` in api/routes/contract.py:1339, the same discipline the tier
+// fixtures use. Deliberately the whole sentence and not the bare field name: the field name also
+// appears in bodies that are not this refusal, the realizable one being FastAPI's own type failure
+// caught before the handler runs ("body.target_not_outcome_acknowledged: Input should be a valid
+// boolean"), which names the field without ever having asked for an acknowledgment.
+//
+// Fail-closed in both directions: matching too little only withholds the control (the sentence
+// still renders verbatim, and the flow degrades to "read this and pick another target"), while
+// matching too much would put the word "acknowledge" in front of a person who was never told
+// anything to acknowledge. Withholding is the safe error, so the narrow match is the right one.
+const NOT_OUTCOME_ACK_INSTRUCTION =
+  'Re-send with target_not_outcome_acknowledged: true to record that you know.'
 
 // One line per registry class, keyed off the SERVER's closed `target_leakage_class` vocabulary —
 // the same pattern as BINDING_STATE_LABEL below, and each line is the api.ts contract's own
@@ -2235,7 +2243,7 @@ export function WorkbenchScreen() {
       // beside it. Anything else stays an error line — including a 422 this screen cannot
       // identify, which must never quietly become an offer to acknowledge.
       if (err instanceof ApiError && err.status === 422 && decision !== 'exploring' && ref
-        && err.detail.includes(NOT_OUTCOME_ACK_FIELD)) {
+        && err.detail.includes(NOT_OUTCOME_ACK_INSTRUCTION)) {
         setIntakeAck({ detail: err.detail, decision, ref })
       } else {
         setIntakeError(err instanceof ApiError

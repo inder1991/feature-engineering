@@ -3199,6 +3199,27 @@ describe('Intake target confirmation', () => {
         expect(banner()).toBeNull()
         expect(screen.queryByRole('button', { name: /record this target anyway/i })).toBeNull()
       })
+
+    // THE BOUNDARY. The discriminator matches the refusal's whole closing INSTRUCTION, not the
+    // bare field name — because the field name also appears in bodies that are not this refusal.
+    // The realizable one is FastAPI's own type failure, caught before the handler runs: its native
+    // list-`detail` reaches this component already flattened by the transport (api.ts renders
+    // `[{loc, msg}]` as "loc.joined: msg"), and it names the field without ever having asked for
+    // an acknowledgment. Offering the control there would re-send a body FastAPI already refused
+    // to parse — and would put the word "acknowledge" in front of a person who was never told
+    // anything to acknowledge.
+    it('a 422 that merely MENTIONS the field is an error, not an acknowledge offer', async () => {
+      const typeFailure =
+        'body.target_not_outcome_acknowledged: Input should be a valid boolean'
+      contractIntake.mockResolvedValue(INTAKE)
+      contractIntakeTarget.mockRejectedValueOnce(new api.ApiError(422, typeFailure))
+      await generateConfirmOn()
+      await screen.findByText(/I understood your target as/)
+      await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+      expect(await screen.findByText(typeFailure)).toBeInTheDocument()
+      expect(banner()).toBeNull()
+      expect(screen.queryByRole('button', { name: /record this target anyway/i })).toBeNull()
+    })
   })
 
   // ── T7 (a)/(b): the ticket's own facts, which nobody was shown on the AML run ─────────────────
@@ -4394,7 +4415,9 @@ describe('Slice 3: the revise drawer', () => {
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     await selectCandidate('avg_balance')
 
-    const detail = 'the generation lane is drained for migration 1107'
+    // Distinct from every other 503 fixture in this file on purpose: each of the six re-aimed
+    // pins must prove verbatim rendering on its OWN sentence, not on one shared between two.
+    const detail = 'the planner pool is saturated; no worker took the revised round'
     contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, detail))
     await openRevise()
     await retypeHypothesis(REVISED)
