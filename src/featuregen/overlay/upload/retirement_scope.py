@@ -28,12 +28,14 @@ from featuregen.canonical import jcs_sha256
 __all__ = [
     "RetirementScope",
     "TombstoneV1",
+    "approve_regeneration_exception",
+    "approved_ceiling_for",
     "consume_exception",
     "coverage_identity",
+    "covering_tombstones",
     "record_tombstone",
     "retirement_scope_key",
     "scope_locked",
-    "tombstone_covering",
     "valid_exception_for",
 ]
 
@@ -233,24 +235,96 @@ def tombstone_covering(
         exact_formula_identity_hash=row[3], reason=row[4], replacement_draft_id=row[5])
 
 
+def covering_tombstones(
+    conn, *, scope_key: str, formula_identity_hash: str,
+) -> tuple[TombstoneV1, ...]:
+    """EVERY withdrawal covering this request — both scopes, at most one row each by
+    content-addressing. THE ONE LAW's read (Task 6 round-4): every covering withdrawal must be
+    individually NAMED by a valid coupon, so every consumer reads the SET. The single-pick
+    `tombstone_covering` above generated every hole in three review rounds — its candidate-first
+    precedence let whichever tombstone it returned MASK the other — and it survives only as a
+    display convenience.
+    """
+    rows = conn.execute(
+        "SELECT tombstone_id, scope, retirement_scope_key, exact_formula_identity_hash, reason, "
+        "       replacement_draft_id "
+        "  FROM formula_draft_retirement_tombstone "
+        " WHERE (scope = 'CANDIDATE_ACROSS_CONFIGURATIONS' AND retirement_scope_key = %s) "
+        "    OR (scope = 'EXACT_DRAFT' AND exact_formula_identity_hash = %s) "
+        " ORDER BY CASE scope WHEN 'CANDIDATE_ACROSS_CONFIGURATIONS' THEN 0 ELSE 1 END",
+        (scope_key, formula_identity_hash)).fetchall()
+    return tuple(
+        TombstoneV1(tombstone_id=r[0], scope=RetirementScope(r[1]), retirement_scope_key=r[2],
+                    exact_formula_identity_hash=r[3], reason=r[4], replacement_draft_id=r[5])
+        for r in rows)
+
+
+def approved_ceiling_for(
+    conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
+    strategy_identity_hash: str,
+) -> str | None:
+    """The cost-confirmed ceiling a draft at this identity would RIDE, or None.
+
+    ▲ ONE QUERY for the NO-COUPON doors (narrowed by whole-branch C1): where a mint CONSUMES a
+    coupon, the ride is that coupon's own `llm_spend_authorization_id` and this locator is not
+    consulted — the recency pick here and the antiquity pick of the coupon could disagree, and
+    the mint then burned one approval's coupon while riding another's money. What remains for
+    this locator: the service's no-coupon preference and the run-spine retry projection's
+    reporting, which must give one answer, so both call this one function. Its quirks are
+    LOAD-BEARING and byte-stable by agreement with that side:
+
+    * the expiry filter is on the AUTHORIZATION only (`a.expires_at`) — a coupon's own expiry
+      bounds new coupon MINTS, never which ceiling an in-flight regeneration rides;
+    * no `uses_consumed` filter — a consumed coupon still names the ceiling its mint is riding;
+    * `ORDER BY e.approved_at DESC LIMIT 1` — the LATEST approval act is the operative one.
+
+    Returns the `llm_spend_authorization_id`, or None when no unexpired approval binds one (the
+    service then falls to its bounded development envelope, or refuses on the job path).
+    """
+    row = conn.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception e "
+        "  JOIN llm_spend_authorization_revision a "
+        "    ON a.spend_authorization_id = e.llm_spend_authorization_id "
+        " WHERE e.target_formula_identity_hash = %s AND e.provider_contract_hash = %s "
+        "   AND e.strategy_identity_hash = %s AND a.expires_at > now() "
+        " ORDER BY e.approved_at DESC LIMIT 1",
+        (target_formula_identity_hash, provider_contract_hash,
+         strategy_identity_hash)).fetchone()
+    return None if row is None else row[0]
+
+
 def valid_exception_for(
     conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
-    strategy_identity_hash: str, now,
+    strategy_identity_hash: str, now, covering_tombstone_id: str | None,
+    excluding: tuple[str, ...] = (),
 ) -> str | None:
     """The unexpired, unconsumed exception authorizing THIS exact regeneration, or ``None``.
+
+    ``excluding`` skips named coupons: the request gate passes over a coupon whose bound MONEY
+    cannot buy one call (whole-branch C1 — the mint rides the consumed coupon's money, so a
+    coupon the law forbids consuming is not available to the mint; without the skip, a
+    dead-money old coupon would block a fresh approval FOR EVER, and the refusal would name
+    the exact remedy that cannot work).
 
     ▲ Every binding is checked, not just the scope: an exception authorizes creating **one exact
     identity**, under **one provider contract** and **one strategy**. An earlier design keyed it on
     the scope and a timestamp, which authorized any regeneration of that candidate, at any cost,
     under any configuration, for ever.
     """
+    # ▲ The tombstone filter lives INSIDE the locator (Task 6 round-2): the first cut located
+    # one row (oldest) and nullified on a tombstone mismatch — so an old non-naming coupon
+    # SHADOWED a younger one that correctly named the withdrawal, and the refusal text
+    # instructed the exact action that could not work (approve again → still refused). With the
+    # predicate here, the locator finds the coupon that matches the CURRENT withdrawal state:
+    # the covering tombstone's id when one covers, NULL when none does.
     row = conn.execute(
         "SELECT exception_id FROM formula_draft_regeneration_exception "
         " WHERE target_formula_identity_hash = %s AND provider_contract_hash = %s "
         "   AND strategy_identity_hash = %s AND expires_at > %s AND uses_consumed < max_uses "
+        "   AND tombstone_id IS NOT DISTINCT FROM %s AND NOT (exception_id = ANY(%s)) "
         " ORDER BY approved_at LIMIT 1",
         (target_formula_identity_hash, provider_contract_hash, strategy_identity_hash,
-         now)).fetchone()
+         now, covering_tombstone_id, list(excluding))).fetchone()
     return None if row is None else row[0]
 
 
@@ -267,3 +341,104 @@ def consume_exception(conn, exception_id: str) -> bool:
         " WHERE exception_id = %s AND uses_consumed < max_uses RETURNING exception_id",
         (exception_id,)).fetchone()
     return row is not None
+
+
+def approve_regeneration_exception(
+    conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
+    strategy_identity_hash: str, actor_subject: str, llm_spend_authorization_id: str,
+    expires_at: str, scope_key: str, max_uses: int = 1,
+) -> tuple[tuple[str, ...], bool]:
+    """ONE approval act binding the FULL covering set — Task 6 round-4's one law.
+
+    One 1103 row per covering withdrawal (the content-addressed id folds ``tombstone_id``, so
+    the rows are individually representable), plus the plain no-tombstone row when nothing
+    covers (the not-an-answer retry approval). The writer no longer PICKS a tombstone — three
+    review rounds showed that whichever single tombstone anything picked masked the other — so
+    the remedy loop dies: an approval always names exactly what covers at approval time.
+
+    Idempotent per binding: a replayed approval is the SAME rows with the SAME ``max_uses``
+    budgets, never a stack. Returns ``(exception_ids, any_created)``.
+    """
+    from featuregen.canonical import jcs_sha256
+
+    # ▲ UNDER THE SCOPE LOCK (round-4 delta probe): the ordinal read, the covering-set read and
+    # the coupon INSERTs serialize on the SAME advisory lock the minting transaction holds. The
+    # lock is not the whole argument — under REPEATABLE READ the snapshot may predate it — the
+    # argument that carries is that the exhausted-count is MONOTONE: an undercount reproduces a
+    # prior generation's identity and collapses under ON CONFLICT (created=False) instead of
+    # stacking a coupon; concurrent identical approvals converge the same way.
+    with scope_locked(conn, scope_key):
+        return _approve_locked(
+            conn, target_formula_identity_hash=target_formula_identity_hash,
+            provider_contract_hash=provider_contract_hash,
+            strategy_identity_hash=strategy_identity_hash, actor_subject=actor_subject,
+            llm_spend_authorization_id=llm_spend_authorization_id, expires_at=expires_at,
+            scope_key=scope_key, max_uses=max_uses, jcs_sha256=jcs_sha256)
+
+
+def _approve_locked(
+    conn, *, target_formula_identity_hash, provider_contract_hash, strategy_identity_hash,
+    actor_subject, llm_spend_authorization_id, expires_at, scope_key, max_uses, jcs_sha256,
+) -> tuple[tuple[str, ...], bool]:
+    """The approval body, with the scope lock already held.
+
+    ▲ One EXPIRY edge, stated so it is a decision rather than a discovery (round-4 delta): the
+    ordinal counts EXHAUSTED coupons only — an EXPIRED-but-unexhausted coupon does not bump it,
+    so an identical re-approval returns that dead coupon (`created=False`). Deliberate: expiry
+    is time's own refusal, day-floored expiry makes the same-day identical case reachable only
+    through the rare sub-day exact windows, and re-arming past an expiry requires a genuinely
+    new approval window (next day's floor, or changed terms) rather than a silent re-mint of
+    terms whose validity lapsed.
+    """
+    covering = covering_tombstones(
+        conn, scope_key=scope_key, formula_identity_hash=target_formula_identity_hash)
+    tombstone_ids: tuple[str | None, ...] = (
+        tuple(t.tombstone_id for t in covering) if covering else (None,))
+
+    exception_ids: list[str] = []
+    any_created = False
+    for tombstone_id in tombstone_ids:
+        # ▲ THE REGENERATION ORDINAL (round-4 acceptance probe 1): without it, a same-day
+        # same-ceiling re-approval after the override FAILED AGAIN content-addressed straight
+        # back to the EXHAUSTED coupon — NB-1's dead end one level up. Folding the count of
+        # already-exhausted coupons for this exact binding gives each approval GENERATION its
+        # own identity: a replay while a coupon is still live is that same coupon (count
+        # unchanged), and an approval after exhaustion is a fresh one — which is what the
+        # governance actor clicking approve again is asking for.
+        # ▲ ROUND-5 C1: the count scopes to the EXACT binding — every field the identity
+        # folds. Counting at (identity, tombstone) alone let a sibling binding's exhaustion
+        # bump THIS binding's ordinal, so a plain replay of a still-live approval minted an
+        # extra live coupon: two paid regenerations from one governance decision.
+        exhausted_before = conn.execute(
+            "SELECT COUNT(*) FROM formula_draft_regeneration_exception "
+            "WHERE target_formula_identity_hash = %s "
+            "  AND tombstone_id IS NOT DISTINCT FROM %s AND uses_consumed >= max_uses "
+            "  AND provider_contract_hash = %s AND strategy_identity_hash = %s "
+            "  AND actor_subject = %s AND llm_spend_authorization_id = %s "
+            "  AND expires_at = %s AND max_uses = %s",
+            (target_formula_identity_hash, tombstone_id, provider_contract_hash,
+             strategy_identity_hash, actor_subject, llm_spend_authorization_id,
+             expires_at, max_uses)).fetchone()[0]
+        exception_id = "exc-" + jcs_sha256({
+            "target_formula_identity_hash": target_formula_identity_hash,
+            "provider_contract_hash": provider_contract_hash,
+            "strategy_identity_hash": strategy_identity_hash,
+            "actor_subject": actor_subject,
+            "llm_spend_authorization_id": llm_spend_authorization_id,
+            "expires_at": str(expires_at),
+            "max_uses": max_uses,
+            "tombstone_id": tombstone_id,
+            "regeneration_ordinal": exhausted_before,
+        })[:32]
+        inserted = conn.execute(
+            "INSERT INTO formula_draft_regeneration_exception (exception_id, tombstone_id, "
+            "target_formula_identity_hash, provider_contract_hash, strategy_identity_hash, "
+            "llm_spend_authorization_id, actor_subject, overrides_tombstone, max_uses, "
+            "expires_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (exception_id) DO NOTHING RETURNING exception_id",
+            (exception_id, tombstone_id, target_formula_identity_hash, provider_contract_hash,
+             strategy_identity_hash, llm_spend_authorization_id, actor_subject,
+             tombstone_id is not None, max_uses, expires_at)).fetchone()
+        exception_ids.append(exception_id)
+        any_created = any_created or inserted is not None
+    return tuple(exception_ids), any_created

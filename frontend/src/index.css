@@ -8231,3 +8231,35 @@ button.stat:hover {
     to { opacity: 1; transform: none; }
   }
 }
+
+/* ---------------------------------------------------------------- run authoring: two readings
+   Appended for RunDetailScreen's attempt history (spec §R4.4.1). Migration 1107 lets a governed
+   retry write a second draft against the same formula identity, so the table shows EVERY attempt
+   and the server names which one is each candidate's current answer. That row is the primary one;
+   the attempts it superseded recede. Weight and ink only — the Reading cell always carries the
+   words ("Current answer" / "Earlier attempt"), so neither colour nor weight ever works alone.
+   Composes the existing table / .badge / .stage-detail vocabulary; nothing above this line is
+   modified. */
+.attempt-current > td {
+  font-weight: 600;
+}
+
+.attempt-earlier > td {
+  color: var(--ink-soft);
+}
+
+/* ---------------------------------------------------------------- run authoring: governed warning
+   Appended for the Retry cell's `retry_warnings` (spec §R4.2). A WARN disposition is a
+   proceed-with-knowledge, never a refusal, so it must NOT read like the blockers stacked above it:
+   those are muted `.stage-detail` explaining a control that is OFF, and this sits beside a control
+   that is ON. Ink and a soft warn ground only — the existing `.badge.held` chip carries the code,
+   so colour never works alone. Composes the existing token / .badge / .mono vocabulary; nothing
+   above this line is modified. */
+.retry-warning {
+  margin-top: 4px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12px;
+}

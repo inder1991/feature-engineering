@@ -216,3 +216,26 @@ def test_a_DIFFERENT_VALIDITY_WINDOW_is_a_DIFFERENT_approval(db):
 
     assert first == same, "the identical approval is ONE row"
     assert renewed != first, "a new validity window is a NEW bounded approval — the renewal"
+
+
+def test_C7_a_SAME_DAY_sub_day_approval_keeps_its_EXACT_instant(db):
+    """Whole-branch C7: `canonical_approval_expiry`'s guard branch — floor to UTC midnight ONLY
+    when that midnight is still ahead; a same-day (or past) instant whose floor has already
+    passed keeps its EXACT value, so deliberately short ceilings stay exact and their replay
+    window is their own short life. An unconditional-floor mutant must die here: it would
+    return midnight for the noon instant below."""
+    from featuregen.overlay.upload.llm_spend import canonical_approval_expiry
+
+    noon_today = db.execute(
+        "SELECT to_char(date_trunc('day', now() AT TIME ZONE 'utc'), 'YYYY-MM-DD') "
+        "|| 'T12:00:00+00:00'").fetchone()[0]
+    kept = canonical_approval_expiry(db, noon_today)
+    assert kept == noon_today, \
+        "today's floor is never ahead of now, so the exact instant survives"
+
+    tomorrow_five = db.execute(
+        "SELECT to_char(date_trunc('day', now() AT TIME ZONE 'utc') + interval '1 day', "
+        "'YYYY-MM-DD') || 'T17:00:00+00:00'").fetchone()[0]
+    floored = canonical_approval_expiry(db, tomorrow_five)
+    assert floored.endswith("T00:00:00+00:00") and floored[:10] == tomorrow_five[:10], \
+        "a future-day instant floors to ITS midnight — the money-safe direction"

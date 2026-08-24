@@ -1,4 +1,37 @@
 """Stub-auth headers + a small deposits catalog CSV shared across the API tests."""
+from datetime import UTC, datetime, timedelta
+
+# ── the window every cost confirmation lives inside ─────────────────────────────────────────────
+# `ExpiryWindow` (api.routes.code_generation_jobs) bounds `expires_at` on BOTH approval bodies to
+# the platform's own triage window: a real ISO-8601 instant, strictly in the future, at most 168
+# hours out — the same 1..168 `MethodOverrideIn.expires_in_hours` already states for the other
+# approval a person gives.
+#
+# ▲ SO A FIXED CALENDAR DATE IS A FIXTURE THAT EXPIRES. Every approval fixture read
+# `2026-12-31`, which was ~129 days out when the bound landed (refused) and would have been in
+# the PAST a year later (refused, differently). Three days out is comfortably inside the bound
+# and comfortably clear of the UTC-midnight FLOOR `canonical_approval_expiry` applies, so the
+# same-day replay tests still get two distinct instants that floor to one recorded expiry.
+_APPROVAL_DAY = (datetime.now(UTC) + timedelta(days=3)).strftime("%Y-%m-%d")
+
+#: The expiry every approval fixture confirms with.
+APPROVAL_EXPIRES_AT = f"{_APPROVAL_DAY}T09:00:00Z"
+
+#: A DIFFERENT instant on the SAME UTC day — what the day-flooring replay tests are made of.
+APPROVAL_EXPIRES_AT_SAME_DAY = f"{_APPROVAL_DAY}T17:00:00Z"
+
+#: The UTC midnight both of those floor to, spelled the way the store reads it back.
+APPROVAL_EXPIRY_FLOOR = f"{_APPROVAL_DAY} 00:00:00"
+
+
+def hours_from_now(hours: float) -> str:
+    """An ISO-8601 instant `hours` from now.
+
+    The expiry-window boundary tests describe a DISTANCE from now, never a date: `169` has to stay
+    one hour outside the bound for ever, and a literal that meant that in August means something
+    else in December.
+    """
+    return (datetime.now(UTC) + timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
 
 # Default caller: broad FUNCTIONAL access (all of catalog/feature/iam) but NO data-sensitivity role,
 # so read-scope tests still hide pii/restricted. platform_admin via the stub is authenticated=False,

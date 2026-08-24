@@ -52,6 +52,27 @@ class SpendRemaining:
     cost: Decimal
 
 
+def canonical_approval_expiry(conn, requested_expires_at) -> str:
+    """Clamp a caller's expiry to UTC-day granularity — FLOOR, never ceil (Task 4 follow-up).
+
+    With expiry inside the idempotency identity (correct), a replayed confirm minting a fresh
+    `now()+24h` wrote a NEW approval per replay, and a latest-first reader then saw an unspent
+    ceiling each time — budget reset by browser replay. Flooring the requested instant to its
+    UTC midnight makes every same-day replay the SAME approval, and the direction is the money-
+    safe one: the recorded validity is never LONGER than what the person approved. A sub-day
+    approval whose floor would already be expired keeps its exact value — deliberately short
+    ceilings stay exact, and their replay window is their own short life.
+    """
+    row = conn.execute(
+        "SELECT CASE WHEN date_trunc('day', %s::timestamptz AT TIME ZONE 'utc') "
+        "         > (now() AT TIME ZONE 'utc') "
+        "       THEN to_char(date_trunc('day', %s::timestamptz AT TIME ZONE 'utc'), "
+        "                    'YYYY-MM-DD') || 'T00:00:00+00:00' "
+        "       ELSE NULL END",
+        (requested_expires_at, requested_expires_at)).fetchone()
+    return row[0] if row[0] is not None else str(requested_expires_at)
+
+
 def authorize_spend(
     conn, *, action: str, actor_subject: str, job_identity: str, member_identities,
     provider_contract_hash: str, max_calls: int, max_tokens: int, currency: str,
@@ -127,6 +148,19 @@ def remaining_spend(conn, spend_authorization_id: str, *, now) -> SpendRemaining
     return SpendRemaining(
         calls=row[0] - used_calls, tokens=row[1] - used_tokens,
         cost=Decimal(row[2]) - used_cost)
+
+
+def per_call_worst_case(max_calls, max_tokens, max_cost) -> tuple[int, Decimal]:
+    """The worst case ONE physical call reserves — the approval's own arithmetic, ONE copy.
+
+    ▲ Whole-branch review rider (2026-08-24): three hand-copies of this arithmetic existed
+    (worker binding, store dead-ticket guard, run-spine projection), and a floor-vs-ceil drift
+    between them is exactly one token wide — too small for any journey pin to catch. Reserving
+    ``ceil(max_tokens/max_calls)`` and ``max_cost/max_calls`` per call means the approved call
+    count exactly exhausts the approved totals; every consumer calls THIS.
+    """
+    return (-(-int(max_tokens) // int(max_calls)),
+            Decimal(str(max_cost)) / int(max_calls))
 
 
 def reserve_spend(

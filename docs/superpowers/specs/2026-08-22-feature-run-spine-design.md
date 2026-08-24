@@ -754,16 +754,16 @@ All opened at the code baseline; ® = verified in the revision-2 review or re-ve
 | run minted per recommendation generation · `fgr_` second prefix | `contract.py:790` · `gate1.py:733` |
 | many runs per intent | `1021:17` |
 | ® child plan's mutable job lifecycle | child §3.5 (migration 1109): `code_generation_job` status, member states, events, per-action state |
-| ® a FAILED draft cannot re-enqueue | `formula_draft_store.py:306` (`created=False`, enqueue only on create) + `formula_draft_identity` UNIQUE (1090) |
+| ~~a FAILED draft cannot re-enqueue~~ **SUPERSEDED by 1107 + R4.2**: the money-guard index covers only answers (`WHERE state NOT IN ('FAILED','CANCELLED')`); retry is governed per R4.2 (LLM: exception+spend; deterministic: free, Option 2 ruling) | `1107_money_guard_covers_only_answers.sql` |
 | ® scope children mutable after the parent, id-only hash | `scope_records.py:422` · `confirmed_scope_use_case` (0974, ON DELETE CASCADE) |
 | ® the runner applies any missing file, checksum-ledgered | `migrations.py:288` |
 | ® dev stubs carry `authenticated=False` | `deps.py:95` |
 | ® `contract_generation_input` chain target | 1024: PK `generation_run_id`, NOT NULL `intent_id` + `confirmed_scope_id` |
 | ® the sealing pattern to copy | 1006: DEFERRABLE INITIALLY DEFERRED item FK, items-first, write-once triggers, `item_count` |
 | fork cannot mint new selections · build-set identity excludes the formula · latest-wins resolve | `1072:97` · `1092:56,66` · `restore_formula_v3.py:90` |
-| authoring idempotent on identity; config hash a constant | 1090 · `_authoring_config_hash` |
+| authoring idempotent on identity; ~~config hash a constant~~ **the constant-hash function was DELETED** — identity V2 is composed once in `formula_draft_service.py` (`{identity_version, formula_strategy, strategy_identity_hash, provider_contract_hash iff LLM}`) | 1090 · 1103/1109 companions |
 | authoring subject is a candidate | parent §0.1.4 / §0.1.1 |
-| sandbox lane absent · publication settled only by tests | parent §9.0 · `publication_attempt_store.py:183` callers · `feature_execution.py:424` |
+| ~~sandbox lane absent~~ **the §9.0 verification worker EXISTS** (executor seam awaits step 0b — posture-named FAILED, never a fake pass); publication read path repaired at `2a03a77b`; the PUBLISH_SANDBOX worker remains absent | `verification_lane.py` · 1110 |
 | `publication_attempt` bare text ids | `1081:32` — live row count **unmeasured** |
 | six role bundles · tenant on the envelope | `permissions.py` · `envelopes.py:26` |
 | migrations 1100–1114 reserved; 1113/1114 = compiler evaluation | parent §17 allocation table (line numbers shift with the plan's in-flight edits — cite the section) |
@@ -850,19 +850,33 @@ domain store uses.
 | Action | The truthful act |
 |---|---|
 | `AUTHOR_FORMULA` | **Reuse existing formula** — a READ; never an attempt |
-| `AUTHOR_FORMULA` | **Retry after FAILED/CANCELLED — OFFERED**, admissible only when BOTH gates hold: a regeneration exception bound to the exact formula identity (1103; one-time consumption; carries its own NOT NULL spend authorization) AND spend enforced per physical call at the audited seam (1105). Typed refusals: `DraftRetired` / `DraftNotAnAnswer` / `SpendExhausted` |
+| `AUTHOR_FORMULA` | **Retry after FAILED/CANCELLED — OFFERED, and the gates are LANE-AWARE** (owner ruling 2026-08-23, Option 2, stated sixteen lines below and shipped). **LLM lane:** a regeneration exception bound to the exact formula identity (1103; one-time consumption; carries its own NOT NULL spend authorization) AND spend enforced per physical call at the audited seam (1105) — the store gates on `provider_contract_hash is not None`. **Deterministic lane:** free by construction — no provider contract is folded, no call is dispatched, nothing is spent, so no exception exists to require (1103's NOT NULL columns make one unrepresentable). **Both lanes:** a covering tombstone refuses, because withdrawal is a decision rather than a cost. Typed refusals: `DraftRetired` / `DraftNotAnAnswer` / `SpendExhausted` / `DraftCeilingExhausted` (the request seam's pre-consumption check that an approved ceiling can cover ONE per-call worst-case reservation → 409 `COST_AUTHORIZATION_EXHAUSTED`) |
 | `AUTHOR_FORMULA` | "Request another opinion" on a LIVE draft — still deferred (identity must move; a live draft's slot is held) |
 
-Three unreachability gaps stand between the blessing and a working button, and they are Stage I
-work: (1) no production writer of `formula_draft_regeneration_exception` exists — an
-exception-creation act (owner/admin, cost-confirmed) must be built; (2) `DraftNotAnAnswer` is
-uncaught by both `request_draft_for_candidate` callers — the route 500s and the coordinator marks
-the whole job FAILED; both must catch it and answer with the retry affordance; (3) the
+Three unreachability gaps stood between the blessing and a working button. (1) CLOSED (Task 6,
+substrate chain accepted at `b35d3249` after a five-round adversarial loop): the
+exception-creation act exists — POST regeneration-exceptions behind `governance:confirm`. Its
+governing law, which replaced three rounds of precedence patches: **every covering withdrawal
+must be individually NAMED by a valid, then consumed, coupon — at request AND at advance**; the
+writer binds the FULL covering set in one approval act (one coupon per withdrawal, one shared
+spend ceiling) under the same scope lock the mint and the withdrawal hold; the coupon identity
+folds a per-exact-binding regeneration ordinal, so a post-exhaustion re-approval mints a fresh
+generation while replays of a live approval converge on it. (2) CLOSED (same chain):
+`DraftNotAnAnswer` is translated to `NotAnAnswerAtRequest` in the service and caught by BOTH
+callers — the route answers a typed 409, the coordinator blocks the one member by name
+(`FORMULA_DRAFT_NOT_AN_ANSWER`), never the whole job; (3) the
 deterministic lane cannot be covered by an exception at all (1103's `provider_contract_hash` NOT
 NULL + 1105's spend NOT NULL make it unrepresentable) — a FAILED reviewed-lane draft is
-permanently stuck at its identity. (3) needs an OWNER RULING: bless a deterministic-retry shape
-(e.g. nullable provider contract on the exception for zero-spend retries) or declare
-reviewed-lane failures terminal-by-design.
+permanently stuck at its identity. (3) RULED (owner,
+2026-08-23, Option 2): **deterministic-lane retries are free by construction.** The exception
+mechanism gates SPEND — its own wording is "re-authoring spends again" — and the reviewed lane
+provably spends nothing (1104's CHECK forbids a provider contract on REVIEWED; 1118's
+certification programme asserts zero provider dispatch by CHECK). A FAILED/CANCELLED
+reviewed-lane draft may therefore be re-requested WITHOUT an exception; worker-time needs no
+approval. Tombstones (deliberate withdrawal) still refuse BOTH lanes — governance keeps its teeth
+exactly where a human decided something. The honest concession, recorded: "every retry is an
+approved act" narrows to "every retry THAT SPENDS is an approved act." The regeneration-exception
+surface (gap 1) is accordingly LLM-lane-only.
 
 ### R4.3 Socket corrections (§7)
 
@@ -870,7 +884,7 @@ Availability stays DERIVED; three stored reason codes are now false and must der
 
 | Stage | Truth at `e5c4f581` |
 |---|---|
-| `EXECUTE_SANDBOX` | worker EXISTS (§9.0 lane); still honestly UNAVAILABLE for two derivable reasons — the deployment switch is off, and the executor substrate (step 0b) is absent (`_EXECUTOR is None` → posture-named FAILED, never a fake pass). Derive switch-first like `_generate_preview_stage`; never `WORKER_NOT_IMPLEMENTED` |
+| `EXECUTE_SANDBOX` | worker EXISTS (§9.0 lane); still honestly UNAVAILABLE, derived from TWO INDEPENDENT SWITCHES surface-first (`FEATUREGEN_MATERIALIZE_ENABLED` gates the whole route surface at the router; `FEATUREGEN_VERIFICATION_V2_ENABLED` gates the lane) — shipped as `MATERIALIZATION_DISABLED` then `VERIFICATION_DISABLED` then `NOT_STARTED` (Task 1, deviation upheld). `_EXECUTOR is None` is deliberately unread: its absence surfaces as a posture-named FAILED attempt, not unavailability. Never `WORKER_NOT_IMPLEMENTED` |
 | `MATERIALIZE_PRODUCTION` / `PUBLISH_PRODUCTION` | state machines BUILT (1113/1114) behind `action_available()` — the true reason is `ACTION_UNAVAILABLE` under §0.1.0, derivable |
 | `PUBLISH_SANDBOX` | still genuinely `WORKER_NOT_IMPLEMENTED` — and its READ path repair (the substrate's `2a03a77b`) is the lane's own affair |
 | `TRAIN_MODEL` | unchanged — `SUBSYSTEM_NOT_BUILT` |
@@ -896,8 +910,10 @@ governance to this increment). Stage I therefore is:
    open, still ceiling-less) becomes an adapter or dies. Ownership of these files is coordinated
    with the substrate session before execution.
 4. **The retry chain** per R4.2's three gaps, including the owner ruling request for (3).
-5. **Corrections carried**: `§15`'s two stale fact rows; migration numbering (1117 free, 1118
-   taken — Stage I expects ZERO new migrations; Stage II re-reserves).
+5. **Corrections carried**: `§15`'s two stale fact rows; migration numbering (1117 free; 1118
+   taken by the compiler-certification programme and 1119 taken by
+   `formula_draft_authoring_decision`, shipped by Stage I Task 5 — Stage I expected ZERO new
+   migrations and shipped one; Stage II re-reserves from 1120).
 
 Everything else in the frozen NO-GO plan (`2026-08-23-run-spine-actionable-stage1.md`) that
 described invocation tables, CAS-minted headers, or migration 1117 content is dead; that document

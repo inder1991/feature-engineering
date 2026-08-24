@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import get_conn, get_identity, require_permission
+from featuregen.api.routes.code_generation_jobs import ExpiryWindow, MoneyCeiling
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.formula_draft_service import (
     FORMULA_DRAFT_HANDLER,
@@ -230,14 +231,19 @@ def request_formula_method_override(
     an expiry — the strategy resolver then consumes it as an input fact on the NEXT draft
     request, which mints a NEW draft identity (child D2): nothing re-labels the refused one.
     """
+    from featuregen.overlay.upload.llm_spend import canonical_approval_expiry
     from featuregen.overlay.upload.method_override import (
         OverrideRefusalUnverified,
         request_method_override,
     )
 
-    expires = conn.execute(
-        "SELECT (now() + make_interval(hours => %s))::text",
-        (body.expires_in_hours,)).fetchone()[0]
+    # Day-floored for the same replay reason as spend approvals: a replayed override request
+    # computing a fresh now()+N would otherwise mint a new revision per replay, quietly
+    # extending the override's life one replay at a time.
+    expires = canonical_approval_expiry(
+        conn,
+        conn.execute("SELECT (now() + make_interval(hours => %s))::text",
+                     (body.expires_in_hours,)).fetchone()[0])
     try:
         override_id, created = request_method_override(
             conn, considered_revision_id=revision_id, option_id=option_id,
@@ -264,6 +270,83 @@ def request_formula_method_override(
                    "again and the resolver will author by LLM, with the override named in the "
                    "draft's identity" if created else
                    "this exact override is already recorded; it is the one in effect"),
+    }
+
+
+class RegenerationApprovalIn(BaseModel):
+    """The approver's cost confirmation — everything else is DERIVED from the target draft."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_calls: int = Field(gt=0)
+    max_tokens: int = Field(gt=0)
+    #: THE one declaration of a confirmed amount of money, read-only from the code-generation
+    #: route's body types — the reason `feature_runs` imports `SpendApprovalIn` rather than
+    #: re-declaring it. Without it this field carried the same raw-500 hole: a string that only
+    #: fails at the `numeric` cast, three layers below the person who typed it.
+    max_cost: MoneyCeiling
+    currency: str = Field(min_length=3, max_length=3)
+    pricing_version: str = Field(min_length=1)
+    #: THE one declaration of when a confirmed ceiling stops authorizing, from the same body types
+    #: `max_cost` comes from. Unvalidated, this field minted coupons dead on arrival behind a 201
+    #: "cost-confirmed", and accepted a 74-year window against the 1..168-hour rule the override
+    #: body three classes up states for the same kind of approval.
+    expires_at: ExpiryWindow
+    max_uses: int = Field(default=1, ge=1, le=10)
+
+
+@router.post(
+    "/formula-drafts/{formula_draft_id}/regeneration-exceptions", status_code=201,
+    dependencies=[Depends(require_permission("governance:confirm"))])
+def approve_regeneration(
+    formula_draft_id: str, body: RegenerationApprovalIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """§11.1's approval surface, LLM-lane-only by the owner's Option 2 ruling.
+
+    A GOVERNANCE act (`governance:confirm` — the recipe-review primitive), because approving a
+    re-spend after a recorded failure is somebody taking responsibility for buying the answer
+    again. The three bindings — target identity, provider contract, strategy — are derived
+    server-side from the target draft's candidate under the CURRENT resolution; the body carries
+    only the cost confirmation. One-time-consumption semantics are 1103's, consumed only by the
+    transaction that mints the replacement.
+    """
+    from featuregen.overlay.upload.formula_draft_service import (
+        RegenerationNotApprovable,
+        approve_regeneration_for_draft,
+    )
+
+    try:
+        exception_ids, spend_authorization_id, created = approve_regeneration_for_draft(
+            conn, formula_draft_id=formula_draft_id, actor_subject=identity.subject,
+            max_calls=body.max_calls, max_tokens=body.max_tokens, max_cost=body.max_cost,
+            currency=body.currency, pricing_version=body.pricing_version,
+            expires_at=body.expires_at, max_uses=body.max_uses)
+    except RegenerationNotApprovable as exc:
+        raise HTTPException(
+            status_code=404 if exc.kind == "unknown_draft" else 409,
+            detail={"code": {"deterministic_lane": "DETERMINISTIC_RETRY_IS_FREE",
+                             "not_a_formula": "NOT_A_FORMULA",
+                             "unknown_draft": "UNKNOWN_DRAFT"}.get(exc.kind, exc.kind.upper()),
+                    "detail": exc.detail}) from exc
+    except CandidateUnavailable as exc:
+        raise HTTPException(
+            status_code={"unknown_revision": 404,
+                         "option_not_in_revision": 422}.get(exc.kind, 409),
+            detail=exc.detail) from exc
+
+    counters.incr("featuregen.regeneration.approved" if created
+                  else "featuregen.regeneration.deduplicated")
+    return {
+        # ▲ ONE approval act binds the FULL covering set (round-4's one law) — one exception per
+        # covering withdrawal, or the single plain-retry row when nothing covers. The first id
+        # is kept under the old key for existing readers.
+        "exception_ids": list(exception_ids),
+        "exception_id": exception_ids[0],
+        "spend_authorization_id": spend_authorization_id,
+        "created": created,
+        "detail": ("the regeneration is approved and cost-confirmed; re-request the draft and "
+                   "the exception is consumed by the mint it authorizes" if created else
+                   "this exact approval already exists; its one budget is the one in effect"),
     }
 
 

@@ -1,5 +1,6 @@
 # Run Spine Actionable — Stage I Implementation Plan (invocation substrate + AUTHOR_FORMULA)
 
+> ▲ **SUPERSEDED by `2026-08-23-run-spine-actionable-stage1-rev2.md` (Option B) — historical record only.**
 > ▲ **NO-GO — DO NOT EXECUTE (owner review, 2026-08-23).** Ten P0 blockers stand against this
 > revision; the verdicts and the corrected 13-step sequence are recorded in the owner's review and
 > the session ledger. Headline corrections a revision must fold: authoring input sealing + atomic
