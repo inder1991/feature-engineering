@@ -1698,6 +1698,26 @@ export interface IntakeTicket {
   // The Change-it menu (prompt v2): ranked next-best readings, subset of the catalog shortlist,
   // never the chosen target. [] on older-backend replays and honest nothing-else-comes-close.
   runners_up: string[]
+  // T7 (a) — OUTCOME OR PROXY, said out loud. `target_leakage_class` is the concept registry's own
+  // three-way split; only 'outcome' is the label itself, so anything else means the proposal
+  // ABSTAINED (`confidence: 'abstain'`) and `proxy_candidates` carries the ranked fallbacks, each
+  // labelled with the concept it actually carries. `null` = the column carries no registered
+  // concept, which asserts nothing — so it is uncommittable but is NOT called a proxy.
+  target_concept: string
+  target_leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  target_is_proxy: boolean
+  proxy_candidates: {
+    ref: string; concept: string
+    leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  }[]
+  // T7 (b) — where the window came from, or why it has none. 'contradicted' means the objective's
+  // own stated horizon and the model's number disagreed: NO window was accepted and
+  // `window_refusal` names both numbers.
+  window_source: 'stated' | 'model_only' | 'unstated' | 'contradicted'
+  window_refusal: {
+    code: 'WINDOW_CONTRADICTS_GOAL'; stated_text: string; stated_days: number | null
+    ticket_days: number; detail: string
+  } | null
 }
 
 export interface IntakeResp {
@@ -1712,6 +1732,10 @@ export interface IntakeResp {
   } | null
   // The runners-up with the same one-liner material — the Change-it panel's one-click buttons.
   runner_up_details: { ref: string; catalog_source: string; concept: string; ai_summary: string }[]
+  // The abstention answer's one-liner material, same shape, in `proxy_candidates` order.
+  proxy_candidate_details: {
+    ref: string; catalog_source: string; concept: string; ai_summary: string
+  }[]
 }
 
 // One hypothesis in, one draft reading out. Cached server-side by content (hypothesis + shortlist
@@ -1736,17 +1760,27 @@ export interface IntakeReading {
   business_domain: string[]
   target_provenance: string | null
   target_confirmed_by: string | null
+  // T7 (c) — the disclosure echoed back. The SERVER's own derivation from the concept registry,
+  // never the flag the client sent: a client cannot relabel a column by claiming one.
+  target_concept: string
+  target_leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  target_is_proxy: boolean
 }
 
 // Record the human's answer to the confirm screen. Author-only (403 otherwise); the signed ref is
 // validated against the read-scoped catalog server-side — a column you cannot see cannot be your
 // target; off-vocabulary domain tokens are refused, never silently dropped.
+//
+// T7 (c): confirming a target whose concept is not outcome-family is confirming a PROXY, and the
+// server refuses it (422, detail naming the concept and its class) unless `targetIsProxy` is sent.
+// The acknowledgment is the person's, so send it only when they have actually been shown the
+// banner — passing it by default would be the undisclosed commit this gate exists to stop.
 export function contractIntakeTarget(
   intentId: string,
   decision: 'confirmed' | 'corrected' | 'exploring',
   opts: {
     targetRef?: string; targetWindowDays?: number; targetType?: string
-    businessDomain?: string[]; catalogSource?: string
+    businessDomain?: string[]; catalogSource?: string; targetIsProxy?: boolean
   } = {},
 ): Promise<IntakeReading> {
   return post('/contract/intake/target', {
@@ -1757,6 +1791,7 @@ export function contractIntakeTarget(
     target_type: opts.targetType ?? null,
     business_domain: opts.businessDomain ?? [],
     catalog_source: opts.catalogSource ?? null,
+    target_is_proxy: opts.targetIsProxy ?? false,
   })
 }
 

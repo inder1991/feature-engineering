@@ -73,10 +73,12 @@ from featuregen.overlay.upload.contract.intake import (
     submit_intent,
 )
 from featuregen.overlay.upload.contract.intake_ticket import (
+    OUTCOME_CLASS,
     _use_case_vocabulary,
     extract_intake_ticket,
     is_readable_column,
     record_target_reading,
+    target_leakage_class,
     target_reading,
 )
 from featuregen.overlay.upload.contract.live_activation import (
@@ -287,6 +289,11 @@ class IntakeTargetIn(BaseModel):
                                     pattern="^(binary_classification|regression|multiclass)$")
     business_domain: list[str] = []
     catalog_source: str | None = None
+    #: T7 (c) — the PROXY DISCLOSURE. When the signed column's concept is not outcome-family, the
+    #: client must send `true` here, and the refusal below is typed when it does not. This is an
+    #: ACKNOWLEDGMENT, never a classification: the server derives the class from the registry and
+    #: reports its own answer back, so a client cannot relabel a column by claiming one.
+    target_is_proxy: bool = False
 
 
 # ---- routes -------------------------------------------------------------------------------------
@@ -1298,6 +1305,20 @@ def _intent_row(conn, intent_id: str):
         (intent_id,)).fetchone()
 
 
+def _target_class(conn, ref: str, catalog_source: str | None) -> tuple[str, str | None]:
+    """``(concept, leakage_class)`` for a signed target ref, read from the CATALOG.
+
+    Deliberately not from the ticket: the human may correct to any column they can see, and the
+    class must describe the column they actually signed. An unknown ref or an unregistered concept
+    yields ``("", None)`` — nothing asserted, so nothing is claimed about it either way."""
+    detail = conn.execute(
+        "SELECT concept FROM graph_node WHERE kind = 'column' AND object_ref = %s "
+        "AND (%s::text IS NULL OR catalog_source = %s) LIMIT 1",
+        (ref, catalog_source, catalog_source)).fetchone()
+    concept_name = (detail[0] if detail else "") or ""
+    return concept_name, target_leakage_class(concept_name)
+
+
 @router.post("/contract/intake", dependencies=[Depends(require_feature_generate)])
 def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLLM) -> dict:
     """The mandatory read: persist the intent (per-actor idempotent, the recognitions discipline),
@@ -1349,6 +1370,7 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
         return {"ref": ref, "catalog_source": detail[0], "concept": detail[1] or "",
                 "ai_summary": detail[2] or ""}
 
+    refusal = ticket.window_refusal
     return {"intent_id": intent.intent_id, "reason": reason,
             "ticket": {"target_column": ticket.target_column,
                        "target_window_days": ticket.target_window_days,
@@ -1356,11 +1378,28 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
                        "business_domain": list(ticket.business_domain),
                        "confidence": ticket.confidence, "pinned": ticket.pinned,
                        "contradiction": ticket.contradiction,
-                       "runners_up": list(ticket.runners_up)},
+                       "runners_up": list(ticket.runners_up),
+                       # T7 (a): outcome or proxy, and the ranked fallbacks behind an abstention
+                       "target_concept": ticket.target_concept,
+                       "target_leakage_class": ticket.target_leakage_class,
+                       "target_is_proxy": ticket.target_is_proxy,
+                       "proxy_candidates": [
+                           {"ref": c.ref, "concept": c.concept,
+                            "leakage_class": c.leakage_class}
+                           for c in ticket.proxy_candidates],
+                       # T7 (b): where the window came from, or why it has none
+                       "window_source": ticket.window_source,
+                       "window_refusal": None if refusal is None else {
+                           "code": refusal.code, "stated_text": refusal.stated_text,
+                           "stated_days": refusal.stated_days,
+                           "ticket_days": refusal.ticket_days, "detail": refusal.detail}},
             "target_detail": _column_detail(ticket.target_column),
             # the Change-it menu, ranked, with the same one-liner material as the main line
             "runner_up_details": [d for r in ticket.runners_up
-                                  if (d := _column_detail(r)) is not None]}
+                                  if (d := _column_detail(r)) is not None],
+            # the abstention answer's own one-liner material, same shape as the menu above
+            "proxy_candidate_details": [d for c in ticket.proxy_candidates
+                                        if (d := _column_detail(c.ref)) is not None]}
 
 
 @router.post("/contract/intake/target", dependencies=[Depends(require_feature_generate)])
@@ -1371,13 +1410,22 @@ def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dic
     any column they can see); the domain tokens are validated against the closed use-case
     vocabulary STRICTLY (a human decision is recorded verbatim or refused, never silently edited).
     The existing server-side leakage path (``intent_target_ref``) reads the same row, so the veto
-    downstream runs on the signed value with no further wiring."""
+    downstream runs on the signed value with no further wiring.
+
+    T7 (c) — THE PROXY DISCLOSURE. Signing a target whose concept is not outcome-family is signing
+    a PROXY, and on the 2026-08-24 AML run nobody was ever told that. Such a confirmation now
+    requires ``target_is_proxy: true`` in the body and is a typed 422 without it. The class is the
+    SERVER's derivation from the concept registry (:func:`target_leakage_class`) — the client only
+    acknowledges it — and an unregistered concept asserts nothing, so it is never called a proxy.
+    """
     row = _intent_row(conn, body.intent_id)
     if row is None:
         raise HTTPException(status_code=404, detail="No such intent")
     if row[0] != identity.subject:
         raise HTTPException(status_code=403,
                             detail="only the intent's author can sign its target reading")
+    leakage_class: str | None = None
+    concept_name = ""
     if body.decision in ("confirmed", "corrected"):
         if not body.target_ref:
             raise HTTPException(status_code=422,
@@ -1386,6 +1434,15 @@ def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dic
                                   catalog_source=body.catalog_source):
             raise HTTPException(status_code=422,
                                 detail="target_ref is not a readable column in this catalog")
+        concept_name, leakage_class = _target_class(conn, body.target_ref, body.catalog_source)
+        if leakage_class is not None and leakage_class != OUTCOME_CLASS \
+                and not body.target_is_proxy:
+            raise HTTPException(
+                status_code=422,
+                detail=(f"{body.target_ref} carries the concept '{concept_name}', which the "
+                        f"registry classifies as '{leakage_class}' — not an outcome-family label. "
+                        "Confirming it means predicting a PROXY for the outcome. Re-send with "
+                        "target_is_proxy: true to record that you know."))
     vocabulary = set(_use_case_vocabulary())
     off_vocab = [d for d in body.business_domain if d not in vocabulary]
     if off_vocab:
@@ -1398,8 +1455,21 @@ def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dic
         target_window_days=body.target_window_days, target_type=body.target_type,
         business_domain=tuple(body.business_domain), confirmed_by=identity.subject)
     counters.incr(f"overlay.intake.target_{body.decision}")
+    # THE DISCLOSURE HAS NOWHERE DURABLE TO LIVE. `contract_intent` has no column that can carry
+    # it and no metadata JSON to hide it in (`business_domain` is a closed vocabulary array), and
+    # this program adds no migrations — so the acknowledgment rides the RESPONSE and a logged
+    # record, and the missing column is an owner item, not a silent omission. The 422 above is the
+    # part that actually holds: an undisclosed proxy confirmation cannot be recorded at all.
+    is_proxy = leakage_class is not None and leakage_class != OUTCOME_CLASS
+    if is_proxy:
+        counters.incr("overlay.intake.target_proxy_disclosed")
+        logger.info(
+            "proxy target disclosed and confirmed: intent=%s ref=%s concept=%s class=%s by=%s",
+            body.intent_id, body.target_ref, concept_name, leakage_class, identity.subject)
     return {"intent_id": body.intent_id, **(target_reading(conn, body.intent_id) or {}),
-            "business_domain": sorted(body.business_domain)}
+            "business_domain": sorted(body.business_domain),
+            "target_concept": concept_name, "target_leakage_class": leakage_class,
+            "target_is_proxy": is_proxy}
 
 
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])

@@ -13,6 +13,7 @@ from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.contract.gate1 import intent_target_ref
 from featuregen.overlay.upload.contract.intake_ticket import INTAKE_TICKET_TASK
+from featuregen.runtime.observability import counters
 
 _BALANCE = "public.accounts.balance"
 _EMAIL = "public.customers.email"
@@ -213,3 +214,109 @@ def test_a_new_pin_overwrites_a_prior_pin_but_never_a_human_decision(make_client
         "catalog_source": "deposits"}, headers=AUTH)
     ref, _, _, provenance, _ = _reading(conn, first["intent_id"])
     assert (ref, provenance) == ("public.transactions.amount", "human_confirmed")
+
+
+# ══ T7 (c) — proxy disclosure: confirming a non-outcome target is an ACKNOWLEDGED act ════════════
+
+def _proxy_fake(target: str = _BALANCE) -> FakeLLM:
+    """Every column enriched to `restriction_status` — the concept `cust_susp_flg` actually carried
+    on the 2026-08-24 AML run. `near_label=True` in the registry: a compliance CONSEQUENCE, never
+    the outcome. Any target here is therefore PROXY-labelled by the server."""
+    fake = _fake(target)
+    fake._task_fallback["overlay.enrich.concept"] = [
+        FakeResponse(output={"concept": "restriction_status"})]
+    return fake
+
+
+def test_the_proposal_LABELS_a_proxy_target_and_abstains_on_it(make_client):
+    client = make_client(_proxy_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.post("/contract/intake", json={
+        "hypothesis": "Customers likely to be flagged for AML review in the next 90 days.",
+        "catalog_source": "deposits"}, headers=AUTH).json()
+    ticket = body["ticket"]
+    assert ticket["target_is_proxy"] is True
+    assert ticket["target_leakage_class"] == "near_label"
+    assert ticket["target_concept"] == "restriction_status"
+    assert ticket["confidence"] == "abstain", "no outcome-family concept -> nothing auto-commits"
+    assert ticket["proxy_candidates"][0]["ref"] == _BALANCE
+    assert ticket["proxy_candidates"][0]["concept"] == "restriction_status"
+
+
+def test_confirming_a_proxy_target_WITHOUT_the_acknowledgment_is_a_typed_refusal(make_client, conn):
+    client = make_client(_proxy_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = client.post("/contract/intake", json={
+        "hypothesis": "Customers likely to be flagged for AML review in the next 90 days.",
+        "catalog_source": "deposits"}, headers=AUTH).json()["intent_id"]
+    res = client.post("/contract/intake/target", json={
+        "intent_id": intent_id, "decision": "confirmed", "target_ref": _BALANCE,
+        "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 422
+    detail = res.json()["detail"]
+    assert "restriction_status" in detail and "near_label" in detail
+    assert "target_is_proxy" in detail, "the refusal names the field the client must send"
+    assert _reading(conn, intent_id)[3] is None, "nothing was recorded behind the refusal"
+
+
+def test_the_acknowledgment_lets_the_proxy_confirmation_through_and_is_disclosed_back(
+        make_client, conn):
+    client = make_client(_proxy_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = client.post("/contract/intake", json={
+        "hypothesis": "Customers likely to be flagged for AML review in the next 90 days.",
+        "catalog_source": "deposits"}, headers=AUTH).json()["intent_id"]
+    res = client.post("/contract/intake/target", json={
+        "intent_id": intent_id, "decision": "confirmed", "target_ref": _BALANCE,
+        "target_is_proxy": True, "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["target_is_proxy"] is True
+    assert body["target_leakage_class"] == "near_label"
+    assert body["target_concept"] == "restriction_status"
+    ref, _, _, provenance, _ = _reading(conn, intent_id)
+    assert (ref, provenance) == (_BALANCE, "human_confirmed")
+    # ...and the disclosure itself is recorded. `contract_intent` has no column that can carry it
+    # and this program adds no migrations, so the durable record is the counter + the log line —
+    # a stated limit, not a silent omission. The SCHEMA GAP is an owner item.
+    assert counters.snapshot()["counters"].get("overlay.intake.target_proxy_disclosed", 0) >= 1
+
+
+def test_the_server_decides_the_class_the_client_only_acknowledges_it(make_client):
+    """A client claiming `target_is_proxy` on a column the registry does NOT call a proxy does not
+    get to relabel it — the answer is the server's own derivation."""
+    client = make_client(_fake())            # concepts land unregistered: nothing is asserted
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = client.post("/contract/intake", json={
+        "hypothesis": "Customers leave when their deposits shrink over time.",
+        "catalog_source": "deposits"}, headers=AUTH).json()["intent_id"]
+    body = client.post("/contract/intake/target", json={
+        "intent_id": intent_id, "decision": "confirmed", "target_ref": _BALANCE,
+        "target_is_proxy": True, "catalog_source": "deposits"}, headers=AUTH).json()
+    assert body["target_is_proxy"] is False
+    assert body["target_leakage_class"] is None
+
+
+def test_an_exploring_declaration_needs_no_acknowledgment(make_client):
+    client = make_client(_proxy_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = client.post("/contract/intake", json={
+        "hypothesis": "What features exist around AML review?",
+        "catalog_source": "deposits"}, headers=AUTH).json()["intent_id"]
+    assert client.post("/contract/intake/target", json={
+        "intent_id": intent_id, "decision": "exploring"},
+        headers=AUTH).status_code == 200, "there is no target to disclose anything about"
+
+
+def test_the_window_refusal_rides_the_intake_response(make_client):
+    client = make_client(_proxy_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.post("/contract/intake", json={
+        "hypothesis": "Customers flagged for AML review within 30 days of onboarding.",
+        "catalog_source": "deposits"}, headers=AUTH).json()
+    # the scripted ticket says 90; the objective says 30
+    assert body["ticket"]["window_refusal"]["code"] == "WINDOW_CONTRADICTS_GOAL"
+    assert body["ticket"]["window_refusal"]["stated_days"] == 30
+    assert body["ticket"]["window_refusal"]["ticket_days"] == 90
+    assert body["ticket"]["target_window_days"] is None
+    assert body["ticket"]["window_source"] == "contradicted"

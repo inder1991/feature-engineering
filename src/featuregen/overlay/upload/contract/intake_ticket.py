@@ -18,6 +18,12 @@ Discipline, in one line each:
   hypothesis text" hashed one input of four).
 * Failure degrades, never blocks — no client / fault / ceiling yields a ticket with the pinned
   target (if any) and honest abstains everywhere else.
+* OUTCOME OR PROXY, never silently either (T7, 2026-08-24). A proposal COMMITS only when the
+  target's concept is outcome-family; anything else abstains and hands back the nearest proxies,
+  each labelled with the concept it actually carries. See :func:`target_leakage_class`.
+* WINDOW OR ABSENCE, never a contradiction (T7). The goal text's stated horizon is extracted
+  deterministically and cross-checked against the model's number; a disagreement is a typed
+  refusal that accepts NO window, so the near-label critic abstains for a stated reason.
 * The human confirmation gate (B2) consumes this ticket: the ticket is a DRAFT reading,
   `llm/proposed` in spirit, until a person signs the target — and the signed reading lands on
   `contract_intent` via :func:`record_target_reading` (migration 1059), where the existing
@@ -33,6 +39,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 from featuregen.overlay.field_evidence import canonical_hash
+from featuregen.overlay.upload.concepts import concept as _concept_record
+from featuregen.overlay.upload.recipe_contract_v2 import LEAKAGE_CLASSES
 from featuregen.overlay.upload.structured_results import (
     find_structured_result,
     record_structured_result,
@@ -68,6 +76,162 @@ _INSTRUCTION = (
 _WORD_RE = re.compile(r"[a-z0-9_]+")
 
 
+# ══ T7 (a) — the outcome family, DERIVED from what the registry already declares ═════════════════
+#
+# NO NEW TAXONOMY. Two behaviour fields the concept registry has carried since it was authored
+# answer "is this column the label?", and both are already load-bearing elsewhere:
+#
+#   * ``Concept.leakage_anchor`` — its own comment reads "True for outcome_label + the
+#     target-defining flags (§3.10/§3.7)", and ``templates._safe_to_bind`` refuses to build a
+#     feature FROM any of them because "reading the target = leakage". Eight concepts today
+#     (``outcome_label`` and its four children ``lapsed``/``surrendered``/``settlement_fail``/
+#     ``redeemed``, plus ``delinquency_flag``/``default_flag``/``fraud_flag``). THAT set — the
+#     columns the platform already treats as being the answer — is the OUTCOME family, and nothing
+#     else is.
+#   * ``Concept.near_label`` — "funnel-tail signals that BORDER the label". Thirteen concepts,
+#     ``restriction_status`` among them, whose own description says these are "AML/fraud
+#     CONSEQUENCES, so a financial-crime model trained on them reads its own answer back".
+#
+# The three class NAMES are ``recipe_contract_v2.LEAKAGE_CLASSES`` — the vocabulary the recipe
+# contract already publishes for exactly this three-way split. Looked up by key rather than
+# re-spelled, so dropping one there is a loud ImportError-time KeyError here, never silent drift.
+_LEAKAGE_CLASS = {name: name for name in LEAKAGE_CLASSES}
+OUTCOME_CLASS = _LEAKAGE_CLASS["outcome"]
+NEAR_LABEL_CLASS = _LEAKAGE_CLASS["near_label"]
+STANDARD_CLASS = _LEAKAGE_CLASS["standard"]
+
+#: How many proxies an abstention hands back. The answer is a shortlist for a person to read, not
+#: the catalog again.
+_PROXY_LIMIT = 5
+
+
+def target_leakage_class(concept_name: str | None) -> str | None:
+    """Which :data:`LEAKAGE_CLASSES` member ``concept_name`` belongs to, or None.
+
+    None means the column carries NO REGISTERED CONCEPT, and absence is not an assertion (the
+    ``concepts.is_descriptive`` precedent, stated there in the same words). An unclassified column
+    is therefore never called a proxy — but it is never committable either, because nothing
+    certifies it as the label.
+    """
+    record = _concept_record(concept_name or "")
+    if record is None:
+        return None
+    if record.leakage_anchor:
+        return OUTCOME_CLASS
+    if record.near_label:
+        return NEAR_LABEL_CLASS
+    return STANDARD_CLASS
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyCandidateV1:
+    """One row of the abstention answer: a ref, the concept it ACTUALLY carries, and what that
+    concept makes it. ``concept`` is "" when the column carries none — the same honest absence
+    ``leakage_class = None`` states."""
+
+    ref: str
+    concept: str
+    leakage_class: str | None
+
+
+# ══ T7 (b) — the stated horizon, extracted deterministically ═════════════════════════════════════
+#
+# CONSERVATIVE BY CONSTRUCTION: three literal patterns, digits only, and an extraction failure is
+# NO CLAIM rather than a guess. "Churn = 90 days of inactivity" is a DEFINITION of the event and
+# matches none of them; "in the next 90 days" is a horizon and matches the first.
+_HORIZON_PATTERNS = (
+    re.compile(r"\bnext\s+(\d{1,5})\s+(day|week|month)s?\b"),
+    re.compile(r"\bwithin\s+(\d{1,5})\s+(day|week|month)s?\b"),
+    re.compile(r"\b(\d{1,5})[-\s](day|week|month)\s+window\b"),
+)
+
+#: Units with an EXACT day count. A month has none — 28, 29, 30 and 31 are all months — so a month
+#: horizon states that a horizon exists without stating a number this code may compare against.
+#: Converting it would manufacture the precise false confidence this task exists to remove.
+_EXACT_DAYS = {"day": 1, "week": 7}
+
+#: How ``target_window_days`` got its value — or why it has none.
+#: ``stated`` the goal text names this horizon and the reading agrees; ``model_only`` the goal
+#: names none (or names one in months) and the number is the model's reading alone; ``unstated``
+#: nobody stated one, which is honest absence; ``contradicted`` the two disagree, so no window is
+#: accepted and :attr:`IntakeTicketV1.window_refusal` says which numbers disagreed.
+WINDOW_SOURCES = ("stated", "model_only", "unstated", "contradicted")
+
+#: The one typed refusal code this seam raises.
+WINDOW_CONTRADICTS_GOAL = "WINDOW_CONTRADICTS_GOAL"
+
+
+@dataclass(frozen=True, slots=True)
+class StatedHorizonV1:
+    """A horizon the goal text states. ``days`` is None for a month horizon — stated, not
+    countable — and ``text`` is always the objective's own words, for the refusal to quote."""
+
+    text: str
+    days: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class WindowRefusalV1:
+    """The typed refusal: both numbers, named. ``ticket_days`` is the model's RAW answer, so a
+    reading of 0 against a stated 90 days says "0", not "None"."""
+
+    code: str
+    stated_text: str
+    stated_days: int | None
+    ticket_days: int
+    detail: str
+
+
+def stated_horizon(goal: str) -> StatedHorizonV1 | None:
+    """The horizon the goal text states, or None when it states none — or states two.
+
+    Two different horizons in one objective is an ambiguity, not a horizon: this returns None and
+    the ticket makes no claim, exactly as it does when nothing matched at all.
+    """
+    found: set[tuple[int, str]] = set()
+    lowered = goal.lower()
+    for pattern in _HORIZON_PATTERNS:
+        for count, unit in pattern.findall(lowered):
+            found.add((int(count), unit))
+    if len(found) != 1:
+        return None
+    ((count, unit),) = found
+    per_day = _EXACT_DAYS.get(unit)
+    return StatedHorizonV1(f"{count} {unit if count == 1 else unit + 's'}",
+                           None if per_day is None else count * per_day)
+
+
+def _resolve_window(raw: object, goal: str) -> tuple[int | None, str, WindowRefusalV1 | None]:
+    """Cross-check the model's window against the goal's stated horizon.
+
+    Nothing cross-checked these two on the 2026-08-24 AML run: the objective said "in the next 90
+    days", the ticket said 0, and the near-label critic downstream then abstained on every
+    candidate without anyone learning why. The four outcomes are :data:`WINDOW_SOURCES`.
+    """
+    model_days = raw if isinstance(raw, int) and raw >= 0 else None
+    accepted = model_days if (model_days or 0) > 0 else None
+    horizon = stated_horizon(goal)
+    if horizon is None:
+        return accepted, ("model_only" if accepted is not None else "unstated"), None
+    if accepted is not None:
+        if horizon.days is None:
+            # A month horizon and a number: a horizon IS stated, but no exact day count exists to
+            # compare it with. Neither confirmed nor contradicted — the number stands on the model.
+            return accepted, "model_only", None
+        if accepted == horizon.days:
+            return accepted, "stated", None
+    # Either the two numbers disagree, or the objective states a horizon and the reading carries
+    # none at all — the run's own 0-against-90. The second arm needs no day count, so a MONTH
+    # horizon catches it too, quoting the objective's words instead of an invented number.
+    ticket_days = model_days if model_days is not None else 0
+    return None, "contradicted", WindowRefusalV1(
+        code=WINDOW_CONTRADICTS_GOAL, stated_text=horizon.text, stated_days=horizon.days,
+        ticket_days=ticket_days,
+        detail=(f"the objective states a horizon of {horizon.text}; the intake reading returned "
+                f"target_window_days={ticket_days}. The two disagree, so no label window is "
+                f"accepted — state the horizon on the confirm screen."))
+
+
 @dataclass(frozen=True, slots=True)
 class IntakeTicketV1:
     """The structured reading of one hypothesis. `target_column` is a validated graph ref or None;
@@ -87,6 +251,57 @@ class IntakeTicketV1:
     # never the chosen target — one-click corrections on the confirm screen. () on v1 replays,
     # degraded tickets, and honest nothing-else-comes-close answers alike.
     runners_up: tuple[str, ...] = ()
+
+    # ── T7 (a): outcome or proxy, said out loud ──────────────────────────────────────────────────
+    #: The concept ``target_column`` ACTUALLY carries — "" when it carries none, or when there is
+    #: no target. Never the concept the summary prose implied.
+    target_concept: str = ""
+    #: ``target_concept``'s :data:`LEAKAGE_CLASSES` member; None when unregistered (nothing said).
+    target_leakage_class: str | None = None
+    #: True only when the registry POSITIVELY places the target outside the outcome family. An
+    #: unclassified target is uncommittable but is not a proxy — that would be a claim too.
+    target_is_proxy: bool = False
+    #: The abstention answer as DATA: the nearest proxies, ranked, each labelled with its real
+    #: concept. Populated whenever the target is not outcome-family (including when there is no
+    #: target at all); () when the target IS the label, because there is nothing to fall back to.
+    proxy_candidates: tuple[ProxyCandidateV1, ...] = ()
+
+    # ── T7 (b): a window, or a stated absence, or a named disagreement ───────────────────────────
+    #: One of :data:`WINDOW_SOURCES`.
+    window_source: str = "unstated"
+    #: Present only when ``window_source == "contradicted"``; ``target_window_days`` is then None.
+    window_refusal: WindowRefusalV1 | None = None
+
+
+def _proxy_candidates(target: str | None, runners: Sequence[str],
+                      concepts_by_ref: dict[str, str]) -> tuple[ProxyCandidateV1, ...]:
+    """The ranked proxies behind an abstention.
+
+    Order: near-label concepts first (the registry says they BORDER the label, so they are the
+    nearest honest thing), then the rest — and inside each class the model's own ranking, target
+    then runners-up, since that is the only relevance judgment anyone made. Outcome-family columns
+    are excluded on purpose: a label is not a proxy for itself.
+
+    NO SUBSTITUTION. This never promotes a column to ``target_column``; the module's first
+    discipline is SELECTION, never generation, and code choosing a target the model did not pick
+    would break it.
+    """
+    ordered = [ref for ref in (target, *runners) if ref]
+    ordered += sorted(ref for ref, name in concepts_by_ref.items()
+                      if target_leakage_class(name) == NEAR_LABEL_CLASS)
+    ranked: list[ProxyCandidateV1] = []
+    seen: set[str] = set()
+    for ref in ordered:
+        if ref in seen or ref not in concepts_by_ref:
+            continue
+        name = concepts_by_ref[ref]
+        klass = target_leakage_class(name)
+        if klass == OUTCOME_CLASS:
+            continue
+        seen.add(ref)
+        ranked.append(ProxyCandidateV1(ref=ref, concept=name, leakage_class=klass))
+    ranked.sort(key=lambda c: 0 if c.leakage_class == NEAR_LABEL_CLASS else 1)
+    return tuple(ranked[:_PROXY_LIMIT])
 
 
 def _use_case_vocabulary() -> tuple[str, ...]:
@@ -157,18 +372,35 @@ def _input_hash(*, hypothesis: str, shortlist: Sequence[dict],
     })
 
 
-def _degraded(pin: str | None) -> IntakeTicketV1:
+def _degraded(pin: str | None, concepts_by_ref: dict[str, str] | None = None) -> IntakeTicketV1:
+    """The no-client / fault / ceiling ticket. It still LABELS the pinned target, because the
+    registry read that decides outcome-vs-proxy is pure code and never needed the provider."""
+    concepts_by_ref = concepts_by_ref or {}
+    name = concepts_by_ref.get(pin or "", "")
+    klass = target_leakage_class(name)
+    is_outcome = klass == OUTCOME_CLASS
     return IntakeTicketV1(target_column=pin, target_window_days=None, target_type="abstain",
                           business_domain=(), confidence="abstain", pinned=pin is not None,
-                          contradiction=None, runners_up=())
+                          contradiction=None, runners_up=(),
+                          target_concept=name, target_leakage_class=klass,
+                          target_is_proxy=(pin is not None and klass is not None
+                                           and not is_outcome),
+                          proxy_candidates=(() if is_outcome else
+                                            _proxy_candidates(pin, (), concepts_by_ref)))
 
 
-def _ticket_from_output(output: dict, *, pin: str | None,
-                        shortlist_refs: set[str], vocabulary: set[str]) -> IntakeTicketV1:
+def _ticket_from_output(output: dict, *, pin: str | None, goal: str,
+                        concepts_by_ref: dict[str, str], vocabulary: set[str]) -> IntakeTicketV1:
     """Validate the model's reading into a ticket. Everything is checked against a closed set: an
     off-shortlist target is ABSTAIN (never trusted — the veto must not guard an empty room);
     off-vocabulary domains are dropped; a pinned name always wins, with a disagreement kept as the
-    confirm screen's contradiction warning."""
+    confirm screen's contradiction warning.
+
+    T7 adds two checks the 2026-08-24 AML run had neither of: the target's concept decides whether
+    a COMMIT is even available (:func:`target_leakage_class`), and the model's window is
+    cross-checked against the goal text's own stated horizon (:func:`_resolve_window`).
+    """
+    shortlist_refs = set(concepts_by_ref)
     raw_target = output.get("target_ref")
     model_target = raw_target if (isinstance(raw_target, str)
                                   and raw_target in shortlist_refs) else None
@@ -181,8 +413,8 @@ def _ticket_from_output(output: dict, *, pin: str | None,
                             f"{model_target.rsplit('.', 1)[-1]}")
     else:
         target = model_target
-    window = output.get("target_window_days")
-    window = window if isinstance(window, int) and window > 0 else None
+    window, window_source, window_refusal = _resolve_window(
+        output.get("target_window_days"), goal)
     target_type = output.get("target_type")
     target_type = target_type if target_type in _TARGET_TYPES else "abstain"
     domains = output.get("business_domain")
@@ -199,10 +431,26 @@ def _ticket_from_output(output: dict, *, pin: str | None,
         r for r in raw_runners
         if isinstance(r, str) and r in shortlist_refs and r != target
     ))[:3] if isinstance(raw_runners, list) else ()
+    # ABSTAIN-BY-DEFAULT. A proposal may COMMIT only onto an outcome-family concept; everything
+    # else abstains and hands back the ranked proxies instead. A PIN is exempt from the confidence
+    # override — the person literally typed that column name, so the platform is not proposing
+    # anything — but it is labelled exactly the same, and the confirm gate still asks for the
+    # disclosure before the label becomes a decision.
+    concept_name = concepts_by_ref.get(target or "", "")
+    klass = target_leakage_class(concept_name)
+    is_outcome = klass == OUTCOME_CLASS
+    if not is_outcome and pin is None:
+        confidence = "abstain"
     return IntakeTicketV1(target_column=target, target_window_days=window,
                           target_type=target_type, business_domain=domains,
                           confidence=confidence, pinned=pin is not None,
-                          contradiction=contradiction, runners_up=runners)
+                          contradiction=contradiction, runners_up=runners,
+                          target_concept=concept_name, target_leakage_class=klass,
+                          target_is_proxy=(target is not None and klass is not None
+                                           and not is_outcome),
+                          proxy_candidates=(() if is_outcome else
+                                            _proxy_candidates(target, runners, concepts_by_ref)),
+                          window_source=window_source, window_refusal=window_refusal)
 
 
 _PROVENANCES = ("human_confirmed", "user_typed", "exploring")
@@ -297,9 +545,13 @@ def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str 
     ``extracted`` (fresh, stored), ``unavailable`` (no client / fault — degraded ticket, pinned
     target survives), ``call_ceiling``. The model output is STORED verbatim (including honest
     abstains); validation runs on every read as well as on first extraction, so a shortlist change
-    re-validates a replayed ticket too."""
+    re-validates a replayed ticket too — and since T7's outcome/proxy labelling and window
+    cross-check are both part of that validation, a ticket recorded BEFORE this rule existed is
+    re-judged under it on its next read, with no re-dispatch and no stored-output rewrite."""
     shortlist = _shortlist(conn, catalog_source, roles)
-    shortlist_refs = {e["ref"] for e in shortlist}
+    # The concept each candidate ACTUALLY carries, by ref — the outcome/proxy answer's whole
+    # input, and already on the shelf photo the model was shown.
+    concepts_by_ref = {e["ref"]: e.get("concept") or "" for e in shortlist}
     vocabulary = _use_case_vocabulary()
     pin = _exact_pin(hypothesis, shortlist)
     key = _input_hash(hypothesis=hypothesis, shortlist=shortlist, vocabulary=vocabulary)
@@ -308,13 +560,13 @@ def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str 
         conn, result_type=INTAKE_TICKET_RESULT_TYPE,
         result_version=INTAKE_TICKET_RESULT_VERSION, input_content_hash=key)
     if stored is not None:
-        return _ticket_from_output(dict(stored.output), pin=pin,
-                                   shortlist_refs=shortlist_refs,
+        return _ticket_from_output(dict(stored.output), pin=pin, goal=hypothesis,
+                                   concepts_by_ref=concepts_by_ref,
                                    vocabulary=set(vocabulary)), "replayed"
     if client is None:
-        return _degraded(pin), "unavailable"
+        return _degraded(pin, concepts_by_ref), "unavailable"
     if call_ledger is not None and not call_ledger.charge():
-        return _degraded(pin), "call_ceiling"
+        return _degraded(pin, concepts_by_ref), "call_ceiling"
 
     from featuregen.overlay.upload.contract.intake import redact_free_text
     from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
@@ -336,11 +588,11 @@ def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str 
     except Exception:  # noqa: BLE001 — mandatory to ATTEMPT, never load-bearing
         logger.warning("intake-ticket extraction failed; degrading to the pinned/abstain ticket",
                        exc_info=True)
-        return _degraded(pin), "unavailable"
+        return _degraded(pin, concepts_by_ref), "unavailable"
     if call.output is None:
-        return _degraded(pin), "unavailable"
-    ticket = _ticket_from_output(dict(call.output), pin=pin, shortlist_refs=shortlist_refs,
-                                 vocabulary=set(vocabulary))
+        return _degraded(pin, concepts_by_ref), "unavailable"
+    ticket = _ticket_from_output(dict(call.output), pin=pin, goal=hypothesis,
+                                 concepts_by_ref=concepts_by_ref, vocabulary=set(vocabulary))
     record_structured_result(
         conn, result_type=INTAKE_TICKET_RESULT_TYPE,
         result_version=INTAKE_TICKET_RESULT_VERSION, input_content_hash=key,
