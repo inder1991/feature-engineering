@@ -156,6 +156,20 @@ def _refine_as_intent_revision(conn, body, client, identity) -> dict:
         catalog_source=body.catalog_source, target_ref=body.target_ref)
     served = projection.ideas or projection.actionable_ideas
     if not served:
+        # T2: the revision may have failed for a reason that is not a REFUSAL at all — the
+        # instruction asked for a concept this catalog does not carry, so no card exists to
+        # return. Answering that with the generic "did not survive validation" would hide the
+        # one fact the analyst can act on, so the missing concepts and the binder's own code
+        # are what comes back. Still a 200: this is data the reviewer acts on, not an error.
+        if projection.needs_setup:
+            entry = projection.needs_setup[0]
+            first = next((code for operand in entry.unbound_operands
+                          for code in operand.reason_codes), "")
+            return {"rejected": {
+                "reason": ("the revision needs a concept this catalog does not carry: "
+                           + ", ".join(entry.missing_concepts)),
+                "code": first or "SEMANTIC_NOT_BINDABLE",
+                "needs_setup": [e.to_json() for e in projection.needs_setup]}}
         reject = projection.rejections[0] if projection.rejections else {
             "reason": "the revision did not survive validation", "code": "REFUSED"}
         return {"rejected": {"reason": str(reject.get("reason", "")),

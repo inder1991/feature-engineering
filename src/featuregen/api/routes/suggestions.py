@@ -444,6 +444,29 @@ class SemanticEngineCorroborationV4Response(_Model):
     source_definition_id: str
 
 
+class SemanticEngineUnboundOperandV4Response(_Model):
+    role: str
+    concept: str
+    operand_class: str
+    #: The binder's verdict status for this role; ``""`` when it emitted no verdict at all.
+    status: str
+    reason_codes: list[str]
+    resolution: str
+
+
+class SemanticEngineNeedsSetupV4Response(_Model):
+    """T2 — why an entry carries no ``card``: a REQUIRED operand of this candidate never bound,
+    so there is no computation to offer. Names the concepts THIS catalog would have to carry;
+    it never names another catalog, because the projection holds no cross-catalog inventory."""
+
+    name: str
+    source_definition_id: str
+    recipe_id: str | None
+    catalog_source: str
+    missing_concepts: list[str]
+    unbound_operands: list[SemanticEngineUnboundOperandV4Response]
+
+
 class SemanticEngineEntryV4Response(_Model):
     """One engine candidate anchored to this table. ``card`` is the SHARED option carrier (D4,
     UI-05) — the same projected FeatureIdea the Workbench renders, serialized by gate1's own
@@ -451,6 +474,9 @@ class SemanticEngineEntryV4Response(_Model):
     would be a second copy of the card model and could drift from the one that ships."""
 
     card: dict[str, Any] | None
+    #: Present (non-null) exactly when ``card`` is null for T2's reason — the two are the two
+    #: halves of one answer, and an entry never carries both.
+    needs_setup: SemanticEngineNeedsSetupV4Response | None = None
     recipe_id: str
     binding_state: str
     readiness: str

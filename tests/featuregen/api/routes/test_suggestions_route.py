@@ -377,7 +377,11 @@ def test_the_cards_are_the_same_carrier(client, conn, ftr_catalog):  # noqa: F81
     """D4 hardens the SE-13 parity: not just "binding states agree" — the CARDS are the SAME
     carrier. Every bound entry's `card` is the projected FeatureIdea serialized by gate1's
     OWN serializer (proven by re-projecting and comparing equal), so the page and the
-    Workbench cannot render two different stories about one candidate."""
+    Workbench cannot render two different stories about one candidate.
+
+    T2 extends the parity to the OTHER outcome: a candidate the projection holds out carries a
+    `needs_setup` entry instead, from the same projection, so "no card here" is one answer both
+    surfaces give for the same reason rather than an absence each explains its own way."""
     from featuregen.overlay.upload.candidate_assembly import assemble_candidates
     from featuregen.overlay.upload.contract.gate1 import _idea_json
     from featuregen.overlay.upload.generation_semantic_context import (
@@ -404,14 +408,31 @@ def test_the_cards_are_the_same_carrier(client, conn, ftr_catalog):  # noqa: F81
     expected = {idea.source_definition_id: _idea_json(idea)
                 for idea in (*projection.ideas, *projection.actionable_ideas)
                 if idea.source_definition_id}
-    carded = [entry for entry in entries if entry.get("card")]
-    assert carded, "the projection served at least one card for this table"
-    for entry in carded:
+    expected_setup = {entry.source_definition_id: entry.to_json()
+                      for entry in projection.needs_setup}
+    for entry in (e for e in entries if e.get("card")):
         card = entry["card"]
         key = card.get("source_definition_id")
         assert key in expected, key
         assert card == expected[key], \
             "one candidate, one carrier — the page serves gate1's own serialization"
+    # T2: on this fixture NO candidate binds all of its required operands, so the honest page
+    # carries no cards at all — and the guard that used to keep this test non-vacuous ("at
+    # least one card") would now pass only by re-serving what cannot compute. The claim that
+    # survives, and the one a reader depends on, is that EVERY entry is answered by exactly one
+    # of the two carriers, both minted by the projection this test re-runs.
+    for entry in entries:
+        key = (entry["card"] or {}).get("source_definition_id") or (
+            (entry.get("needs_setup") or {}).get("source_definition_id"))
+        assert key, f"entry for {entry['recipe_id']} carries neither a card nor a reason"
+        assert bool(entry["card"]) != bool(entry.get("needs_setup")), \
+            "a candidate is served OR held out, never both"
+    assert [e for e in entries if e.get("needs_setup")], \
+        "this fixture's engine really does hold candidates out (0 of 18 bind)"
+    for entry in entries:
+        if entry.get("needs_setup"):
+            key = entry["needs_setup"]["source_definition_id"]
+            assert entry["needs_setup"] == expected_setup[key]
 
 
 def test_an_unknown_table_stays_a_200_payload_state(client, ftr_catalog):  # noqa: F811
