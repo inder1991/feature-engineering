@@ -155,6 +155,18 @@ class DraftNotAnAnswer(FormulaControlFlow):
     """
 
 
+class DraftCeilingExhausted(FormulaControlFlow):
+    """The ceiling this regeneration would ride is already spent — refuse BEFORE the coupon.
+
+    ▲ Round-3's dead-ticket class at the ORIGINAL door (Task 7 review item 1): without this
+    check the mint consumed the naming coupon, and the draft then died at the dispatch seam
+    where 1105 enforces spend per physical call — the person burned their one approval buying
+    a draft that could not complete. Same shape as the fence fix: never sell a ticket the
+    ladder cannot honor. The run-spine door already refuses this case in its projection
+    pre-flight; this store gate is what makes the two doors one answer again.
+    """
+
+
 class DraftRetired(FormulaControlFlow):
     """This draft is retired: it is no longer the current answer and must not be advanced, restored
     or compiled.
@@ -359,8 +371,12 @@ def request_draft(
         DraftRetired: a tombstone covers this request and no valid exception authorises it.
         DraftNotAnAnswer: the existing draft for this identity is FAILED or CANCELLED, so returning
             it would report a bought answer that was never bought.
+        DraftCeilingExhausted: the approved ceiling this mint would ride cannot cover ONE more
+            per-call worst-case reservation, so the coupon must survive for a request that can.
     """
+    from featuregen.overlay.upload.llm_spend import remaining_spend
     from featuregen.overlay.upload.retirement_scope import (
+        approved_ceiling_for,
         consume_exception,
         covering_tombstones,
         retirement_scope_key,
@@ -392,8 +408,10 @@ def request_draft(
             requested_by=requested_by, requested_at=requested_at,
             provider_contract_hash=provider_contract_hash,
             strategy_identity_hash=strategy_identity_hash, now=now,
+            approved_ceiling_for=approved_ceiling_for,
             consume_exception=consume_exception,
             covering_tombstones=covering_tombstones,
+            remaining_spend=remaining_spend,
             valid_exception_for=valid_exception_for)
 
 
@@ -402,7 +420,8 @@ def _request_draft_locked(
     option_id: str, planning_request_hash: str, catalog_snapshot_hash: str,
     authoring_config_hash: str, definition_revision: str, requested_by: str, requested_at: str,
     provider_contract_hash, strategy_identity_hash, now,
-    consume_exception, covering_tombstones, valid_exception_for,
+    approved_ceiling_for, consume_exception, covering_tombstones, remaining_spend,
+    valid_exception_for,
 ) -> tuple[str, bool]:
     """The request itself, with the retirement scope's lock already held."""
     # ── WHO MUST PRESENT AN EXCEPTION, decided BEFORE anything is spent or written ──────────────
@@ -493,6 +512,44 @@ def _request_draft_locked(
                     f"recorded — so returning it as an existing draft would report a purchase that "
                     f"never happened. Re-attempting needs an approved regeneration exception for "
                     f"this exact identity")
+
+    if located:
+        # ▲ THE DEAD-TICKET GUARD (Task 7 review item 1). Coupons are about to be consumed, so
+        # the ceiling the mint would ride must still cover work — otherwise the draft dies at
+        # the dispatch seam where 1105 reserves per physical call, AFTER the approval is burned.
+        # The ride is the SAME locator the service prefers with (and the run-spine projection
+        # switches to on its side's next round — two callers today, three then). `None` here
+        # means the approval's authorization EXPIRED: the service then rides its bounded
+        # development envelope (or refuses COST_AUTHORIZATION_MISSING on the job path, before
+        # this gate runs), so the mint CAN complete and there is no dead ticket to refuse.
+        ride = approved_ceiling_for(
+            conn, target_formula_identity_hash=identity,
+            provider_contract_hash=provider_contract_hash,
+            strategy_identity_hash=strategy_identity_hash)
+        if ride is not None:
+            # ▲ THE BAR IS ONE PER-CALL WORST-CASE RESERVATION, NOT ZERO (scoped-review item 1:
+            # a zero floor passed a remainder too small for the FIRST dispatch to reserve —
+            # coupon consumed, then refused one seam later). The dispatch seam reserves
+            # calls=1, tokens=ceil(max_tokens/max_calls), cost=max_cost/max_calls
+            # (formula_draft_worker's SpendBindingV1 construction) — the SAME arithmetic here,
+            # so the guard refuses exactly when the seam would.
+            from decimal import Decimal
+
+            left = remaining_spend(conn, ride, now=resolved_now)
+            max_calls, max_tokens, max_cost = conn.execute(
+                "SELECT max_calls, max_tokens, max_cost FROM llm_spend_authorization_revision "
+                "WHERE spend_authorization_id = %s", (ride,)).fetchone()
+            call_tokens = -(-int(max_tokens) // int(max_calls))
+            call_cost = Decimal(str(max_cost)) / int(max_calls)
+            if left.calls < 1 or left.tokens < call_tokens or left.cost < call_cost:
+                raise DraftCeilingExhausted(
+                    f"the approved ceiling {ride} for formula identity {identity} cannot cover "
+                    f"one more call (remaining: calls={left.calls}, tokens={left.tokens}, "
+                    f"cost={left.cost}; one call reserves calls=1, tokens={call_tokens}, "
+                    f"cost={call_cost}) — "
+                    f"minting would consume the regeneration exception to buy a draft that "
+                    f"cannot dispatch. Nothing was consumed or written; re-confirming the cost "
+                    f"under a fresh authorization is the remedy, and it is the approver's")
 
     inserted = conn.execute(
         "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "

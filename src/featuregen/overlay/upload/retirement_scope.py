@@ -28,12 +28,14 @@ from featuregen.canonical import jcs_sha256
 __all__ = [
     "RetirementScope",
     "TombstoneV1",
+    "approve_regeneration_exception",
+    "approved_ceiling_for",
     "consume_exception",
     "coverage_identity",
+    "covering_tombstones",
     "record_tombstone",
     "retirement_scope_key",
     "scope_locked",
-    "tombstone_covering",
     "valid_exception_for",
 ]
 
@@ -255,6 +257,38 @@ def covering_tombstones(
         TombstoneV1(tombstone_id=r[0], scope=RetirementScope(r[1]), retirement_scope_key=r[2],
                     exact_formula_identity_hash=r[3], reason=r[4], replacement_draft_id=r[5])
         for r in rows)
+
+
+def approved_ceiling_for(
+    conn, *, target_formula_identity_hash: str, provider_contract_hash: str,
+    strategy_identity_hash: str,
+) -> str | None:
+    """The cost-confirmed ceiling a draft at this identity would RIDE, or None.
+
+    ▲ ONE QUERY, EVERY DOOR. The service's approved-ceiling preference, the store's dead-ticket
+    guard and the run-spine retry projection must give one answer, so they call this one locator
+    (the run-spine side carried a byte-identical copy while the service file was barred to its
+    implementers — this is the extraction that retires it). Its quirks are LOAD-BEARING and
+    byte-stable by agreement with that side:
+
+    * the expiry filter is on the AUTHORIZATION only (`a.expires_at`) — a coupon's own expiry
+      bounds new coupon MINTS, never which ceiling an in-flight regeneration rides;
+    * no `uses_consumed` filter — a consumed coupon still names the ceiling its mint is riding;
+    * `ORDER BY e.approved_at DESC LIMIT 1` — the LATEST approval act is the operative one.
+
+    Returns the `llm_spend_authorization_id`, or None when no unexpired approval binds one (the
+    service then falls to its bounded development envelope, or refuses on the job path).
+    """
+    row = conn.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception e "
+        "  JOIN llm_spend_authorization_revision a "
+        "    ON a.spend_authorization_id = e.llm_spend_authorization_id "
+        " WHERE e.target_formula_identity_hash = %s AND e.provider_contract_hash = %s "
+        "   AND e.strategy_identity_hash = %s AND a.expires_at > now() "
+        " ORDER BY e.approved_at DESC LIMIT 1",
+        (target_formula_identity_hash, provider_contract_hash,
+         strategy_identity_hash)).fetchone()
+    return None if row is None else row[0]
 
 
 def valid_exception_for(

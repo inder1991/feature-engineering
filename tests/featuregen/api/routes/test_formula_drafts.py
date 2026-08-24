@@ -809,3 +809,123 @@ def test_the_APPROVED_ceiling_is_the_one_enforced_never_a_dev_envelope_over_it(
         "SELECT COUNT(*) FROM llm_spend_authorization_revision "
         "WHERE pricing_version = 'development'").fetchone()
     assert envelopes == (0,), "no dev envelope was minted over the approval"
+
+
+def test_a_SPENT_approved_ceiling_refuses_at_the_door_with_the_coupon_unburned(
+        client, conn, engineer_headers):
+    """Task 7 review item 1, the route chain: an approved ceiling spent to zero must 409 with
+    COST_AUTHORIZATION_EXHAUSTED — the code the run-spine projection reports for the same state,
+    two doors one answer — and the naming coupon survives unconsumed, because a refusal that
+    burns the approval turns the remedy into a second governance act."""
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.llm_spend import reserve_spend
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _revision(conn, revision_id="crev-dead", snapshot_id="snap-dead")
+    candidate = frozen_candidate(conn, "crev-dead", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-dead', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-dead', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    record_tombstone(conn, formula_draft_id="fd-dead",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post("/formula-drafts/fd-dead/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+    spend = approved.json()["spend_authorization_id"]
+    now = conn.execute("SELECT now()").fetchone()[0]
+    reserve_spend(conn, spend_authorization_id=spend, calls=_CEILING["max_calls"],
+                  tokens=_CEILING["max_tokens"], cost=_CEILING["max_cost"], now=now)
+
+    refused = client.post(DRAFT_PATH.format(rev="crev-dead", opt="opt-a"),
+                          headers=engineer_headers)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "COST_AUTHORIZATION_EXHAUSTED"
+    unburned = conn.execute(
+        "SELECT bool_and(uses_consumed = 0) FROM formula_draft_regeneration_exception "
+        "WHERE llm_spend_authorization_id = %s", (spend,)).fetchone()
+    assert unburned == (True,), "the refusal left every naming coupon unconsumed"
+    envelopes = conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision "
+        "WHERE pricing_version = 'development'").fetchone()
+    assert envelopes == (0,), "and no dev envelope was minted around the spent approval"
+
+
+def test_PRODUCTION_posture_an_EXPIRED_approval_refuses_and_never_rides_the_envelope(
+        client, conn):
+    """The dev-posture fall-through's PRODUCTION twin, pinned (Task 7 scoped-review rider):
+    with mint_development_envelope=False — the coordinator's posture — an EXPIRED
+    human-confirmed ceiling must be a typed refusal, not a silent substitution: the locator
+    returns None, and Task 5 review 4b's raise fires BEFORE the store call, so no coupon is
+    consumed, no draft is minted, and no envelope exists for the mint to ride."""
+    import pytest
+
+    from featuregen.overlay.upload.formula_draft_service import (
+        AuthoringRefused,
+        frozen_candidate,
+        request_draft_for_candidate,
+    )
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _revision(conn, revision_id="crev-pexp", snapshot_id="snap-pexp")
+    candidate = frozen_candidate(conn, "crev-pexp", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-pexp', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-pexp', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    record_tombstone(conn, formula_draft_id="fd-pexp",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post("/formula-drafts/fd-pexp/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+    # ▲ A DEFENSIVE pin, stated honestly (scoped review refuted the window narrative an earlier
+    # draft of this comment carried): the shipped approval surface computes ONE
+    # `canonical_approval_expiry` and hands it to BOTH the coupon and the authorization, so
+    # coupon-valid/authorization-expired is UNREACHABLE through shipped routes today. The
+    # invariant holds by CALLER DISCIPLINE, not construction — `approve_regeneration_exception`
+    # takes `expires_at` and the spend pointer as independent parameters, so one future caller
+    # with a longer coupon expiry reopens this exact state. That is why the pin earns its
+    # place. The test constructs the state the same way such a caller would: a valid coupon
+    # (governance passes as RETIREMENT_OVERRIDDEN) pointed at an expired authorization.
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+
+    expired_spend = authorize_spend(
+        conn, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-pexp",
+        member_identities=["ident-pexp"], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2020-01-01T00:00:00Z")
+    conn.execute(
+        "UPDATE formula_draft_regeneration_exception SET llm_spend_authorization_id = %s "
+        "WHERE llm_spend_authorization_id = %s",
+        (expired_spend, approved.json()["spend_authorization_id"]))
+    spend = expired_spend
+    drafts_before = conn.execute("SELECT COUNT(*) FROM formula_draft").fetchone()
+
+    with pytest.raises(AuthoringRefused) as refusal:
+        request_draft_for_candidate(
+            conn, revision_id="crev-pexp", option_id="opt-a", formula_draft_id="fd-pexp-2",
+            requested_by="user:sam", now="2026-08-24T00:00:00Z",
+            mint_development_envelope=False)
+    assert refusal.value.blockers == ("COST_AUTHORIZATION_MISSING",)
+    unburned = conn.execute(
+        "SELECT bool_and(uses_consumed = 0) FROM formula_draft_regeneration_exception "
+        "WHERE llm_spend_authorization_id = %s", (spend,)).fetchone()
+    assert unburned == (True,), "the refusal consumed NO coupon"
+    assert conn.execute("SELECT COUNT(*) FROM formula_draft").fetchone() == drafts_before, \
+        "and minted NO draft"
+    envelopes = conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision "
+        "WHERE pricing_version = 'development'").fetchone()
+    assert envelopes == (0,), "and no development envelope was ever created to substitute"
