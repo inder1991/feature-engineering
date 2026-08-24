@@ -16,18 +16,29 @@ export class ApiError extends Error {
   // SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION on a 422). null whenever the server sent none —
   // framework validation errors deliberately have no code, so a caller must never read the
   // absence as "some other code".
+  //
+  // ALSO the `code` of a STRUCTURED refusal — the `{code, detail, ...facts}` body the build-set,
+  // code-generation and run-spine routes answer 409s with. It is the same idea in the other shape,
+  // and reading it from both is what stops a caller having to know which shape a route chose.
   errorCode: string | null
+  // The whole structured refusal body, when the server sent one. A refusal that carries FACTS —
+  // which members are blocked, how many provider calls the ceiling must cover — is unusable if the
+  // transport keeps only its sentence, and a screen that re-derived those numbers would be
+  // quoting itself rather than the enforcement.
+  payload: Record<string, unknown> | null
   constructor(
     status: number,
     detail: string,
     ingestionRunId: string | null = null,
     errorCode: string | null = null,
+    payload: Record<string, unknown> | null = null,
   ) {
     super(detail)
     this.status = status
     this.detail = detail
     this.ingestionRunId = ingestionRunId
     this.errorCode = errorCode
+    this.payload = payload
   }
 }
 
@@ -54,10 +65,19 @@ async function requestWithResponse<T>(
     // statusText is empty under HTTP/2, so never let the message end up blank.
     let detail = res.statusText || `HTTP ${res.status}`
     let errorCode: string | null = null
+    let payload: Record<string, unknown> | null = null
     try {
       const body = await res.json()
       if (typeof body.detail === 'string') {
         detail = body.detail
+      } else if (body.detail !== null && typeof body.detail === 'object'
+        && !Array.isArray(body.detail)) {
+        // The STRUCTURED refusal: `{code, detail, ...facts}`. Without this branch the sentence the
+        // server wrote is dropped and every such 409 reads as 'Conflict' — the status word, in
+        // place of the one thing the route said to help.
+        payload = body.detail as Record<string, unknown>
+        if (typeof payload.detail === 'string') detail = payload.detail
+        if (typeof payload.code === 'string') errorCode = payload.code
       } else if (Array.isArray(body.detail) && body.detail.length > 0) {
         // FastAPI 422 validation shape: detail is [{loc, msg, type}, ...]
         detail = body.detail
@@ -73,7 +93,8 @@ async function requestWithResponse<T>(
     }
     // A failed ingest still opened a run: keep its id (header) on the error, or it is lost —
     // the JSON body of a 4xx/5xx never carries it.
-    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'), errorCode)
+    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'), errorCode,
+      payload)
   }
   return { body: (await res.json()) as T, response: res }
 }
@@ -4496,22 +4517,32 @@ export interface VerifiedOutputSummary {
   retention_state: string
 }
 
+// §9.0: verifications are DURABLE REQUESTS a worker executes. The v2 shape leads — status,
+// server-owned stage words, findings — while the legacy attempt fields survive as nullable for
+// rows that predate the lane. `verified_output` in the v2 shape is the SANDBOX OUTPUT REVISION:
+// content-addressed, the thing publication binds to; `staging_path` is a v1 mechanism and is an
+// honest null on v2 rows.
 export interface VerificationResult {
-  execution_hash: string
+  request_id?: string | null
+  execution_hash: string | null
   sealed_artifact_id: string
-  attempt: number
-  staging_path: string
-  started_at: string
+  status?: string
+  stage_label?: string
+  terminal?: boolean
+  findings?: { code: string; reason?: string }[]
+  failure_reason?: string | null
+  attempt: number | null
+  staging_path: string | null
+  started_at?: string
   // null is the ORDINARY answer while a worker is still running — never an error, and never a
   // fabricated pending output.
   verified_output: VerifiedOutputSummary | null
 }
 
 export interface VerificationRequested {
-  execution_hash: string
+  request_id: string
+  created: boolean
   sealed_artifact_id: string
-  attempt: number
-  staging_path: string
   detail: string
 }
 
@@ -4557,24 +4588,27 @@ export function getArtifactCode(artifactId: string): Promise<ArtifactCode> {
   return request(`/feature-execution/${encodeURIComponent(artifactId)}/code`)
 }
 
+// ▲ The body matches the REWRITTEN route exactly (extra="forbid"): the authorization and the
+// environment are properties OF THE ARTIFACT, recorded at sealing — the server refuses a client
+// that supplies them, so this type cannot offer them.
 export function requestVerification(body: {
   sealed_artifact_id: string
-  generation_authorization_revision_id: string
   check_set_hash: string
   inventory_observation_id: string
-  environment_id: string
   attempt: number
 }): Promise<VerificationRequested> {
   return post('/feature-execution/verifications', body)
 }
 
-export function getVerificationResult(executionHash: string): Promise<VerificationResult> {
-  return request(`/feature-execution/verifications/${encodeURIComponent(executionHash)}`)
+// Accepts a v2 request id (the POST's answer) or a legacy execution hash.
+export function getVerificationResult(verificationId: string): Promise<VerificationResult> {
+  return request(`/feature-execution/verifications/${encodeURIComponent(verificationId)}`)
 }
 
 export function requestPublication(body: {
   verified_output_revision_id: string
-  staging_path: string
+  // Required for a legacy attempt's output; a v2 content-addressed output needs none.
+  staging_path?: string | null
   sealed_artifact_id: string
   environment_id: string
   logical_group_name: string
@@ -4632,17 +4666,63 @@ export interface RunRailStage {
   // Why a stage is UNAVAILABLE — a socket whose machinery does not exist yet. NOT_STARTED (a
   // stage that could actually run) carries none.
   reason_code: string | null
+  // The stage's own count, when it has one to state ("2 of 5 bound — accumulating"). It rides ONE
+  // entry today (BIND_SELECTIONS), which is why it is optional rather than a null every other
+  // stage would have to carry: a field no stage fills is a field every client tests for.
+  detail?: string | null
+}
+
+// One code-generation journey bridged to this run through its considered revision. The status is
+// the job store's own word, rendered verbatim. `actions` is a LIST because one job performs
+// several acts and migration 1111 refused to collapse them: "a single `requested_action` with a
+// single authorization could not truthfully cover AUTHOR_FORMULA and GENERATE_PREVIEW".
+export interface RunJobRow {
+  job_id: string
+  status: string
+  requested_at: string
+  actions: { action: string; state: string }[]
 }
 
 export interface RunAuthoringRow {
   formula_draft_id: string
+  // BOTH halves of the candidate key: an option id is only meaningful inside the revision that
+  // froze it, and one run can hold several considered revisions — so two rows reading `o1` may be
+  // two different candidates with two different current answers.
+  considered_revision_id: string
   option_id: string
   // Two axes, never one field: state/rail_state is the immutable historical outcome, eligibility
   // is derived at read time from the retirement row.
   state: string
   rail_state: string
+  // Derived from BOTH withdrawal stores: 1096's per-draft retirement row and 1103's tombstones,
+  // which key on what a withdrawal COVERS (one exact identity, or the candidate across every
+  // configuration). Reading one alone showed a withdrawn candidate as `current`.
   eligibility: 'current' | 'withdrawn'
   retirement_reason: string | null
+  // The successor the withdrawal named, when it named one — a "withdrawn" with an onward answer.
+  retirement_replacement_draft_id: string | null
+  // Whether this attempt may be bought AGAIN (spec §R4.2), derived SERVER-side from the approval,
+  // the ceiling, the withdrawals and the money guard. The question is only asked of an attempt that
+  // bought nothing — a FAILED or CANCELLED draft — so an answered or in-flight row reads `false`
+  // with an EMPTY `retry_blockers`: the absence of the question, never a refusal nobody made.
+  retryable: boolean
+  // Why not, in the server's own words. The code is the substrate's vocabulary and the sentence is
+  // the run surface's; both render verbatim, because the greyed-out control and the entrance's 409
+  // are one refusal and a client that re-worded either would be a second policy.
+  retry_blockers: { code: string; detail: string }[]
+  // What a person clicking Retry is entitled to know — a governed WARN, never a refusal.
+  // `RETIREMENT_OVERRIDDEN` says this retry proceeds OVER a deliberate withdrawal because an
+  // approved regeneration NAMES it. Kept apart from the blockers because it does not stop the
+  // click: folding the two lists would make a proceed-with-knowledge read as a reason it is off.
+  retry_warnings: { code: string; detail: string }[]
+}
+
+// One candidate's CURRENT answer — an attempt row plus the one thing only the latest attempt can
+// say. `resolved: false` means the platform bought nothing for this candidate: every attempt
+// FAILED or was CANCELLED, and the most recent one is where it stands. The flag rides the current
+// reading alone, so a superseded attempt is never asked a question only the latest one answers.
+export interface RunAuthoringCurrent extends RunAuthoringRow {
+  resolved: boolean
 }
 
 export interface FeatureRunDetail {
@@ -4663,10 +4743,33 @@ export interface FeatureRunDetail {
       considered_revision_id: string
       chosen_at: string
     }[]
-    // Nothing can write a binding in the foundation, so this is always empty today.
-    bind_selections: unknown[]
+    // One row per selection→formula pin (migration 1101), written by the code-generation
+    // coordinator when a job binds its members. NOT a count: the rail's BIND_SELECTIONS entry
+    // states how many of this run's choices are bound, and a second number rendered from these
+    // rows would be a different one — a selection can be pinned to two drafts, and a pin can cover
+    // a candidate no gate-1 choice named. These rows answer WHICH, and only which.
+    bind_selections: {
+      binding_id: string
+      selection_revision_id: string
+      formula_draft_id: string
+      considered_revision_id: string
+      option_id: string
+      recorded_at: string
+    }[]
   }
-  authoring: RunAuthoringRow[]
+  // TWO READINGS of the same drafts, never one list: since migration 1107 a governed retry writes
+  // a second draft against the same formula identity, so a candidate can hold BOTH a failure and
+  // the answer that replaced it. `current` is where each candidate stands now (one row per
+  // candidate); `history` is every attempt, in the order they were requested.
+  authoring: { current: RunAuthoringCurrent[]; history: RunAuthoringRow[] }
+  // The code-generation jobs this run's candidates are being built through, newest first. Empty
+  // both when no job exists and when migration 1111 has not landed on the database being served —
+  // the run page never tells those apart, because the server deliberately does not.
+  jobs: RunJobRow[]
+  // Whether the run page's ONE gesture can run, DERIVED beside the rail from the same facts its
+  // entrance refuses on — so a control offered here can never be one the POST would refuse. When
+  // `available` is false the code and the sentence are the server's, rendered verbatim.
+  prepare_code: { available: boolean; reason_code: string | null; detail: string | null }
   rail: RunRailStage[]
 }
 
@@ -4683,4 +4786,63 @@ export function getFeatureRunDetail(runId: string): Promise<FeatureRunDetail> {
   // 404 covers both absence and denial on this route, deliberately — a 403 would confirm the id
   // exists. The client must not try to tell them apart.
   return request(`/feature-runs/${encodeURIComponent(runId)}`)
+}
+
+// The run page's ONE write (spec §R4.4.2): prepare formulas and code for candidates of this run.
+//
+// The body carries the CANDIDATES and, when the LLM authors any of them, the ceiling the person
+// confirmed — and nothing else. The considered revision, the target reading and each candidate's
+// selection are the run's own frozen facts, resolved server-side: a client that named them could
+// aim one run's gesture at another run's revision.
+//
+// `spend_approval` is omitted on the first call by design. The server answers 409
+// COST_AUTHORIZATION_MISSING carrying the number of provider calls its own enforcement will
+// budget, and the confirmation is sent on the second call with THAT number — never one this
+// browser computed.
+export function prepareRunCode(
+  runId: string,
+  body: { option_ids: string[]; spend_approval?: RunSpendApproval },
+): Promise<{
+  job_id: string
+  created: boolean
+  // Which job's declaration this build continues. The five declarations a build freezes are a
+  // person's, never the server's, so the reuse is named rather than silent.
+  declaration_source_job_id: string
+  run: FeatureRunDetail
+  detail: string
+}> {
+  return post(`/feature-runs/${encodeURIComponent(runId)}/prepare-code`, body)
+}
+
+// The run page's second write (spec §R4.2): buy a failed formula attempt again.
+//
+// The body names the ATTEMPT and nothing else. Its candidate is resolved from the run's own recorded
+// history — a client that named one could aim this run's retry at another run's candidate — and the
+// ceiling is not here either: a retry rides the ceiling its governance approval already confirmed,
+// so there is no cost modal on this path and adding one would collect a second, unapproved number.
+export function retryRunAuthoring(
+  runId: string,
+  body: { formula_draft_id: string },
+): Promise<{
+  // The NEW attempt. `created` is always true on a 202: a request that landed on an existing draft
+  // minted nothing, and the server refuses it rather than reporting a purchase that did not happen.
+  formula_draft_id: string
+  created: boolean
+  formula_strategy: string
+  strategy_warnings: string[]
+  run: FeatureRunDetail
+  detail: string
+}> {
+  return post(`/feature-runs/${encodeURIComponent(runId)}/authoring-retries`, body)
+}
+
+// The SIX keys the code-generation screen's confirmation carries, unchanged: it is the same act of
+// agreeing to a cost, recorded as the same durable ceiling (§11.2).
+export interface RunSpendApproval {
+  max_calls: number
+  max_tokens: number
+  max_cost: string
+  currency: string
+  pricing_version: string
+  expires_at: string
 }

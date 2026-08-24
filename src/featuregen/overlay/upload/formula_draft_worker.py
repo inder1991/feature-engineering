@@ -477,6 +477,7 @@ def _author(
     # registry or a review moving since then must not re-route a draft whose identity claims the
     # first answer. A draft with no plan row predates the strategy contract and authors by LLM,
     # which is what every such draft's identity actually recorded.
+    _recheck_authoring_decision(conn, draft_id)
     reviewed = _reviewed_blueprint_for(conn, draft_id)
 
     return run_authoring_v2_replay(
@@ -508,9 +509,8 @@ def _spend_binding_for(conn, draft_id: str):
     a price: reserving ceiling/calls per call means the approved call count exactly exhausts the
     approved totals.
     """
-    from decimal import Decimal
-
     from featuregen.overlay.upload.dispatch_audit import SpendBindingV1
+    from featuregen.overlay.upload.llm_spend import per_call_worst_case
 
     row = conn.execute(
         "SELECT a.spend_authorization_id, a.max_calls, a.max_tokens, a.max_cost "
@@ -521,10 +521,10 @@ def _spend_binding_for(conn, draft_id: str):
     if row is None:
         return None
     spend_authorization_id, max_calls, max_tokens, max_cost = row
+    call_tokens, call_cost = per_call_worst_case(max_calls, max_tokens, max_cost)
     return SpendBindingV1(
         spend_authorization_id=spend_authorization_id,
-        call_tokens=-(-int(max_tokens) // int(max_calls)),        # ceil division
-        call_cost=Decimal(str(max_cost)) / int(max_calls))
+        call_tokens=call_tokens, call_cost=call_cost)
 
 
 def _frozen_grounding_context(conn, draft_id: str):
@@ -575,6 +575,54 @@ def _frozen_grounding_context(conn, draft_id: str):
 #: hand-built contexts, and because a deployment that must disable the lane does it by posture in
 #: `formula_strategy_facts`, never by surgery here.
 _BOUND_CONTEXT_LOADER = _frozen_grounding_context
+
+
+def _recheck_authoring_decision(conn, draft_id: str) -> None:
+    """§8.2's SECOND LOOK for authoring (Stage I Task 5) — mirror of the generation lane's shape.
+
+    A draft with a plan row is a GOVERNED draft: the service records its AUTHOR_FORMULA decision
+    on that row in the same transaction, so a plan row with NULL here can only be a bypass (a
+    hand-enqueued draft) or a pre-1119 plan — and both refuse as `ACTION_DECISION_MISSING`,
+    because absence must never read as permission. A draft with NO plan row predates the
+    strategy contract entirely and keeps its documented legacy path. Drift is a REFUSAL a person
+    re-requests, never a re-decision.
+
+    ▲ HONESTY NOTE (Task 5 review): today's three pins are all recomputed from APPEND-ONLY rows,
+    so `ACTION_DECISION_DRIFTED` has no live signal — it fires only on a decided-in divergence
+    (a decision recorded against different facts than the plan row carries). That is the check's
+    current value: not drift-over-time, but decision/plan DISAGREEMENT. A future mutable pin
+    (e.g. a revocable contract) inherits the drift semantics without new machinery.
+    """
+    from featuregen.materialize.action_decision import DecisionDrift, DecisionMissing, recheck
+    from featuregen.overlay.upload.formula_draft_service import authoring_evidence_pins
+    from featuregen.overlay.upload.retirement_scope import retirement_scope_key
+
+    row = conn.execute(
+        "SELECT p.action_decision_revision_id, p.strategy_identity_hash, "
+        "       d.considered_revision_id, d.option_id, d.planning_request_hash, "
+        "       d.catalog_snapshot_hash, d.definition_revision "
+        "  FROM formula_draft_authoring_plan p "
+        "  JOIN formula_draft d ON d.formula_draft_id = p.formula_draft_id "
+        " WHERE p.formula_draft_id = %s", (draft_id,)).fetchone()
+    if row is None:
+        return                                # pre-contract draft: the documented legacy path
+    decision_id = row[0]
+    if decision_id is None:
+        raise _DraftBlocked({
+            "code": "ACTION_DECISION_MISSING",
+            "reason": "this governed draft carries no request-time AUTHOR_FORMULA decision — a "
+                      "queue bypass by definition; request it again through the service"})
+    pins = authoring_evidence_pins(
+        retirement_scope_key=retirement_scope_key(
+            considered_revision_id=row[2], option_id=row[3], planning_request_hash=row[4],
+            catalog_snapshot_hash=row[5], definition_revision=row[6]),
+        catalog_snapshot_hash=row[5], strategy_identity_hash=row[1])
+    try:
+        recheck(conn, decision_id, current_pins=pins)
+    except DecisionMissing as exc:
+        raise _DraftBlocked({"code": "ACTION_DECISION_MISSING", "reason": str(exc)}) from exc
+    except DecisionDrift as exc:
+        raise _DraftBlocked({"code": "ACTION_DECISION_DRIFTED", "reason": str(exc)}) from exc
 
 
 def _reviewed_blueprint_for(conn, draft_id: str):

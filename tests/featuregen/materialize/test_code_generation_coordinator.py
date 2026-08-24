@@ -398,3 +398,65 @@ def test_a_draft_with_no_ceiling_binds_NOTHING(db):
     from featuregen.overlay.upload.formula_draft_worker import _spend_binding_for
 
     assert _spend_binding_for(db, "fd-none") is None
+
+
+def test_a_FAILED_PREDECESSOR_blocks_the_member_by_name_never_the_whole_job(db, monkeypatch):
+    """DraftNotAnAnswer is a considered refusal (§11.1.2): the member blocks with the code, the
+    job settles as BLOCKED — not FAILED as a 'coordinator crash'. Found by the run-spine session:
+    the control-flow exception was uncaught in both service callers."""
+    from featuregen.overlay.upload import formula_draft_service
+    from featuregen.overlay.upload.formula_draft_service import NotAnAnswerAtRequest
+
+    job_id = _job(db, "naa", n_members=1)
+
+    def fake(conn, **kwargs):
+        raise NotAnAnswerAtRequest("the existing draft records a failure")
+
+    monkeypatch.setattr(formula_draft_service, "request_draft_for_candidate", fake)
+    process_code_generation_once(db, worker_id="w1")
+
+    job = read_job(db, job_id)
+    assert job.status is JobStatusV1.BLOCKED, "a product refusal, never a platform crash"
+    assert read_members(db, job_id)[0].blockers == ("FORMULA_DRAFT_NOT_AN_ANSWER",)
+
+
+def test_an_ABSENT_JOB_CEILING_refuses_the_member_never_substitutes_a_dev_envelope(db):
+    """Task 5 review 4b: the job's ceiling was cost-CONFIRMED at the write; if it is gone (or
+    expired) at drive time, the member refuses as COST_AUTHORIZATION_MISSING — quietly minting a
+    $25 development envelope would replace what a person approved with what nobody did."""
+    from tests.featuregen.api.routes.test_formula_drafts import _revision
+
+    tag = "noceil"
+    revision = _revision(db, revision_id=f"crev-{tag}", snapshot_id=f"snap-{tag}")
+    db.execute(
+        "INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
+        "VALUES (%s,'int-1','exploration','h') ON CONFLICT DO NOTHING", (f"trr-{tag}",))
+    selection = f"sel-{tag}"
+    db.execute(
+        "INSERT INTO feature_selection_revision (revision_id, target_reading_revision_id, "
+        "considered_revision_id, option_id, decision_id, planning_request_hash, "
+        "binding_plan_hash, content_hash) VALUES (%s,%s,%s,'opt-a',%s,'sha256:ask',"
+        "'sha256:plan',%s)",
+        (selection, f"trr-{tag}", revision, f"dec-{selection}", f"ch-{selection}"))
+    declaration = build_set_declaration()
+    job_id, _ = create_job(
+        db, job_id=f"cgj-{tag}", considered_revision_id=revision,
+        target_reading_revision_id=f"trr-{tag}", environment_id="hdfc-local",
+        logical_group_name=f"grp-{tag}", declaration=encode_declaration(declaration),
+        declaration_identity=declaration_identity(declaration),
+        execution_parameters=_PARAMS,
+        members=(JobMemberSpecV1(position=0, selection_revision_id=selection,
+                                 considered_revision_id=revision, option_id="opt-a",
+                                 formula_strategy="LLM_AUTHORED"),),
+        requested_by="user:sam", requested_at="2026-08-23T00:00:00Z")
+
+    # NO spend authorization exists for the job identity — the drive runs the REAL service.
+    process_code_generation_once(db, worker_id="w1")
+
+    job = read_job(db, job_id)
+    assert job.status is JobStatusV1.BLOCKED
+    assert read_members(db, job_id)[0].blockers == ("COST_AUTHORIZATION_MISSING",)
+    envelopes = db.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision "
+        "WHERE pricing_version = 'development'").fetchone()
+    assert envelopes == (0,), "nothing was minted on the job path"

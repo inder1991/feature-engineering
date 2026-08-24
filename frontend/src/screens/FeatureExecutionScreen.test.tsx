@@ -179,14 +179,16 @@ it('calls no executing endpoint on mount', async () => {
 
 it('verifies only when the button is pressed', async () => {
   stubReads()
+  // The v2 shapes (§9.0): the POST answers with the durable REQUEST id, and the poll reads the
+  // request's status with the legacy attempt fields as honest nulls.
   const verify = vi.spyOn(api, 'requestVerification').mockResolvedValue({
-    execution_hash: 'exec-1', sealed_artifact_id: 'art-1', attempt: 1,
-    staging_path: 'hdfs://nn/staging/gar-1/attempt=1', detail: 'recorded',
+    request_id: 'vfr-1', created: true, sealed_artifact_id: 'art-1', detail: 'recorded',
   })
-  vi.spyOn(api, 'getVerificationResult').mockResolvedValue({
-    execution_hash: 'exec-1', sealed_artifact_id: 'art-1', attempt: 1,
-    staging_path: 'hdfs://nn/staging/gar-1/attempt=1', started_at: 't0',
-    verified_output: null,
+  const poll = vi.spyOn(api, 'getVerificationResult').mockResolvedValue({
+    request_id: 'vfr-1', execution_hash: null, sealed_artifact_id: 'art-1',
+    status: 'REQUESTED', stage_label: 'Queued — the durable worker will execute it',
+    terminal: false, findings: [], failure_reason: null,
+    attempt: null, staging_path: null, verified_output: null,
   })
 
   render(<FeatureExecutionScreen {...PROPS} />)
@@ -195,6 +197,14 @@ it('verifies only when the button is pressed', async () => {
 
   await userEvent.click(screen.getByRole('button', { name: /verify in sandbox/i }))
   await waitFor(() => expect(verify).toHaveBeenCalledTimes(1))
+  // The poll is keyed on the REQUEST id the POST returned — the read path the §9.0 rewrite
+  // orphaned until the run-spine session caught it (the old code passed undefined here).
+  expect(poll).toHaveBeenCalledWith('vfr-1')
+  // The body carries no authorization and no environment — the route forbids both.
+  expect(verify.mock.calls[0][0]).toEqual({
+    sealed_artifact_id: 'art-1', check_set_hash: 'sha256:cs',
+    inventory_observation_id: 'obs-1', attempt: 1,
+  })
   expect(await screen.findByText(/a worker is still running this attempt/)).toBeTruthy()
 })
 

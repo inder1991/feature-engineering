@@ -785,7 +785,17 @@ claim 295 previews — see §0.
 
 ### Step 4 (CHILD) — recipe formula routing
 
-▲ **STATUS 2026-08-23 — 4a is DONE and 4b is WIRED, POSTURE OFF.** The facts assembler
+▲ **STATUS 2026-08-23 — 4a and 4b are DONE, and the LANE IS ON** (superseding the paragraph
+below, which was stale on arrival — the run-spine session caught the parent/child disagreement in
+ebbf5bee). The "deliberately NOT on" premise was FALSE and its correction is what flipped the
+lane: grounding contexts ARE persisted — gate1's engine pass writes every served recipe
+candidate's context into `considered_json["recipe_grounding_context_by_candidate_key"]` at
+generation — so the worker rehydrates the SAME bytes the serving run bound with
+(`_frozen_grounding_context`), `DETERMINISTIC_AUTHORING_AVAILABLE = True`, and
+`REVIEWED_LANE_UNAVAILABLE` is now only the honest per-candidate gap (legacy revision, ambiguous
+key, never-bound context), never a deployment posture. Original block kept for the record:
+
+**STATUS as first written — 4a DONE, 4b WIRED, POSTURE OFF.** The facts assembler
 (`formula_strategy_facts.py`) reads the per-option decision row with the frozen idea as honest
 fallback, probes each registry PER GENERATION (never the union — two of three reviewed recipes are
 Formula V1), normalizes the three origin vocabularies once, and the route resolves BEFORE the draft

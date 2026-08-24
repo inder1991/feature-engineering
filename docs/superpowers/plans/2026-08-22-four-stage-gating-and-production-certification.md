@@ -634,12 +634,19 @@ code_generation_job_action
 
 **Every worker claims ONE action stage and revalidates that stage's own authorization and decision.**
 
-▲ **And there is a live bypass to close in the same change.** `POST
-/considered-revisions/{id}/options/{id}/formula-drafts` (`formula_drafts.py:117`) creates a draft and
-an outbox message with **no action authorization, no decision and no spend authorization** — the
-worker then trusts `formula_draft.requested_by` (`formula_draft_worker.py:239`). Direct formula
-drafting is `AUTHOR_FORMULA`; it must bind all three **before the outbox row is written**, on the same
-before-the-queue discipline as retirement (§11.1.1) and spend (§11.2).
+▲ **CLOSED — Stage I Task 5 (2026-08-23).** This row used to read: the drafts route creates a
+draft and an outbox message with no action authorization, no decision and no spend authorization.
+All three now bind in `request_draft_for_candidate`'s one transaction, BEFORE the outbox row:
+`authorize_action(AUTHOR_FORMULA, resource=retirement_scope_key)` under the `control-plane`
+authoring environment · `decide()` carrying the candidate's REAL facts (the tombstone and
+legacy-regeneration blockers from `candidate_governance_blockers`, plus the resolver's warnings)
+so the §5 fold is what refuses a retired candidate · and spend as a MANDATORY ceiling — the HTTP
+path's posture is ROUTE-MINTS-DEV-ENVELOPE (bounded: 45 calls sized from the per-draft worst
+case of 8 author turns × 5 attempts + the critic's 5 · 250k tokens · $25 · UTC-day-boundary
+expiry, with expiry inside `authorize_spend`'s idempotency identity so renewal is real), while
+the JOB path REFUSES on an absent ceiling rather than substituting one nobody confirmed. The
+worker's second look rechecks the plan row's decision (`ACTION_DECISION_MISSING` /
+`ACTION_DECISION_DRIFTED`).
 
 ### ▲ 0.1.4 `AUTHOR_FORMULA`'s subject is a CANDIDATE, not a selection — R8
 
@@ -3037,6 +3044,106 @@ approved IRs + reviewed datasets, an operator/governance act; zero cases exist),
 execution adapter wiring (step 0b substrate), step 8's residual (rides step 10's cutover — the
 old route's ladder), step 10 (journey tests + legacy deletion), and all operator work.
 
+## ▲ Stage I record (2026-08-23) — Tasks 5 and 6, and the closed §11.1 items
+
+*(Written fresh in the Task 6 fix round: every earlier attempt to record this chained off a
+python-replace whose anchor no-oped silently, so commits f2fbacab, a0bde41e-adjacent and
+2a03a77b each CLAIMED doc rows this file never carried — the Task 6 review caught it, and every
+replace in this file now asserts its anchor.)*
+
+**Task 5 (accepted):** per-draft AUTHOR_FORMULA governance in the one composition —
+`authoring_evidence_pins`, authorize+decide with the candidate's REAL facts
+(`candidate_governance_blockers`), decision durable on the plan row (migration 1119; 1104+1119
+one cutover), worker recheck, spend mandatory (route mints the bounded dev envelope
+`PER_DRAFT_CALL_ENVELOPE = 45`; the job path REFUSES an absent ceiling), approval expiry floored
+to UTC-day INSIDE the spend idempotency identity so a replayed confirm cannot reset a budget.
+
+**Task 6 (owner ruling OPTION 2 — "deterministic-lane retries are FREE BY CONSTRUCTION",
+recorded in the run-spine spec R4.2 gap 3 at their 9a613bfa) — BOTH former §11.1 owed items are
+CLOSED:**
+* *(was: no production surface creates a regeneration exception)* — `POST
+  /formula-drafts/{id}/regeneration-exceptions` under `governance:confirm`: bindings derived
+  server-side from the target's candidate under the CURRENT resolution, THROUGH
+  `tombstone_covering` (the one reader — so the writer's "which withdrawal does this override"
+  is the gate's own answer), NOT NULL spend minted via `canonical_approval_expiry`,
+  content-addressed so a replayed approval is ONE coupon, consumed once by the mint it
+  authorizes. An exception must NAME the covering tombstone — and the naming filter
+  lives INSIDE the locator (round-2 correction: the first cut located the OLDEST coupon and
+  nullified on mismatch, which both prevented pre-arm AND disarmed the legitimate
+  post-withdrawal approval — an old blank coupon shadowed the younger naming one, making the
+  refusal's own remedy unreachable until the blank expired). The advance fence honors a
+  CONSUMED naming coupon, so the override mint can FINISH — proven by the acceptance chain
+  (FAILED → tombstone → approve-naming → mint → advance to READY).
+* *(was: the reviewed-lane exception is unrepresentable, so a FAILED reviewed draft is stuck)* —
+  the unrepresentability IS the design: `request_draft`'s not-an-answer gate is strategy-aware;
+  a reviewed re-attempt (no provider contract, 1104's construction) mints freely with zero
+  exception and zero spend rows. Tombstones refuse FIRST, both lanes. The LLM lane is unchanged,
+  and the approval surface refuses a deterministic candidate by name
+  (`DETERMINISTIC_RETRY_IS_FREE`).
+
+**Still owed (small, non-blocking — from the Task 5/6 reviews):** `_spend_binding_for` fails
+open on legacy rows while governance fails closed (asymmetry to collapse when convenient); no
+terminal-state requirement on the approval target (a coupon can pre-arm against a healthy
+draft — the tombstone-naming rule already prevents pre-disarm); coupons stack when differing
+only in `max_cost`; the deterministic route-refusal test monkeypatches the resolver (no
+end-to-end real-REVIEWED proof yet); the job route's log line lost `llm_members`; the
+`control-plane` authoring-environment note belongs in §0.1.x proper.
+
+### ▲ Task 6 ACCEPTANCE record (2026-08-24) — five rounds, the one law, and the queue
+
+**Accepted and merged** into `feature/run-spine-stage1` at the peer's `f828aca9`; my lane's
+final commit is `b35d3249`. Suite at acceptance: 13,516 passed. The review ran five rounds at
+the cap, every defect probe-proven before it was believed — including two of the reviewer's own
+premises withdrawn on evidence.
+
+**The bullet above is CORRECTED by rounds 4–5** — it records the round-2/3 shape. The final law:
+* **THE ONE LAW**: every covering withdrawal (tombstone) must be individually NAMED by a valid
+  — then CONSUMED — regeneration exception coupon. `covering_tombstones()` is a SET read (both
+  scopes); `tombstone_covering()` survives as display-only single-pick and is called by nothing
+  in src. One approval act binds the FULL covering set: one 1103 row per covering tombstone.
+* **The regeneration ordinal is per-EXACT-binding** (round-5 C1, the money invariant): the
+  exhausted-count's WHERE carries every identity-folded field — identity, tombstone_id (IS NOT
+  DISTINCT FROM), provider_contract_hash, strategy_identity_hash, actor_subject,
+  llm_spend_authorization_id, expires_at, max_uses. Counting at (identity, tombstone) alone let
+  a SIBLING binding's exhaustion bump this binding's ordinal, so a replay of a still-live
+  approval minted a second live coupon — two paid regenerations from one governance decision.
+* **The approval writer runs under the scope lock** the mint and the withdrawal already hold;
+  the carrying argument is the MONOTONE count collapsing under ON CONFLICT, not the lock alone.
+* **Expired-but-unexhausted is a stated decision**: the ordinal counts EXHAUSTED coupons only;
+  an identical re-approval returns the dead coupon (`created=False`); re-arming needs the next
+  day's floored expiry or changed terms.
+* **NULL-closure, both derivations agreeing**: the only nullable identity column is
+  `tombstone_id` (already IS NOT DISTINCT FROM); `llm_spend_authorization_id` is NOT NULL as of
+  1105:146, inside the interlocked migration range, so `=` is vacuously NULL-safe on the rest.
+
+**Queue (consolidated — none gating; the paragraph above stands, plus):**
+* ▲ ON THE RECORD: the `expires_at` representation-aliasing closure DEPENDS on
+  `llm_spend_authorization_id` staying co-folded in BOTH the coupon identity and the ordinal
+  count — nobody drops it from either fold.
+* The ordinal count filters seven columns behind a single-column index — perf nit at current
+  row counts; an index on the binding fields (or `exact_formula_identity_hash` — same owed
+  migration) when convenient.
+* ~~`retirement_scope.__all__` stale~~ — CLOSED at `e2d9819f`, together with the two Task 7
+  review items (2026-08-24, same commit): the **dead-ticket guard** at the request seam
+  (`DraftCeilingExhausted` → `AuthoringRefused(COST_AUTHORIZATION_EXHAUSTED)`, refusing BEFORE
+  the coupon is consumed; expired-authorization falls through to the dev envelope, pinned) and
+  the **ONE ceiling locator** `approved_ceiling_for` in `retirement_scope.py` (byte-stable
+  semantics; the run-spine projection switched to it at their `3aaf90b7`). ▲ Whole-branch C1
+  (2026-08-24) then NARROWED it to the no-coupon doors: **the mint rides the money of the
+  coupon it consumes** (the coupon's own `llm_spend_authorization_id`, ride resolved by the
+  STORE and returned to the service; ride-first, job ceiling, no-coupon preference, envelope,
+  refusal — in that order), the dead-money coupon is SKIPPED by the pick (a coupon the law
+  forbids consuming is not available, else the refusal prescribes the remedy it blocks), and
+  EXPIRED coupon-money refuses on BOTH postures instead of riding the envelope — two earlier
+  pins were INVERTED by this law, deliberately. Shared `per_call_worst_case` in llm_spend.py
+  is the ONE arithmetic (worker + store + their projection).
+* From the round-5 ledger (reviewer's file:line record is the source of truth): the
+  201-with-"budget in effect" message over a dead coupon; the spend-preference query's missing
+  expiry/exhaustion filters and the refuses-vs-substitutes posture (flagged for the
+  whole-branch review); the fence naming query's reliance on the 1107 one-live invariant; the
+  deterministic refusal citing `covering[0]`; one-ceiling-across-N-bindings and
+  expired-unexhausted pins; coupon stacking when differing only in `max_cost`.
+
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`
 **UNAVAILABLE** until production governance exists. **They stay specified and they stop being
@@ -3116,6 +3223,9 @@ still follow step order.**
 | 1114 | **parent §12.1** | `recipe_compiler_eval_attempt` + the compiler certificate record | 9 |
 | 1115 | **run-spine spec §6/§13 (foundation)** | `feature_run_identity` (composite-FK chain, write-once) + `feature_run_profile` + `feature_run_state` + the three additive UNIQUE chain indexes on `contract_generation_input` / `contract_considered_revision` / `catalog_metadata_snapshot` | foundation |
 | 1116 | **run-spine spec §9 (foundation)** | simple FKs: `formula_draft.considered_revision_id` and `feature_selection_revision.considered_revision_id` → `contract_considered_revision` (live-measured 0 orphans) | foundation |
+| 1117 | **run-spine** | reserved, currently unused (Stage I expects zero migrations) | — |
+| 1118 | **parent §12** | ▲ **DONE** — the compiler certification programme: `recipe_compiler_evaluation_contract` (NO provider hashes, structurally) + `recipe_compiler_eval_case` (ONE governed revision; tolerances CONSTRAINED EMPTY) + `recipe_compiler_eval_attempt` (honesty CHECKs) | 9 |
+| 1119 | **Stage I Task 5** | ▲ **DONE** — `formula_draft_authoring_plan.action_decision_revision_id` (nullable expand; the GATE is not nullable — the worker refuses NULL on a governed plan row). ▲ **A NEW FILE, not an edit to 1104**: the §20.1 cutover may apply 1104 live at any moment, and an edited applied migration breaks the checksum ledger. ▲ **DEPLOY NOTE: 1104 and 1119 must apply in the SAME cutover** — a plan row written under 1104-without-1119 is permanently `ACTION_DECISION_MISSING` (the plan table is append-only; unbackfillable) and its BLOCKED draft holds the identity slot | 5 (Stage I) |
 
 ▲ **Ordering note (run-spine foundation).** 1115/1116 may APPLY before 1104–1114 exist: the two
 blocks are mutually independent (1115/1116's FKs reach only ≤1024 tables; nothing in 1100–1114

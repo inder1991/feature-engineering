@@ -86,7 +86,9 @@ function BlockerList({ blockers }: { blockers: ExecutionBlocker[] }) {
 export function FeatureExecutionScreen(props: Props) {
   const {
     artifactId, environmentId, logicalGroupName, inventoryObservationId,
-    generationAuthorizationRevisionId, checkSetHash, goal, targetMode, targetRef,
+    // generationAuthorizationRevisionId stays in Props for the call sites; the POST no longer
+    // sends it (the server reads it off the artifact), so it is deliberately not destructured.
+    checkSetHash, goal, targetMode, targetRef,
   } = props
 
   const [code, setCode] = useState<ArtifactCode | null>(null)
@@ -161,16 +163,17 @@ export function FeatureExecutionScreen(props: Props) {
   async function onVerify() {
     setActionError(null)
     try {
+      // The body matches the rewritten route (extra="forbid"): the authorization and the
+      // environment are properties of the ARTIFACT — the server refuses a client that supplies
+      // them, so this call no longer offers them.
       const started = await requestVerification({
         sealed_artifact_id: artifactId,
-        generation_authorization_revision_id: generationAuthorizationRevisionId,
         check_set_hash: checkSetHash,
         inventory_observation_id: inventoryObservationId,
-        environment_id: environmentId,
         attempt,
       })
       setAttempt(attempt + 1)
-      setVerification(await getVerificationResult(started.execution_hash))
+      setVerification(await getVerificationResult(started.request_id))
     } catch (error) {
       if (error instanceof ApiError) setActionError(error.message)
     }
@@ -184,7 +187,8 @@ export function FeatureExecutionScreen(props: Props) {
     try {
       await requestPublication({
         verified_output_revision_id: output.revision_id,
-        staging_path: verification.staging_path,
+        // Honest absence for a v2 content-addressed output; required only for legacy attempts.
+        staging_path: verification.staging_path ?? undefined,
         sealed_artifact_id: artifactId,
         environment_id: environmentId,
         logical_group_name: logicalGroupName,
@@ -242,7 +246,12 @@ export function FeatureExecutionScreen(props: Props) {
         {verification ? (
           <div className="verification-result">
             <p>
-              Attempt {verification.attempt} staged at <code>{verification.staging_path}</code>
+              {/* v2 rows carry server-owned stage words; the v1 attempt/staging line renders
+                  only when those mechanics exist — honest absence, never an empty template. */}
+              {verification.stage_label ?? (verification.attempt != null
+                ? <>Attempt {verification.attempt} staged at{' '}
+                    <code>{verification.staging_path}</code></>
+                : 'Verification requested')}
             </p>
             {verification.verified_output ? (
               <p>

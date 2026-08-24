@@ -140,7 +140,7 @@ def test_THE_SIX_ROUTES_ARE_REGISTERED(monkeypatch):
         "/feature-execution/generations",
         "/feature-execution/publications",
         "/feature-execution/verifications",
-        "/feature-execution/verifications/{execution_hash}",
+        "/feature-execution/verifications/{verification_id}",
         "/feature-execution/{artifact_id}/code",
         "/feature-execution/{artifact_id}/verify-eligibility",
         # Step 7 (§9): the two PRODUCTION acts — real endpoints that refuse honestly under the

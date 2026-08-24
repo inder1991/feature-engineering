@@ -13,6 +13,11 @@ from __future__ import annotations
 import json
 
 import pytest
+from tests.featuregen.api._helpers import (
+    APPROVAL_EXPIRES_AT,
+    APPROVAL_EXPIRES_AT_SAME_DAY,
+    APPROVAL_EXPIRY_FLOOR,
+)
 from tests.featuregen.api.routes.test_formula_drafts import _revision
 from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
 
@@ -63,8 +68,10 @@ def _seed(conn, *, tag: str) -> dict:
     }
 
 
+#: The expiry is the shared fixture window — `ExpiryWindow` bounds a confirmation to 168 hours, so
+#: a fixed calendar date here would be a fixture that expires.
 _APPROVAL = {"max_calls": 5, "max_tokens": 200_000, "max_cost": "12.50", "currency": "USD",
-             "pricing_version": "pricing@1", "expires_at": "2026-12-31T00:00:00Z"}
+             "pricing_version": "pricing@1", "expires_at": APPROVAL_EXPIRES_AT}
 
 
 # ══ the plan is a QUESTION ══════════════════════════════════════════════════════════════════════
@@ -78,7 +85,9 @@ def test_THE_PLAN_WRITES_NOTHING(client, conn, enabled, engineer_headers):
     assert plan["members"][0]["formula_strategy"] == "LLM_AUTHORED"
     assert plan["llm_members"] == 1
     assert plan["spend_approval_required"] is True
-    assert plan["estimated_provider_calls"] == 5, "1 call + 2 retries + 2 repairs, quoted"
+    assert plan["estimated_provider_calls"] == 45, \
+        "the PER-DRAFT bound (8 author turns × 5 attempts + critic's 5) — the ONE constant the " \
+        "quote, the ceiling and the dev envelope all import (re-review carried finding 1)"
     assert plan["spend_approval"] is None, "READS an approval; never creates one"
     # ▲ Nothing durable: no job, no decision revision, no spend ceiling — `ask`, not `decide`.
     for table in ("code_generation_job", "action_decision_revision",
@@ -178,3 +187,133 @@ def test_FLAG_OFF_IS_A_404_for_every_endpoint(client, conn, monkeypatch, enginee
     assert client.post(PLAN, json=body, headers=engineer_headers).status_code == 404
     assert client.post(JOBS, json=body, headers=engineer_headers).status_code == 404
     assert client.get(f"{JOBS}/x", headers=engineer_headers).status_code == 404
+
+
+def test_a_READY_LEGACY_V1_DRAFT_refuses_costing_until_a_regeneration_is_approved(
+        client, conn, enabled, engineer_headers):
+    """§11.1.2's state-aware rule at the PLAN endpoint — and the bite test the first cut lacked:
+    the hand-rolled exception query named a column that does not exist (`consumed_at`), so this
+    exact path raised UndefinedColumn at runtime. Found by the run-spine session's mapping. The
+    check now goes through `valid_exception_for`, whose contract+strategy bindings are the point."""
+    from featuregen.canonical import jcs_sha256
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.formula_strategy import resolve_formula_strategy
+    from featuregen.overlay.upload.formula_strategy_facts import (
+        assemble_strategy_facts,
+        current_author_contract_hash,
+    )
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import retirement_scope_key
+
+    body = _seed(conn, tag="lgr")
+    candidate = frozen_candidate(conn, body["considered_revision_id"], "opt-a")
+    scope_key = retirement_scope_key(
+        considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        definition_revision=candidate.definition_revision)
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, formula_content_hash, formula_json, "
+        "requested_by, requested_at) VALUES ('fd-lgr', %s, 'opt-a', %s, %s, 'legacy-cfg', %s, "
+        "'ident-lgr', 'READY', 'sha256:f', '{\"v\": 1}'::jsonb, 'user:sam', "
+        "'2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    conn.execute(
+        "INSERT INTO formula_draft_authoring_identity (formula_draft_id, identity_version, "
+        "retirement_scope_key, config_payload_json, config_hash) "
+        "VALUES ('fd-lgr', 1, %s, '{}'::jsonb, 'legacy-cfg')", (scope_key,))
+
+    refused = client.post(PLAN, json=body, headers=engineer_headers).json()
+    assert "LEGACY_REGENERATION_NOT_APPROVED" in refused["members"][0]["blockers"]
+
+    # An APPROVED regeneration — bound to the exact V2 identity, contract and strategy the plan
+    # computes — clears it. Anything looser must not.
+    assembled = assemble_strategy_facts(
+        conn, considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        idea=candidate.idea, catalog_snapshot_hash=candidate.catalog_snapshot_hash)
+    decision = resolve_formula_strategy(assembled.facts)
+    contract = current_author_contract_hash()
+    identity_hash = __import__("featuregen.overlay.upload.formula_draft_store",
+                               fromlist=["formula_identity"]).formula_identity(
+        considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        authoring_config_hash=jcs_sha256({
+            "identity_version": 2, "formula_strategy": str(decision.strategy),
+            "strategy_identity_hash": decision.strategy_identity_hash,
+            "provider_contract_hash": contract}),
+        definition_revision=candidate.definition_revision)
+    spend = authorize_spend(
+        conn, action="AUTHOR_FORMULA", actor_subject="user:sam", job_identity="job-lgr",
+        member_identities=["sel-lgr"], provider_contract_hash=contract, max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    conn.execute(
+        "INSERT INTO formula_draft_regeneration_exception (exception_id, "
+        "target_formula_identity_hash, provider_contract_hash, strategy_identity_hash, "
+        "actor_subject, overrides_tombstone, expires_at, llm_spend_authorization_id) "
+        "VALUES ('exc-lgr', %s, %s, %s, 'user:owner', false, "
+        "'2026-12-31T00:00:00Z', %s)",
+        (identity_hash, contract, decision.strategy_identity_hash, spend))
+
+    cleared = client.post(PLAN, json=body, headers=engineer_headers).json()
+    assert "LEGACY_REGENERATION_NOT_APPROVED" not in cleared["members"][0]["blockers"]
+
+
+def test_THE_WRITE_ROUTE_maps_a_bad_selection_like_the_plan_route(client, conn, enabled,
+                                                                  engineer_headers):
+    """Task 5 review item 1: SelectionUnavailable escaped the WRITE route as a 500 while the
+    plan route answered 404/409 — same refusals, same statuses, BOTH routes."""
+    body = {**_seed(conn, tag="wmap"), "spend_approval": _APPROVAL}
+
+    unknown = client.post(JOBS, json={**body, "selection_revision_ids": ["sel-absent"]},
+                          headers=engineer_headers)
+    assert unknown.status_code == 404, unknown.text
+
+    # A selection anchored to a DIFFERENT considered revision (minimal second revision — the
+    # shared fixture's fixed intent/run ids cannot seed twice in one test).
+    conn.execute(
+        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
+        "VALUES ('int-wmap2','h','hypothesis') ON CONFLICT DO NOTHING")
+    conn.execute(
+        "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
+        "generation_run_id, considered_json, considered_content_hash, "
+        "canonicalization_version) VALUES ('crev-wmap2','int-wmap2','run-wmap2','{}'::jsonb,"
+        "'sha256:c','contract-considered-v3')")
+    conn.execute(
+        "INSERT INTO feature_selection_revision (revision_id, target_reading_revision_id, "
+        "considered_revision_id, option_id, decision_id, planning_request_hash, "
+        "binding_plan_hash, content_hash) VALUES ('sel-wmap2','trr-wmap','crev-wmap2','opt-a',"
+        "'dec-wmap2','sha256:a','sha256:b','ch-wmap2')")
+    crossed = client.post(JOBS, json={**body, "selection_revision_ids": ["sel-wmap2"]},
+                          headers=engineer_headers)
+    assert crossed.status_code == 409, crossed.text
+    assert "one build reads one" in crossed.json()["detail"]
+
+
+def test_A_REPLAYED_CONFIRM_cannot_reset_the_budget(client, conn, enabled, engineer_headers):
+    """Task 4 follow-up: with expiry inside the approval's identity, a browser replay minting a
+    fresh now()+24h wrote a NEW approval per replay — and the latest-first reader adopted the
+    unspent ceiling each time. The server FLOORS the requested expiry to its UTC day, so every
+    same-day replay is the SAME approval; the direction is money-safe (validity never extends
+    past what was approved)."""
+    body = _seed(conn, tag="rp")
+    first = client.post(JOBS, json={
+        **body, "spend_approval": {**_APPROVAL, "expires_at": APPROVAL_EXPIRES_AT}},
+        headers=engineer_headers)
+    replay = client.post(JOBS, json={
+        **body, "spend_approval": {**_APPROVAL, "expires_at": APPROVAL_EXPIRES_AT_SAME_DAY}},
+        headers=engineer_headers)
+
+    assert first.status_code == 202 and replay.status_code == 202
+    assert replay.json()["job_id"] == first.json()["job_id"]
+    rows = conn.execute(
+        "SELECT to_char(expires_at AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS') "
+        "FROM llm_spend_authorization_revision "
+        "WHERE pricing_version = %s", (_APPROVAL["pricing_version"],)).fetchall()
+    assert len(rows) == 1, "two same-day expiries, ONE approval — the replay bought nothing"
+    assert rows[0][0] == APPROVAL_EXPIRY_FLOOR, \
+        "floored to the requested instant's UTC midnight — never extended"

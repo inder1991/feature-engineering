@@ -44,9 +44,10 @@ def _considered_revision_exists(db):
 
 def _request(conn, *, draft_id="fd-ret-1", config="cfg-1", **over):
     facts = {**CANDIDATE, **over}
-    return request_draft(
+    draft_id_out, created, _ride = request_draft(
         conn, formula_draft_id=draft_id, authoring_config_hash=config,
         requested_by="user:sam", requested_at="t", **facts)
+    return draft_id_out, created
 
 
 def _identity(config="cfg-1", **over) -> str:
@@ -216,6 +217,7 @@ def test_AN_EXCEPTION_THAT_DOES_NOT_BIND_DOES_NOT_AUTHORIZE(db, over, why):
     assert valid_exception_for(
         db, target_formula_identity_hash=_identity(config="cfg-2"),
         provider_contract_hash="pc-1", strategy_identity_hash="st-1",
+        covering_tombstone_id=tombstone.tombstone_id,
         now="2026-08-23T00:00:00Z") is None, why
 
 
@@ -282,8 +284,11 @@ def test_A_TERMINAL_FAILURE_IS_NOT_RETURNED_AS_AN_EXISTING_DRAFT(db, state):
         "UPDATE formula_draft SET state = %s, failure_reason = %s WHERE formula_draft_id = 'fd-ret-1'",
         (state, "boom" if state == "FAILED" else None))
 
+    # ▲ As the LLM LANE asks (provider contract present): Option 2 made the contract-less path
+    # the FREE deterministic lane — that path's own tests live in test_formula_draft_retirement.
     with pytest.raises(DraftNotAnAnswer, match="not an answer this platform bought"):
-        _request(db, draft_id="fd-ret-2")
+        _request(db, draft_id="fd-ret-2", provider_contract_hash="sha256:llm",
+                 strategy_identity_hash="sih-llm")
 
 
 def test_A_BLOCKED_DRAFT_IS_STILL_AN_ANSWER(db):
@@ -424,5 +429,7 @@ def test_A_FAILED_IDENTITY_WITHOUT_AN_EXCEPTION_STILL_REFUSES_by_name(db):
     db.execute("UPDATE formula_draft SET state = 'FAILED', failure_reason = 'x' "
                "WHERE formula_draft_id = 'fd-ret-1'")
 
+    # As the LLM lane asks — see the note above.
     with pytest.raises(DraftNotAnAnswer, match="approved regeneration exception"):
-        _request(db, draft_id="fd-ret-2")
+        _request(db, draft_id="fd-ret-2", provider_contract_hash="sha256:llm",
+                 strategy_identity_hash="sih-llm")

@@ -201,3 +201,41 @@ def test_A_RESERVATION_CANNOT_BE_EDITED_OR_DELETED(db):
     with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
         db.execute("UPDATE llm_spend_reservation SET expires_at = now() "
                    "WHERE reservation_id = %s", (reservation,))
+
+
+def test_a_DIFFERENT_VALIDITY_WINDOW_is_a_DIFFERENT_approval(db):
+    """Task 5 review C-2: expiry is INSIDE the idempotency identity. Outside it, every ceiling
+    was a LIFETIME budget per (actor, subject, contract) — once expired, a re-mint returned the
+    same expired row for ever and the subject became permanently unauthorable."""
+    common = dict(action="AUTHOR_FORMULA", actor_subject="user:sam", job_identity="job-c2",
+                  member_identities=["m"], provider_contract_hash="sha256:c", max_calls=5,
+                  max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1")
+    first = authorize_spend(db, **common, expires_at="2026-12-01T00:00:00Z")
+    same = authorize_spend(db, **common, expires_at="2026-12-01T00:00:00Z")
+    renewed = authorize_spend(db, **common, expires_at="2026-12-02T00:00:00Z")
+
+    assert first == same, "the identical approval is ONE row"
+    assert renewed != first, "a new validity window is a NEW bounded approval — the renewal"
+
+
+def test_C7_a_SAME_DAY_sub_day_approval_keeps_its_EXACT_instant(db):
+    """Whole-branch C7: `canonical_approval_expiry`'s guard branch — floor to UTC midnight ONLY
+    when that midnight is still ahead; a same-day (or past) instant whose floor has already
+    passed keeps its EXACT value, so deliberately short ceilings stay exact and their replay
+    window is their own short life. An unconditional-floor mutant must die here: it would
+    return midnight for the noon instant below."""
+    from featuregen.overlay.upload.llm_spend import canonical_approval_expiry
+
+    noon_today = db.execute(
+        "SELECT to_char(date_trunc('day', now() AT TIME ZONE 'utc'), 'YYYY-MM-DD') "
+        "|| 'T12:00:00+00:00'").fetchone()[0]
+    kept = canonical_approval_expiry(db, noon_today)
+    assert kept == noon_today, \
+        "today's floor is never ahead of now, so the exact instant survives"
+
+    tomorrow_five = db.execute(
+        "SELECT to_char(date_trunc('day', now() AT TIME ZONE 'utc') + interval '1 day', "
+        "'YYYY-MM-DD') || 'T17:00:00+00:00'").fetchone()[0]
+    floored = canonical_approval_expiry(db, tomorrow_five)
+    assert floored.endswith("T00:00:00+00:00") and floored[:10] == tomorrow_five[:10], \
+        "a future-day instant floors to ITS midnight — the money-safe direction"

@@ -7,6 +7,7 @@ import {
   getCodeGenerationJob,
 } from '../api'
 import { useIdentityKey } from '../session'
+import type { Route } from '../nav'
 
 // Step 5b — the generation workspace: one durable journey, watched from a job id.
 //
@@ -31,7 +32,7 @@ import { useIdentityKey } from '../session'
 
 interface Props {
   jobId: string
-  navigate?: (route: string, params?: Record<string, string>) => void
+  navigate?: (route: Route, params?: Record<string, string>) => void
 }
 
 // The seven stages in journey order, each derived from SERVER facts alone.
