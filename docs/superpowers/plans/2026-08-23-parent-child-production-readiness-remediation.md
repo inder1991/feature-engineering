@@ -11,6 +11,30 @@
 > boundary. The child still owns formula-method routing and recipe-to-code coordination. This plan
 > owns the repairs required for those responsibilities to be true in running code.
 
+> ▲ **SUPERSESSION RECORD — 2026-08-24 (Task P1 of the serving plan; owner-ruled R8 "narrowed
+> supersession", recorded here and in the parent program's amended Stage-2 gate).**
+> The cross-catalog serving plan — `2026-08-24-cross-catalog-serving-first-card.md` (Rev 13) —
+> supersedes parts of this plan as follows; everything not named below stands unchanged:
+>
+> 1. **ABSORBED by the serving plan:** this plan's per-action fact-loader requirement (D2's
+>    server-owned facts) — now the serving plan's R1 (one authority, six typed fact loaders) and
+>    its A1 fact-loader framework — and the plan-envelope hash columns of Task 5's 1122 design and
+>    Task 8's 1124 design (planning-request / binding-plan hashes on lineage and frozen-plan rows),
+>    which land in the serving plan's own identity-persistence and binding-chain migrations
+>    (its T0-mapping rows 1134/1135), never in 1122/1124.
+> 2. **OWNED by the serving plan's B0a/B0b (R8):** the preserved work of Task 4 (server-derived
+>    principal/data scope — roles closed on both routes), Task 5 (target lineage), and Task 8
+>    (frozen method identity). Those tasks are not re-executed here; their acceptance intent is
+>    discharged by B0a/B0b under the serving plan's rigor.
+> 3. **Reservation 1121 is DEAD.** The number was applied LIVE as
+>    `1121_governed_telemetry_outbox.sql` (cross-catalog Stage 1B; cluster head verified 1121 on
+>    2026-08-24). Task 2's governed-action-execution-binding design keeps its content but must take
+>    a new number from this plan's remaining block at write time.
+> 4. **Reservations 1122–1129 STAND** for this plan's OTHER tasks (the non-absorbed remainder of
+>    the §3 table), subject to the registry re-check each migration task already requires.
+> 5. **The authoritative 1130–1139 table is the serving plan's §T0-assigned migration mapping** —
+>    numbers for the serving program live ONLY there; this plan allocates nothing above 1129.
+
 **Goal:** A person can select recipe- or LLM-origin features, author the correct formulas, generate
 inspectable Kedro/PySpark code, execute and publish it in a sandbox, and—only with current
 method-specific certification—materialize and publish it in production. Every act must be bound to
@@ -182,6 +206,11 @@ numbers are provisional until execution rebases on the merged registry:
 - 1120 remains reserved for the cross-catalog programme;
 - this programme provisionally owns 1121–1129.
 
+▲ *Amended 2026-08-24: 1120 AND 1121 are applied live (cross-catalog Stage 1B; 1121 =
+`governed_telemetry_outbox`) — this programme's 1121 reservation is dead and its block is
+1122–1129; 1130–1139 belong to the serving plan's T0 mapping. See the supersession record at the
+top of this document.*
+
 If another branch has claimed one, renumber before writing; do not race the ledger.
 
 ### D16 — Pre-live permits a clean cutover, not fabricated backfills
@@ -245,6 +274,11 @@ Governance -> Formula quality
 ## 3. Migration programme
 
 The filenames below are provisional reservations, not permission to skip the registry check.
+
+▲ *Amended 2026-08-24: the 1121 row below is DEAD as a number (applied live as
+`governed_telemetry_outbox`) — its content re-numbers from the 1122–1129 block at write time; the
+plan-envelope hash columns of the 1122/1124 designs are absorbed by the serving plan (its 1134/1135
+rows). See the supersession record at the top.*
 
 | Migration | Purpose | Key guarantees |
 |---|---|---|
@@ -443,6 +477,9 @@ if all hashes happen to match.
 
 ### Task 4 — Remove client roles and bind authoritative data scope
 
+▲ *Superseded 2026-08-24: preserved work owned by the serving plan's B0a (R8) — see the
+supersession record at the top.*
+
 **Owner:** parent.
 
 **Files:** build-set and code-generation request models, coordinator, generation job codec, compile
@@ -459,6 +496,10 @@ lane, frontend API types.
 restricted data cannot be compiled without the corresponding server entitlement.
 
 ### Task 5 — Migration 1122: enforce target/selection/formula lineage
+
+▲ *Superseded 2026-08-24: target-lineage work owned by the serving plan's B0b, and the 1122
+design's plan-envelope hash columns absorbed by its binding-chain migration (R8) — see the
+supersession record at the top.*
 
 **Owner:** child with parent schema review.
 
@@ -527,6 +568,10 @@ calls and fail the run; never discard or reduce actual usage to keep the ledger 
 the ceiling. The UI ceiling and backend reservation are derived from one response contract.
 
 ### Task 8 — Migration 1124: freeze strategy, governed review and method identity V2
+
+▲ *Superseded 2026-08-24: frozen-method-identity work owned by the serving plan's B0b, and the
+1124 design's plan-envelope hash columns absorbed by its identity-persistence migration (R8) — see
+the supersession record at the top.*
 
 **Owner:** child routing; parent owns certificate identity review.
 
