@@ -35,6 +35,13 @@ def _bank(conn) -> None:
     catalog = [
         (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True,
                       entity="Customer"), "customer_id"),
+        # T2: the account key the balance recipes bind their population on. Before T2 this
+        # fixture served OPTIONS anyway — every eligible recipe became an actionable card with
+        # its measure unbound — so these tests could address options over a catalog that could
+        # not compute one. A card is an offer to compute something, so the catalog now carries
+        # what the offer needs: with this column 12 candidates bind completely.
+        (CanonicalRow("bank", "accounts", "acct_id", "integer", entity="Account"),
+         "account_id"),
         (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive",
                       currency="USD"), "monetary_stock"),
         (CanonicalRow("bank", "accounts", "as_of_date", "timestamp", as_of=True), "as_of_date"),
@@ -202,8 +209,15 @@ def test_v2_serves_three_sections_with_actions_from_the_fold(make_client, conn, 
         assert "create_contract" in entry["blocked_actions"]    # nothing authorable yet here
         blockers = entry["blocked_actions"]["create_contract"]
         assert all(b["code"] and b["next_step"] for b in blockers)
+    # T2: an OPTION is now always a candidate whose REQUIRED operands all bound — an unbound
+    # one is setup work and mints no option id, so it can appear in neither section. That
+    # narrows `actionable` to what the section builder has always actually decided it on:
+    # BOUND-BUT-PLANLESS (B10 — no declared population, a cross-dataset hop, a UOA mismatch).
+    # The old `in ("ambiguous", "missing", "blocked")` held only because nothing on this
+    # fixture bound at all, which is the defect this test now sits downstream of.
+    assert body["needs_setup"], "the held-out candidates are named, not dropped"
     for entry in body["actionable_options"]:
-        assert entry["binding_state"] in ("ambiguous", "missing", "blocked")
+        assert entry["binding_state"] == "bound"
         # every actionable option is a REAL option: it has a decision row at its exact key
         row = conn.execute(
             "SELECT 1 FROM semantic_option_decision WHERE option_id = %s",
@@ -214,8 +228,10 @@ def test_v2_serves_three_sections_with_actions_from_the_fold(make_client, conn, 
 def test_v1_never_carries_the_section_keys(make_client, conn, monkeypatch):
     _bank(conn)
     body = _post(make_client(llm_client=_fake()))
+    # `needs_setup` is T2's addition and obeys the same no-silent-leak rule as every key
+    # above it: a frozen v1 client must never see a new field appear and infer a version.
     for key in ("recommended_options", "actionable_options", "rejected_outputs",
-                "contract_version", "semantic_planning_mode"):
+                "needs_setup", "contract_version", "semantic_planning_mode"):
         assert key not in body
 
 
