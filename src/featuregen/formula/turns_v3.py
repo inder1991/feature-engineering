@@ -67,8 +67,10 @@ _PROPOSAL_V3_NODE: dict = {
 #: REFUSES it: every subschema must declare what it is. Live diagnostic (draft
 #: ``fd_01M0SZTAJCQDR0KG4JPV16T9ZP``): every ``formula.author`` call this platform has ever made
 #: died with ``HTTP 400, keyword=type`` on ``typedLiteral.properties.type`` and
-#: ``parameterDecl.properties.type`` — SEVENTEEN such enums in this schema (46 across v1/v2/v3),
-#: not the two the 400 happened to name — and the error read as a keyword misattribution only
+#: ``parameterDecl.properties.type`` — SEVENTEEN such enums in this schema (46 across v1/v2/v3;
+#: the two v3-only ones beyond v2's fifteen are ``semanticRowSelection.properties.kind`` and
+#: ``.semantic_value``), not the two the 400 happened to name — and the error read as a keyword
+#: misattribution only
 #: because the offending property is itself NAMED ``type``.
 #: ``project_for_anthropic`` now carries the same declaration for every schema on its way out; this
 #: is the belt to that braces, so the schema the audit RECORDS is honest and not only the wire form.

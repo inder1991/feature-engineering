@@ -102,8 +102,12 @@ next one. Red-first against the unfixed v3 schema.
 #### T11 OPERATOR CONSEQUENCES — the identity move (written down 2026-08-24, post-review)
 
 **The census was wider than the diagnostic:** 17 bare enums in v3, 15 in v2, 14 in v1 — 46 in all,
-not the two the 400 named. v1 is fixed on the wire by the projection but still bare at rest (it was
-outside the implementer's surface; one line if uniformity is wanted).
+not the two the 400 named (v3's two beyond v2 are ``semanticRowSelection.properties.kind`` and
+``.semantic_value``). v1 is fixed on the wire by the projection but still bare at rest — and the
+review established the stronger fact: **v1 is production-dead** (``AUTHORABLE_EXPECTATION_SCHEMAS``
+is a one-element v2 set, and the live draft worker calls only ``run_authoring_v2_replay`` with
+``turn_contract ∈ {v2, v3}``). "Not fixed" and "cannot be reached" are different operator facts;
+this is the second one. One line if at-rest uniformity is ever wanted.
 
 **Why the schemas were audited by nothing.** Both existing auditors — the 2026-08-14 ratchet and
 `enrich_llm.register_enrichment_schemas`' fail-closed bootstrap guard — iterate `enrich_llm._SCHEMAS`,

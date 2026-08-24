@@ -218,7 +218,7 @@ def test_an_x_wire_enum_lands_on_the_wire_TYPED_even_on_an_untyped_node():
 
     `x-wire-enum` MINTS an `enum` during projection (step 3c), lifting a vocabulary onto a node
     whose canonical form deliberately carries none. The first cut of this fix declared enum types
-    at step 1b, upstream of that swap, so a vocabulary lifted onto a node with no `"type"` of its
+    at step 1c, upstream of that swap, so a vocabulary lifted onto a node with no `"type"` of its
     own arrived at the provider as a bare enum — the exact shape that 400ed every author call, re-
     entering through the one other door in the module. The declaration now runs downstream of both
     producers. No canonical schema uses this combination today; the point is that it cannot become

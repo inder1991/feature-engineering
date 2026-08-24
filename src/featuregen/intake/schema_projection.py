@@ -98,10 +98,13 @@ def _project(node: object) -> object:
     #     ▲ IT RUNS HERE, LAST, AND THAT POSITION IS THE POINT. An untyped enum reaches the wire
     #     through TWO doors: written that way in the canonical schema (the author turn schemas'
     #     46 of them), or minted right above by the `x-wire-enum` swap, which lifts a vocabulary
-    #     onto a node that may carry no type of its own. Declaring at 1b — where this first sat —
-    #     closed only the first door and left the second wide open to the same outage. Nothing
-    #     between here and there reads `type`, so running once, downstream of both producers, is
-    #     both sufficient and the only placement that stays correct.
+    #     onto a node that may carry no type of its own. Declaring at 1c — where this first sat —
+    #     closed only the first door and left the second wide open to the same outage. One line
+    #     between here and there DOES read `type` (step 3 compares it to "object"), but this
+    #     transform can only emit boolean/integer/null/number/string — never "object" — so the
+    #     read cannot move; running once, downstream of both producers, is sufficient and the
+    #     only placement that stays correct (equivalence executed over all 71 provider-bound
+    #     schemas: zero differ between the two positions except the second-door case itself).
     node = _declare_enum_type(node)
     # 4) recurse into nested schema containers
     for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
