@@ -709,6 +709,9 @@ function NeedsSetupPanel({ entries, open, onToggle }: {
 }) {
   const n = entries.length
   return (
+    // The `rej-panel` shell is reused for its neutral surface only — the DANGER-toned
+    // `badge rej-count` that the rejections panel wears is deliberately not: a count of work
+    // nobody has done yet must not be dressed as a count of things that went wrong.
     <div className="rej-panel" data-testid="needs-setup">
       <div className="rej-line">
         <span className="badge tabular-nums">{n} need setup</span>
@@ -4472,12 +4475,30 @@ export function WorkbenchScreen() {
                               {refine.error}
                             </p>
                           )}
+                          {/* WHAT THE SERVER REFUSED WITH, without a cause this screen invented.
+                              This line used to open "The safety gauntlet rejected this revision",
+                              but most arms of /features/refine-candidate are not the gauntlet at
+                              all — an intent-parse rejection, an out-of-scope objective, or (since
+                              T2) an operand that never bound. Only the round-consumed fact is the
+                              client's own, because it is the client's own counter.
+
+                              T2's arm is a 200 carrying `needs_setup` — setup work, which gets
+                              neither the danger class nor an alert announcement. */}
                           {refine.rejection && (
-                            <p className="error" role="alert">
-                              The safety gauntlet rejected this revision:{' '}
-                              {refine.rejection.reason} ({rejectLabel(refine.rejection.code)}).
-                              The round is consumed; the candidate is unchanged.
-                            </p>
+                            refine.rejection.needs_setup?.length
+                              ? (
+                                <p className="hint">
+                                  This revision was not served: {refine.rejection.reason}{' '}
+                                  ({rejectLabel(refine.rejection.code)}). The round is consumed;
+                                  the candidate is unchanged.
+                                </p>
+                              ) : (
+                                <p className="error" role="alert">
+                                  This revision was refused: {refine.rejection.reason}{' '}
+                                  ({rejectLabel(refine.rejection.code)}). The round is consumed;
+                                  the candidate is unchanged.
+                                </p>
+                              )
                           )}
                           {refine.pending && (
                             <div className="revision" role="status">

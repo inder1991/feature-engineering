@@ -444,6 +444,12 @@ export interface RefineCandidate {
 export interface RefineRejection {
   reason: string
   code: string
+  // T2: present exactly when the revision did not BIND — a required operand found no column, so
+  // there is no card to return. The route answers this with a 200 on purpose ("data the reviewer
+  // acts on, not an error"), and its presence is the honest discriminator between setup work and
+  // a genuine refusal: the two carry different remedies and different owners. `reason` already
+  // carries the entry's own sentence; this carries the per-operand detail behind it.
+  needs_setup?: NeedsSetupCandidate[]
 }
 
 // Both refine outcomes arrive as 200 data: a gauntlet rejection of the revision is something

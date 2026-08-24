@@ -1854,21 +1854,59 @@ describe('per-candidate feedback', () => {
     expect(row).toHaveFocus()
   })
 
-  it('renders a gauntlet rejection as a danger line, consuming the round, changing nothing', async () => {
+  it('renders a refusal as a danger line, consuming the round, changing nothing', async () => {
     refineCandidate.mockResolvedValue({
       rejected: { reason: 'leaks target', code: 'LEAKAGE' },
     })
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
     await openRefineAndSend('use the churn label')
-    expect(await screen.findByText(
-      /rejected this revision: leaks target \(leakage\)\. The round is consumed/,
-    )).toBeInTheDocument()
+    const line = await screen.findByText(
+      /refused: leaks target \(leakage\)\. The round is consumed/)
+    expect(line).toBeInTheDocument()
+    // T9: the line used to open "The safety gauntlet rejected this revision". Most arms of
+    // /features/refine-candidate are not the gauntlet at all — an intent-parse rejection, a
+    // scope rejection, or (since T2) an operand that did not bind — so the attribution was a
+    // cause this screen invented for whatever the server refused with.
+    expect(line).not.toHaveTextContent(/safety gauntlet/i)
     expect(screen.queryByRole('button', { name: 'Approve revision' })).not.toBeInTheDocument()
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
     expect(screen.getByRole('button', {
       name: 'Send feedback for one revision · round 2 of 3',
     })).toBeInTheDocument()
+  })
+
+  // T2 reaches the refine seam too: /features/refine-candidate answers a revision whose required
+  // operand did not bind with a `needs_setup` envelope and a 200 — "data the reviewer acts on, not
+  // an error", in the route's own words. Rendering it in danger styling under a gauntlet heading
+  // made setup work look like a safety failure.
+  it('a revision that did not BIND is setup work, not a refusal', async () => {
+    refineCandidate.mockResolvedValue({
+      rejected: {
+        reason: 'the revision did not bind: no read-scoped column carries credit_limit',
+        code: 'SEMANTIC_NOT_BINDABLE',
+        needs_setup: [{
+          name: 'drawn_utilisation', source_definition_id: 'intent:1', recipe_id: null,
+          catalog_source: 'cib', unbound_concepts: ['credit_limit'],
+          unbound_operands: [{
+            role: 'limit', concept: 'credit_limit', operand_class: 'measure',
+            status: 'unresolved', reason_codes: [], resolution: '', tied_refs: [],
+            sentence: 'no read-scoped column carries credit_limit',
+          }],
+          sentence: 'no read-scoped column carries credit_limit',
+        }],
+      },
+    })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use the utilisation ratio')
+    const line = await screen.findByText(/no read-scoped column carries credit_limit/)
+    // The server's sentence, and no cause the screen made up.
+    expect(line).not.toHaveTextContent(/safety gauntlet/i)
+    expect(line).not.toHaveTextContent(/refused/i)
+    // Setup work is not a failure: it does not wear the danger class or announce as an alert.
+    expect(line).not.toHaveClass('error')
+    expect(line.getAttribute('role')).not.toBe('alert')
   })
 
   it('disables per-candidate feedback after three rounds', async () => {
@@ -1885,7 +1923,7 @@ describe('per-candidate feedback', () => {
       await userEvent.click(screen.getByRole('button', {
         name: `Send feedback for one revision · round ${round} of 3`,
       }))
-      expect(await screen.findByText(/rejected this revision/)).toBeInTheDocument()
+      expect(await screen.findByText(/This revision was refused/)).toBeInTheDocument()
     }
     expect(screen.getByRole('button', { name: 'Rounds exhausted' })).toBeDisabled()
     expect(screen.getByLabelText('What should change')).toBeDisabled()
@@ -1980,7 +2018,7 @@ describe('per-candidate feedback', () => {
     await screen.findByText('avg_balance')
     await selectCandidate('avg_balance')
     await openRefineAndSend('use the churn label')
-    expect(await screen.findByText(/rejected this revision/)).toBeInTheDocument()
+    expect(await screen.findByText(/This revision was refused/)).toBeInTheDocument()
     contractConsideredSet.mockResolvedValueOnce(
       considered(singleSetRound([idea('inactivity_days')])))
     await userEvent.type(
