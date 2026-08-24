@@ -1,126 +1,128 @@
-# Cross-Catalog Serving — "First Served Card" Implementation Plan (REV 2)
+# Cross-Catalog Serving — "First Served Card" Implementation Plan (REV 3)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Rev 2 supersedes Rev 1 in place after an adversarial review (2026-08-24) whose 9 major findings + P1 gaps ALL verified against origin/main — Rev 1's A1/A2/B1/C1-C3 rested on false premises and are rewritten here. Parent spec: `2026-08-23-cross-catalog-program-rev5.md` §Stage-2; owner directives override where recorded.
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development. Rev 3 supersedes Rev 2 after a second adversarial review (2026-08-24, 15 findings — the checkable ones ALL verified at `463498ed`/`d7b2317f`). Parent spec: `2026-08-23-cross-catalog-program-rev5.md` §Stage-2. The governing correction, verbatim:
+>
+> **"AI-proposed links should be sufficient to propose and explain cross-catalog features. Exact physical evidence should control what can EXECUTE — not whether the user can SEE the feature idea."**
 
-**Goal:** A user's hypothesis returns served cross-catalog feature cards over AI-proposed-or-better links; confirm and preview generation carry the EXACT join the user saw; production publication stays certificate-gated.
+**Goal:** A hypothesis surfaces cross-catalog feature cards from LOGICAL plans over AI-proposed-or-better links; each card states exactly what the platform can do with it (the capability ladder) and why; whatever generates carries the EXACT pinned join the user confirmed; production stays certificate-gated.
 
-**Owner's serving policy (2026-08-24, verbatim intent):**
+## The capability ladder (the product model — closed vocabulary, closed reason codes)
 
-| Action | AI-proposed link |
+```
+CARD_AVAILABLE        logical plan resolves over active bridges (proposed suffices)
+FORMULA_AUTHORABLE    grain + operands + window bindable (realization NOT required)
+PREVIEW_PROVISIONAL   exact column mapping known, cardinality unproven → runtime-gated code
+PREVIEW_EXECUTABLE    directional realization attached, cardinality 1:1 / N:1 proven
+PRODUCTION_ELIGIBLE   certification + full execution-evidence checks
+```
+
+Each rung names its blocker from a CLOSED set when unavailable: `DIRECTIONAL_REALIZATION_MISSING`, `DIRECTIONAL_MAPPING_INCOMPLETE`, `CARDINALITY_EVIDENCE_REQUIRED`, `ALLOCATION_POLICY_REQUIRED`, `REALIZATION_ATTACHMENT_DEFECT`, plus the existing refusal vocabulary. A proposed link with no realization yields a CARD and FORMULA with `preview: DIRECTIONAL_REALIZATION_MISSING` — never invisibility. Human confirmation moves DISPLAY provenance only; it never changes a rung, an identity, or generated code.
+
+## Identity & staleness law (adopted verbatim; every task tests against it)
+
+| Change | Expected result |
 |---|---|
-| Show cross-catalog card | Allow |
-| Rank/recommend | Allow |
-| Author formula | Allow |
-| Generate preview code | Allow when an exact join can be encoded; otherwise a clearly provisional preview with runtime validation gates |
-| Execute in sandbox | Allow, with duplicate/cardinality checks |
-| Publish to production | Production certification + evidence checks |
-
-Human review changes displayed provenance ("AI-proposed link — not yet human-reviewed" → "Human-confirmed link"); it never unlocks the engineering workflow. **Link authority (who proposed) is separate from execution evidence (does the system know exactly how to join without wrong numbers) — the second is deterministic and automated, never human.**
+| Proposed → human-confirmed | No physical-plan or code rekey |
+| Strength/ranking changes | No code rekey |
+| Candidate withdrawn/rejected | Refuse |
+| Realization revoked | Refuse |
+| New realization supersedes old | Refuse old pinned plan; NEVER substitute latest |
+| Evidence display text changes | No physical rekey |
+| Join column/predicate/cardinality changes | New plan identity |
 
 ## Global Constraints
 
-- **Executable-authority law** (verbatim, `multisource_compile.py`): "Human confirmation is audit metadata, never execution authority. A bridge crossing is executable only when the path carries the exact deterministic directional realization revision."
-- **The exact-join invariant (the review's finding 6, this plan's spine):** the join a user confirms is the join that generates. The plan envelope is a first-class input to restore/admission/compilation; the compiler derives joins from PINNED realization revisions or refuses when its independent resolution differs. Revalidation checks revocation/currentness of the pinned revisions — it never substitutes "latest".
-- **One activation authority:** `FEATUREGEN_INTENT_LIVE_CROSS_CATALOG` + the signed gate artifact (`live_activation.py` — flag read :56, startup check ~:242) is THE switch. No new serving flag. Targeted first-serve = a durable targeted-cohort approval INSIDE that authority. Serving, draft, and confirmation read the SAME resolved activation verdict; a card is never actionable when deployment-level state guarantees confirmation fails.
-- **Byte-neutrality until activation:** engine cards byte-unchanged always; governed cards strictly additive; activation-off responses byte-identical (pinned).
-- **Anchor rule:** every served cross-catalog option includes the user's anchor catalog. A CIB-scoped request never receives a feature spanning only other catalogs.
-- **Identity discipline, honestly declared:** pre-compile realization attachment RE-MINTS physical plan identity — this IS an identity-impacting change: PLANNER_VERSION bumps, the Stage-1 literal pins are REGENERATED deliberately in the same task with the bump, never silently. Downstream: `PLAN_CONTRACT_VERSION` + `GOVERNED_SERVING_POLICY_VERSION` enter `current_version_vector()` in Phase B's atomic commit.
-- **Four-way validation vocabulary; prediction goals serve "candidate predictors"** (approved label + population required for predictive claims; feature lookback window and prediction horizon are SEPARATE facts, separately asserted).
-- **Honest refusal + demand;** demand history is append-only — satisfaction is a PROJECTION (current unresolved-demand view marks rows satisfied), never deletion.
-- Every deploy/migration/flag flip = explicit user go. Never bare `git stash`/`git stash pop`; never `git checkout --` a file with uncommitted work.
+- **Discovery from logic, execution from evidence.** Cards/formulas need only the logical plan (path over `active_bridges` — proposed and confirmed are equally traversable, per the projection's own doctrine). Execution rungs need deterministic physical evidence. Neither gate borrows from the other.
+- **Pinned plan is the SOLE compilation authority.** Generation compiles FROM the frozen envelope and exact realization revisions; it revalidates those revisions (currentness, revocation, authorization) and refuses on failure; it NEVER re-plans, compares-and-chooses, or substitutes "latest". A fresh planner run is diagnostic-only.
+- **Production readers stay intact.** `executable_bridge_realizations` (M:N-excluding) is untouched; provisional capability arrives via a SEPARATE typed assessment {`EXECUTABLE`, `PROVISIONAL_UNKNOWN_CARDINALITY`, `REFUSED`} + separate provisional reader + provisional join IR.
+- **The runtime cardinality gate is join-tuple uniqueness, not row counts:** target-side join-tuple uniqueness under the exact predicates + declared null-key policy + unmatched-key coverage policy + optional max-matches, checked BEFORE aggregation; failure stops output by name. (Row-count preservation is unsound — join type and unmatched keys move counts independently.)
+- **One activation authority, one object:** `ResolvedCrossCatalogActivationV1` {deployment flag state (`FEATUREGEN_INTENT_LIVE_CROSS_CATALOG`), signed approval/evaluation identity, signed artifact hash + expiry, cohort approval identity, version vector, allowed/blocked reasons} — resolved ONCE per request, identity pinned into the considered option, revalidated (same facts) at draft and confirm. `PLAN_CONTRACT_VERSION` is ALREADY in the vector — BUMPED, not added; `GOVERNED_SERVING_POLICY_VERSION` added. No new flag.
+- **Anchor rule; byte-neutrality when inactive; append-only demand history with a satisfaction projection; four-way validation vocabulary; "candidate predictor" for prediction goals (lookback vs horizon asserted separately); every deploy/migration/flag = explicit user go. Scope: cross-catalog GRAIN BRIDGING (aggregate-then-bridge) ONLY — dimension/reference-enrichment joins (filter-before-aggregation, e.g. "payments BY customers rated high-risk") are a chartered follow-up with their own typed contract; cards for such hypotheses refuse the un-plannable clause honestly.**
+- Never bare `git stash`/`git stash pop`; never `git checkout --` a file with uncommitted work.
 
-## §V Verified facts (2026-08-24 @ `463498ed`; T0 re-verifies ALL + the review's citations)
+## §V Verified facts (2026-08-24 @ `463498ed` + `d7b2317f`; T0 re-verifies ALL + reconciles with the then-current execution branch)
 
-- V1. `active_bridges` (`bridge_projection.py:141`) serves CONFIRMED and PROPOSED alike via `available_identifier_links()` (lifecycle allow-list DRAFT/PARTIALLY_CONFIRMED/VERIFIED applied; REJECTED/STALE/REVERIFY absent); planner consumes via `_scoped_bridges` (`assembly.py:179`), fail-closed on scope. **AI-proposed links are ALREADY eligible.** The two-state review vocabulary is proposed / human-confirmed.
-- V2. `entity_bridge_edge WHERE status='VERIFIED'` (`multisource_compile.py:288`) is audit/lifecycle metadata on a different axis — NOT the candidacy gate. `ActiveBridgeV1` already carries status/strength/candidate revision/evidence refs.
-- V3. `attach_executable_bridge_realizations` (`assembly.py:404`): pure; exactly-one directional `CurrentBridgeRealizationV1` per governed segment or `None`. `executable_bridge_realizations` (`bridge_store.py`) EXCLUDES `_EXECUTION_BLOCKING_CARDINALITIES = {ONE_TO_MANY, MANY_TO_MANY}` (:125); `revalidate_bridge_realization(conn, realization, *, purpose, environment, execution_tier)` exists (:776).
-- V4. G3 (`physical_cardinality_unavailable`) is produced DURING contract compilation; the governed lens consumes already-compiled results (`governed_lens.py:580,:648`) — post-G3 there is no resolved plan to attach to. The attachment seam is BEFORE `_compile_or_mark` — in `plan_bindings` via `CompilerContext` — with ONE batched frozen realization read per request, never per recipe/segment.
-- V5. Serving unreachability: entity-only requests rejected at `routes/contract.py:775`; catalog-scoped enter the engine branch (`gate1.py:1160`); the governed branch is `elif is_live:` (`gate1.py:1308`) — mutually exclusive with the engine branch. B1 restructures; it does not merely "thread".
-- V6. Run-spine lane: build set pins selection+formula via `selection_formula_binding.py:32`; `restore_formula_v3.py:91` restores selection + formula draft + content hash ONLY; `ResolvedFeatureInputV2` has no envelope field; `compile_ir_v2.py:108` accepts none and re-resolves joins from current state. `PlanEnvelopeV1` (`planner/plan_envelope.py:37`) is flattened/incomplete.
-- V7. Renderer collision: `render/project.py:347` keys raw datasets on `{schema}.{table}`; `compile/wiring.py:186` uses `catalog::schema.table` — two catalogs with `public.customer` collide. S2-P5 CANNOT defer past rendered output.
-- V8. Formula reality: all A3 AML recipes are `readiness="FORMULA_BLOCKED"`; `posted_debit_amount` is the ONLY reviewed V2 expectation (`recipe_formula_expectations_v2.py:23`); growing that registry is an OPERATOR act (D-2/A5). Recipe-origin selections without a reviewed expectation route through LLM authoring (paid; method provenance recorded).
-- V9. Decision facts key on canonical `source_definition_id` through intermediate maps — engine/governed twins can collide BEFORE final persistence (B2 scope = every intermediate map).
-- V10. Deployment: generation enabled in the Kind manifest but `FEATUREGEN_MATERIALIZE_INVENTORY` commented out — Phase C's journey needs the worker inventory + multi-catalog mappings deployed and health-checked (operator precondition, D-rail).
-- V11. Stage-1 substrate available for reuse: complete `GovernedOptionV1` builder, `decision_facts_for_governed_option`, demand ledger 1120/1121 + report + queues, chooser. Migration numbers ≥1122 free (T0 confirms).
+- V1. `active_bridges` serves proposed+confirmed alike; `ActiveBridgeV1` carries ONLY {fact_key, entity, left/right catalog+object_ref, status ("confirmed"|"proposed", documented as ANNOTATION), strength} — NO candidate revision, NO evidence refs, and the projection collapses endpoints to `members[0]` (`bridge_projection.py:165,168`) — composite keys are LOST today.
+- V2. Compilation produces G3 (`physical_cardinality_unavailable`) on unrealized crossings; the lens refuses such options → today a proposed-but-unrealized link yields NO card. Rev 3's Phase A inverts this at the lens: capability-laddered cards, not refusals.
+- V3. `attach_executable_bridge_realizations` pure (`assembly.py:404`); `executable_bridge_realizations` excludes {ONE_TO_MANY, MANY_TO_MANY} (`bridge_store.py:125`) and performs MULTIPLE reads per realization (no single batch); `revalidate_bridge_realization(conn, realization, *, purpose, environment, execution_tier)` exists (`:776`) — purpose/environment/tier are REQUIRED for validation and the serving request carries NONE today.
+- V4. Serving unreachable: `routes/contract.py:775` entity-only rejection; `gate1.py:1160` engine branch vs `:1308` `elif is_live:` mutual exclusion.
+- V5. Generation lane: `selection_formula_binding.py:32` pins selection+formula only; `restore_formula_v3.py:91` restores no plan; `ResolvedFeatureInputV2` (`admission_v2.py:94-100`) DELIBERATELY has no optional plan field (docstring: a `None`-filled field reads as "checked, and fine") — the pinned lane needs a NEW MANDATORY wrapper, not a field; `compile_ir_v2.py:108` re-resolves joins from current state; formula drafts are authored BEFORE selection and bound to no plan.
+- V6. Renderer keys raw datasets `{schema}.{table}` (`render/project.py:347`) vs wiring's `catalog::schema.table` (`wiring.py:186`); catalog YAML, node inputs, spine validation, gate manifests, source-binding validation all need the qualified dialect; same-`schema.table` two-catalog collision is real.
+- V7. Migration 1120's demand verdict CHECK is CLOSED and the file immutable — new demand types require a NEW migration. Telemetry today reads only executable realizations, so unknown-cardinality realizations masquerade as "no realization".
+- V8. All A3 AML recipes `FORMULA_BLOCKED`; `posted_debit_amount` is the only reviewed expectation; growing that registry is an operator act. A `posted_debit_amount` feature CAN compile single-catalog — cross-catalog journeys must assert the IR itself (join step, two catalog-qualified inputs, bridge-gate node, pinned grain, one envelope digest card→selection→build→IR→render).
+- V9. `PLAN_CONTRACT_VERSION` already in `current_version_vector()` (`live_activation.py:62`); flag at `:56`; signed-gate startup check ~`:242`.
+- V10. Kind manifest: generation on, `FEATUREGEN_MATERIALIZE_INVENTORY` commented out (operator precondition).
+- V11. Stage-1 substrate reusable (governed option builder, decision facts, 1120/1121 ledger + report, chooser). Migrations ≥1122 free (T0 confirms exact numbers).
 
-**T0 (mandatory):** re-verify V1-V11 and EVERY file:line the review cited; confirm run-spine store contracts and gold-gate names; reserve migrations (envelope persistence, selection-plan binding, demand-satisfaction projection, cohort approval — expected 1122-1125); ledger deltas; amend tasks before dispatch.
+**T0 (mandatory):** re-verify V1-V11 and every review citation against the then-current origin/main; pin run-spine store contracts + gold-gate names; reserve migrations (projection/evidence extension if persisted, PlanEnvelopeV2 relational model, three bindings, demand-type extension, execution-context revision, cohort approval); ledger deltas; amend tasks before dispatch.
 
 ---
 
-# PHASE A — The exact join exists before compilation
+# PHASE A — Discovery tells the truth (cards from logical plans)
 
-## Task A1 (rewritten): tier and evidence propagate — no new candidacy reader
-**Files:** `planner/contracts.py` (segment gains defaulted, DECLARED-identity-impacting fields — see A2's remint), `planner/assembly.py` (thread `ActiveBridgeV1.status`/strength/candidate revision/evidence refs from `_scoped_bridges` into the minted segments), `contract/governed_lens.py` (plan facts + option display material carry tier/strength/evidence refs).
-**What:** AI-proposed links are already eligible (V1). This task carries their EXISTING review status ("proposed"/"human-confirmed"), strength, candidate revision, and evidence references from `ActiveBridgeV1` into the plan segments, plan facts, observation rows (additive `param`-style jsonb — no 1120 schema change), and the card material. Display vocabulary: exactly the two real states.
-**Tests:** proposed-link fixture plans with `link_status="proposed"` + strength on the segment; confirmed fixture shows "human-confirmed"; no raw ledger reads added (grep-pin: no new `entity_bridge_candidate_evidence` consumer).
+## A1: capability states + closed reason codes (the contract everything else meets)
+`contract/capability.py`: the five states, the closed blocker vocabulary, `CapabilityAssessmentV1` (per-option: rung reached, per-rung blocker codes, evidence refs). Pure; exhaustively tested; the single source for card copy, route payloads, demand mapping, and journey assertions.
 
-## Task A2 (rewritten): realization attachment BEFORE contract compilation — a declared identity change
-**Files:** `planner/plan_bindings`/`CompilerContext` (T0 pins exact names): ONE batched frozen realization read per planning request; `attach_executable_bridge_realizations` runs between path assembly and `_compile_or_mark`; `planner/contracts.py`: PLANNER_VERSION bump + the Stage-1 literal pins REGENERATED in this task, deliberately, with the bump.
-**Pipeline (the review's corrected order):** assemble candidate path → load frozen realization set once → attach exact directional realization → re-mint physical identity → compile contract → select resolved plan → envelope/card.
-**Outcomes:** attachable → segments carry realization revision + `deterministically_validated`; no realization → the EXISTING G3 refusal + demand (no new vocabulary); ambiguous → refuse; M:N → see A2b. Cardinality from the realization becomes a plan fact.
-**Tests:** the Stage-1 G3-pinned fixture resolves once realizations seeded; ambiguity refuses; frozen-read batching pinned (query-count); pin regeneration commit-reviewed as identity-change-declared.
+## A2: the governed bridge projection carries what plans need
+Extend the PROJECTION (never a raw candidate-ledger reader): full ORDERED endpoint member tuples (composite keys — `source_system+customer_number`-class), candidate revision, evidence revisions, direction, exact column-pair mapping when available. `members[0]` collapse removed. Annotations (status/strength/evidence text) stay OUT of physical identity per the matrix. If no exact ordered mapping exists: card allowed, formula per assessment, preview blocked `DIRECTIONAL_MAPPING_INCOMPLETE` — NEVER a mapping inferred by zipping flattened members.
 
-## Task A2b: the M:N product rule (owner policy, encoded)
-**What:** joins whose realization proves 1:1 or N:1 (`max_right_matches_per_left_row <= 1` observation) → full preview eligibility. KNOWN M:N → card serves + formula authors; preview generation refuses by name (`mn_join_requires_allocation_policy`) and files demand. UNPROVEN cardinality on a proposed link → the provisional-preview lane: generated code embeds RUNTIME validation gates (post-join row-count preservation + distinct-key assertions) that fail the run with a named error instead of producing wrong aggregates; the card and the rendered project both say "provisional — runtime-validated". `executable_bridge_realizations`'s M:N exclusion is NEVER silently relaxed. (Explicit dedup/allocation policies for M:N are chartered follow-up, value-validated when built.)
-**Tests:** each of the three outcomes with expected behavior; the runtime gate actually fails a seeded fan-out fixture at execution.
+## A3: server-owned execution context
+Serving resolves an authorized preview/sandbox execution context BEFORE planning; persisted immutable `execution_context_revision_id`; included in considered-option identity; replanning under a different environment mints a NEW plan. (Without it, purpose/environment/tier — which `revalidate_bridge_realization` requires — would be fabricated at serve time.)
 
-## Task A3: AML end-to-end fixture — planning shape AND values
-Two-catalog AML fixture (payments events + core customers; proposed link; seeded realizations): resolves `corridor_cross_border_share`, `high_risk_corridor_exposure`, `fan_in_fan_out`, `rapid_movement_passthrough` at customer grain, 90d. PLUS the adversarial value set (the review's P1): duplicate transaction ids, reversals, multi-currency, late posting, post-cutoff rows, joint-account M:N ownership — each with a pinned expected VALUE or named refusal (value assertions land in Phase C's generation tests; the fixture and expectations are authored HERE). Lookback-window and prediction-horizon asserted as separate facts.
+## A4: `BridgeRealizationSnapshotV1` — one immutable batched read
+Constant-query snapshot of realization state for the COMPLETE considered set (executable + provisional-relevant rows), taken once per request; all downstream assessment reads the snapshot. Deterministic candidate CAP separated from the runtime DEADLINE; truncation persisted with its cause (cap vs deadline) and disclosed.
 
-### Phase A gate: suites green; declared identity change reviewed; A3 planning assertions green.
+## A5: the lens serves the ladder instead of refusing
+The governed lens converts compilation outcomes + snapshot evidence into `CapabilityAssessmentV1` per option: unrealized proposed link → CARD_AVAILABLE/FORMULA_AUTHORABLE with `preview: DIRECTIONAL_REALIZATION_MISSING`; mapped-but-unproven → PREVIEW_PROVISIONAL; realization attached + 1:1/N:1 → PREVIEW_EXECUTABLE; known M:N → card+formula, preview `ALLOCATION_POLICY_REQUIRED`. Identity-impacting planner changes (realization attachment before compile for the executable rung) are DECLARED: PLANNER_VERSION bump + literal pins regenerated deliberately in the same task.
 
-# PHASE B — Serving reachable, truthful, one authority
+## A6: demand ledger speaks the new vocabulary (new migration; 1120 untouched)
+`bridge_demand_extension` (or successor table) with demand types {`DIRECTIONAL_REALIZATION_MISSING`, `DIRECTIONAL_MAPPING_INCOMPLETE`, `CARDINALITY_EVIDENCE_REQUIRED`, `ALLOCATION_POLICY_REQUIRED`, `REALIZATION_ATTACHMENT_DEFECT`} recording exact bridge, direction, ordered endpoints, realization revision, purpose/environment/tier. Telemetry + the report + the panel consume it; the satisfaction PROJECTION marks current demand met (history immutable).
 
-## Task B1 (rewritten): restructure the scoped branch — engine AND governed, anchored
-**Files:** `contract/gate1.py` (the `elif is_live:` mutual exclusion becomes: catalog-scoped → engine lane runs; governed planner ALSO runs for plans INCLUDING the anchor catalog; merge additively), `routes/contract.py` (activation verdict resolved ONCE from the existing authority and threaded), `live_activation.py` (targeted-cohort approval added INSIDE the existing signed-gate authority; `GOVERNED_SERVING_POLICY_VERSION` + `PLAN_CONTRACT_VERSION` join `current_version_vector()` — same commit; freeze expectations updated deliberately).
-**Rules:** anchor rule enforced (every governed option includes the user's catalog); activation-off = byte-identical (pinned); the SAME verdict gates serving, draft, confirm — no card renders actionable when the deployment's signed artifact guarantees confirm fails. **Request-path ceiling (P1):** shortlist + hard candidate cap + query ceiling + deadline + the ONE frozen realization read + deterministic truncation disclosed on the response.
-**Tests:** unreachability closed (governed options in a catalog-scoped response); anchor violation impossible (fixture with an authorized-but-unrelated third catalog); stale-approval under the new vector; ceiling pins (query-count + cap + disclosure).
+### Phase A gate: ladder assessments correct on fixtures for ALL five rungs; composite-key fixture round-trips; suites green; identity change reviewed.
 
-## Task B2 (widened): twin identity through EVERY intermediate map
-All in-memory maps and persistence keyed `option_id`/`governed_variant_id` (not canonical id) end to end; persisted `source_definition_id` stays canonical in the column. Test: engine + governed twin of ONE recipe survive every stage without overwrite; facts rows distinct.
+# PHASE B — The pinned plan (one join from card to code)
 
-## Task B3: the truthful card
-Participating catalogs; join summary; link provenance ("AI-proposed link — not yet human-reviewed" / "Human-confirmed link"); realization state; M:N/provisional labeling per A2b; "candidate predictor" for prediction goals; "final checks run at draft"; no "blocked"/"approved"-below-VERIFIED; truncation disclosure. Vitest exact-copy per element.
+## B1: PlanEnvelopeV2 — relational model first
+Migration + `planner/plan_envelope_v2.py`: ordered segment direction + endpoint refs (FULL tuples), relationship + realization revisions, realization content/dependency hashes, directional cardinality, selected parameters, output grain + grain key, temporal declaration + window, source-binding revisions, purpose/environment/execution tier (from A3's context revision), policy/currency/reference revisions, compiler + renderer versions. Canonicalization + full content digest. Same-read-set/different-shape → different digests.
 
-## Task B4: draft/confirm positive proof + staleness
-Committed confirm over an A3 card (real registry); confirm re-resolves the SAME activation verdict; moved candidate/realization since serve → named staleness refusal, never a silently different join.
+## B2: three bindings, composite FKs — disagreement impossible
+`considered_option_plan_binding` (considered_revision_id, option_id, plan_envelope_id, plan_digest); `formula_draft_authoring_plan` (formula_draft_id, considered_revision_id, option_id, plan_envelope_id); `selection_formula_plan_binding` (selection_revision_id, formula_draft_id, plan_envelope_id). Composite FKs so a formula authored under Plan A can never bind a selection under Plan B. Envelope digest enters build-set identity.
 
-### Phase B gate: served card demonstrable; byte-identity + anchor + ceiling pinned; suites green.
+## B3: `PinnedResolvedFeatureInputV3` through restore → admission → compilation
+A NEW MANDATORY wrapper (V5's docstring law — no optional field on V2): restore loads the bindings + envelope; admission compares digests; `compile_ir_v2` derives joins FROM the pinned realization revisions (sole authority); worker revalidates pinned revisions via `revalidate_bridge_realization` with the pinned context — refuse on revocation/supersession, never substitute. Fresh planner = diagnostic lane only, clearly labeled.
 
-# PHASE C — The confirmed join generates (correct order)
+## B4: the provisional lane (separate contracts, production readers untouched)
+Typed assessment {EXECUTABLE, PROVISIONAL_UNKNOWN_CARDINALITY, REFUSED}; separate provisional realization reader; provisional join IR step carrying exact column pairs + predicates; wiring into `compile_expression`; renderer support; the PRE-AGGREGATION runtime gate per the Global Constraint (join-tuple uniqueness + null-key + unmatched-key coverage + max-matches), failing by name before any aggregate. Rendered output labeled provisional.
 
-## Task C1 (was C2): PlanEnvelopeV2 — defined, persisted, hashed FIRST
-**Files:** `planner/plan_envelope_v2.py` + migration (reserved at T0): relational persistence + FKs.
-**Contents (the review's list, verbatim floor):** ordered segment direction + endpoint refs; relationship + realization revisions; realization content/dependency hashes; directional cardinality; selected parameters; output grain + grain key; temporal declaration + window; source-binding revisions; purpose/environment/execution tier; policy/currency/reference revisions; compiler + renderer versions. Canonicalization + full content digest.
-**Tests:** round-trip; digest stability; two same-read-set join shapes → different digests (the fan-out fixture's foundation).
+### Phase B gate: the Plan-A/Plan-B story impossible by construction (binding tests); fan-out fixture refuses at admission AND compilation; provisional gate fails a seeded fan-out at runtime; suites green.
 
-## Task C2 (was C1): immutable selection→plan binding, into build-set identity
-**Files:** new binding store (migration reserved) linking selection revision ↔ envelope (FK), referenced from `selection_formula_binding.py`/build-set membership; envelope digest enters build-set identity.
-**Tests:** pin round-trip; build-set identity changes when the envelope does; mutation refusal.
+# PHASE C — Rendering + serving (wired LAST)
 
-## Task C3: the envelope through restore → admission → V3 compilation
-**Files:** `restore_formula_v3.py` (restore the binding + envelope), `ResolvedFeatureInputV2` (envelope field, versioned), `compile_ir_v2.py` (joins derived FROM pinned realization revisions; independent re-resolution compared — divergence REFUSES by name), worker revalidation via `revalidate_bridge_realization` (revocation/currentness of the PINNED revisions; never "latest").
-**Acceptance:** the review's failure story impossible — bridge state changes between confirm and generate → named refusal, never Plan B. The fan-out fixture (two same-read-set shapes; one refuses) passes at admission AND compilation.
+## C1: catalog-qualified dialect everywhere
+`catalog::schema.table` through raw keys, generated dataset names, node inputs, catalog YAML, spine validation, gate manifests, source-binding validation; RENDERER_VERSION bump (declared). Tests: two catalogs, same `schema.table`, distinct datasets through the COMPLETE rendered project; NEGATIVE: wrong-catalog spine supplied → rendering REFUSES (not just distinct names).
 
-## Task C4 (from parent S2-P5 — no longer deferred): one dataset-key dialect
-`render/project.py` raw-dataset keys + Kedro catalog names adopt `catalog::schema.table` (`wiring.py:186`'s dialect); RENDERER_VERSION bump (identity-impacting, declared); test: two same-named tables in two catalogs render + resolve as two datasets through the COMPLETE rendered project; tested through `render_project` AND `_hop_datasets` in one test.
+## C2: serving under one verdict
+Branch restructure (engine + governed lanes, additive merge, anchor rule), request-path ceiling (cap/deadline/one snapshot read/disclosed truncation), `ResolvedCrossCatalogActivationV1` resolved once and pinned; draft + confirm revalidate the same facts; byte-identity when inactive; staleness per the matrix. Card copy from `CapabilityAssessmentV1` — including the ladder, blockers, link provenance, provisional labeling, "candidate predictor".
 
-## Task C5: formula reality — two public journeys
-**Journey 1 (deterministic):** a cross-catalog-plannable feature over `posted_debit_amount` (the one reviewed expectation) end to end: card → confirm → build set → preview generation → rendered two-catalog project → A3-class VALUE assertions.
-**Journey 2 (LLM-authored recipe-origin):** one AML recipe (`FORMULA_BLOCKED`) through LLM formula authoring: spend authorization reuses the existing cost-confirmation mechanism; FakeLLM fixture coverage; method provenance recorded per the per-member-authoring design; the LLM-authoring certificate requirement for recipe-origin honored.
-**Operator lever (D-rail, named):** SME review adding AML entries to `recipe_formula_expectations_v2` (the D-2/A5 operator act) converts Journey-2 recipes to Journey-1 — the plan works with or without it.
+## C3: twin identity end to end
+Every intermediate map + persistence keyed `option_id`/`governed_variant_id`; canonical id stays canonical in its column; engine+governed twin survives all stages.
 
-## Task C6: preview honesty + the gold gate
-Preview admitted without gold certification; output labeled **"rendered preview — not execution-ready"** unless the FULL parent S2-P6 checklist ran (this plan implements: per-catalog physical binding via the EXISTING inventory/physical-binding substrate — no new store — + engine compatibility + read authorization; residency/PIT/data-movement stay in the label until the parent gate lands); `PUBLISH_PRODUCTION` hard-block verified by test; sandbox execution runs duplicate/cardinality checks (A2b's gates) per the owner's policy table.
+### Phase C gate: a proposed-link card served with honest rungs; suites green; byte-identity + anchor + ceiling pinned.
 
-### Phase C gate: A3 hypothesis → card → confirm → pinned build set → preview generation → rendered two-catalog project with VALUE-correct features (Journey 1) + authored-formula journey (Journey 2) green; same-read-set fixture refuses; dialect collision test green; suites green.
+# PHASE D — The five journeys (public APIs, real workers)
 
-# PHASE D — Operator rail (explicit user go, parallel)
-- D1: migrations backend-first; telemetry flip + worker scheduling (recon: demand ranks realization seeding); `FEATUREGEN_MATERIALIZE_INVENTORY` + multi-catalog mappings deployed and health-checked BEFORE Phase-C journeys run live (V10).
-- D2: demand-satisfaction PROJECTION (unresolved-demand view; history immutable); ranking weights tier + fan-out risk.
-- D3: targeted-cohort activation (inside the one authority) for first-serve; SME corpus review + signed thresholds + wave-1 report gate BROAD activation.
+1. **Proposed link, no realization:** card + authored formula; preview named `DIRECTIONAL_REALIZATION_MISSING`; demand recorded.
+2. **Proposed link, unknown cardinality:** provisional preview; runtime gate PASS case and FAIL case (seeded fan-out stops before aggregation, named).
+3. **Exact 1:1/N:1:** full cross-catalog preview — IR asserts ≥1 cross-catalog join step, two catalog-qualified physical inputs, the bridge-gate node, pinned landing grain, ONE envelope digest across card→selection→build→IR→render.
+4. **Known M:N:** card + formula; preview refused; `ALLOCATION_POLICY_REQUIRED` demand recorded.
+5. **AML value journey (LLM-authored):** a `FORMULA_BLOCKED` AML recipe through LLM authoring (spend via the existing cost-confirmation mechanism, FakeLLM fixtures, method provenance) → preview generation → fixture EXECUTION with expected banking values or named refusals over the adversarial set (duplicate txn ids, reversals, multi-currency, late posting, post-cutoff, joint-account M:N). Lookback vs horizon asserted separately.
 
-# Not in scope (parent charter): M:N allocation policies (A2b charters), full S2-P6 residency/PIT/data-movement (C6 labels honestly), LLM promotion journey beyond Journey 2's authoring lane, federated execution, G2, operator propose-bridge surface.
+### Phase D gate = the plan's acceptance. Operator lever (named): SME reviewing AML expectations converts journey 5 to deterministic.
+
+# PHASE E — Operator rail (explicit user go, parallel)
+E1: 1120/1121 (+ new migrations) backend-first; telemetry flip + worker scheduling (recon for realization seeding priorities); `FEATUREGEN_MATERIALIZE_INVENTORY` + multi-catalog mappings deployed + health-checked before live Phase-D runs. E2: demand-satisfaction projection live; ranking weights tier + fan-out risk (annotations only). E3: targeted-cohort activation (first-serve) inside the one authority; SME thresholds + wave-1 report gate BROAD activation.
+
+# Not in scope (chartered): M:N allocation policies; dimension/reference-enrichment joins (typed contract, PIT rules, renderer support — the "filter by customer risk before aggregation" class); full S2-P6 residency/PIT/data-movement (preview stays labeled "not execution-ready" until it lands); federated execution; G2; propose-bridge surface.
 
 # Execution
 SDD, Stage-1 protocol; T0 first; ledger at `.superpowers/sdd/<plan-basename>/progress.md`; final whole-branch review; NO merge/push/deploy/flag-flip without explicit user go.
