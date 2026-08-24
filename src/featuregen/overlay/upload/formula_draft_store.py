@@ -371,6 +371,8 @@ def request_draft(
         DraftRetired: a tombstone covers this request and no valid exception authorises it.
         DraftNotAnAnswer: the existing draft for this identity is FAILED or CANCELLED, so returning
             it would report a bought answer that was never bought.
+        DraftCeilingExhausted: the approved ceiling this mint would ride cannot cover ONE more
+            per-call worst-case reservation, so the coupon must survive for a request that can.
     """
     from featuregen.overlay.upload.llm_spend import remaining_spend
     from featuregen.overlay.upload.retirement_scope import (
@@ -513,23 +515,38 @@ def _request_draft_locked(
 
     if located:
         # ▲ THE DEAD-TICKET GUARD (Task 7 review item 1). Coupons are about to be consumed, so
-        # the ceiling the mint would ride must still have budget — otherwise the draft dies at
+        # the ceiling the mint would ride must still cover work — otherwise the draft dies at
         # the dispatch seam where 1105 reserves per physical call, AFTER the approval is burned.
-        # The ride is the SAME locator the service prefers with and the run-spine projection
-        # reports from, so all three doors give one answer. `None` here means the approval's
-        # authorization EXPIRED: the service then rides its bounded development envelope (or
-        # refuses COST_AUTHORIZATION_MISSING on the job path, before this gate runs), so the
-        # mint CAN complete and there is no dead ticket to refuse.
+        # The ride is the SAME locator the service prefers with (and the run-spine projection
+        # switches to on its side's next round — two callers today, three then). `None` here
+        # means the approval's authorization EXPIRED: the service then rides its bounded
+        # development envelope (or refuses COST_AUTHORIZATION_MISSING on the job path, before
+        # this gate runs), so the mint CAN complete and there is no dead ticket to refuse.
         ride = approved_ceiling_for(
             conn, target_formula_identity_hash=identity,
             provider_contract_hash=provider_contract_hash,
             strategy_identity_hash=strategy_identity_hash)
         if ride is not None:
+            # ▲ THE BAR IS ONE PER-CALL WORST-CASE RESERVATION, NOT ZERO (scoped-review item 1:
+            # a zero floor passed a remainder too small for the FIRST dispatch to reserve —
+            # coupon consumed, then refused one seam later). The dispatch seam reserves
+            # calls=1, tokens=ceil(max_tokens/max_calls), cost=max_cost/max_calls
+            # (formula_draft_worker's SpendBindingV1 construction) — the SAME arithmetic here,
+            # so the guard refuses exactly when the seam would.
+            from decimal import Decimal
+
             left = remaining_spend(conn, ride, now=resolved_now)
-            if left.calls <= 0 or left.tokens <= 0 or left.cost <= 0:
+            max_calls, max_tokens, max_cost = conn.execute(
+                "SELECT max_calls, max_tokens, max_cost FROM llm_spend_authorization_revision "
+                "WHERE spend_authorization_id = %s", (ride,)).fetchone()
+            call_tokens = -(-int(max_tokens) // int(max_calls))
+            call_cost = Decimal(str(max_cost)) / int(max_calls)
+            if left.calls < 1 or left.tokens < call_tokens or left.cost < call_cost:
                 raise DraftCeilingExhausted(
-                    f"the approved ceiling {ride} for formula identity {identity} is spent "
-                    f"(remaining: calls={left.calls}, tokens={left.tokens}, cost={left.cost}) — "
+                    f"the approved ceiling {ride} for formula identity {identity} cannot cover "
+                    f"one more call (remaining: calls={left.calls}, tokens={left.tokens}, "
+                    f"cost={left.cost}; one call reserves calls=1, tokens={call_tokens}, "
+                    f"cost={call_cost}) — "
                     f"minting would consume the regeneration exception to buy a draft that "
                     f"cannot dispatch. Nothing was consumed or written; re-confirming the cost "
                     f"under a fresh authorization is the remedy, and it is the approver's")

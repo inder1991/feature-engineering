@@ -1179,8 +1179,9 @@ def test_an_EXPIRED_authorization_is_not_a_dead_ticket_the_mint_rides_the_envelo
     """The guard's None path, pinned: when the approval's authorization has EXPIRED, the
     preference locator returns None and the service rides its bounded development envelope —
     the mint CAN complete, so the store must NOT refuse. Exhaustion refuses; expiry falls
-    through to the envelope. (Expired-AND-exhausted is unconstructible through the public
-    API — `reserve_spend` refuses expired authorizations — so expiry alone is the pin.)"""
+    through to the envelope. (Expired-AND-exhausted is unconstructible in THIS order —
+    `reserve_spend` refuses expired authorizations — but exhaust-then-WAIT reaches it; benign,
+    expiry dominates and the locator filters the row either way, so expiry alone is the pin.)"""
     from featuregen.overlay.upload.llm_spend import authorize_spend
     from featuregen.overlay.upload.retirement_scope import (
         approve_regeneration_exception,
@@ -1209,3 +1210,45 @@ def test_an_EXPIRED_authorization_is_not_a_dead_ticket_the_mint_rides_the_envelo
         "SELECT uses_consumed FROM formula_draft_regeneration_exception "
         "WHERE exception_id = %s", (coupon,)).fetchone()
     assert consumed == (1,), "the coupon still authorizes THIS mint and is consumed by it"
+
+
+def test_a_SLIVER_remainder_below_one_call_is_still_a_dead_ticket(db):
+    """Scoped-review item 1, the probe verbatim: a remainder above ZERO but below ONE per-call
+    worst-case reservation (5-call/1000-token/$1.00 ceiling, 4 calls/900 tokens/$0.80 already
+    reserved → 1 call/100 tokens/$0.20 left, but one call reserves tokens=ceil(1000/5)=200)
+    must refuse with the coupon unburned — the zero floor let it through to die at the FIRST
+    dispatch reserve, one seam late and one coupon poorer."""
+    import pytest
+
+    from featuregen.overlay.upload.formula_draft_store import DraftCeilingExhausted
+    from featuregen.overlay.upload.llm_spend import authorize_spend, reserve_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        approve_regeneration_exception,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-sliv")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-sliv",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-sliv",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    (coupon,), _ = approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
+    now = db.execute("SELECT now()").fetchone()[0]
+    reserve_spend(db, spend_authorization_id=spend, calls=4, tokens=900, cost="0.80", now=now)
+
+    with pytest.raises(DraftCeilingExhausted, match="cannot cover one more call"):
+        _request_again(db, draft_id="fd-sliv-retry", option_id="opt-fd-sliv",
+                       provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+    consumed, drafts = db.execute(
+        "SELECT (SELECT uses_consumed FROM formula_draft_regeneration_exception "
+        "        WHERE exception_id = %s), "
+        "       (SELECT COUNT(*) FROM formula_draft WHERE formula_identity_hash = %s)",
+        (coupon, identity)).fetchone()
+    assert consumed == 0 and drafts == 1, "coupon unburned, no dead ticket minted"
