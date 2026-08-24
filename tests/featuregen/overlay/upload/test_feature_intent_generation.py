@@ -209,6 +209,22 @@ def test_the_lens_hands_the_repairs_on_beside_the_rejections(db):
         (0, "output.unit_kind", "days", "duration_days")]
 
 
+def test_an_invented_concept_beside_a_bad_class_is_a_gap_and_the_sibling_survives(db):
+    """The population that invents an operand-class word is the population that invents concept
+    names, so this pair is ordinary traffic — not an edge case. It must stay a PER-ITEM refusal:
+    the registry answers None for an unknown name, the resolver reads that as "determines
+    nothing", and the batch's clean sibling is served exactly as it would have been."""
+    invented = _wire_intent(display_name="Invented operand", operands=[
+        {"role": "who", "concept": "not_a_registered_concept", "operand_class": "attribute"}])
+    result, _ = _run(db, {"intents": [invented, _wire_intent(display_name="Clean twin")]})
+    assert len(result.intents) == 1
+    assert result.intents[0].display_name == "Clean twin"
+    assert len(result.rejections) == 1
+    assert result.rejections[0]["code"] == INTENT_VOCABULARY_GAP
+    assert "'attribute'" in result.rejections[0]["detail"]
+    assert "not_a_registered_concept" in result.rejections[0]["detail"]
+
+
 def test_a_repair_is_logged_where_an_operator_watching_a_live_run_can_see_it(db, caplog):
     """The trace on the result is for callers; this line is for whoever is reading logs while the
     run happens. Both, because a repair nobody can see is a silent edit of the model's answer."""

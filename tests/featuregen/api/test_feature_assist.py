@@ -116,6 +116,31 @@ def test_refine_without_a_catalog_is_a_typed_422_not_an_empty_answer(make_client
     assert res.json()["detail"]["code"] == "SEMANTIC_REQUIRES_CATALOG_SOURCE"
 
 
+def test_refine_answers_200_when_the_model_invents_a_concept_and_a_class(make_client, conn):
+    """T1 regression: this route's contract is that BOTH outcomes are 200 — a revision or a typed
+    `rejected`. A model that writes an off-vocabulary `operand_class` is the same model that
+    writes an invented concept name, and the vocabulary seam used to dereference the registry's
+    None for that pair — an unhandled 500 here, and a silently killed intent lane in gate1."""
+    import sys
+    sys.path.insert(0, ".")
+    from tests.featuregen.api.test_semantic_v1_serving import _bank, _intent_payload
+
+    payload = _intent_payload()
+    payload["intents"][0]["operands"] = [
+        {"role": "who", "concept": "not_a_registered_concept", "operand_class": "attribute"}]
+    _bank(conn)
+    res = make_client(llm_client=FakeLLM(script={
+        "overlay.feature.intents": FakeResponse(output=payload)})).post(
+        "/features/refine", json={
+            "candidate": {"name": "activity_recency", "description": "days since last event",
+                          "derives_from": [], "aggregation": None, "grain_table": None},
+            "instruction": "make it deposits only", "catalog_source": "bank"}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    rejected = res.json()["rejected"]
+    assert rejected["code"] == "INTENT_VOCABULARY_GAP"
+    assert "vocabulary gap" in rejected["reason"]
+
+
 def test_refine_revises_the_meaning_through_the_engine(
         make_client, conn, monkeypatch):
     """B9: refine round-trips under the mode — instruction in, ENGINE-bound revision out with

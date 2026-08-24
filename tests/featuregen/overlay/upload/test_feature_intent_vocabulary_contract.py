@@ -24,10 +24,14 @@ import pathlib
 import pytest
 
 from featuregen.intake.schema_projection import project_for_anthropic
+from featuregen.overlay.upload.concept_operand_classes import allowed_operand_classes
+from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.enrich_llm import canonical_output_schema
 from featuregen.overlay.upload.feature_intent import FeatureIntentV1, parse_feature_intent
 from featuregen.overlay.upload.feature_intent_generation import (
+    _determined_group_classes,
     _normalize_intent_vocabulary,
+    _resolve_operand_class,
     _vocabulary_gaps,
 )
 from featuregen.overlay.upload.feature_planning_contracts import PlanningContractError
@@ -175,8 +179,10 @@ def test_a_value_the_model_meant_is_never_overwritten():
 
 def test_an_operand_class_the_registry_cannot_determine_is_a_gap_not_a_guess():
     """`attribute` is not translated — the platform has no attribute class to translate it into,
-    and the concept's own group (categorical: status / dimension / policy_input / measure /
-    direction) does not determine one. Recovery is never worth a guess."""
+    and the concept's own group (`customer_risk_rating` is quantity_risk, whose reviewed uses
+    split across measure / policy_input / status / dimension) does not determine one. Recovery is
+    never worth a guess."""
+    assert concept("customer_risk_rating").group == "quantity_risk"
     doc = {"output_grain_entity": "customer",
            "operands": [{"role": "measured", "concept": "customer_risk_rating",
                          "operand_class": "attribute"}]}
@@ -184,6 +190,38 @@ def test_an_operand_class_the_registry_cannot_determine_is_a_gap_not_a_guess():
     assert applied == ()
     gap = _vocabulary_gaps(fixed)
     assert "'attribute'" in gap and "does not determine" in gap
+
+
+def test_an_unregistered_concept_determines_nothing_and_never_raises():
+    """`concepts.concept()` answers None for a name it does not hold — it does not raise — and an
+    invented concept arrives on exactly the items that invent operand-class words. Resolving must
+    read that None as "determines nothing"; dereferencing it took the whole batch down."""
+    assert concept("not_a_registered_concept") is None
+    assert _resolve_operand_class("not_a_registered_concept", "customer") is None
+
+
+def test_group_unanimity_needs_more_than_one_concept_behind_it():
+    """The support floor. `stablecoin` is a registered crypto concept no reviewed recipe uses as
+    an operand, so only its group could speak for it — and the whole crypto group is ONE operand
+    of ONE concept in ONE recipe. Unanimity over one observation is one data point wearing the
+    word, so it licenses nothing. `flag` (8 concepts across 11 recipes) is what agreement looks
+    like when it means something."""
+    assert concept("stablecoin").group == "crypto"
+    assert allowed_operand_classes("stablecoin") is None          # no reviewed usage of its own
+    assert _resolve_operand_class("stablecoin", "customer") is None
+
+    assert _determined_group_classes() == {"flag": "status"}
+    assert _resolve_operand_class("pep_flag", "customer") == (
+        "status", "the only class any reviewed flag concept serves")
+
+
+def test_the_floor_costs_the_recorded_run_nothing():
+    """The floor is a real constraint, not a free one — so prove it does not pay for itself with
+    this run's recoveries: `flag` is the only group that fires on the recorded eight, and it
+    clears the floor by a wide margin."""
+    groups = _determined_group_classes()
+    assert set(groups) == {"flag"}
+    assert len([i for i in _RECORDED_INTENTS if _replay(i)[0] is not None]) == 6
 
 
 # ── the wire contract: the schema publishes the parser's own vocabularies ─────────────────────

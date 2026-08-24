@@ -94,10 +94,23 @@ _ANCHOR_KIND_SPELLINGS = {"as_of_snapshot": "as_of", "event_window": "event"}
 _WINDOW_UNIT_SPELLINGS = {"day": "days"}
 
 
-def _group_operand_classes() -> dict[str, frozenset[str]]:
-    """Which operand classes each governed concept GROUP is actually used in, derived from the
-    reviewed V2 registry — the same provenance rule `concept_operand_classes` is built on (the
-    registry's authored usage is the reviewed truth; a hand-typed parallel table would drift).
+#: How many DISTINCT CONCEPTS a group's unanimity must span before it may determine a class.
+#: Three, because one concept is a single authoring decision (however many recipes reuse it) and
+#: two can still be one pack authored in one sitting — three is the smallest number that cannot be
+#: either. Measured against the reviewed registry today: `flag` clears it (8 concepts across 11
+#: recipes); `currency` (2), `eligibility` (1), `crypto` (1), `geographic` (1) and `label` (1) do
+#: not, and unanimity over one operand is one data point wearing the word.
+_GROUP_SUPPORT_FLOOR = 3
+
+
+def _determined_group_classes() -> dict[str, str]:
+    """Concept GROUP → the ONE operand class its reviewed usage determines, for groups whose
+    agreement is wide enough to mean something.
+
+    Derived from the reviewed V2 registry — the same provenance rule `concept_operand_classes` is
+    built on (the registry's authored usage is the reviewed truth; a hand-typed parallel table
+    would drift). Two conditions, both required: every reviewed use agrees on one class, AND the
+    agreement spans at least `_GROUP_SUPPORT_FLOOR` distinct concepts.
 
     Imported inside the function on purpose: `recipe_registry_v2` builds 317 recipes at import,
     and this module is imported by the generation path whether or not a repair is ever needed."""
@@ -106,19 +119,23 @@ def _group_operand_classes() -> dict[str, frozenset[str]]:
         from featuregen.overlay.upload.concepts import concept as registered_concept
         from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 
-        seen: dict[str, set[str]] = {}
+        classes: dict[str, set[str]] = {}
+        concepts: dict[str, set[str]] = {}
         for recipe in V2_RECIPES:
             for operand in recipe.operands:
-                try:
-                    group = registered_concept(operand.concept).group
-                except Exception:      # noqa: BLE001 — an unregistered concept simply has no group
+                registered = registered_concept(operand.concept)
+                if registered is None:     # unregistered: no group, so it supports no claim
                     continue
-                seen.setdefault(group, set()).add(operand.operand_class)
-        _GROUP_CLASSES = {group: frozenset(classes) for group, classes in seen.items()}
+                group = registered.group or ""
+                classes.setdefault(group, set()).add(operand.operand_class)
+                concepts.setdefault(group, set()).add(operand.concept)
+        _GROUP_CLASSES = {
+            group: next(iter(seen)) for group, seen in classes.items()
+            if group and len(seen) == 1 and len(concepts[group]) >= _GROUP_SUPPORT_FLOOR}
     return _GROUP_CLASSES
 
 
-_GROUP_CLASSES: dict[str, frozenset[str]] | None = None
+_GROUP_CLASSES: dict[str, str] | None = None
 
 
 def _resolve_operand_class(concept: str, grain_entity: str) -> tuple[str, str] | None:
@@ -139,18 +156,25 @@ def _resolve_operand_class(concept: str, grain_entity: str) -> tuple[str, str] |
       (`origination_date` is used both ways; its pit_role is not);
     * the concept is a registered IDENTIFIER (it has a namespace) of the output grain's own
       entity — an identifier of the population being computed is that population's key;
-    * every reviewed use of the concept's GROUP agrees on one class (`flag` → `status`, 11 of 11).
+    * every reviewed use of the concept's GROUP agrees on one class, over enough distinct
+      concepts to mean it (`flag` → `status`; see `_determined_group_classes`).
 
-    Anything else returns None and becomes a NAMED gap. Recovery is never worth a guess."""
+    That last rung is the weakest and it is the one that fires where the concept's OWN registry
+    presence is zero — `pep_flag` and `new_to_bank_flag` are registered concepts that no reviewed
+    recipe has ever used as an operand, so nothing more specific than their group can speak for
+    them. It carries a support floor for exactly that reason.
+
+    An UNREGISTERED concept determines nothing and returns None here — never an exception. The
+    model that invents an operand-class word is the same model that invents concept names, so
+    this path is ordinary traffic, and a raise would take the whole batch down with one item."""
     from featuregen.overlay.upload.concept_operand_classes import allowed_operand_classes
     from featuregen.overlay.upload.concepts import concept as registered_concept
 
     allowed = allowed_operand_classes(concept)
     if allowed and len(allowed) == 1:
         return allowed[0], "the only class the governed concept map allows"
-    try:
-        registered = registered_concept(concept)
-    except Exception:                  # noqa: BLE001 — an unknown concept determines nothing
+    registered = registered_concept(concept)
+    if registered is None:             # `concept()` answers None for an unknown name
         return None
     if registered.pit_role == "as_of":
         return "as_of_timestamp", "the concept's registered as-of point-in-time role"
@@ -159,10 +183,9 @@ def _resolve_operand_class(concept: str, grain_entity: str) -> tuple[str, str] |
     if registered.namespace and registered.entity_link and grain_entity \
             and registered.entity_link.lower() == grain_entity.lower():
         return "entity_key", "a registered identifier of the output grain's own entity"
-    group_classes = _group_operand_classes().get(registered.group or "", frozenset())
-    if len(group_classes) == 1:
-        return (next(iter(group_classes)),
-                f"the only class any reviewed {registered.group} concept serves")
+    determined = _determined_group_classes().get(registered.group or "")
+    if determined is not None:
+        return determined, f"the only class any reviewed {registered.group} concept serves"
     return None
 
 
