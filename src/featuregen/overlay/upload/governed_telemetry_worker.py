@@ -64,6 +64,7 @@ from featuregen.overlay.upload.feature_planning_contracts import (
 )
 from featuregen.overlay.upload.field_resolution import canonical_hash
 from featuregen.overlay.upload.governed_observation_store import (
+    STALE_REGISTRY,
     claim_telemetry_work,
     complete_telemetry_work,
     record_bridge_demand,
@@ -97,10 +98,9 @@ MAX_REQUESTS_PER_ITEM = 60
 #: the id from the row's values alone.
 UNRESOLVED_PLAN_CONTENT_HASH = "unresolved"
 
-#: The resolution status of a request the worker refused to plan because the registry moved under
-#: the work item. Not a planner verdict — 1120 leaves ``resolution_status`` free text precisely so
-#: an ADAPTER-level outcome can be recorded honestly instead of dressed as one.
-STALE_REGISTRY = "stale_registry"
+#: ``STALE_REGISTRY`` — the registry-moved refusal status — now lives in
+#: ``governed_observation_store`` (both this writer and the S1C-2 report read it; the store is the
+#: import both already share) and is re-exported here unchanged via ``__all__``.
 
 #: The same refusal for a PAYLOAD-carried request (an LLM intent): its bytes did not reconstruct
 #: into a request that hashes to what was frozen. Spelled differently from ``stale_registry``

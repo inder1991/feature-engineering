@@ -22,6 +22,7 @@ import pytest
 import featuregen.overlay.upload.governed_planning_report as report_module
 from featuregen.overlay.upload.feature_metadata_snapshot import ensure_generation_run
 from featuregen.overlay.upload.governed_observation_store import (
+    STALE_REGISTRY,
     claim_telemetry_work,
     complete_telemetry_work,
     enqueue_governed_telemetry,
@@ -32,7 +33,6 @@ from featuregen.overlay.upload.governed_planning_report import (
     LEGACY_TEMPLATE_PLANNING_REQUEST_HASH,
     wave1_report,
 )
-from featuregen.overlay.upload.governed_telemetry_worker import STALE_REGISTRY
 from featuregen.overlay.upload.hypothesis_corpus import load_hypothesis_corpus
 
 #: Every section the report carries — the shape a consumer renders, pinned once and reused by the
@@ -255,12 +255,17 @@ def test_bridge_demand_counts_queues_and_distinct_identities(conn) -> None:
 def test_the_stale_registry_count_is_its_own_line(conn) -> None:
     """``stale_registry`` is the telemetry worker's ADAPTER-level refusal — the registry moved
     under the frozen work item. Its rate divides by recipe-origin rows, the only lane that can
-    go stale."""
+    go stale — and the numerator carries the SAME origin filter, so an llm-origin row that
+    somehow wore the status could never push the rate past 1."""
     _seed(conn, "stale_a", mode="telemetry", resolution_status=STALE_REGISTRY,
           physical_plan_content_hash="unresolved")
     _seed(conn, "stale_b")
     _seed(conn, "stale_c", definition_origin="llm_intent", recipe_id=None,
           canonical_definition_id="intent:x")
+    # an llm-origin row wearing the status counts in NEITHER half of the rate
+    _seed(conn, "stale_llm", definition_origin="llm_intent", recipe_id=None,
+          canonical_definition_id="intent:y", resolution_status=STALE_REGISTRY,
+          physical_plan_content_hash="unresolved")
 
     stale = wave1_report(conn)["bridge_demand"]["stale_registry"]
     assert stale == {"stale_observations": 1, "recipe_origin_observations": 2,
@@ -332,25 +337,31 @@ def test_volumes_count_modes_runs_intents_and_the_outbox(conn) -> None:
     record_planning_observations(conn, generation_run_id=run_id, intent_id=intent_id,
                                  observation_mode="telemetry", rows=[_observation("vol_tele")])
 
-    # claims take the OLDEST claimable items, so the stays-queued item is enqueued last
     retry_item = enqueue_governed_telemetry(conn, generation_run_id=run_id,
                                             intent_id=intent_id, frozen_inputs={})
     done_item = enqueue_governed_telemetry(conn, generation_run_id=run_id,
                                            intent_id=intent_id, frozen_inputs={})
-    enqueue_governed_telemetry(conn, generation_run_id=run_id, intent_id=intent_id,
-                               frozen_inputs={})                     # stays queued
+    queued_item = enqueue_governed_telemetry(conn, generation_run_id=run_id,
+                                             intent_id=intent_id, frozen_inputs={})
+    # Claims take the OLDEST claimable item by (recorded_at, work_item_id) — but recorded_at
+    # defaults to now(), which is TRANSACTION-FIXED in Postgres, so all three enqueues share one
+    # timestamp and the ULID tiebreak's random suffix would make the claim order a coin flip.
+    # Pin DISTINCT timestamps explicitly (the outbox is the ledger pair's one mutable table) so
+    # each item's role is deterministic.
+    for offset, work_item_id in enumerate((retry_item, done_item, queued_item)):
+        conn.execute("UPDATE governed_telemetry_outbox SET recorded_at = %s "
+                     "WHERE work_item_id = %s",
+                     (datetime(2026, 8, 20, 0, 0, offset, tzinfo=UTC), work_item_id))
+    first = claim_telemetry_work(conn, owner="w1")
+    second = claim_telemetry_work(conn, owner="w1")
+    assert [first["work_item_id"], second["work_item_id"]] == [retry_item, done_item]
     # a reclaim after lease expiry is a RETRY: attempt_count rises past 1
-    claim_order = [claim_telemetry_work(conn, owner="w1") for _ in range(2)]
-    claimed_ids = {row["work_item_id"] for row in claim_order}
-    assert claimed_ids == {retry_item, done_item}
     conn.execute("UPDATE governed_telemetry_outbox SET lease_expires_at = now() - interval '1s' "
                  "WHERE work_item_id = %s", (retry_item,))
     reclaimed = claim_telemetry_work(conn, owner="w2")
     assert reclaimed["work_item_id"] == retry_item and reclaimed["attempt_count"] == 2
-    done_fence = next(row["lease_fence"] for row in claim_order
-                      if row["work_item_id"] == done_item)
     assert complete_telemetry_work(conn, work_item_id=done_item, owner="w1",
-                                   fence=done_fence, ok=True)
+                                   fence=second["lease_fence"], ok=True)
 
     volumes = wave1_report(conn)["volumes"]
     assert volumes["by_mode"]["live"] == {"observations": 2, "distinct_runs": 2,

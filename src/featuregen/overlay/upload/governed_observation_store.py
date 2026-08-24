@@ -51,6 +51,14 @@ from featuregen.overlay.upload.taxonomy.entity_registry import GRAPH_VERSION
 #: The observation modes 1120's CHECK admits.
 OBSERVATION_MODES = frozenset({"live", "telemetry"})
 
+#: The resolution status of a request the telemetry worker refused to plan because the registry
+#: moved under the work item. Not a planner verdict — 1120 leaves ``resolution_status`` free text
+#: precisely so an ADAPTER-level outcome can be recorded honestly instead of dressed as one.
+#: Lives HERE (not in the worker) because both the writer (``governed_telemetry_worker``) and the
+#: read side (``governed_planning_report``) need it, and the report should not pull the worker's
+#: whole planning import graph into the API route chain for one constant.
+STALE_REGISTRY = "stale_registry"
+
 #: Verdict -> queue. CLOSED: a rejection whose reason is not one of these is not a demand at all
 #: (a concept mismatch is a modelling problem, not a missing bridge), and the store drops it rather
 #: than filing it somewhere plausible. 1120 carries the same mapping as a CHECK, so the routing is
@@ -611,6 +619,7 @@ __all__ = [
     "OBSERVATION_MODES",
     "RECENT_WINDOW_DAYS",
     "RESOLVED_STATUSES",
+    "STALE_REGISTRY",
     "SUGGESTED_ENDPOINT_SAMPLE",
     "claim_telemetry_work",
     "complete_telemetry_work",

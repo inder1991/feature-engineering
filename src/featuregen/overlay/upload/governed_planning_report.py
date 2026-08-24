@@ -26,9 +26,9 @@ from typing import Any
 from featuregen.contracts import DbConn
 from featuregen.overlay.upload.governed_observation_store import (
     RESOLVED_STATUSES,
+    STALE_REGISTRY,
     resolution_summary,
 )
-from featuregen.overlay.upload.governed_telemetry_worker import STALE_REGISTRY
 from featuregen.overlay.upload.hypothesis_corpus import load_hypothesis_corpus
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
 
@@ -161,6 +161,10 @@ def _origin_coverage(conn: DbConn, as_of: datetime) -> dict:
 
 
 def _hop_distribution(conn: DbConn, as_of: datetime) -> list[dict]:
+    """Observations per ``hop_count``, split resolved/refused. ``refused`` is observations minus
+    STRICTLY resolved: ``resolved_with_ambiguity`` and ``partially_resolved`` count as refused,
+    per the store's ``RESOLVED_STATUSES`` ruling ("resolution rate" never quietly means "produced
+    something")."""
     return [
         {"hop_count": hop_count, "observations": observations, "resolved": resolved,
          "refused": observations - resolved}
@@ -202,8 +206,9 @@ def _authority_floor(conn: DbConn, as_of: datetime) -> dict:
 
 def _bridge_demand(conn: DbConn, as_of: datetime) -> dict:
     """Per-queue totals and distinct demand identities, plus the ``stale_registry`` count as its
-    own line. Stale rate divides by RECIPE-origin rows: only the recipe lane can find the registry
-    moved under a frozen work item."""
+    own line. Stale rate divides by RECIPE-origin rows — only the recipe lane can find the
+    registry moved under a frozen work item — and the numerator carries the SAME origin filter,
+    so rate <= 1 holds by construction, not by adjacency."""
     queues = {name: {"demand_rows": 0, "distinct_demand_identities": 0}
               for name in _QUEUE_NAMES}
     for queue, demand_rows, identities in conn.execute(
@@ -212,7 +217,8 @@ def _bridge_demand(conn: DbConn, as_of: datetime) -> dict:
             " GROUP BY 1 ORDER BY 1", (as_of,)).fetchall():
         queues[queue] = {"demand_rows": demand_rows, "distinct_demand_identities": identities}
     stale, recipe_origin = conn.execute(
-        "SELECT count(*) FILTER (WHERE resolution_status = %s),"
+        "SELECT count(*) FILTER (WHERE resolution_status = %s"
+        "                          AND definition_origin = 'recipe_v2'),"
         "       count(*) FILTER (WHERE definition_origin = 'recipe_v2') "
         "  FROM governed_planning_observation WHERE recorded_at <= %s",
         (STALE_REGISTRY, as_of)).fetchone()
