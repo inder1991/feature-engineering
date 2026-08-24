@@ -408,11 +408,19 @@ class V2RecipeCandidateV1:
     # temporal blocked, or nothing bound) — the activation fold keeps create_contract blocked.
     binding_plan: dict | None = None
     plan_refusals: tuple = ()
-    # B5: the variant identity — recipe_id + this candidate's exact parameter choice. Every
-    # authored parameterization is its OWN candidate; the variant key is what capture, facts,
-    # and option identity key on (recipe_id stays the DISPOSITION/review key).
+    # The variant identity — recipe_id + this candidate's exact parameter choice. The variant key
+    # is what capture, facts, and option identity key on (recipe_id stays the DISPOSITION/review
+    # key). Under B5 every authored parameterization was its OWN candidate; since T6 (2026-08-24)
+    # the lens emits ONE per recipe, at the PRIMARY variant, so `variant_primary` is True on every
+    # candidate it produces. It is kept, and kept true, because it is what a reader checks to know
+    # a card is not a sibling — a field that quietly disappeared would answer that question by
+    # silence.
     variant_key: str = ""
     variant_primary: bool = True
+    #: The whole authored axis with the chosen value bracketed ("window: 30/[90]/180") — the
+    #: siblings, as a control ON the card rather than as sibling cards. ▲ It is a LABEL today:
+    #: choosing another value means naming it in the hypothesis and re-running, because the
+    #: primary is the deterministic token match. Making it actionable is unchartered.
     param_alternatives: str = ""
     # B4: the candidate's own business definition for the card — recipes carry the authored
     # business_definition, intents carry the model's. DISPLAY ONLY: deliberately not on the
