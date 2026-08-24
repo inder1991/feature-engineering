@@ -18,10 +18,14 @@
 >
 > 1. **ABSORBED by the serving plan:** this plan's per-action fact-loader requirement (D2's
 >    server-owned facts) — now the serving plan's R1 (one authority, six typed fact loaders) and
->    its A1 fact-loader framework — and the plan-envelope hash columns of Task 5's 1122 design and
->    Task 8's 1124 design (planning-request / binding-plan hashes on lineage and frozen-plan rows),
->    which land in the serving plan's own identity-persistence and binding-chain migrations
->    (its T0-mapping rows 1134/1135), never in 1122/1124.
+>    its A1 fact-loader framework — and the plan-envelope hash columns of Task 8's 1124 design
+>    (catalog-snapshot / planning-request / binding-plan hashes on the frozen-plan row), together
+>    with the EXISTING 1072 `selection_formula_binding` hash columns, which the serving plan
+>    preserves as provenance pins; these land in its own identity-persistence and binding-chain
+>    migrations (its T0-mapping rows 1134/1135), never in 1122/1124. Task 5's absorption is the
+>    lineage-table overlap: its 1122 lineage design (target/selection/formula composite keys)
+>    overlaps the serving plan's binding-chain migration (row 1135) — Task 5's written design
+>    specifies no hash columns.
 > 2. **OWNED by the serving plan's B0a/B0b (R8):** the preserved work of Task 4 (server-derived
 >    principal/data scope — roles closed on both routes), Task 5 (target lineage), and Task 8
 >    (frozen method identity). Those tasks are not re-executed here; their acceptance intent is
@@ -277,8 +281,8 @@ The filenames below are provisional reservations, not permission to skip the reg
 
 ▲ *Amended 2026-08-24: the 1121 row below is DEAD as a number (applied live as
 `governed_telemetry_outbox`) — its content re-numbers from the 1122–1129 block at write time; the
-plan-envelope hash columns of the 1122/1124 designs are absorbed by the serving plan (its 1134/1135
-rows). See the supersession record at the top.*
+1124 design's plan-envelope hash columns and the 1122 design's lineage-table overlap are absorbed
+by the serving plan (its 1134/1135 rows). See the supersession record at the top.*
 
 | Migration | Purpose | Key guarantees |
 |---|---|---|
@@ -498,8 +502,8 @@ restricted data cannot be compiled without the corresponding server entitlement.
 ### Task 5 — Migration 1122: enforce target/selection/formula lineage
 
 ▲ *Superseded 2026-08-24: target-lineage work owned by the serving plan's B0b, and the 1122
-design's plan-envelope hash columns absorbed by its binding-chain migration (R8) — see the
-supersession record at the top.*
+lineage design overlapped by its binding-chain migration (R8; this design specifies no hash
+columns — the absorbed hashes are Task 8's) — see the supersession record at the top.*
 
 **Owner:** child with parent schema review.
 
