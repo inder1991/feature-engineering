@@ -277,16 +277,13 @@ _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
         "_grain_key_ref", "assemble_paths",
         "_hop_realizable_elsewhere", "_hop_realizers", "_near_side_key_refs",
         "MAX_NEAR_SIDE_COLUMNS_WALKED", "NEAR_SIDE_WALKED", "NEAR_SIDE_CAPPED",
-        "NEAR_SIDE_DEADLINE_SKIPPED", "NEAR_SIDE_NOT_COLLECTED", _MODULE_BODY,
+        "NEAR_SIDE_DEADLINE_SKIPPED", "NEAR_SIDE_NOT_COLLECTED",
     }),
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
         "compile_temporal",
     }),
     "src/featuregen/overlay/upload/planner/plan.py": frozenset({
-        "METADATA_RESOLUTION_MODES", "plan_bindings", "_assemble_rollups",
-    }),
-    "src/featuregen/overlay/upload/planner/candidates.py": frozenset({
-        "discover_ingredient_candidates",
+        "_assemble_rollups",
     }),
 }
 
