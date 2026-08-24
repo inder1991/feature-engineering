@@ -51,6 +51,11 @@ OUTPUT_TYPES = ("numeric", "integer", "boolean", "date")
 AUTHORITY_LEVELS = ("none", "declared", "governed")
 TEMPORAL_ANCHOR_KINDS = ("event", "as_of", "effective_interval", "contractual_future",
                          "pre_decision")
+# Named because they are a CONTRACT, not a local literal: the LLM intent seam's output schema
+# publishes these to the model (enrich_llm's `feature_intents` v2), and a schema that re-spelled
+# them could promise a token TemporalSpecV2 refuses — the defect this naming closes.
+WINDOW_UNITS = ("days", "minutes", "none")
+CUTOFF_INCLUSIVITY = ("inclusive", "exclusive")
 LEAKAGE_CLASSES = ("standard", "near_label", "outcome")
 
 # A formula's result class decides which additivity claims are even POSSIBLE — the audit found 72
@@ -218,8 +223,8 @@ class TemporalSpecV2:
 
     def __post_init__(self) -> None:
         _closed(self.anchor_kind, TEMPORAL_ANCHOR_KINDS, "anchor_kind")
-        _closed(self.window_unit, ("days", "minutes", "none"), "window_unit")
-        _closed(self.cutoff_inclusivity, ("inclusive", "exclusive"), "cutoff_inclusivity")
+        _closed(self.window_unit, WINDOW_UNITS, "window_unit")
+        _closed(self.cutoff_inclusivity, CUTOFF_INCLUSIVITY, "cutoff_inclusivity")
         if self.anchor_kind == "contractual_future":
             _require(bool(self.future_horizon_policy.strip()),
                      "a contractual-future anchor requires a future-horizon policy")

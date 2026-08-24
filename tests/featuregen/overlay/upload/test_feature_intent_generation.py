@@ -11,6 +11,7 @@ from featuregen.overlay.upload.feature_intent_generation import (
     INTENT_MODEL_SPEC_NOT_OFFERED,
     INTENT_OBJECTIVE_OUT_OF_SCOPE,
     INTENT_REJECTED_PARSE,
+    INTENT_VOCABULARY_GAP,
     generate_feature_intents,
     semantic_capability_inventory,
 )
@@ -89,7 +90,7 @@ def test_a_valid_intent_parses_with_our_provenance_never_the_models(db):
     # B3: the scope hash is the SCOPE's identity; the catalog context hash is its own key.
     assert intent.generation_provenance.confirmed_scope_hash == "scope-hash-test"
     assert intent.generation_provenance.semantic_context_hash == context.context_hash()
-    assert intent.generation_provenance.output_schema_version == "feature_intents@1"
+    assert intent.generation_provenance.output_schema_version == "feature_intents@2"
 
 
 def test_a_malformed_sibling_never_fails_the_batch(db):
@@ -142,11 +143,16 @@ def test_no_validated_output_is_an_honest_unavailable_never_a_crash(db):
 
 def test_a_malformed_output_spec_rejects_the_item_never_the_batch(db):
     """SE-6 wire-up regression: the typed spec constructors raise RecipeContractError (not the
-    PlanningContractError base) — a bad unit_kind on ONE proposed intent must become that
-    item's INTENT_REJECTED_PARSE rejection while a valid sibling still parses."""
+    PlanningContractError base) — a malformed output on ONE proposed intent must become that
+    item's INTENT_REJECTED_PARSE rejection while a valid sibling still parses.
+
+    T1 moved which defect proves it. An off-vocabulary `unit_kind` is now a NAMED vocabulary gap
+    (below), so the malformed case is a CROSS-FIELD one instead: every vocabulary is in order and
+    a monetary output still owes a currency policy — exactly the class no JSON Schema can
+    express, which is why the per-item parse seam still has to be the one that says so."""
     bad = _wire_intent(output={
-        "output_id": "bad_unit", "display_label": "Bad unit", "output_type": "numeric",
-        "additivity": "additive", "unit_kind": "duration",     # not a closed UNIT_KINDS value
+        "output_id": "unpriced", "display_label": "Unpriced amount", "output_type": "numeric",
+        "additivity": "additive", "unit_kind": "monetary",     # …with no currency policy
         "null_input_policy": "nulls excluded and counted",
         "empty_population_policy": "zero with populated flag",
     })
@@ -154,7 +160,46 @@ def test_a_malformed_output_spec_rejects_the_item_never_the_batch(db):
     assert len(result.intents) == 1                            # the valid sibling survived
     assert len(result.rejections) == 1
     assert result.rejections[0]["code"] == "INTENT_REJECTED_PARSE"
-    assert "unit_kind" in result.rejections[0]["detail"]
+    assert "currency policy" in result.rejections[0]["detail"]
+
+
+# ── T1: the vocabulary contract at the seam ────────────────────────────────────────────────────
+
+def test_a_recorded_misspelling_is_repaired_and_the_repair_is_recorded(db):
+    """`unit_kind: days` was one of the eight refusals on the 2026-08-24 AML run. The v2 wire
+    schema stops a compliant provider spelling it again; the seam still recovers it — and says so,
+    because an intent served differently from what the model wrote must be able to show where."""
+    recorded = _wire_intent(output={
+        "output_id": "tenure", "display_label": "Relationship tenure", "output_type": "numeric",
+        "additivity": "non_additive", "unit_kind": "days",
+        "null_input_policy": "unknown origination returns null",
+        "empty_population_policy": "no relationship history returns null",
+    }, operation_class="recency")
+    result, _ = _run(db, {"intents": [recorded]})
+    assert result.rejections == (), result.rejections
+    assert result.intents[0].output.unit_kind == "duration_days"
+    assert result.normalizations == ({"index": 0, "field": "unit_kind", "from": "days",
+                                      "to": "duration_days",
+                                      "reason": "the governed spelling of this unit"},)
+
+
+def test_a_vocabulary_gap_is_named_per_item_never_filed_as_malformed(db):
+    """`output_type: categorical` is not a malformed answer — an ordinal rating is a real feature
+    shape OUTPUT_TYPES has no entry for, and adding one is an owner's decision. The item refuses
+    under its own code, naming the entry; the clean sibling is untouched."""
+    gapped = _wire_intent(display_name="Risk rating snapshot", output={
+        "output_id": "risk_rating", "display_label": "Risk rating", "output_type": "categorical",
+        "additivity": "non_additive", "unit_kind": "rating_scale",
+        "null_input_policy": "unrated customers return null",
+        "empty_population_policy": "no rating history returns null",
+    })
+    result, _ = _run(db, {"intents": [gapped, _wire_intent()]})
+    assert len(result.intents) == 1                            # the clean sibling survived
+    assert result.normalizations == ()
+    assert result.rejections[0]["code"] == INTENT_VOCABULARY_GAP
+    assert "vocabulary gap" in result.rejections[0]["detail"]
+    assert "'categorical'" in result.rejections[0]["detail"]
+    assert "owner decision" in result.rejections[0]["detail"]
 
 
 # ── C8: model prose naming physical objects is a per-item parse failure ────────────────────────
