@@ -31,16 +31,20 @@ first real review is itself an operator act the runbook's explicit-go table cove
 
 Every "measured by" entry is the **exact section key** of the wave-1 report payload
 (`wave1_report` in `src/featuregen/overlay/upload/governed_planning_report.py`, served at
-`GET /governance/cross-catalog-report`). Rates in that report ship beside their denominators and
-are `None` — never `0.0` — when the denominator is zero.
+`GET /governance/cross-catalog-report`). The report's **own** sections ship rates beside their
+denominators and return `None` — never `0.0` — on a zero denominator. One exception, worth
+knowing before the first look: `origin_coverage` embeds the store's `resolution_summary`
+verbatim, and the store's rate helper reports **`0.0`** on a zero denominator
+(`governed_observation_store.py`) — so `origin_coverage.totals.resolution_rate` reads `0.0`
+over an empty ledger, which is exactly the pre-flag-flip state the first operator look hits.
 
 | Metric | Proposed threshold (DRAFT) | Measured by (report section key) | Rationale |
 |---|---|---|---|
 | Minimum resolution rate per domain | ≥ 0.60 per bucket, over ≥ 20 observations in that bucket | `resolution_by_domain` (bucket = the V2 registry's recipe `family`, plus the `llm_intent`, `legacy_template` and `unmapped_recipe` buckets); cross-checked against `origin_coverage.by_origin` | Below 0.6 the governed planner refuses more than it plans for that pack, and serving it in Stage 2 would surface mostly refusals. 0.6 is a floor to clear, not a target. |
 | Maximum stale-registry ("stale bridge") rate | ≤ 0.05, over ≥ 20 recipe-origin observations | `bridge_demand.stale_registry.stale_rate` (numerator and denominator are both recipe-origin by construction) | A stale row means the registry moved under a frozen work item; above 5% the telemetry is measuring registry churn, not planning quality. |
-| Chooser accuracy floor | ≥ 0.70, over ≥ 10 corpus-matched picks | **Not yet a report key** — today it sits in `not_computable_in_stage_1` as `chooser_accuracy`. The raw rows exist: the shadow chooser writes `param_divergence` entries with `"source": "chooser"` carrying `agrees_with_hypothesis_tokens` (`true`/`false`/`null`; `null` = no token window or no pick, excluded from the denominator). Accuracy becomes computable once a scheduler wires a real `param_chooser` and rows accrue. | 0.7 is the floor below which the Stage-2 promotion of the same chooser to serving (the S1C-3 design intent) is not defensible; picks are corpus-anchored so the number means "agrees with the SME's implied window". |
+| Chooser accuracy floor | ≥ 0.70, over ≥ 10 token-evaluable picks | **Not yet a report key** — today it sits in `not_computable_in_stage_1` as `chooser_accuracy`. The raw rows exist: the shadow chooser writes `param_divergence` entries with `"source": "chooser"` carrying `agrees_with_hypothesis_tokens` (`true`/`false`/`null`; `null` = no token window or no pick, excluded from the denominator). Computing the number needs BOTH shadow rows accruing (a scheduler wiring a real `param_chooser`) AND a report-side aggregation that does not exist yet — `NOT_COMPUTABLE_IN_STAGE_1` is a static tuple and no accuracy section exists. | 0.7 is the floor below which the Stage-2 promotion of the same chooser to serving (the S1C-3 design intent) is not defensible. The number means "the chooser's pick agrees with the **production hypothesis's own implied window**" (the run's redacted hypothesis) — NOT the S1C-1 corpus: observations are not corpus-keyed, and true corpus anchoring requires the evaluation harness that plans corpus hypotheses (the report's `corpus_expectation_accuracy` gap). |
 | Worker p95 latency | `enqueue_to_complete_seconds` p95 ≤ 300 s, over ≥ 20 done outbox items | `worker_latency.enqueue_to_complete_seconds` (`p95`; the section states `includes_queue_wait: true`) | The label is the report's own: this measures **enqueue-to-complete including queue wait**, so it bounds evidence freshness, not planner CPU. 300 s matches the outbox's default lease (`claim_telemetry_work` `lease_seconds=300`): a healthy worker finishes an item within one lease. |
-| Per-item planning request ceiling | stays **60** (not raised without a new signature) | Not a report key — a code constant: `MAX_REQUESTS_PER_ITEM = 60` (`governed_telemetry_worker.py`); drops past the cap are counted and logged, and volumes are visible in `volumes.by_mode` | The ceiling bounds worker cost per item. Raising it is a cost decision, so it is pinned here rather than left to drift; the cap drops intents last (a capped recipe is still in the registry tomorrow). |
+| Per-item planning request ceiling | stays **60** (not raised without a new signature) | Not a report key — a code constant: `MAX_REQUESTS_PER_ITEM = 60` (`governed_telemetry_worker.py`). Drops past the cap surface **only** in worker logs and the invocation's returned summary (its `dropped` key) — never in the report; `volumes.by_mode` shows observation volumes, not drops | The ceiling bounds worker cost per item. Raising it is a cost decision, so it is pinned here rather than left to drift; the cap drops intents last (a capped recipe is still in the registry tomorrow). |
 
 The report's authority-floor pass rate (`authority_floor.pass_rate`, denominator = `met + unmet`
 only) is reported but deliberately **not thresholded** in this draft: the `concept`-tier
@@ -57,7 +61,7 @@ rows proves nothing. Below its floor a threshold is **not evaluable**: neither m
 |---|---|
 | Resolution rate per domain | 20 observations **in that bucket** (a platform-wide total does not evaluate a domain) |
 | Stale-registry rate | 20 recipe-origin observations (`bridge_demand.stale_registry.recipe_origin_observations`) |
-| Chooser accuracy | 10 corpus-matched picks (rows where `agrees_with_hypothesis_tokens` is not `null`) |
+| Chooser accuracy | 10 token-evaluable picks (rows where `agrees_with_hypothesis_tokens` is not `null`) |
 | Worker p95 | 20 done outbox items (the report itself refuses a percentile below 2: `enqueue_to_complete_seconds: null` with a reason) |
 | Per-item request ceiling | always evaluable — it is a code constant, checked by inspection |
 
@@ -72,7 +76,7 @@ lacks; thresholding any of them in Stage 1 would threshold a fabrication.
 
 | Metric (report's name) | Why not computable in Stage 1 |
 |---|---|
-| `chooser_accuracy` | No chooser shadow rows until a scheduler wires a real chooser and its shadow decisions accrue (the S1C-3 machinery is merged; the report text still says "until S1C-3 lands" — accrual, not landing, is the real dependency). Thresholded above as a DRAFT number so the floor exists the day rows do. |
+| `chooser_accuracy` | No chooser shadow rows until a scheduler wires a real chooser and its shadow decisions accrue (the S1C-3 machinery is merged; the report text still says "until S1C-3 lands" — accrual, not landing, is the real dependency). Computing it is ALSO a report-side code change: `NOT_COMPUTABLE_IN_STAGE_1` is a static tuple and no accuracy aggregation exists yet. Thresholded above as a DRAFT number so the floor exists the day both halves do. |
 | `corpus_expectation_accuracy` | Observations are not corpus-keyed (no observation column joins to `corpus_id`); pairing expectation with outcome needs an evaluation harness that plans the corpus hypotheses. |
 | `fan_out_risk_distribution` | `governed_planning_observation` (1120) persists no segment-cardinality column; `hop_count`/`bridge_count` carry reach, not cardinality. Stage-2's plan-envelope work is where that evidence arrives. |
 | `incremental_cross_catalog_relevance` | Needs served A/B exposure; Stage 1 serves nothing. |
@@ -82,7 +86,7 @@ lacks; thresholding any of them in Stage 1 would threshold a fabrication.
 | `served_ranking_quality` | Nothing is served in Stage 1 — no served rankings to score. |
 | `sme_review_of_served_cards` | Nothing is served in Stage 1; `governed_plan_review_event` reviews PLANS, not servings. |
 
-## Corpus baseline the thresholds measure against
+## The S1C-1 corpus baseline (review context)
 
 The packaged S1C-1 corpus (`hypothesis_corpus_v1.json`, loaded by `hypothesis_corpus.py`):
 17 entries across the seven closed banking domains (retail 3, customer 3, servicing 3, cib 2,

@@ -39,7 +39,8 @@ has carried FEWER migrations than the live database before (live at 1099 while t
 
 ```sql
 SELECT name FROM schema_migrations ORDER BY name DESC LIMIT 5;
--- must include 1120_governed_planning_observation.sql and 1121_governed_telemetry_outbox.sql
+-- must include 1120_governed_planning_observation and 1121_governed_telemetry_outbox
+-- (schema_migrations.name stores the FILE STEM — no .sql suffix)
 ```
 
 ## 2. The flag: `FEATUREGEN_INTENT_SHADOW_TELEMETRY`
@@ -72,9 +73,10 @@ evidence never accumulates. Flipping it is the explicit operator go that starts 
 restores its frozen inputs, replans, records observations + demand, completes. **Nothing in the
 tree schedules it.** Choosing how it runs is an operator decision; the honest options:
 
-* **A Kubernetes CronJob** invoking a management command. Note: no `python -m featuregen`
-  subcommand for the worker exists today — adding one is a (small) code change that must ride a
-  reviewed branch, not this runbook.
+* **A Kubernetes CronJob** invoking a management command. Beware the name collision:
+  `python -m featuregen worker` EXISTS, but it runs the durable-runtime queue daemon — it does
+  **not** drain the governed telemetry outbox. No subcommand for THIS worker exists today;
+  adding one is a (small) code change that must ride a reviewed branch, not this runbook.
 * **A sidecar loop** in the backend deployment, calling `run_governed_telemetry_once` until it
   returns `None`, then sleeping.
 * **Manual invocation** during the evaluation phase — the only option available with zero code
@@ -95,13 +97,15 @@ fence-guarded completion (a reclaimed item's late results are discarded as `leas
 double-written); an item-scoped failure is **terminal** for that item (`status='failed'`, no
 silent retry — a failure worth re-running is re-enqueued deliberately); `attempt_count` rises on
 every claim including reclaim-after-expiry, so a poison item shows as a rising count; requests
-per item are capped at `MAX_REQUESTS_PER_ITEM = 60`, drops counted and logged.
+per item are capped at `MAX_REQUESTS_PER_ITEM = 60` — drops are counted in the invocation's
+returned summary (its `dropped` key) and logged, and they never reach the report.
 
 **The chooser is injected, evaluation-only.** `param_chooser=None` (the default everywhere — no
 production caller wires one yet) is chooser-off, byte-identical to the pre-chooser worker. The
 worker reads NO environment: whatever scheduler constructs a real chooser resolves the flag and
 API key outside and hands the client in. Provider spend is content-address-bounded via the shared
-`structured_result` store — a repeated (menu, hypothesis, prompt-version) address replays free;
+`structured_result` store — a repeated (parameter, menu, hypothesis, prompt-version) address
+replays free;
 `chosen` and `invalid_pick` are cached, **`unavailable` is never cached** (a billing outage must
 not poison an address forever). Wiring a real chooser starts provider spend: explicit user go.
 
@@ -166,7 +170,9 @@ Each verified in the program ledger and task reports before being written here.
   reviewed write surface or a deliberate operator SQL insert — an explicit-go act either way.
 * **Chooser accuracy accrues, it did not land computed.** S1C-3 merged the machinery;
   `chooser_accuracy` stays in `not_computable_in_stage_1` until a scheduler wires a real
-  `param_chooser` and shadow rows accrue (§3).
+  `param_chooser` and shadow rows accrue (§3) — **and** the report gains an accuracy
+  aggregation of its own: `NOT_COMPUTABLE_IN_STAGE_1` is a static tuple, no accuracy section
+  exists, so computing the number is a report-side code change, part of the gap.
 * **Chartered follow-ups are Stage-2 material, not operational actions:** G3 realization
   attachment (identity-impacting — segment identity changes when a revision attaches; plus the G2
   measure-derivation residual and the output_grain-vs-entity_link vocabulary gap), and the
