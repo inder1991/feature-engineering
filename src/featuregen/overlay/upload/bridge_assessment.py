@@ -539,19 +539,18 @@ def _human_reviewed(stream: Sequence[EventEnvelope], confirmed_event_id: str | N
     )
 
 
-def read_overlay_identifier_link_state(
-    conn: DbConn, bridge_fact_key: str | None
+def link_state_from_stream(
+    stream: Sequence[EventEnvelope],
 ) -> OverlayIdentifierLinkStateV1:
-    """Fold the authoritative stream once and map availability/review for every consumer."""
-    if not bridge_fact_key:
-        return OverlayIdentifierLinkStateV1(
-            LinkAvailability.UNAVAILABLE, None, LinkUnavailableReason.UNREADABLE,
-            LinkReviewStatus.UNREVIEWED, None, {})
-    from featuregen.overlay import store
+    """Map one PRE-LOADED overlay stream to availability/review — the pure half of
+    :func:`read_overlay_identifier_link_state`, split out so A4's batched snapshot reader (one
+    ``= ANY`` events read for a whole considered set) reuses the SAME availability authority
+    instead of minting a second spelling of the fold. Behavior is byte-identical to the inline
+    logic this replaces: an empty or unfoldable stream fails closed as UNREADABLE."""
     from featuregen.overlay.state import fold_overlay_state
 
     try:
-        stream = tuple(store.load_fact(conn, bridge_fact_key))
+        stream = tuple(stream)
         if not stream:
             raise LookupError("missing overlay fact stream")
         folded = fold_overlay_state(stream)
@@ -580,6 +579,25 @@ def read_overlay_identifier_link_state(
     return OverlayIdentifierLinkStateV1(
         LinkAvailability.AVAILABLE if available else LinkAvailability.UNAVAILABLE,
         status, reason, reviewed, stream[-1].event_id, value)
+
+
+def read_overlay_identifier_link_state(
+    conn: DbConn, bridge_fact_key: str | None
+) -> OverlayIdentifierLinkStateV1:
+    """Fold the authoritative stream once and map availability/review for every consumer."""
+    if not bridge_fact_key:
+        return OverlayIdentifierLinkStateV1(
+            LinkAvailability.UNAVAILABLE, None, LinkUnavailableReason.UNREADABLE,
+            LinkReviewStatus.UNREVIEWED, None, {})
+    from featuregen.overlay import store
+
+    try:
+        stream = tuple(store.load_fact(conn, bridge_fact_key))
+    except Exception:  # noqa: BLE001 - an unreadable lifecycle must fail closed
+        return OverlayIdentifierLinkStateV1(
+            LinkAvailability.UNAVAILABLE, None, LinkUnavailableReason.UNREADABLE,
+            LinkReviewStatus.UNREVIEWED, None, {})
+    return link_state_from_stream(stream)
 
 
 def read_identifier_link_availability(

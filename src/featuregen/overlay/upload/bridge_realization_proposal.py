@@ -534,6 +534,15 @@ def assess_realization_for_preview(
     the pinned id exactly (a pin that cannot be verified is a construction defect, not a verdict).
     ``logical_temporal_semantics``, when the caller compiles against a logical segment, triggers
     the unmatched-row coherence validation against the guard policy.
+
+    THE A4→B2b SEAM: ``pinned_dependency_snapshot_id`` here still means the per-revision
+    dependency-set hash (``brds_``, ``bridge_dependency_snapshot_id``). A4's persisted
+    ``BridgeRealizationSnapshotV1`` (``brsnap_``, migration 1131) is what R11 ultimately wants
+    this pin to name — the frozen batched read of the WHOLE considered set — and routing this
+    assessment through that snapshot, INCLUDING the mandatory ``snapshot.complete`` check
+    (nothing may treat a truncated snapshot as the complete considered set), is B2b's wiring
+    change: re-meaning the parameter re-contracts this function and its suite, so it is noted
+    here rather than smuggled in.
     """
     if (join_validation_policy is None) != (join_validation_policy_revision_id is None):
         raise ContractDefect(
