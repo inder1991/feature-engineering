@@ -28,10 +28,11 @@ from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.bridge_assessment import (
+    BridgeContractError,
     LinkReviewStatus,
     available_identifier_links,
 )
-from featuregen.overlay.upload.object_ref import parse_ref
+from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.projections.runner import run_projection, try_lock_checkpoint_nowait
 from featuregen.runtime.observability import counters
 
@@ -39,7 +40,40 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
+class BridgeCurrentnessV1:
+    """The link's CURRENTNESS DEPENDENCIES (the staleness law / R9's provenance split): the exact
+    revision facts a consumer pins to know when the SAME link has MOVED — never part of the link's
+    semantic identity, never display material.
+
+    * ``candidate_revision_id`` — the current assessment revision (evidence, bindings, verdicts,
+      wording). A display/evidence change mints a NEW revision here while the semantic revision
+      stands still: the no-rekey law, made structural.
+    * ``overlay_head_event_id`` — the governed lifecycle stream head the availability read saw;
+      lifecycle movement (a confirmation, an expiry) advances it without touching identity."""
+
+    candidate_revision_id: str
+    overlay_head_event_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ActiveBridgeV1:
+    """One available cross-catalog link, split into THREE surfaces (R9 / the staleness law):
+
+    * LOAD-BEARING SEMANTIC MATERIAL — ``entity_id``, the two endpoint catalogs with their FULL
+      ordered member tuples (``left_member_refs`` / ``right_member_refs``: composite keys survive),
+      and ``link_semantic_revision``. Changing any of it means a DIFFERENT link.
+    * CURRENTNESS DEPENDENCIES — ``fact_key`` (the governed lifecycle stream ADDRESS,
+      orientation-free) and ``currentness`` (what the projection read there). They say when the
+      same link moved; they never enter its identity.
+    * DISPLAY/RANKING ANNOTATIONS — ``status`` and ``strength``. Free to change; never rekey.
+
+    Direction is deliberately ABSENT: left/right is the assessment surface's canonical (lexical)
+    endpoint ordering, not a traversal — direction belongs to path segments and to the realization
+    producer's per-call traversal input (:func:`ordered_member_pairs`), never to the link type.
+
+    Every field added after the original eight is DEFAULTED so existing positional constructors
+    still build."""
+
     fact_key: str
     entity_id: str
     left_catalog_source: str
@@ -54,6 +88,21 @@ class ActiveBridgeV1:
     #: confirmation as a tie-break WITHIN a safety band. Lets a consumer PREFER the link the platform
     #: measured to be safer without being barred from a weaker one.
     strength: int = 0
+    #: The COMPLETE ordered member tuple of each endpoint, as canonical logical column refs
+    #: (``source::schema.table.column``), in DECLARED composite order. ``left_object_ref`` /
+    #: ``right_object_ref`` above remain the legacy single-member flattening (the FIRST member,
+    #: catalog-less ``schema.table.column``) — exact for single-member links, a compat surface for
+    #: composite ones. These tuples are the authoritative endpoint shape: nothing is discarded.
+    left_member_refs: tuple[str, ...] = ()
+    right_member_refs: tuple[str, ...] = ()
+    #: The link's stable SEMANTIC identity — the assessment surface's own ``candidate_id`` (content
+    #: hash over the candidate family + BOTH endpoints' ordered logical member tuples), REUSED here
+    #: rather than a parallel identity being minted. Join-column changes rekey it; evidence
+    #: wording, proposed→confirmed and strength changes never do.
+    link_semantic_revision: str = ""
+    #: Currentness dependencies (``None`` only on a positionally-built thin value; always populated
+    #: by :func:`active_bridges`).
+    currentness: BridgeCurrentnessV1 | None = None
 
 
 def _obj_ref_str(d: dict) -> str:
@@ -155,23 +204,89 @@ def active_bridges(conn) -> tuple[ActiveBridgeV1, ...]:
     human confirmation only breaks ties inside a safety band — so a consumer that takes the first
     workable path prefers what the platform measured, not what someone endorsed. Ordering inside a
     band is stable (endorsement, then entity, then left ref).
+
+    A2: each link carries its ENDPOINTS' COMPLETE ordered member tuples (composite keys survive —
+    this used to collapse both endpoints to ``members[0]`` and discard the rest), its stable
+    ``link_semantic_revision`` (the assessment surface's own ``candidate_id``, reused) and its
+    ``currentness`` dependencies — see :class:`ActiveBridgeV1` for the three-surface split. The
+    tuples come from the SAME governed assessment path (``available_identifier_links``), never
+    from a raw candidate-ledger read.
     """
-    return tuple(
-        ActiveBridgeV1(
+    out: list[ActiveBridgeV1] = []
+    for link in available_identifier_links(conn):
+        left_members = tuple(
+            member.logical_column_ref for member in link.assessment.left_endpoint.members)
+        right_members = tuple(
+            member.logical_column_ref for member in link.assessment.right_endpoint.members)
+        out.append(ActiveBridgeV1(
             link.assessment.bridge_fact_key or "",
             link.assessment.left_endpoint.entity_id or "",
             parse_ref(link.assessment.left_endpoint.logical_table_ref)[0],
-            _flat_object_ref(
-                link.assessment.left_endpoint.members[0].logical_column_ref),
+            # The legacy thin fields flatten the FIRST member only — the pre-A2 shape, kept as a
+            # compat surface (exact for single-member links). The full tuples ride alongside.
+            _flat_object_ref(left_members[0]),
             parse_ref(link.assessment.right_endpoint.logical_table_ref)[0],
-            _flat_object_ref(
-                link.assessment.right_endpoint.members[0].logical_column_ref),
+            _flat_object_ref(right_members[0]),
             (
                 "confirmed"
                 if link.availability.review_status is LinkReviewStatus.HUMAN_VERIFIED
                 else "proposed"
             ),
             link.ranking_strength,
-        )
-        for link in available_identifier_links(conn)
-    )
+            left_member_refs=left_members,
+            right_member_refs=right_members,
+            link_semantic_revision=link.assessment.candidate_id,
+            currentness=BridgeCurrentnessV1(
+                candidate_revision_id=link.assessment.candidate_revision_id,
+                overlay_head_event_id=link.availability.overlay_head_event_id,
+            ),
+        ))
+    return tuple(out)
+
+
+def ordered_member_pairs(
+    bridge: ActiveBridgeV1, *, from_logical_table_ref: str
+) -> tuple[tuple[str, str], ...]:
+    """The step-4 producer's ``ordered_member_pairs`` input, SUPPLIED by the projection.
+
+    Zips the two endpoints' complete ordered member tuples in the caller's traversal orientation —
+    one ``(from_ref, to_ref)`` per composite position, DECLARED order preserved. Direction is
+    resolved HERE, per call, from ``from_logical_table_ref`` (the same orientation input
+    ``produce_provisional_realization`` takes) and is never stored on the link type: a link is
+    symmetric; a traversal is not.
+
+    Refuses (:class:`BridgeContractError`) rather than guessing: a thin value carrying no member
+    tuples, a ref that is not a TABLE ref, a table naming neither endpoint, endpoints on the same
+    table (orientation undecidable), and endpoints of different arity (no positional mapping
+    exists to supply — the caller must state the pairs explicitly)."""
+    if not bridge.left_member_refs or not bridge.right_member_refs:
+        raise BridgeContractError(
+            "this bridge value carries no endpoint member tuples — read it through active_bridges")
+    source, schema, table, column = parse_ref(from_logical_table_ref.strip().lower())
+    if column is not None:
+        raise BridgeContractError(
+            f"from_logical_table_ref must address a TABLE, got {from_logical_table_ref!r}")
+    wanted = normalize_ref(source, schema, table)
+
+    def _table_ref(member_ref: str) -> str:
+        m_source, m_schema, m_table, _m_column = parse_ref(member_ref)
+        return normalize_ref(m_source, m_schema, m_table)
+
+    left_table = _table_ref(bridge.left_member_refs[0])
+    right_table = _table_ref(bridge.right_member_refs[0])
+    if left_table == right_table:
+        raise BridgeContractError(
+            "both link endpoints live on the same table; a table ref cannot orient the traversal")
+    if wanted == left_table:
+        from_members, to_members = bridge.left_member_refs, bridge.right_member_refs
+    elif wanted == right_table:
+        from_members, to_members = bridge.right_member_refs, bridge.left_member_refs
+    else:
+        raise BridgeContractError(
+            f"from_logical_table_ref {wanted!r} names neither link endpoint "
+            f"({left_table!r}, {right_table!r})")
+    if len(from_members) != len(to_members):
+        raise BridgeContractError(
+            f"endpoints have different member arity ({len(from_members)} vs {len(to_members)}); "
+            "no positional mapping can be supplied — state the pairs explicitly")
+    return tuple(zip(from_members, to_members, strict=True))
