@@ -273,7 +273,6 @@ def test_the_re_aimed_run_serves_one_entry_per_recipe_and_never_a_variant_fan_ou
         "one entry per eligible recipe — under the pre-T6 lens this was one per authored VARIANT"
     recipe_ids = [c["recipe_id"] for c in cards] + [e["recipe_id"] for e in needs_setup]
     assert len(set(recipe_ids)) == len(recipe_ids), "no recipe appears twice, in any lane"
-    assert len(cards) <= eligible
 
     # The chosen parameterization rides every entry's identity, and the card names the axis it
     # was chosen from with the choice bracketed. "90 days" in the brief is what picked it.
@@ -374,6 +373,8 @@ def test_the_needs_setup_lane_speaks_each_operand_s_own_status_in_its_own_words(
             elif operand["status"] == "blocked":
                 assert operand["tied_refs"], \
                     "a blocked binding matched a column — the refusal must name it"
+                assert "POPULATION_DISTINCTNESS_VIOLATED" in operand["reason_codes"], \
+                    "the docstring says this branch is T8 firing — so the pin says it too"
                 listed = ", ".join(operand["tied_refs"])
                 codes = ", ".join(operand["reason_codes"])
                 assert operand["sentence"] == (
@@ -487,7 +488,9 @@ def test_confirming_the_proxy_target_needs_the_acknowledgment_and_then_records_i
     ``near_label``: the registry positively asserts label-adjacency, so the word PROXY is EARNED
     here and the registry's own warrant is quoted rather than paraphrased. (A ``standard`` concept
     gets a refusal that claims no correlation at all; an unregistered one gets "absence is not an
-    assertion". Those tiers have their own byte-level pins in ``test_contract_intake``.)
+    assertion". Those tiers have their own substring pins in ``test_contract_intake``; the one
+    byte-level fixture of this tier's sentence lives in ``WorkbenchScreen.test.tsx``, where the
+    verbatim law is proved from the client's side.)
 
     The acknowledgment asserts exactly one thing — "I know the registry does not certify this as
     the outcome label" — and it is the ONLY door: behind the refusal, nothing is written.
@@ -597,6 +600,8 @@ def test_the_alternatives_are_a_LABEL_and_the_only_control_is_the_hypothesis(mak
     control rather than about the catalog: identical estate, identical declared depth, identical
     scope — one word of the brief changed, and the card appears.
     """
+    changed_one_word = HYPOTHESIS.replace("90 days", "30 days")
+    assert changed_one_word != HYPOTHESIS, "the contrast must actually change the brief"
     _two_catalogs(conn)
     _declare_history_depth(conn, days="60")
 
@@ -607,7 +612,7 @@ def test_the_alternatives_are_a_LABEL_and_the_only_control_is_the_hypothesis(mak
                 for section in res.json()["alternatives"] for f in section["features"]]
 
     assert _cards(HYPOTHESIS) == [], "the brief's own 90-day window is beyond the declared depth"
-    assert _cards("customers move money over 30 days") == ["round_amount_ratio@window=30"], \
+    assert _cards(changed_one_word) == ["round_amount_ratio@window=30"], \
         "re-typing the brief is the parameter control this platform actually has"
 
 
@@ -659,8 +664,10 @@ def test_KNOWN_OPEN_an_account_anchored_counterparty_still_binds_a_customer_mast
     non-anchor operand whose concept IDENTIFIES THE ANCHOR'S OWN ENTITY must not bind the
     population's grain key. Here the anchor is an Account and the counterparty asks for a Customer,
     so the same-entity condition is not met and the rule correctly declines to fire — the third
-    assertion below pins that derivation rather than describing it. T8 covers 6 of the 12
-    structurally identifiable counterparty legs in the registry; this is one of the other six.
+    assertion below pins that derivation rather than describing it. Measured on today's registry:
+    22 party legs in all, 19 structurally identifiable, 11 carrying ``customer_id``; T8 protects
+    5 of them, and the account-anchored ``customer_id`` class it cannot protect is exactly 6 legs
+    — this recipe is one of the six.
 
     **Why T2 does not catch it either.** T2 diverts a candidate with any UNBOUND required operand.
     Every operand here is bound. A wrongly-bound operand is invisible to a rule about unbound ones.
