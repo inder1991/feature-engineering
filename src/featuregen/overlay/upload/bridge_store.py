@@ -546,17 +546,20 @@ def load_current_candidate_assessments(
     return tuple(out)
 
 
-def record_realization_revision(
+def append_realization_revision(
     conn,
     revision: BridgeJoinRealizationRevisionV1,
-    current: BridgeRealizationCurrentV1,
     *,
     dependencies: tuple[BridgeDependencyRefV1, ...],
-    expected_pointer_version: int = 0,
 ) -> None:
-    """Append a realization revision/dependencies and CAS-publish its typed current pointer."""
-    if current.realization_revision_id != revision.realization_revision_id:
-        raise ValueError("current pointer must name the supplied realization revision")
+    """Append the immutable revision + dependency rows; NEVER touches the current pointer.
+
+    The append half of :func:`record_realization_revision`, split out for R11: candidate
+    generation mints an IMMUTABLE provisional revision and must not CAS-publish the shared
+    current pointer (two users considering different mappings must not compete over global
+    state). Idempotent on content — re-appending the same revision is a no-op, and a
+    same-key/different-content write raises :class:`BridgeStoreCorruption`.
+    """
     conn.execute(
         "INSERT INTO bridge_join_realization_revision "
         "(realization_revision_id, realization_id, bridge_fact_key, realization_json, "
@@ -596,6 +599,24 @@ def record_realization_revision(
                 dependency.revision,
             ),
         )
+
+
+def record_realization_revision(
+    conn,
+    revision: BridgeJoinRealizationRevisionV1,
+    current: BridgeRealizationCurrentV1,
+    *,
+    dependencies: tuple[BridgeDependencyRefV1, ...],
+    expected_pointer_version: int = 0,
+) -> None:
+    """Append a realization revision/dependencies and CAS-publish its typed current pointer.
+
+    Composes :func:`append_realization_revision` (the append-only half) with the CAS-publish
+    half below. A provisional producer (R11/A4c) calls the append half directly and never this.
+    """
+    if current.realization_revision_id != revision.realization_revision_id:
+        raise ValueError("current pointer must name the supplied realization revision")
+    append_realization_revision(conn, revision, dependencies=dependencies)
     if expected_pointer_version == 0:
         changed = conn.execute(
             "INSERT INTO bridge_join_realization_current "
