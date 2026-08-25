@@ -175,6 +175,30 @@ control. Making that control actionable is a route+frontend change nobody has ch
 listed here rather than done, because inventing a parameter-override seam is a bigger decision than
 this task.
 
+**▲ AND THE COST OF THAT LIMITATION, WRITTEN DOWN (the reverse direction, added 2026-08-25 after
+review).** The section above recorded only the favourable half. When the primary variant is the one
+C9's history-depth law BLOCKS, T6 serves nothing where the parent served a working sibling — and
+that is the LIKELIER path, because real hypotheses carry window tokens and the audit's own did.
+
+Measured on the v2bank fixture with `history_depth_days=60` declared on `transactions`
+(net_transaction_flow and inflow_outflow_ratio both author window ∈ 30/90/180):
+
+| hypothesis | parent (all variants) | T6 (primary only) |
+| --- | --- | --- |
+| **"money moves over 180 days"** | candidates `@30, @90, @180`; **`@30` served as a card**, `@90`+`@180` to needs_setup. Whole projection: **ideas 2**, needs_setup 19 | candidate `@180` only → blocked → needs_setup. Whole projection: **ideas 0**, needs_setup 7 |
+| "money moves between customers" *(no token)* | candidates `@30, @90, @180`; `@30` served. ideas 2, needs_setup 19 | candidate `@30` only; `@30` served. **ideas 2**, needs_setup 5 |
+
+So: with no window token the two agree exactly; with a window token naming a depth the catalog
+cannot cover, **the operator goes from two cards to zero**. The parent hid the block behind a
+sibling that answered a question nobody asked (a 30-day figure for a "180 days" brief); T6 reports
+the block and offers nothing. Both are defensible — serving a silently-different window is the
+confidence-without-warrant this programme exists to remove — but the second is a REAL loss of
+served work, not a neutral cleanup, and it belongs on the record beside the 135→43 win.
+
+The design answer is the `param_alternatives` control becoming actionable (offer the 30-day
+variant *as* the alternative it already names, instead of silently substituting it). That stays
+unchartered per the paragraph above; this note is the reason it is worth chartering.
+
 ### T7 — Target intake honesty
 (a) abstain-by-default when no outcome-family concept exists — answer names the nearest proxies;
 (b) deterministic goal-text window extraction; a ticket whose `target_window_days` contradicts

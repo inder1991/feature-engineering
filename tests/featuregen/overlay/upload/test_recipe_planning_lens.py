@@ -541,6 +541,71 @@ def test_the_collapse_moved_option_identity_and_that_was_a_conscious_act(db):
         "809bdab28c761766767bcbd7231fa06530b1190fcfe6edfec217260922e61c35"]
 
 
+def test_a_blocked_primary_serves_nothing_where_the_parent_served_a_sibling(db):
+    """▲ T6's COST, in executable form — the reverse direction of the collapse.
+
+    C9's history-depth law is the ONE axis on which the binder is not variant-invariant: it reads
+    the variant's own ``window`` and blocks the event-time operand when the declared depth cannot
+    cover it. So when the primary variant is the blocked one, T6 serves NOTHING where the parent
+    served a working sibling — and that is the likelier path, because real hypotheses carry window
+    tokens and the audit's own did.
+
+    Measured here with 60 days declared and a "180 days" hypothesis:
+
+        parent (all variants)  candidates @30 @90 @180 -> @30 SERVED, @90/@180 needs_setup
+        T6     (primary only)  candidate  @180          -> blocked, needs_setup, NO card
+
+    Both are defensible: the parent hid the block behind a sibling answering a question nobody
+    asked (a 30-day figure for a "180 days" brief). But this is a real loss of served work, and it
+    is pinned so it stays a decision rather than a surprise. The remedy — making
+    ``param_alternatives`` actionable so the 30-day variant is OFFERED rather than substituted —
+    is unchartered; see the T6 OPERATOR CONSEQUENCES section of the plan doc."""
+    from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+    from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+    from featuregen.overlay.upload.object_ref import normalize_ref
+    from featuregen.overlay.upload.semantic_projection import project_assembled_set
+
+    _catalog(db)
+    logical = normalize_ref(SOURCE, "public", "transactions", None)
+    record_field_evidence(
+        db, logical_ref=logical, field_name="history_depth_days", proposed_value="60",
+        producer=EvidenceProducer.SOURCE, strength=AssertionStrength.ATTESTED,
+        producer_ref="source:test", source_snapshot_id="snap-test",
+        input_hash=field_input_hash(logical_ref=logical, field_name="history_depth_days",
+                                    material="60"))
+
+    def _serve(hypothesis: str):
+        candidates = v2_recipe_candidates(
+            db, catalog_source=SOURCE,
+            scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
+            redacted_hypothesis=hypothesis)
+        projection = project_assembled_set(
+            assemble_candidates(list(candidates)), catalog_source=SOURCE)
+        return candidates, projection
+
+    # The declared depth covers 30 days but not 180 — asserted, so the pin cannot go vacuous on a
+    # catalog where nothing was blocked in the first place.
+    deep, _ = _serve("money moves over 180 days")
+    (blocked,) = [c for c in deep if c.recipe_id == EXEMPLAR.recipe_id]
+    assert dict(blocked.planning_request.parameter_values)["window"] == 180
+    assert any(v.status == "blocked" and "HISTORY_DEPTH_INSUFFICIENT" in v.reason_codes
+               for v in blocked.verdicts)
+
+    # ▲ The consequence: a window-token hypothesis the catalog cannot cover serves NO cards.
+    _, over_depth = _serve("money moves over 180 days")
+    assert over_depth.ideas == []
+    assert over_depth.actionable_ideas == []
+    assert over_depth.needs_setup, "the block is reported, not hidden"
+
+    # …and with no token the primary is the authored-first 30-day variant, which the depth covers,
+    # so the collapse costs nothing at all. Both halves, so neither can be read alone.
+    _, within_depth = _serve("money moves between customers")
+    assert [idea.source_definition_id for idea in within_depth.ideas
+            if idea.source_definition_id.startswith(EXEMPLAR.recipe_id)] == [
+        f"{EXEMPLAR.recipe_id}@window=30"]
+
+
 def test_no_window_token_leads_with_the_authored_first_value(db):
     _catalog(db)
     candidates = v2_recipe_candidates(
