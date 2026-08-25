@@ -322,8 +322,12 @@ def build_v2_recipe_grounding_context(
         "version": "recipe-candidate-v2",
         "generation_source": "recipe",
         "recipe_id": candidate.recipe_id,
-        # The VARIANT is part of the identity: two windows are two candidates, and a capture that
-        # confused them would author a formula for a quantity the human never saw.
+        # The VARIANT is part of the identity: two windows are two QUANTITIES, and a capture that
+        # confused them would author a formula for one the human never saw. Since T6 (2026-08-24)
+        # a run serves one variant per recipe, so the two no longer race inside a single
+        # considered set — but they still differ ACROSS runs (the primary follows the hypothesis's
+        # own window token), which is exactly when a stale capture would do the damage. The key's
+        # composition is unmoved, so the surviving variant keeps the identity it always had.
         "variant_key": candidate.variant_key or candidate.recipe_id,
         "recipe_revision_hash": candidate.recipe_revision_hash,
         "planning_request_hash": candidate.planning_request_hash,

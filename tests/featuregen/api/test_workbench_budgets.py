@@ -36,9 +36,14 @@ SOURCE = "budget_cib"
 #: candidate count).
 #: T2 (2026-08-24) moved that composition DOWN, to 391 measured on this fixture: no candidate
 #: on the cib shape binds all of its required operands, so no option id and no decision row is
-#: minted for one. The budget is a ceiling and is deliberately NOT lowered to match — it exists
-#: to catch a per-candidate read coming back, and a catalog that does serve cards must still
-#: fit under it.
+#: minted for one. T6 (same day) moved it down again, to **198 measured**, for a different
+#: reason: the lens serves the PRIMARY variant per recipe instead of one candidate per authored
+#: parameterization, so the per-candidate observation writes and the tie-break replay lookups
+#: both fall with the candidate count (this fixture's engine now sees 44 candidates where it saw
+#: 120). Non-replay SELECTs measured at 14 against the 40 ceiling.
+#: The budget is a ceiling and is deliberately NOT lowered to match either move — it exists to
+#: catch a per-candidate read coming back, and a catalog that does serve cards must still fit
+#: under it.
 SQL_BUDGET = 600
 PROVIDER_CALL_BUDGET = 2
 LATENCY_BUDGET_SECONDS = 20.0

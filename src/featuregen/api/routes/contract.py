@@ -32,6 +32,7 @@ from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
 from featuregen.intake.redaction import REDACTION_VERSION
 from featuregen.overlay.upload.activation_policy import activation_decision
+from featuregen.overlay.upload.catalog_satisfiability import assess_catalog_satisfiability
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract.author import (
     ContractDraft,
@@ -803,6 +804,39 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             check_projection_readiness(conn)
         except CatalogProjectionUnavailable as e:
             raise HTTPException(status_code=503, detail=e.detail) from e
+    # T5 — CATALOG SATISFIABILITY. The 2026-08-24 audit's first finding was not about a card: the
+    # live AML run named ``cib`` (a customer master with no monetary column) while ``ftr`` sat
+    # unplanned, and nothing warned. Below the floor (a concept a MAJORITY of the eligible recipes
+    # REQUIRE, carried by nothing on this catalog) the honest answer is a typed refusal that NAMES
+    # the concept, how many recipes need it, and the catalog that has it — the last of which
+    # `semantic_projection`'s `needs_setup` lane structurally cannot say, because it holds one
+    # assembled set and no connection. The floor and its rationale live in the module; this seam
+    # only decides WHERE it fires.
+    #
+    # Placed exactly like the two refusals above it, and for the same three reasons: AFTER the
+    # stronger deployment-level facts (the live-activation interlock, the projection-readiness
+    # gate) so an unhealthy deployment gets the more accurate answer; BEFORE the mint and every
+    # durable write, so a refused request leaves no orphan run/scope pair that reads like a
+    # generation which produced nothing; and before any provider call, so a mis-aimed brief costs
+    # nothing.
+    #
+    # ▲ BROADEN IS GOVERNED IDENTICALLY, and that is a ruling rather than an oversight. This is
+    # the confirmed-scope path, and `confirmed_scope.unscoped=true` (the broaden action) reaches
+    # it with a scope `v2_applicability` fails OPEN on — all 317 recipes, floor 158. The one law
+    # does not care how wide the scope is: a mis-aimed catalog refuses with directions whether the
+    # human asked for one use-case leaf or for everything. Clause 5 already protects the case with
+    # nowhere to point, and on an exploratory gesture "aim at ftr instead" is MORE useful than a
+    # page of setup work, not less. Both directions are pinned in
+    # `tests/featuregen/api/test_contract_catalog_satisfiability.py`.
+    #
+    # Two surfaces genuinely do NOT reach here, and neither is an exemption: the LEGACY unscoped
+    # route (a request carrying no `confirmed_scope` at all — a different function, and it has no
+    # eligible-recipe set to measure a catalog against), and the per-table suggestions page, which
+    # has no brief to be wrong about.
+    satisfiability = assess_catalog_satisfiability(
+        conn, catalog_source=body.catalog_source, scope=scope, roles=identity.role_claims)
+    if not satisfiability.satisfied:
+        raise HTTPException(status_code=422, detail=satisfiability.to_json())
     # 4. Mint the generation run — the run is born only NOW, when the human commits to generate.
     generation_run_id = mint_id("grun")
     # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists
