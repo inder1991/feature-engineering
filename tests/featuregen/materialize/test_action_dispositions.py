@@ -143,3 +143,68 @@ def test_a_code_OUTSIDE_the_vocabulary_keeps_its_callers_channel():
     assert blockers == ("SOME_LEGACY_CODE",)
     assert warnings == ("SOME_LEGACY_NOTE",)
     assert dropped == ()
+
+
+# ══ Cross-catalog serving (2026-08-24 plan): every new row pinned cell-by-cell ═══════════════════
+_B, _W, _D = Disposition.BLOCK, Disposition.WARN, Disposition.DROP
+
+
+@pytest.mark.parametrize("code, row", [
+    # The owner's matrix: Formula Allow under every link condition; preview is the first act
+    # that computes over the join. R11: unknown cardinality previews only under a COMPLETE
+    # pinned guard policy, so each absent component refuses preview under its own name.
+    (R.DIRECTIONAL_REALIZATION_MISSING, (_W, _B, _B, _B, _B, _B)),
+    (R.DIRECTIONAL_MAPPING_INCOMPLETE, (_W, _B, _B, _B, _B, _B)),
+    (R.JOIN_NULL_POLICY_MISSING, (_W, _B, _B, _B, _B, _B)),
+    (R.JOIN_COVERAGE_POLICY_MISSING, (_W, _B, _B, _B, _B, _B)),
+    (R.MAX_MATCH_POLICY_MISSING, (_W, _B, _B, _B, _B, _B)),
+    (R.TEMPORAL_JOIN_POLICY_MISSING, (_W, _B, _B, _B, _B, _B)),
+    (R.ALLOCATION_POLICY_REQUIRED, (_W, _B, _B, _B, _B, _B)),
+    # R2: the execution context never touches logical identity — not authoring's gate at all.
+    (R.EXECUTION_CONTEXT_MISSING, (_D, _B, _B, _B, _B, _B)),
+    # R13 / matrix row 7: preview RENDERS the guard (proceeds, caller told); the first act that
+    # would EXECUTE over duplicate transaction identity refuses. No feature values, ever.
+    (R.TRANSACTION_IDENTITY_NOT_UNIQUE, (_W, _W, _B, _B, _B, _B)),
+    # S2-P6 split: blocks EXECUTE_SANDBOX, never GENERATE_PREVIEW.
+    (R.EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN, (_D, _W, _B, _B, _B, _B)),
+    # Deployment-capability facts: each gates exactly the action it names.
+    (R.SANDBOX_EXECUTION_NOT_RELEASED, (_D, _D, _B, _D, _D, _D)),
+    (R.SANDBOX_PUBLICATION_NOT_RELEASED, (_D, _D, _D, _B, _D, _D)),
+    (R.VERIFIED_OUTPUT_REQUIRED, (_D, _D, _D, _B, _B, _B)),
+    (R.PRODUCTION_MATERIALIZATION_NOT_RELEASED, (_D, _D, _D, _D, _B, _D)),
+    (R.PRODUCTION_PUBLICATION_NOT_RELEASED, (_D, _D, _D, _D, _D, _B)),
+])
+def test_the_cross_catalog_rows_match_the_plans_matrix_EXACTLY(code, row):
+    """The 2026-08-24 plan's §capability matrix + six-action availability block, cell-by-cell —
+    a future re-cell is a deliberate act against a named plan row, never a drive-by edit."""
+    actions = (_A.AUTHOR_FORMULA, _A.GENERATE_PREVIEW, _A.EXECUTE_SANDBOX, _A.PUBLISH_SANDBOX,
+               _A.MATERIALIZE_PRODUCTION, _A.PUBLISH_PRODUCTION)
+    assert tuple(ACTION_DISPOSITIONS[(code, action)] for action in actions) == row, code
+
+
+def test_PUBLISH_SANDBOX_has_TWO_distinct_facts_never_one_explanation():
+    """Round-13 P1-10: capability not released (SANDBOX_PUBLICATION_NOT_RELEASED) and capability
+    present but THIS artifact unverified (VERIFIED_OUTPUT_REQUIRED) are separate codes with
+    separate rows — a card must be able to say which one it means."""
+    assert R.SANDBOX_PUBLICATION_NOT_RELEASED != R.VERIFIED_OUTPUT_REQUIRED
+    assert ACTION_DISPOSITIONS[
+        (R.SANDBOX_PUBLICATION_NOT_RELEASED, _A.PUBLISH_SANDBOX)] is Disposition.BLOCK
+    assert ACTION_DISPOSITIONS[
+        (R.VERIFIED_OUTPUT_REQUIRED, _A.PUBLISH_SANDBOX)] is Disposition.BLOCK
+    # The release fact gates only the action it names; the verification fact follows
+    # VERIFICATION_NOT_CURRENT's downstream posture into both production acts.
+    assert ACTION_DISPOSITIONS[
+        (R.SANDBOX_PUBLICATION_NOT_RELEASED, _A.MATERIALIZE_PRODUCTION)] is Disposition.DROP
+    assert ACTION_DISPOSITIONS[
+        (R.VERIFIED_OUTPUT_REQUIRED, _A.MATERIALIZE_PRODUCTION)] is Disposition.BLOCK
+
+
+def test_the_formula_column_is_ALLOW_for_every_matrix_link_condition():
+    """The owner's matrix: no link/join/policy fact ever refuses AUTHOR_FORMULA — authoring is
+    allowed under every condition; the join facts gate from the first computing act."""
+    for code in (R.DIRECTIONAL_REALIZATION_MISSING, R.DIRECTIONAL_MAPPING_INCOMPLETE,
+                 R.JOIN_NULL_POLICY_MISSING, R.JOIN_COVERAGE_POLICY_MISSING,
+                 R.MAX_MATCH_POLICY_MISSING, R.TEMPORAL_JOIN_POLICY_MISSING,
+                 R.ALLOCATION_POLICY_REQUIRED, R.TRANSACTION_IDENTITY_NOT_UNIQUE,
+                 R.EXECUTION_CONTEXT_MISSING, R.EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN):
+        assert ACTION_DISPOSITIONS[(code, _A.AUTHOR_FORMULA)] is not Disposition.BLOCK, code

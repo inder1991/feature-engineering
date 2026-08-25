@@ -22,6 +22,19 @@ effective readiness EXACTLY ``MATERIALIZATION_READY`` plus an engine that advert
 formula's schema — "a reviewed expectation exists" is never a substitute for executable
 readiness.
 
+▲ **R1 (2026-08-24 cross-catalog serving plan): ONE decision authority.** The ladder keeps
+``save_idea`` and ``create_contract`` as its own; ``author_formula`` is now an ADAPTER — the
+facts are still this fold's, but the verdict per fact comes from the canonical six-action
+service's disposition table (``materialize.action_dispositions``), the same table
+``action_decision._fold`` applies, so this rung and ``ask()``/``decide()`` can no longer
+disagree about AUTHOR_FORMULA (the live disagreement T0's inventory proved). The two
+materialization rungs are RETIRED IN PLACE: their legacy fold is frozen as the V1-lane gate,
+deliberately NOT folded through the canonical table — the V1 lane cannot supply the canonical
+facts (there is no ``FORMULA_NOT_AUTHORED`` fact here), so folding its stand-ins
+(readiness/review) through a table that downgrades them would turn "no executable formula"
+into an ALLOW. Their canonical successor is EXECUTE_SANDBOX over the sealed-artifact subject,
+whose fact loader lands at step 8/B3; the rungs die with the V1 lane.
+
 Every refusal is a ``BlockerV1`` with a closed reason code and the named next step a human can
 actually take. A blocked action never hides a candidate — the caller serves the blockers.
 """
@@ -128,6 +141,12 @@ class ActivationDecisionV1:
     allowed: bool
     blockers: tuple[BlockerV1, ...]
     policy_version: str = ACTIVATION_POLICY_VERSION
+    # ── R1 adapter fields, appended at the END and DEFAULTED (the S1A-5a convention) so every
+    # existing construction keeps working. Only the canonical-adapter rung populates them today:
+    # a WARN cell proceeds with the caller told (D3 — neither "allowed" nor "blocked"), and a
+    # DROP cell is recorded, never discarded — this action is not that fact's gate.
+    warnings: tuple[BlockerV1, ...] = ()
+    dropped: tuple[str, ...] = ()
 
 
 _FUNNEL_STEP = ("confirm the AI-proposed concept(s) in the Governance screen's "
@@ -249,6 +268,41 @@ def _materialization_blockers(frozen: FrozenOptionFactsV1,
     return blockers
 
 
+def _author_formula_adapter(frozen: FrozenOptionFactsV1,
+                            current: CurrentActivationStateV1) -> ActivationDecisionV1:
+    """R1: the ladder's ``author_formula`` answer COMES FROM the canonical six-action authority.
+
+    The FACTS stay the ladder's own (``_contract_blockers`` — what the user saw, re-read at the
+    durable moment); the VERDICT per fact is the canonical service's: the same ``(code, action)``
+    disposition table ``materialize.action_decision._fold`` applies, folded at AUTHOR_FORMULA.
+    Still a PURE fold — no connection — so the purity law holds and every caller keeps working.
+
+    ▲ Three live downgrades this encodes, each a DELIBERATE R1 consequence pinned by the
+    disagreement-inventory regression tests (T0 §V8; T0 concern 3):
+
+    * RECIPE_REVIEW_NOT_CURRENT — the ladder BLOCKED authoring on a stale review; the canonical
+      cell is WARN at AUTHOR_FORMULA (review facts warn; production gates by the same code's own
+      production cells). Previously blocked, now warns — canonical wins.
+    * PROPOSED_METADATA_ONLY and SEMANTIC_AUTHORITY_INSUFFICIENT — canonical: semantic-
+      confirmation facts are not any of the six actions' gate (DROP, recorded). The funnel still
+      gates where it lives: ``create_contract`` keeps the legacy fold and still blocks on both.
+    """
+    from featuregen.materialize.action_authorization import ActionV1
+    from featuregen.materialize.action_dispositions import fold_member_codes
+
+    facts = _contract_blockers(frozen, current)
+    seen: set[str] = set()
+    unique = [b for b in facts if not (b.code in seen or seen.add(b.code))]
+    blocker_codes, warning_codes, dropped_codes = fold_member_codes(
+        ActionV1.AUTHOR_FORMULA, tuple(b.code for b in unique), ())
+    by_code = {b.code: b for b in unique}
+    return ActivationDecisionV1(
+        action="author_formula", allowed=not blocker_codes,
+        blockers=tuple(by_code[code] for code in blocker_codes),
+        warnings=tuple(by_code[code] for code in warning_codes),
+        dropped=tuple(dropped_codes))
+
+
 def activation_decision(frozen: FrozenOptionFactsV1, current: CurrentActivationStateV1,
                         action: str, actor: object = None) -> ActivationDecisionV1:
     """Decide one action for one frozen option under the current state. Pure and total over
@@ -258,9 +312,14 @@ def activation_decision(frozen: FrozenOptionFactsV1, current: CurrentActivationS
                                     f"the ladder is {ACTIVATION_ACTIONS}")
     if action == "save_idea":
         blockers: list[BlockerV1] = []                       # an idea is an idea — always
-    elif action in ("create_contract", "author_formula"):
+    elif action == "author_formula":
+        return _author_formula_adapter(frozen, current)      # R1: the canonical service answers
+    elif action == "create_contract":
         blockers = _contract_blockers(frozen, current)
     else:
+        # ▲ RETIRED IN PLACE (R1, module docstring): the V1-lane materialization gate, frozen —
+        # NOT folded through the canonical table, whose honest gate for this act needs facts the
+        # V1 lane cannot supply. Canonical successor: EXECUTE_SANDBOX at step 8/B3.
         blockers = _materialization_blockers(frozen, current)
     # Deterministic, deduplicated (state-drift can be flagged by two rules), order-stable.
     seen: set[str] = set()

@@ -199,6 +199,41 @@ _ROWS: dict[str, dict[ActionV1, Disposition]] = {
     # authoring proceeds — that is what the approval IS — and the caller must be told; moot
     # downstream, where the draft exists legitimately.
     R.RETIREMENT_OVERRIDDEN: _row(_W, _D, _D, _D, _D, _D),
+    # ── Cross-catalog serving (2026-08-24 plan): the owner's matrix, encoded EXACTLY ────────────
+    # The matrix's Formula column is Allow under EVERY link condition, so these WARN at authoring
+    # (proceeds, caller told — the §5.1 policy-row pattern) and BLOCK from preview, the first act
+    # that would COMPUTE over the join. R11: unknown cardinality previews ONLY under a complete
+    # pinned guard policy, so each absent policy component refuses preview under its own name.
+    R.DIRECTIONAL_REALIZATION_MISSING: _row(_W, _B, _B, _B, _B, _B),
+    R.DIRECTIONAL_MAPPING_INCOMPLETE: _row(_W, _B, _B, _B, _B, _B),   # matrix: Formula Allow / Preview Block
+    R.JOIN_NULL_POLICY_MISSING: _row(_W, _B, _B, _B, _B, _B),
+    R.JOIN_COVERAGE_POLICY_MISSING: _row(_W, _B, _B, _B, _B, _B),
+    R.MAX_MATCH_POLICY_MISSING: _row(_W, _B, _B, _B, _B, _B),
+    R.TEMPORAL_JOIN_POLICY_MISSING: _row(_W, _B, _B, _B, _B, _B),     # matrix + R14: never silently defaulted
+    # Fan-out law (matrix: "Known M:N, final grain" — Formula Allow, source-grain intermediate
+    # only; Preview Block until a typed operator proves pre-aggregation/dedup/allocation).
+    R.ALLOCATION_POLICY_REQUIRED: _row(_W, _B, _B, _B, _B, _B),
+    # R2: the execution context never touches logical identity, so it is not authoring's gate at
+    # all (DROP — recorded, like the artifact-lifecycle rows); every computing act refuses.
+    R.EXECUTION_CONTEXT_MISSING: _row(_D, _B, _B, _B, _B, _B),
+    # R13 (matrix: "Duplicate transaction identity" — Formula Allow; Preview RENDERS the guard;
+    # the fixture/run REFUSES). Preview proceeds with the guard compiled in and the caller told;
+    # the first act that would EXECUTE over the duplicates refuses. No feature values, ever.
+    R.TRANSACTION_IDENTITY_NOT_UNIQUE: _row(_W, _W, _B, _B, _B, _B),
+    # S2-P6 split: source compatibility blocks EXECUTE_SANDBOX, never GENERATE_PREVIEW. Not an
+    # authoring fact (DROP); warns from preview (an artifact is on the way — the certificate
+    # pattern); refuses from the first act that would run against the source.
+    R.EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN: _row(_D, _W, _B, _B, _B, _B),
+    # ── Deployment-capability facts: each gates EXACTLY the action it names (the six-action
+    # availability block). PUBLISH_SANDBOX is TWO facts, never one explanation (round-13 P1-10):
+    # capability unreleased vs capability present but THIS artifact unverified — the second
+    # matches VERIFICATION_NOT_CURRENT's downstream posture (publication CONSUMES verification,
+    # and production never proceeds over an unverified output).
+    R.SANDBOX_EXECUTION_NOT_RELEASED: _row(_D, _D, _B, _D, _D, _D),
+    R.SANDBOX_PUBLICATION_NOT_RELEASED: _row(_D, _D, _D, _B, _D, _D),
+    R.VERIFIED_OUTPUT_REQUIRED: _row(_D, _D, _D, _B, _B, _B),
+    R.PRODUCTION_MATERIALIZATION_NOT_RELEASED: _row(_D, _D, _D, _D, _B, _D),
+    R.PRODUCTION_PUBLICATION_NOT_RELEASED: _row(_D, _D, _D, _D, _D, _B),
 }
 
 #: §5's shape: ``(code, action) -> Disposition``, 6 cells per vocabulary code, proved complete

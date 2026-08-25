@@ -41,6 +41,7 @@ from featuregen.overlay.upload.planner.logical_plan_v2 import (
     _enum,
     _non_empty,
 )
+from featuregen.overlay.upload.semantic_eligibility_reasons import ALLOCATION_POLICY_REQUIRED
 from featuregen.overlay.upload.source_selection import TEMPORAL_HISTORICAL_CURRENT_ONLY
 from featuregen.overlay.upload.temporal_policy import (
     TEMPORAL_POLICY_ID_PREFIX,
@@ -88,8 +89,10 @@ _VALIDATION_POLICY_CONTRACT = "join_validation_policy_revision_v1"
 JOIN_VALIDATION_POLICY_ID_PREFIX = "jvp_"
 
 #: The fan-out law's refusal code (plan §Identity chain; owner's matrix row "Known M:N, final
-#: grain"). First src/ spelling — the plan's T0 addendum records it as a BUILD item.
-ALLOCATION_POLICY_REQUIRED = "ALLOCATION_POLICY_REQUIRED"
+#: grain"). ONE spelling: since A1's three-part registration the constant is OWNED by the closed
+#: vocabulary (`semantic_eligibility_reasons`, with a family row and an all-six-actions
+#: disposition row) and re-exported from the top import block here, where the fan-out law that
+#: emits it lives.
 
 _HEX_DIGITS = frozenset("0123456789abcdef")
 

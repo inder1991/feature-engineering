@@ -149,6 +149,41 @@ LEGACY_REGENERATION_NOT_APPROVED = "LEGACY_REGENERATION_NOT_APPROVED"
 FORMULA_DRAFT_NOT_AN_ANSWER = "FORMULA_DRAFT_NOT_AN_ANSWER"
 RETIREMENT_OVERRIDDEN = "RETIREMENT_OVERRIDDEN"
 
+# ── Cross-catalog serving (2026-08-24 first-served-card plan: the owner's §capability matrix
+# and the six-action availability block). Same three-part-commit rule as §5 above: constant here,
+# family row below, all-six-actions row in `materialize/action_dispositions.py`. None of these is
+# emitted by the activation policy, so no `ACTIVATION_BLOCKER_DISPOSITIONS` row exists for them.
+
+# The link/join facts. The matrix's Formula column is Allow under EVERY link condition — these
+# gate from preview (the first act that computes over the join), never authoring.
+DIRECTIONAL_REALIZATION_MISSING = "DIRECTIONAL_REALIZATION_MISSING"     # no physical realization of the link yet (pre-A4c; D1)
+DIRECTIONAL_MAPPING_INCOMPLETE = "DIRECTIONAL_MAPPING_INCOMPLETE"       # matrix: "Missing directional mapping"
+EXECUTION_CONTEXT_MISSING = "EXECUTION_CONTEXT_MISSING"                 # no adopted execution context (R2: never logical identity)
+# R11: unknown cardinality is previewable ONLY under a complete pinned guard policy — each
+# guard-policy component that is absent refuses preview under its own name.
+JOIN_NULL_POLICY_MISSING = "JOIN_NULL_POLICY_MISSING"
+JOIN_COVERAGE_POLICY_MISSING = "JOIN_COVERAGE_POLICY_MISSING"
+MAX_MATCH_POLICY_MISSING = "MAX_MATCH_POLICY_MISSING"
+TEMPORAL_JOIN_POLICY_MISSING = "TEMPORAL_JOIN_POLICY_MISSING"           # R14: a policy nobody assessed is never applied
+# R13: COUNT over duplicate governed transaction identity REFUSES — preview renders the guard,
+# the run refuses; the (chartered) remedy is a governed deduplication policy, never COUNT_DISTINCT.
+TRANSACTION_IDENTITY_NOT_UNIQUE = "TRANSACTION_IDENTITY_NOT_UNIQUE"
+# The fan-out law (matrix: "Known M:N, final grain") — ONE spelling; `planner/physical_plan_v1`
+# re-exports this constant for its construction-time refusals.
+ALLOCATION_POLICY_REQUIRED = "ALLOCATION_POLICY_REQUIRED"
+# S2-P6 split: source compatibility blocks EXECUTE_SANDBOX, never GENERATE_PREVIEW.
+EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN = "EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN"
+
+# Deployment-capability facts — SERVER-OWNED, folded by the same six-action service (never a
+# route-local switch). Each gates exactly the action it names; PUBLISH_SANDBOX is TWO DISTINCT
+# facts, never one explanation (round-13 P1-10): the capability itself unreleased vs the
+# capability present but THIS artifact unverified.
+SANDBOX_EXECUTION_NOT_RELEASED = "SANDBOX_EXECUTION_NOT_RELEASED"
+SANDBOX_PUBLICATION_NOT_RELEASED = "SANDBOX_PUBLICATION_NOT_RELEASED"
+VERIFIED_OUTPUT_REQUIRED = "VERIFIED_OUTPUT_REQUIRED"
+PRODUCTION_MATERIALIZATION_NOT_RELEASED = "PRODUCTION_MATERIALIZATION_NOT_RELEASED"
+PRODUCTION_PUBLICATION_NOT_RELEASED = "PRODUCTION_PUBLICATION_NOT_RELEASED"
+
 #: code -> product family. A code absent from this table cannot ship — the pin test enforces.
 REASON_FAMILIES: dict[str, str] = {
     TARGET_LEAKAGE_BLOCKED: "structurally_unsuitable",
@@ -233,6 +268,31 @@ REASON_FAMILIES: dict[str, str] = {
     LEGACY_REGENERATION_NOT_APPROVED: "undecided",
     FORMULA_DRAFT_NOT_AN_ANSWER: "undecided",
     RETIREMENT_OVERRIDDEN: "needs_setup",
+    # ── cross-catalog serving (2026-08-24 plan) ─────────────────────────────────────────────────
+    # The remedies are governance/setup work with an owner: produce a realization (A4c), complete
+    # a mapping, adopt an execution context, declare a policy. None is "unsuitable" — the plan's
+    # whole point is that each has a named, buildable cure.
+    DIRECTIONAL_REALIZATION_MISSING: "needs_setup",
+    DIRECTIONAL_MAPPING_INCOMPLETE: "needs_setup",
+    EXECUTION_CONTEXT_MISSING: "needs_setup",
+    JOIN_NULL_POLICY_MISSING: "needs_setup",
+    JOIN_COVERAGE_POLICY_MISSING: "needs_setup",
+    MAX_MATCH_POLICY_MISSING: "needs_setup",
+    TEMPORAL_JOIN_POLICY_MISSING: "needs_setup",
+    # A PROVEN duplicate: the check already ran, so not needs_data_check. The remedy is a governed
+    # deduplication policy (chartered, outside this increment) or upstream data ownership — policy
+    # work with an owner, honestly named setup.
+    TRANSACTION_IDENTITY_NOT_UNIQUE: "needs_setup",
+    ALLOCATION_POLICY_REQUIRED: "needs_setup",
+    # Unproven, and a measurement would settle it — the definition of needs_data_check.
+    EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN: "needs_data_check",
+    # Platform capability releases: governance work with an owner (the PUBLICATION_CAPABILITY_
+    # MISSING precedent), never a defect of the candidate.
+    SANDBOX_EXECUTION_NOT_RELEASED: "needs_setup",
+    SANDBOX_PUBLICATION_NOT_RELEASED: "needs_setup",
+    VERIFIED_OUTPUT_REQUIRED: "needs_setup",
+    PRODUCTION_MATERIALIZATION_NOT_RELEASED: "needs_setup",
+    PRODUCTION_PUBLICATION_NOT_RELEASED: "needs_setup",
 }
 
 #: UI/primary precedence: hard structural truths first, then authority, then setup/checks —
