@@ -174,6 +174,13 @@ class ConsideredSet:
     # from the candidate that folded it to the formula-shadow work item that freezes it, so the
     # plan the human was shown is the plan compilation will be held to.
     binding_plan_by_candidate_key: dict[str, dict] = field(default_factory=dict)
+    # T2: the candidates the engine held OUT of every served lane because a REQUIRED operand
+    # never bound, each naming the concepts this catalog would have to carry
+    # (`semantic_projection.NeedsSetupCandidateV1`). In memory only, for the same reason the
+    # plan envelope above is: a needs-setup entry mints no option and carries no computation, so
+    # serializing it into the considered revision would move `considered_content_hash` for
+    # essentially every run without a governed artifact behind the move.
+    needs_setup: tuple = ()
     option_ids_by_path: dict[str, str] = field(default_factory=dict)
     # A1b: per-served-definition frozen facts captured at the semantic branch, written as
     # immutable semantic_option_decision rows once option ids mint at revision-persist time.
@@ -972,7 +979,7 @@ def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_contex
     if client is None or semantic_context is None:
         return []
     try:
-        candidates, _rejections = llm_intent_candidates(
+        candidates, _rejections, _normalizations = llm_intent_candidates(
             conn, client, context=semantic_context,
             scope_leaves=_intent_scope_leaves(scope),
             actor=actor_envelope,
@@ -1010,15 +1017,18 @@ def _engine_recipe_contexts(
     freezes it, and nowhere else.
 
     ONE context per served RECIPE, at its LEADING variant. Both consuming maps are keyed by
-    ``recipe_id`` — the key the dispositions and the ranking use — while B5 serves one card per
-    authored parameterization, so a three-window recipe offers three candidates for one ranked row.
-    The leading variant is the answer: ``variant_primary`` is the deterministic hypothesis match
-    (or the authored-first default), i.e. the parameterization that fronts this recipe, which is
-    precisely what the retired legacy pass captured when ``choose_params`` picked one window per
-    template. Recording all three instead would resolve AMBIGUOUS and capture nothing — a
-    regression wearing a different reason code. The bindings are variant-INVARIANT (the binder
-    chooses columns per role, never per parameter), so only the captured window differs, and it
-    differs to the one the human is shown first.
+    ``recipe_id`` — the key the dispositions and the ranking use.
+
+    ▲ Since T6 (2026-08-24) the lens emits ONE candidate per recipe (its primary variant; the
+    siblings ride ``param_alternatives`` on the card), so for the recipe lens this fold is now
+    trivially satisfied — there is nothing to choose between. It is kept because the map is built
+    over EVERY served idea, recipe and LLM-intent alike, and nothing guarantees the intent lens
+    will never propose two candidates that assemble onto one recipe id; the fold is what makes
+    that arrive as "the leading one wins" rather than "whichever came last". Under B5, which
+    served one card per authored parameterization, it was doing real work: a three-window recipe
+    offered three candidates for one ranked row, and recording all three would have resolved
+    AMBIGUOUS and captured nothing. The bindings are variant-INVARIANT either way (the binder
+    chooses columns per role, never per parameter), so only the captured window ever differed.
 
     The logical refs come from the frozen context's own index (schema-preserving, exactly as
     ``logical_ref_of`` rebuilds them), so no per-binding query is issued.
@@ -1153,6 +1163,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
     recipe_candidate_keys_by_recipe_id: dict[str, tuple[str, ...]] = {}
     binding_plan_by_candidate_key: dict[str, dict] = {}
     semantic_decision_facts: dict[str, dict] = {}
+    needs_setup: tuple = ()               # T2's lane (empty on a no-catalog run, honestly)
     # S1B-3: the engine arm's own inputs to the telemetry work item. `engine_served` is what gates
     # the enqueue — telemetry describes what the ONE engine did, and no other arm runs it.
     engine_served = False
@@ -1181,6 +1192,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
         # the recipe's card, never a duplicate. Fail-soft: an intent-generation failure serves
         # the recipe lens alone (logged), because the engine's recipes never depend on a model.
         intent_rejections: list = []
+        # Vocabulary repairs the generation seam applied to intents that WERE served. Carried
+        # here beside the rejections so this gate CAN say a served card's wording was repaired;
+        # rendering it is T9's call. Empty on the fail-soft path, honestly.
+        intent_normalizations: list = []
         all_candidates = list(v2_candidates)
         if client is not None and semantic_context is not None:
             try:
@@ -1188,7 +1203,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                     llm_intent_candidates,
                 )
 
-                intent_cands, intent_rejections = llm_intent_candidates(
+                intent_cands, intent_rejections, intent_normalizations = llm_intent_candidates(
                     conn, client, context=semantic_context,
                     scope_leaves=_intent_scope_leaves(scope),
                     redacted_hypothesis=(
@@ -1268,10 +1283,22 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
             alternatives.append(FeatureSet(lens="actionable",
                                            features=projection.actionable_ideas))
         rejections.extend(projection.rejections)
+        # T2: the candidates that never became cards, kept BY NAME. Not folded into
+        # `rejections` — a rejection says "this candidate is wrong"; this says "this catalog
+        # does not carry what the candidate needs", which has a different remedy and a
+        # different owner.
+        #
+        # T6: and it is now ONE entry per recipe, like the served lanes, because the lens emits
+        # one candidate per recipe. It was one per authored parameterization — measured on the
+        # audit's arrangement, 15 eligible AML recipes produced 45 setup entries. The lane reports
+        # which CONCEPTS did not bind, and the binder chooses columns per role rather than per
+        # parameter, so those were near-duplicates of one answer rather than 45 pieces of work.
+        needs_setup = projection.needs_setup
         engine_served = True
         logger.info(
-            "engine served: ideas=%d rejections=%d grounded=%s",
-            len(projection.ideas), len(projection.rejections),
+            "engine served: ideas=%d actionable=%d needs_setup=%d rejections=%d grounded=%s",
+            len(projection.ideas), len(projection.actionable_ideas),
+            len(projection.needs_setup), len(projection.rejections),
             ",".join(sorted(projection.grounded_ids)) or "-")
     elif catalog_source is not None:
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
@@ -1398,6 +1425,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                        ),
                        recipe_candidate_keys_by_recipe_id=recipe_candidate_keys_by_recipe_id,
                        binding_plan_by_candidate_key=binding_plan_by_candidate_key,
+                       needs_setup=needs_setup,
                        semantic_decision_facts_by_definition_id=semantic_decision_facts)
     logger.info("considered-set built: intent=%s catalog=%s roles=%s → lenses=%s, %d rejected, "
                 "anchor=%s, recommended_lens=%s",

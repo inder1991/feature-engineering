@@ -23,11 +23,12 @@ from featuregen.overlay.upload.recipe_operand_policy import (
     AMBIGUOUS_BY_CLASS,
     DISTINCT_BINDING_VIOLATED,
     ECONOMIC_ROLE_UNPROVEN,
+    POPULATION_DISTINCTNESS_VIOLATED,
     REQUIRED_OPERAND_MISSING,
     bind_v2_operands,
     governed_economic_role,
 )
-from featuregen.overlay.upload.recipe_registry_v2 import PROBE_RECIPE
+from featuregen.overlay.upload.recipe_registry_v2 import PROBE_RECIPE, v2_recipe_by_id
 from featuregen.overlay.upload.tie_break import (
     TieBreakCandidate,
     store_tie_break_verdict,
@@ -579,3 +580,217 @@ def test_a_stronger_correction_clears_a_previously_blocked_variant(db):
     _declare_history_depth(db, "transactions", 400, producer="human", strength="confirmed")
     assert _bind_180().status == "bound", \
         "the stronger append-only correction wins through the resolver pin"
+
+
+# ── T8: a counterparty is not the population ───────────────────────────────────────────────────
+#
+# The audited failure, verbatim (135-candidate quality audit, AML run
+# grun_01M0SQYJ2AAEZY38M9X9XCNMB6): a served card asked "did this customer transact with a
+# counterparty" and bound its COUNTERPARTY operand to the population's own key column, because
+# the counterparty operand asks for `customer_id` and the population's key carries `customer_id`
+# — concept compatibility was the only test and nothing refused. `screening_coverage_share` is
+# that shape in the shipped registry: a `customer` entity_key and a `counterparty` dimension,
+# both declaring the SAME concept, at customer output grain.
+
+CPTY_RECIPE = v2_recipe_by_id("screening_coverage_share")
+
+_POPULATION_KEY = "public.customers.cust_num"
+_COUNTERPARTY_COLUMN = "public.transactions.counter_party_cif_id"
+
+
+def _counterparty_catalog(db, *, with_counterparty_column: bool = False) -> None:
+    """A catalog whose ONLY customer identity is the population's own key — the audit's
+    arrangement. With ``with_counterparty_column`` a genuine per-transaction counterparty
+    identifier joins it, carrying the SAME (acceptable) concept."""
+    rows = [
+        (CanonicalRow(SOURCE, "customers", "cust_num", "varchar(20)", is_grain=True,
+                      entity="Customer", definition="the bank's CIF number for the customer"),
+         "customer_id"),
+        (CanonicalRow(SOURCE, "transactions", "wl_hit", "boolean",
+                      definition="watchlist screening hit"), "watchlist_hit_flag"),
+        (CanonicalRow(SOURCE, "transactions", "booked_ts", "timestamp",
+                      definition="when the transaction was booked"), "event_timestamp"),
+    ]
+    if with_counterparty_column:
+        rows.append((CanonicalRow(SOURCE, "transactions", "counter_party_cif_id", "varchar(20)",
+                                  definition="the counterparty's CIF on this transaction"),
+                     "customer_id"))
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+
+
+def _bind_recipe(db, recipe):
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    request = planning_request_from_recipe(recipe)
+    verdicts, _eligibility = bind_planning_request(db, request, context)
+    return request, verdicts, {v.role: v for v in verdicts}
+
+
+def test_a_counterparty_operand_refuses_the_populations_own_key(db):
+    """PIN 1 — the audit's case. The population's key binds where it belongs; the counterparty
+    operand is REFUSED rather than bound to the customer themselves, and it stays UNBOUND (no
+    selected ref) so T2's needs-setup lane holds the candidate back from serving as a card."""
+    _counterparty_catalog(db)
+    _request, _verdicts, by_role = _bind_recipe(db, CPTY_RECIPE)
+
+    assert by_role["customer"].status == "bound"
+    assert by_role["customer"].selected_ref == _POPULATION_KEY, \
+        "the population's own key operand binds the population's own key — that is its job"
+
+    counterparty = by_role["counterparty"]
+    assert counterparty.status == "blocked"
+    assert counterparty.selected_ref is None, \
+        "a party is never its own counterparty — the operand is left unbound, never bound here"
+    assert counterparty.reason_codes == (POPULATION_DISTINCTNESS_VIOLATED,)
+    assert counterparty.tied_refs == (_POPULATION_KEY,), \
+        "the refusal NAMES the column it refused — a refusal nobody can see is a dead end"
+    assert "never its own counterparty" in counterparty.resolution
+    assert "'customer'" in counterparty.resolution, \
+        "the refusal names WHICH operand owns that column as the population's key"
+
+
+def test_the_refusal_reaches_the_needs_setup_lane_saying_what_actually_happened(db):
+    """PIN 1, second half: T2 holds the candidate back and the T2-T4 sentence for `blocked`
+    tells THIS case's truth — the column exists and the binding was refused, which is a
+    different fact (and a different remedy) from "no column carries this concept"."""
+    from types import SimpleNamespace
+
+    from featuregen.overlay.upload.semantic_projection import unbound_required_operands
+
+    _counterparty_catalog(db)
+    request, verdicts, _by_role = _bind_recipe(db, CPTY_RECIPE)
+    unbound = unbound_required_operands(
+        SimpleNamespace(verdicts=verdicts, planning_request=request))
+
+    assert [u.role for u in unbound] == ["counterparty"], \
+        "exactly one required operand did not bind — so T2 serves no card for this candidate"
+    sentence = unbound[0].sentence()
+    assert sentence == (f"customer_id is carried by {_POPULATION_KEY} and the binding is "
+                        f"blocked ({POPULATION_DISTINCTNESS_VIOLATED})"), sentence
+
+
+def test_a_genuine_counterparty_column_binds_instead_of_the_population_key(db):
+    """PIN 2 — the rule does not merely refuse, it lets the honest candidate through. Both
+    columns carry an ACCEPTABLE concept (`customer_id`); the population's key is the stronger
+    candidate on authority and would have won outright. It is withheld from the counterparty
+    operand only, which then binds the per-transaction counterparty identifier."""
+    _counterparty_catalog(db, with_counterparty_column=True)
+    _confirm_concept(db, _POPULATION_KEY, "customer_id")
+    _request, _verdicts, by_role = _bind_recipe(db, CPTY_RECIPE)
+
+    assert by_role["customer"].selected_ref == _POPULATION_KEY
+    counterparty = by_role["counterparty"]
+    assert counterparty.status == "bound", (counterparty.status, counterparty.reason_codes)
+    assert counterparty.selected_ref == _COUNTERPARTY_COLUMN, \
+        "the counterparty leg lands on the counterparty column, never on the population"
+
+
+def test_the_rule_does_not_overreach_to_the_operands_that_SHOULD_bind_the_grain_key(db):
+    """PIN 3 — the non-overreach pin. The population/entity-key operand binds the grain key
+    (that IS the population), and the operands that name no party bind exactly as before. A
+    rule applied to every role would refuse the population's own key to the population.
+
+    Deliberately the SAME catalog pin 1 refuses on: the one column carrying `customer_id` IS
+    the grain key, so if the rule reached the population's own operand there would be nothing
+    left for it to bind."""
+    from featuregen.overlay.upload.recipe_operand_policy import (
+        population_anchor_and_distinct_roles,
+    )
+
+    _counterparty_catalog(db)
+    request, _verdicts, by_role = _bind_recipe(db, CPTY_RECIPE)
+
+    # The scope, asserted on the derivation itself — the population's own operand and every
+    # operand that names no party are OUTSIDE the rule, by construction and not by luck.
+    anchor_role, protected = population_anchor_and_distinct_roles(request)
+    assert anchor_role == "customer"
+    assert protected == frozenset({"counterparty"}), \
+        "the population's own key operand is never asked to be distinct from itself"
+
+    population = by_role["customer"]
+    assert population.status == "bound"
+    assert population.selected_ref == _POPULATION_KEY
+    assert POPULATION_DISTINCTNESS_VIOLATED not in population.reason_codes
+
+    for role, ref in (("screened", "public.transactions.wl_hit"),
+                      ("event_ts", "public.transactions.booked_ts")):
+        assert by_role[role].status == "bound", (role, by_role[role].reason_codes)
+        assert by_role[role].selected_ref == ref
+        assert POPULATION_DISTINCTNESS_VIOLATED not in by_role[role].reason_codes
+
+
+def test_the_distinct_from_population_set_is_DERIVED_from_the_contract_not_authored():
+    """The role vocabulary, MEASURED over the shipped V2 registry rather than hand-listed.
+
+    DO NOT just paste a new expected set. This asserts that the structural derivation — an
+    operand that is not the population anchor and whose concept IDENTIFIES the same entity the
+    anchor identifies — selects exactly the counterparty legs and NOTHING else. Measured
+    2026-08-24 over 317 recipes: 6 slots, 4 recipes. Dropping the same-entity condition takes
+    it to 66 slots (`original_txn`, `account`, `product`, `invoice`, …) — which is why that
+    condition is the rule and not a decoration. A new entry here means a new recipe declares a
+    second instance of its own population's entity; check it really is a counterparty leg."""
+    from featuregen.overlay.upload.recipe_operand_policy import (
+        population_anchor_and_distinct_roles,
+    )
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    measured = {(recipe.recipe_id, role)
+                for recipe in V2_RECIPES
+                for role in population_anchor_and_distinct_roles(recipe)[1]}
+    assert measured == {
+        ("rapid_movement_passthrough", "in_counterparty"),
+        ("rapid_movement_passthrough", "out_counterparty"),
+        ("fan_in_fan_out", "payer"),
+        ("fan_in_fan_out", "payee"),
+        ("nested_correspondent_flow", "correspondent_bank"),
+        ("screening_coverage_share", "counterparty"),
+    }, sorted(measured)
+
+
+def test_the_law_holds_in_the_live_column_engine_too(db):
+    """One rule, two engines. `bind_v2_operands` is the live-column compatibility engine; the
+    opposing-legs law is deliberately shared with it, and so is this one — a rule that held in
+    only one binder would be a hole shaped exactly like the engine nobody looked at."""
+    _counterparty_catalog(db)
+    verdicts = {v.role: v for v in bind_v2_operands(db, CPTY_RECIPE, catalog_source=SOURCE,
+                                                    roles=("data_owner",))}
+    assert verdicts["customer"].selected_ref == _POPULATION_KEY
+    assert verdicts["counterparty"].status == "blocked"
+    assert verdicts["counterparty"].reason_codes == (POPULATION_DISTINCTNESS_VIOLATED,)
+    assert verdicts["counterparty"].selected_ref is None
+
+
+def test_the_verdict_tuple_keeps_the_recipes_authored_operand_order(db):
+    """The anchor is resolved FIRST so the rule has a population to be distinct from; the
+    verdict tuple is emitted in AUTHORED order regardless, because callers read it positionally
+    against the request's operands."""
+    _counterparty_catalog(db, with_counterparty_column=True)
+    request, verdicts, _by_role = _bind_recipe(db, CPTY_RECIPE)
+    assert [v.role for v in verdicts] == [op.role for op in request.operands]
+
+
+def test_the_rule_holds_when_the_counterparty_leg_is_authored_BEFORE_the_population(db):
+    """The anchor-first hoist, pinned. Every counterparty recipe in today's registry happens to
+    author its population operand first, so the ordering guarantee is a DEFENCE — and a defence
+    nothing exercises is one that silently rots. Authoring the legs the other way round must
+    change neither the refusal nor the order of the verdict tuple."""
+    reordered = replace(CPTY_RECIPE, operands=(CPTY_RECIPE.operands[1],
+                                               CPTY_RECIPE.operands[0],
+                                               *CPTY_RECIPE.operands[2:]))
+    assert [op.role for op in reordered.operands][:2] == ["counterparty", "customer"]
+    _counterparty_catalog(db)
+    request, verdicts, by_role = _bind_recipe(db, reordered)
+
+    assert [v.role for v in verdicts] == [op.role for op in request.operands], \
+        "the verdict tuple stays in AUTHORED order however the binder had to resolve it"
+    assert by_role["customer"].selected_ref == _POPULATION_KEY
+    assert by_role["counterparty"].status == "blocked"
+    assert by_role["counterparty"].reason_codes == (POPULATION_DISTINCTNESS_VIOLATED,)

@@ -5,10 +5,13 @@ persistence. Anthropic's structured-output API accepts only a SUBSET of JSON Sch
 provider-compatible schema for the WIRE ONLY (this module) while the canonical schema remains the
 source of truth for validating the model's RESPONSE (the driver's `reg.validate`, unchanged).
 
-Two transforms: (1) strip provider-unsupported constraint keywords; (2) normalize a nullable-enum
-`{"type":["T","null"],"enum":[...,null]}` into the accepted union `{"anyOf":[{"type":"T",
-"enum":[...]},{"type":"null"}]}`. Pure + deterministic + SDK-independent so a static test can prove
-every outbound schema is clean before any deploy."""
+Three transforms carry the weight (each is documented at its step in `_project`, along with the
+several wire-only strictness bargains that ride with them): (1) strip provider-unsupported
+constraint keywords; (2) normalize a nullable-enum `{"type":["T","null"],"enum":[...,null]}` into
+the accepted union `{"anyOf":[{"type":"T","enum":[...]},{"type":"null"}]}`; (3) declare the type a
+bare enum already implies, because the provider requires every subschema to say what it is. Pure +
+deterministic + SDK-independent so a static test can prove every outbound schema is clean before any
+deploy."""
 from __future__ import annotations
 
 import copy
@@ -81,6 +84,28 @@ def _project(node: object) -> object:
     #     the code trusts belongs in a canonical `enum` so an off-vocabulary answer cannot be read.
     if "x-wire-enum" in node:
         node["enum"] = node.pop("x-wire-enum")
+    # 3d) BARE ENUM → TYPED ENUM (2026-08-24). `{"enum": ["string", "integer", ...]}` with no
+    #     `"type"` beside it is legal JSON Schema — the members constrain the value on their own,
+    #     so `jsonschema` never minded — and the provider's structured-output subset REFUSES it:
+    #     every subschema must declare a type. Unlike the type-array note above, this rejection was
+    #     observed directly, and it had been fatal for the whole life of the formula-author seam:
+    #     every live `formula.author` call died with `HTTP 400, keyword=type` against
+    #     `$defs.typedLiteral.properties.type` and `$defs.parameterDecl.properties.type`, and the
+    #     error read as a keyword misattribution only because the offending property is itself
+    #     NAMED "type". The declaration is purely additive — a homogeneous enum's members already
+    #     say what the type is, so the set of accepted values is identical before and after.
+    #
+    #     ▲ IT RUNS HERE, LAST, AND THAT POSITION IS THE POINT. An untyped enum reaches the wire
+    #     through TWO doors: written that way in the canonical schema (the author turn schemas'
+    #     46 of them), or minted right above by the `x-wire-enum` swap, which lifts a vocabulary
+    #     onto a node that may carry no type of its own. Declaring at 1c — where this first sat —
+    #     closed only the first door and left the second wide open to the same outage. One line
+    #     between here and there DOES read `type` (step 3 compares it to "object"), but this
+    #     transform can only emit boolean/integer/null/number/string — never "object" — so the
+    #     read cannot move; running once, downstream of both producers, is sufficient and the
+    #     only placement that stays correct (equivalence executed over all 71 provider-bound
+    #     schemas: zero differ between the two positions except the second-door case itself).
+    node = _declare_enum_type(node)
     # 4) recurse into nested schema containers
     for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
         if isinstance(node.get(key), dict):
@@ -111,6 +136,80 @@ def _normalize_nullable_enum(node: dict) -> dict:
     return rebuilt
 
 
+def _type_of_enum_members(members: list) -> str | None:
+    """The JSON-Schema type a HOMOGENEOUS enum implies, or None when nothing can be inferred.
+
+    The rule is: a MIXED enum returns None; a homogeneous one is named by its members' JSON type.
+    Order matters twice over, and both are traps rather than taste:
+
+    * `bool` is tested BEFORE `int` because `isinstance(True, int)` is True in Python — an
+      all-boolean enum would otherwise be declared "integer", a type its members do not have.
+    * `integer` is tested BEFORE `number` because an all-integer enum deserves the tighter of the
+      two true declarations; `number` is for the mixed-numeric case (any float present), where
+      "integer" would be a false statement about the members.
+
+    None means "no single type to declare". Inventing one would NARROW the contract the model is
+    held to, so these are left untouched and the schema audit reports them: widening the vocabulary
+    or splitting the property is a human decision, not a normalization.
+    """
+    if not members:
+        return None
+    if all(isinstance(m, bool) for m in members):
+        return "boolean"
+    if all(m is None for m in members):
+        return "null"
+    if all(isinstance(m, int) and not isinstance(m, bool) for m in members):
+        return "integer"
+    if all(isinstance(m, (int, float)) and not isinstance(m, bool) for m in members):
+        return "number"
+    if all(isinstance(m, str) for m in members):
+        return "string"
+    return None
+
+
+def _declare_enum_type(node: dict) -> dict:
+    """Give an enum-only node the type its members imply. Already-dispatchable nodes are untouched."""
+    enum = node.get("enum")
+    if not isinstance(enum, list):
+        return node
+    if any(k in node for k in ("type", "$ref") + _COMBINATOR_KEYS):
+        return node
+    declared = _type_of_enum_members(enum)
+    if declared is None:
+        return node
+    return {"type": declared, **node}
+
+
+def declare_enum_types(schema: dict) -> dict:
+    """A deep copy of `schema` in which every enum-only subschema declares the type it implies.
+
+    The same transform `project_for_anthropic` applies on the wire, offered on its own so a schema
+    can be built ALREADY honest rather than repaired on the way out — see `formula/turns_v3.py`.
+    Provider-independent: an enum that does not say what it is is under-specified for any reader.
+    """
+    return _walk_declaring_enum_types(copy.deepcopy(schema))
+
+
+def _walk_declaring_enum_types(node: object) -> object:
+    if isinstance(node, list):
+        return [_walk_declaring_enum_types(x) for x in node]
+    if not isinstance(node, dict):
+        return node
+    node = _declare_enum_type(node)
+    for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
+        if isinstance(node.get(key), dict):
+            node[key] = {k: _walk_declaring_enum_types(v) for k, v in node[key].items()}
+    if isinstance(node.get("items"), (dict, list)):
+        node["items"] = _walk_declaring_enum_types(node["items"])
+    for key in _COMBINATOR_KEYS + _LIST_OF_SCHEMA_KEYS:    # list-of-schemas
+        if isinstance(node.get(key), list):
+            node[key] = [_walk_declaring_enum_types(v) for v in node[key]]
+    for key in _SINGLE_SUBSCHEMA_KEYS:                     # single sub-schema (bool form skipped)
+        if isinstance(node.get(key), dict):
+            node[key] = _walk_declaring_enum_types(node[key])
+    return node
+
+
 def _normalize_type_array(node: dict) -> dict:
     t = node.get("type")
     if not isinstance(t, list):
@@ -138,6 +237,21 @@ def provider_incompatibilities(schema: object, _path: str = "$") -> list[str]:
         return problems
     if not any(k in schema for k in _SCHEMA_SHAPE_KEYS):
         problems.append(f"missing-type at {_path}")
+    # An UNTYPED ENUM (2026-08-24). TWO blind spots let this reach production, and they are worth
+    # keeping straight because only the second one lives in this function:
+    #   1. COVERAGE, and it was the decisive one. Every auditor of this invariant — the 2026-08-14
+    #      ratchet and `enrich_llm.register_enrichment_schemas`' fail-closed bootstrap guard alike
+    #      — iterates `enrich_llm._SCHEMAS`, which carries no `formula_author_turn*` id at all.
+    #      The author turn schemas were never examined by anything, so no detector could have
+    #      spoken. That is what `test_provider_schema_audit.py` exists to fix.
+    #   2. DETECTION, a real second defect. Had the sweep reached them, this function would still
+    #      have passed them: it counted `enum` among the keys that make a node dispatchable — see
+    #      `_SCHEMA_SHAPE_KEYS` — so a bare enum read as well-formed. Fixed here.
+    # `enum` stays in `_SCHEMA_SHAPE_KEYS` (a bare enum is not a SHAPELESS node, and reporting it
+    # twice would say so); it is reported here under its own name instead. A survivor after
+    # `project_for_anthropic` is a heterogeneous enum the projection declined to guess at.
+    if "enum" in schema and not any(k in schema for k in ("type", "$ref") + _COMBINATOR_KEYS):
+        problems.append(f"untyped-enum at {_path}")
     for kw in schema:
         if kw in PROVIDER_UNSUPPORTED_KEYWORDS:
             problems.append(f"{kw} at {_path}")

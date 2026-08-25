@@ -444,6 +444,12 @@ export interface RefineCandidate {
 export interface RefineRejection {
   reason: string
   code: string
+  // T2: present exactly when the revision did not BIND — a required operand found no column, so
+  // there is no card to return. The route answers this with a 200 on purpose ("data the reviewer
+  // acts on, not an error"), and its presence is the honest discriminator between setup work and
+  // a genuine refusal: the two carry different remedies and different owners. `reason` already
+  // carries the entry's own sentence; this carries the per-operand detail behind it.
+  needs_setup?: NeedsSetupCandidate[]
 }
 
 // Both refine outcomes arrive as 200 data: a gauntlet rejection of the revision is something
@@ -1412,6 +1418,51 @@ export interface OptionActionsEntry {
   blocked_actions: Record<string, OptionActionBlocker[]>
 }
 
+// ── T2: the fourth outcome — setup work, which is not a failure ─────────────────────────────────
+//
+// A candidate whose REQUIRED operands did not bind is not recommended, not actionable and not
+// rejected: there is nothing to offer, save or govern until the binding is settled, so it mints no
+// option id and carries no card. It used to be dropped silently, which is how one arrangement
+// served 0 cards with no reason given while 114 candidates sat behind the drop.
+//
+// EVERY SENTENCE HERE IS THE SERVER'S. `sentence` is built from the binder's own verdict status,
+// and the client renders it rather than re-wording it — because "did not bind" is THREE different
+// conditions and only one of them is an absence.
+export interface UnboundOperand {
+  role: string
+  concept: string
+  operand_class: string
+  // The binder's verdict status for this role; '' when it emitted no verdict at all (honest
+  // absence — a role nobody ruled on has certainly not bound). `unresolved` is the ONLY status
+  // that means the concept is absent: `ambiguous` and `blocked` both mean the catalog CARRIES it.
+  status: string
+  reason_codes: string[]
+  resolution: string
+  // The columns the verdict was looking at — the tie's members, or the blocked candidates. These
+  // are what a human would be choosing between, so dropping them turns "adjudicate this tie" into
+  // "onboard this data": the wrong remedy, given to the wrong owner. Empty for a true absence.
+  tied_refs: string[]
+  // The operand's own answer, worded from its status. Render it; never compose over it.
+  sentence: string
+}
+
+export interface NeedsSetupCandidate {
+  name: string
+  source_definition_id: string
+  recipe_id: string | null
+  // The catalog this was PLANNED over, and no other. The projection holds no cross-catalog
+  // inventory, so it never claims another catalog has the concept — that refusal-with-directions
+  // belongs to the satisfiability check, which plans with the inventory in hand.
+  catalog_source: string
+  // Status-NEUTRAL, and deliberately not named "missing": what these concepts have in common is
+  // that they did not bind, not that they are absent (on the FTR fixture 36 of 66 unbound required
+  // operands are ambiguous — the catalog carries the concept on several columns).
+  unbound_concepts: string[]
+  unbound_operands: UnboundOperand[]
+  // One clause per unbound operand, each in the words its own status earns.
+  sentence: string
+}
+
 export interface ConsideredSetResp {
   intent_id: string
   anchor: FeatureIdea | null
@@ -1434,6 +1485,9 @@ export interface ConsideredSetResp {
   recommended_options?: OptionActionsEntry[]
   actionable_options?: OptionActionsEntry[]
   rejected_outputs?: Rejection[]
+  // T2's fourth outcome, on the v2 response only. Absent on a v1/legacy body; `[]` is the honest
+  // "every candidate bound", which is a different fact from "the server never said".
+  needs_setup?: NeedsSetupCandidate[]
   // Phase 2A — deterministic presentation-priority ranking of the ELIGIBLE recipes, present ONLY
   // when the backend ranking flag is on. Distinct from `recommendation` (the LLM starting-set pick)
   // and from `dispositions` (the per-recipe lens). `ranking_version` stamps the mapping/taxonomy
@@ -1698,6 +1752,37 @@ export interface IntakeTicket {
   // The Change-it menu (prompt v2): ranked next-best readings, subset of the catalog shortlist,
   // never the chosen target. [] on older-backend replays and honest nothing-else-comes-close.
   runners_up: string[]
+  // T7 (a) — OUTCOME OR PROXY, said out loud. `target_leakage_class` is the concept registry's own
+  // three-way split; only 'outcome' is the label itself, so anything else means the proposal
+  // ABSTAINED (`confidence: 'abstain'`). `null` = the column carries no registered concept, which
+  // asserts nothing in either direction.
+  //
+  // `target_is_proxy` is NARROWER than "not the outcome": it is true only for 'near_label', where
+  // the registry positively asserts the column borders the label. A 'standard' concept is one the
+  // registry LOOKED AT and declassified, and an unregistered one is silence — neither may be
+  // rendered as "a proxy for the outcome". Both are still uncommittable, and both still require
+  // the confirm acknowledgment; render that as withheld certification, not as adjacency.
+  target_concept: string
+  target_leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  target_is_proxy: boolean
+  // The two halves of an honest abstention, both catalog-derived: the nearest proxies (ranked,
+  // near-label first), and every outcome-family column this catalog actually HOLDS — the label
+  // the model did not pick. Neither ever changes the target; they report, they do not choose.
+  proxy_candidates: {
+    ref: string; concept: string
+    leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  }[]
+  outcome_candidates: {
+    ref: string; concept: string; leakage_class: 'outcome'
+  }[]
+  // T7 (b) — where the window came from, or why it has none. 'contradicted' means the objective's
+  // own stated horizon and the model's number disagreed: NO window was accepted and
+  // `window_refusal` names both numbers.
+  window_source: 'stated' | 'model_only' | 'unstated' | 'contradicted'
+  window_refusal: {
+    code: 'WINDOW_CONTRADICTS_GOAL'; stated_text: string; stated_days: number | null
+    ticket_days: number; detail: string
+  } | null
 }
 
 export interface IntakeResp {
@@ -1712,6 +1797,14 @@ export interface IntakeResp {
   } | null
   // The runners-up with the same one-liner material — the Change-it panel's one-click buttons.
   runner_up_details: { ref: string; catalog_source: string; concept: string; ai_summary: string }[]
+  // The abstention answer's one-liner material, same shape, in `proxy_candidates` order.
+  proxy_candidate_details: {
+    ref: string; catalog_source: string; concept: string; ai_summary: string
+  }[]
+  // ...and the same for the labels the catalog holds, in `outcome_candidates` order.
+  outcome_candidate_details: {
+    ref: string; catalog_source: string; concept: string; ai_summary: string
+  }[]
 }
 
 // One hypothesis in, one draft reading out. Cached server-side by content (hypothesis + shortlist
@@ -1736,17 +1829,33 @@ export interface IntakeReading {
   business_domain: string[]
   target_provenance: string | null
   target_confirmed_by: string | null
+  // T7 (c) — the disclosure echoed back. The SERVER's own derivation from the concept registry,
+  // never the flag the client sent: a client cannot relabel a column by acknowledging one.
+  // `target_is_proxy` is near-label ONLY — see the note on IntakeTicket.
+  target_concept: string
+  target_leakage_class: 'standard' | 'near_label' | 'outcome' | null
+  target_is_proxy: boolean
 }
 
 // Record the human's answer to the confirm screen. Author-only (403 otherwise); the signed ref is
 // validated against the read-scoped catalog server-side — a column you cannot see cannot be your
 // target; off-vocabulary domain tokens are refused, never silently dropped.
+//
+// T7 (c): confirming a target the registry does not CERTIFY as an outcome label — near_label,
+// standard or unregistered — is a 422 unless `targetNotOutcomeAcknowledged` is sent. The refusal's
+// `detail` is written per tier and is the sentence to render: it says "proxy" only where the
+// registry actually asserts label-adjacency, and withholds certification otherwise. Show the
+// server's words rather than composing your own.
+//
+// The acknowledgment is the PERSON's, so send it only once they have actually been shown that
+// sentence — passing it by default is the undisclosed commit this gate exists to stop.
 export function contractIntakeTarget(
   intentId: string,
   decision: 'confirmed' | 'corrected' | 'exploring',
   opts: {
     targetRef?: string; targetWindowDays?: number; targetType?: string
     businessDomain?: string[]; catalogSource?: string
+    targetNotOutcomeAcknowledged?: boolean
   } = {},
 ): Promise<IntakeReading> {
   return post('/contract/intake/target', {
@@ -1757,6 +1866,7 @@ export function contractIntakeTarget(
     target_type: opts.targetType ?? null,
     business_domain: opts.businessDomain ?? [],
     catalog_source: opts.catalogSource ?? null,
+    target_not_outcome_acknowledged: opts.targetNotOutcomeAcknowledged ?? false,
   })
 }
 
@@ -3531,6 +3641,10 @@ export interface SemanticEngineEntry {
   // D4 (UI-05): the PROJECTED card — the same FeatureIdea carrier the Workbench renders,
   // serialized by the same function server-side. Absent on pre-D4 deployments.
   card?: FeatureIdea | null
+  // T2: present (non-null) exactly when `card` is null for T2's reason — the two are the two
+  // halves of one answer, and an entry never carries both. Its `sentence` is why this entry has
+  // no card, in the binder's own words.
+  needs_setup?: NeedsSetupCandidate | null
   recipe_id: string
   binding_state: string          // bound | ambiguous | missing | blocked
   readiness: string              // the authored RECIPE_READINESS value

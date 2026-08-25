@@ -165,8 +165,11 @@ describe('permissions', () => {
     await user.type(within(row).getByLabelText(/tier/i), 'edp')
     await user.click(within(row).getByRole('button', { name: /declare/i }))
 
-    expect(await screen.findByRole('alert'))
-      .toHaveTextContent(/needs the platform-admin role. You can see them, not edit them/i)
+    // T9: this used to render one hardcoded sentence for every 403 on this panel, throwing away
+    // the server's own. The role the route actually named is the only one that can be right.
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('requires the platform-admin role')
+    expect(alert).not.toHaveTextContent(/You can see them, not edit them/i)
   })
 
   it('surfaces the conflict when a second route claims one engine and tier', async () => {

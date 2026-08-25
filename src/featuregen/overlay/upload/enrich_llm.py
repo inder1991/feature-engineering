@@ -74,6 +74,27 @@ from featuregen.overlay.upload.enrich_batch import (
     BatchItemOutcome,
     validate_batch_results,
 )
+
+# A NEW module-import edge, deliberately: this pulls `recipe_contract_v2` — and through it
+# `formula.schema_v3` — into every import of this module, where neither was loaded before. It is
+# top-level rather than lazy because the `feature_intents` v2 body must exist in `_SCHEMAS` at
+# import time: `register_enrichment_schemas` sweeps the dict, and the provider-compatibility
+# ratchet (tests/featuregen/intake/test_schema_projection.py) iterates it directly, so a body
+# registered on first use would be SILENTLY skipped by the sweep meant to protect it. A
+# function-level import called from module scope would look lazy while changing nothing.
+# The bargain: a broken `recipe_contract_v2`/`schema_v3` now fails enrichment-schema registration
+# too. That is a widening, not a new class of exposure — this module already loads ten
+# `featuregen.formula.*` modules transitively — but it is the reason to keep this import narrow:
+# vocabularies only, never behaviour.
+from featuregen.overlay.upload.recipe_contract_v2 import (
+    ADDITIVITY,
+    CUTOFF_INCLUSIVITY,
+    OPERAND_CLASSES,
+    OUTPUT_TYPES,
+    TEMPORAL_ANCHOR_KINDS,
+    UNIT_KINDS,
+    WINDOW_UNITS,
+)
 from featuregen.overlay.upload.sanitize import sanitize_definition
 from featuregen.overlay.upload.taxonomy.recognition_schema import (
     USE_CASE_RECOGNITION_V2_SCHEMA,
@@ -1591,10 +1612,15 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "properties": {"pick": {"type": "string", "maxLength": 64}},
         "required": ["pick"]},
     # SE-6 — abstract feature intents: meaning WITHOUT columns. The schema carries NO field that
-    # could name physical data (no table/column/ref/SQL fields exist to fill), vocabularies are
-    # enum-closed where the contract's are, and every item is re-parsed code-side through the
-    # STRICT FeatureIntent parser (unknown/physical keys are named refusals; one malformed item
-    # never fails its siblings).
+    # could name physical data (no table/column/ref/SQL fields exist to fill), and every item is
+    # re-parsed code-side through the STRICT FeatureIntent parser (unknown/physical keys are named
+    # refusals; one malformed item never fails its siblings).
+    #
+    # v1 is BYTE-FROZEN: it is the contract every recorded `llm_call` was produced under, and the
+    # closed vocabularies it does NOT declare are exactly the reason v2 exists (below). Only
+    # `computation_kind` carries a vocabulary here; `output_type`, `unit_kind`, `additivity`,
+    # `operand_class`, `anchor_kind`, `window_unit` and `cutoff_inclusivity` are bare strings the
+    # parser then closes — the gap that rejected 8 of 8 intents on the 2026-08-24 AML run.
     ("feature_intents", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {
@@ -1897,6 +1923,49 @@ def _feature_ideas_with_grounding() -> dict:
 
 
 _SCHEMAS[("feature_ideas", 5)] = _feature_ideas_with_grounding()
+
+
+def _feature_intents_with_closed_vocabularies() -> dict:
+    """v2 = the v1 body plus the closed vocabularies the PARSER has always enforced.
+
+    v1 promised more than the parser accepts: seven fields rode as bare strings while
+    `feature_intent`/`recipe_contract_v2` closed them at construction, so a model answering
+    `unit_kind: days` produced a structurally VALID response every item of which was then
+    refused. The 2026-08-24 AML run lost 8 of 8 intents that way.
+
+    DERIVED from v1 (deep copy, then one vocabulary per field) rather than restated, for the
+    reason `_feature_ideas_with_grounding` is derived — and the tuples are IMPORTED from the
+    recipe contract, never re-spelled, because a re-spelled vocabulary drifting from the parser's
+    is the very defect this version closes.
+
+    `x-wire-enum`, not a canonical `enum`: the wire is where a vocabulary earns its keep (a
+    compliant provider cannot spell `days` at all), while the canonical body stays lenient so
+    RESPONSE validation keeps this seam's law — one malformed item rejects THAT item, never its
+    siblings. The closure the code trusts is `feature_intent_generation`'s, per item, loud.
+
+    `operation_class` is deliberately left bare: it is OPTIONAL and must be EMPTY on a conceptual
+    pattern, so a wire enum listing only result classes would push a model with no honest
+    operation into claiming one. The parser closes it per item; no live rejection came from it.
+
+    Growing any tuple below means registering a v3 here — never editing a published version, or
+    one version number means two things across deployments (`use_case_recognition` v2's rule)."""
+    import copy
+
+    body = copy.deepcopy(_SCHEMAS[("feature_intents", 1)])
+    item = body["properties"]["intents"]["items"]["properties"]
+    output = item["output"]["properties"]
+    output["output_type"]["x-wire-enum"] = list(OUTPUT_TYPES)
+    output["unit_kind"]["x-wire-enum"] = list(UNIT_KINDS)
+    output["additivity"]["x-wire-enum"] = list(ADDITIVITY)
+    item["operands"]["items"]["properties"]["operand_class"]["x-wire-enum"] = list(OPERAND_CLASSES)
+    temporal = item["temporal"]["properties"]
+    temporal["anchor_kind"]["x-wire-enum"] = list(TEMPORAL_ANCHOR_KINDS)
+    temporal["window_unit"]["x-wire-enum"] = list(WINDOW_UNITS)
+    temporal["cutoff_inclusivity"]["x-wire-enum"] = list(CUTOFF_INCLUSIVITY)
+    return body
+
+
+_SCHEMAS[("feature_intents", 2)] = _feature_intents_with_closed_vocabularies()
 
 # C-C11 — the S4 policy producer's output. A proposal for how ONE governed policy is realized over
 # ONE bound column: which column carries it, and what the source's physical spelling of each

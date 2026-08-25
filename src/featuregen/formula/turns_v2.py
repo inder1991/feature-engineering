@@ -31,6 +31,7 @@ from featuregen.formula.turns import (
     TURN_TYPE_FINAL_PROPOSAL,
     TURN_TYPE_TOOL_CALL,
 )
+from featuregen.intake.schema_projection import declare_enum_types
 
 __all__ = [
     "AUTHOR_TURN_SCHEMA_ID_V2",
@@ -49,15 +50,26 @@ _proposal_v2 = json.loads(
 _PROPOSAL_V2_NODE: dict = {
     k: v for k, v in _proposal_v2.items() if k not in ("$schema", "$id", "title", "$defs")}
 
+#: ▲ **AND EVERY ENUM DECLARES ITS TYPE** (2026-08-24) — v2 carried the identical defect v3 was
+#: diagnosed with, because both inherit the same bare-enum idiom from their proposal ``$defs``
+#: (``"type": {"enum": [...]}`` with no ``"type"`` keyword). Legal JSON Schema; refused by the
+#: provider's structured-output subset, which requires every subschema to declare what it is.
+#: Fifteen of them here (46 across v1/v2/v3). Purely additive to VALIDATION — the members already
+#: state the type — and the canonical ``proposal_v2.schema.json`` is still never touched.
+#: ▲ It DOES move v2's ``schema_content_hash`` and every identity derived from it, exactly as it
+#: moves v3's. See ``turns_v3.py`` for the live diagnostic this came out of, for the identity
+#: consequence in full, and for why the transform is applied per DEFINITION rather than to ``$defs``.
 _PROPOSAL_V2_DEFS: dict = {
-    **_proposal_v2["$defs"],
-    "aggregateExpression": {
-        **_proposal_v2["$defs"]["aggregateExpression"],
-        "properties": {
-            **_proposal_v2["$defs"]["aggregateExpression"]["properties"],
-            "aggregation": {"type": "string"},
+    _name: declare_enum_types(_node) for _name, _node in {
+        **_proposal_v2["$defs"],
+        "aggregateExpression": {
+            **_proposal_v2["$defs"]["aggregateExpression"],
+            "properties": {
+                **_proposal_v2["$defs"]["aggregateExpression"]["properties"],
+                "aggregation": {"type": "string"},
+            },
         },
-    },
+    }.items()
 }
 
 # ``formulaBody`` is a oneOf over the four shapes; the discriminating ``final_operation`` const/enum

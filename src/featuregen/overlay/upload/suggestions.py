@@ -358,12 +358,21 @@ def semantic_parity_block(conn, *, catalog_source: str, table: str, roles=()) ->
         idea.source_definition_id: _idea_json(idea)
         for idea in (*projection.ideas, *projection.actionable_ideas)
         if idea.source_definition_id}
+    # T2: the projection now serves NO card for a candidate whose REQUIRED operands did not
+    # bind, so `card` is null for those entries. That absence gets its reason here rather than
+    # being left for a reader to infer from a missing key: the entry says WHICH concepts this
+    # table's catalog would have to carry. The block's `verdicts` already carry the per-role
+    # detail; this is the candidate-level summary, and it is what T9 renders.
+    needs_setup_by_definition = {
+        entry.source_definition_id: entry.to_json()
+        for entry in projection.needs_setup if entry.source_definition_id}
 
     def _entry(item) -> dict:
         candidate = item.candidate
+        key = getattr(candidate, "variant_key", "") or candidate.recipe_id
         return {
-            "card": cards_by_definition.get(
-                getattr(candidate, "variant_key", "") or candidate.recipe_id),
+            "card": cards_by_definition.get(key),
+            "needs_setup": needs_setup_by_definition.get(key),
             "recipe_id": candidate.recipe_id,
             "binding_state": candidate.binding_state,
             "readiness": candidate.readiness,

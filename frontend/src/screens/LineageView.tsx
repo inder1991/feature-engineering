@@ -1711,9 +1711,18 @@ function Drawer({
           <p className="ln-drawer-sub">registered feature</p>
           <div className="ln-drawer-chips">
             <Flag tone="feat">feature</Flag>
-            {/* the honest verification stamp: gauntlet-passed, NOT a production-value claim — a soft
-                ok chip, quieter than the solid state chips (predictive value stays unverified) */}
-            {node.verification && <Flag tone="ok">{node.verification}</Flag>}
+            {/* The honest verification stamp: gauntlet-passed, NOT a production-value claim — a
+                soft ok chip, quieter than the solid state chips (predictive value stays
+                unverified). THE TONE FOLLOWS THE STAMP: since T2/T3 the server derives this from
+                the recipe's readiness as well as the gauntlet, so a feature legitimately reads
+                UNVERIFIED, and an ok-toned chip over that word would be exactly the
+                confidence-without-warrant the stamp exists to remove. Same expression as the
+                Workbench candidate chip. */}
+            {node.verification && (
+              <Flag tone={node.verification === 'UNVERIFIED' ? 'stale' : 'ok'}>
+                {node.verification}
+              </Flag>
+            )}
             {node.stale && <Flag tone="stale">stale</Flag>}
           </div>
           <dl className="ln-drawer-kv">
