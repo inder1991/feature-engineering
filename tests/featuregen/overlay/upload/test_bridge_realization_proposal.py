@@ -51,10 +51,12 @@ from featuregen.overlay.upload.bridge_realization_proposal import (
     DIRECTIONAL_CARDINALITY_FANS_OUT,
     DIRECTIONAL_MAPPING_INCOMPLETE,
     ENDPOINT_COLUMN_NOT_READABLE,
+    IDENTIFIER_LINK_CANDIDATE_WITHDRAWN,
     IDENTIFIER_LINK_NOT_AVAILABLE,
     REALIZATION_DEMOTED,
     REALIZATION_ENVIRONMENT_MISMATCH,
     REALIZATION_PIN_SUPERSEDED,
+    REALIZATION_PURPOSE_MISMATCH,
     REALIZATION_REVISION_NOT_FOUND,
     SOURCE_BINDING_REVISION_MISSING,
     UNMATCHED_ROW_CONTRADICTION,
@@ -68,10 +70,12 @@ from featuregen.overlay.upload.bridge_realization_proposal import (
 from featuregen.overlay.upload.bridge_store import (
     BridgeDependencyRefV1,
     append_realization_revision,
+    bridge_candidate_currentness,
     bridge_dependency_snapshot_id,
     demote_realization_revision,
     executable_bridge_realizations,
     load_current_bridge_realizations,
+    record_candidate_assessment,
     record_realization_revision,
 )
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -269,7 +273,10 @@ def _assess(db, produced, **overrides):
     return assess_realization_for_preview(db, **values)
 
 
-def _stored_fanout_revision(db, *, cardinality: Cardinality, predicates=()):
+def _stored_fanout_revision(
+    db, *, cardinality: Cardinality, predicates=(),
+    purposes: tuple[str, ...] = ("feature_generation",),
+):
     """A stored revision the PRODUCER would never mint (known fan-out / unresolved key), built
     through the append half so the assessment's refusal rows are reachable."""
     left, right = _executable_pair(
@@ -302,6 +309,7 @@ def _stored_fanout_revision(db, *, cardinality: Cardinality, predicates=()):
     )
     revision = replace(
         base,
+        applicability_scope=replace(base.applicability_scope, purposes=purposes),
         cardinality_basis=CardinalityBasis.EXACT_PROFILE,
         dependency_snapshot_id=bridge_dependency_snapshot_id(dependencies),
     )
@@ -476,6 +484,35 @@ def test_rejected_link_refuses_production(db) -> None:
     assert refusal.value.code == IDENTIFIER_LINK_NOT_AVAILABLE
 
 
+def test_candidate_currentness_tri_state_none_allows_false_refuses_production(db) -> None:
+    """The tri-state contract, pinned distinctly: ``bridge_candidate_currentness`` returns
+    ``None`` for a link with NO candidate record (a directly governed legacy bridge — generic
+    lifecycle behavior preserved, production proceeds), ``True`` while the candidate is active,
+    and ``False`` ONLY for an explicit automatic withdrawal — which fails closed by name.
+    ``is False`` is the load-bearing spelling: a falsy-``None`` check would refuse every legacy
+    bridge."""
+    _seed_graph(db)
+    _seed_bindings(db)
+    link = _link(db)
+
+    assert bridge_candidate_currentness(db, FACT) is None
+    produced = _produce(db, link)
+    assert produced.revision is not None
+
+    record_candidate_assessment(db, link.assessment, expected_pointer_version=0)
+    assert bridge_candidate_currentness(db, FACT) is True
+    assert _produce(db, link).revision.realization_revision_id == \
+        produced.revision.realization_revision_id
+
+    db.execute(
+        "UPDATE governed_candidate_current SET lifecycle='withdrawn' WHERE candidate_id=%s",
+        (link.assessment.candidate_id,))
+    assert bridge_candidate_currentness(db, FACT) is False
+    with pytest.raises(ProvisionalRealizationRefused) as refusal:
+        _produce(db, link)
+    assert refusal.value.code == IDENTIFIER_LINK_CANDIDATE_WITHDRAWN
+
+
 def test_the_ai_proposed_evidence_is_recorded_verbatim(db) -> None:
     """Obligation 6: the proposal's provenance rides the revision — recorded, never upgraded."""
     _seed_graph(db)
@@ -637,6 +674,51 @@ def test_a_rejected_link_refuses_its_pinned_realization(db) -> None:
     result = _assess(db, produced)
     assert result.verdict is PreviewAssessmentVerdictV1.REFUSED
     assert IDENTIFIER_LINK_NOT_AVAILABLE in result.reason_codes
+
+
+def test_a_withdrawn_candidate_refuses_the_pinned_realization(db) -> None:
+    """The matrix's withdrawn/revoked row, second mechanism: the LINK stream may still fold
+    available while the governed CANDIDATE behind it was withdrawn by a complete derivation —
+    the assessment re-reads the tri-state and refuses on exactly ``is False``."""
+    _seed_graph(db)
+    _seed_bindings(db)
+    link = _link(db)
+    produced = _produce(db, link)
+    record_candidate_assessment(db, link.assessment, expected_pointer_version=0)
+    db.execute(
+        "UPDATE governed_candidate_current SET lifecycle='withdrawn' WHERE candidate_id=%s",
+        (link.assessment.candidate_id,))
+    assert bridge_candidate_currentness(db, FACT) is False
+    result = _assess(db, produced)
+    assert result.verdict is PreviewAssessmentVerdictV1.REFUSED
+    assert IDENTIFIER_LINK_CANDIDATE_WITHDRAWN in result.reason_codes
+
+
+def test_a_purpose_the_scope_never_granted_refuses(db) -> None:
+    """A revision whose applicability scope does not grant feature_generation cannot serve a
+    feature-generation preview, whatever else agrees."""
+    revision = _stored_fanout_revision(
+        db, cardinality=Cardinality.MANY_TO_ONE, purposes=("model_scoring",))
+    result = assess_realization_for_preview(
+        db,
+        pinned_realization_revision_id=revision.realization_revision_id,
+        pinned_dependency_snapshot_id=revision.dependency_snapshot_id,
+        environment_id="pilot")
+    assert result.verdict is PreviewAssessmentVerdictV1.REFUSED
+    assert result.reason_codes == (REALIZATION_PURPOSE_MISMATCH,)
+
+
+def test_a_binding_revision_that_vanished_refuses_at_assessment_time(db) -> None:
+    """The producer verified the binding revision was persisted; the assessment must RE-verify —
+    a revision row gone (or rewritten) between pin and preview is the assessment-side
+    SOURCE_BINDING_REVISION_MISSING, distinct from the producer's honest-absence refusal."""
+    produced = _produced(db)
+    db.execute(
+        "DELETE FROM physical_dataset_binding_revision WHERE binding_revision_id=%s",
+        (produced.revision.from_endpoint.binding_revision_id,))
+    result = _assess(db, produced)
+    assert result.verdict is PreviewAssessmentVerdictV1.REFUSED
+    assert SOURCE_BINDING_REVISION_MISSING in result.reason_codes
 
 
 def test_unknown_pin_refuses_not_found(db) -> None:
