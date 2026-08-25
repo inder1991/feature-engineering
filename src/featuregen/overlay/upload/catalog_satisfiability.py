@@ -90,10 +90,12 @@ on an exploratory gesture "aim at ftr instead" is MORE useful than a page of set
 
 Two measured cautions about that width, both worth knowing before reading a broaden verdict:
 
-* At n=317 the ``measure`` class asks for ~90 different concepts, so ONE column of almost any
-  magnitude covers it. The floor at broaden width therefore refuses a catalog carrying no magnitude
-  AT ALL — not one that is merely narrow. That is the intended severity, and it is why the refusing
-  fixture has to be a customer master with no numeric measure on it.
+* At n=317 the ``measure`` class asks for 61 distinct concepts (measured, required-only), so ONE
+  column carrying any of those 61 covers it — and it need not be numeric: the flipping example in
+  the second caution, ``customer_risk_rating``, is a text rating asked as a required measure. The
+  floor at broaden width therefore refuses a catalog covering NONE of the measure class's concepts
+  — not one that is merely narrow. That is the intended severity, and it is why the refusing
+  fixture is a customer master carrying none of those 61.
 * Consequently the verdict is sensitive to a single column. Measured: the 4-concept cib fixture
   (``customer_id``, ``event_timestamp``, ``category_code``, ``boolean_flag``) REFUSES a broaden;
   adding one ``customer_risk_rating`` column makes it SERVE, because some recipe in the 317 asks
@@ -259,8 +261,9 @@ def _catalog_concepts(conn, *, catalog_source: str, roles) -> frozenset[str]:
 
     ``concept <> ''`` rides beside ``IS NOT NULL`` because the loader's own filter is the truthiness
     test ``if col.concept``, which drops the empty string as well as NULL. Without it a column
-    enriched to '' would be a KEY in this set and not in the context's index — a coverage claim the
-    binder could not honour, in the one direction that matters (it would suppress a refusal)."""
+    enriched to '' would be a KEY in this set and not in the context's index. (Measured: a ''
+    key is INERT — the registry's closure functions return empty for it, so it can never make
+    _covered true; the filter's justification is alignment with the loader, nothing more.)"""
     rows = conn.execute(
         "SELECT DISTINCT concept FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s AND concept IS NOT NULL "
