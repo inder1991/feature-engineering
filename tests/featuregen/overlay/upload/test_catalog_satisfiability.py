@@ -9,6 +9,23 @@ The floor's own edges get their own tests, because the floor is the design decis
 it is CLASS-level (an earlier concept-level cut refused a catalog that serves cards today), the bar
 is a MAJORITY (a lower one refuses every catalog over the known ``status`` mapping gap), and a tie
 serves rather than refuses.
+
+**Both of those decisions are mutation-proved, and the proof is recorded because the first attempt
+at it was wrong.** Scope for every figure below: this file plus
+``tests/featuregen/api/test_contract_catalog_satisfiability.py`` — 18 tests.
+
+* **The unit (class vs concept).** Mutating ``assess_catalog_satisfiability``'s coverage test from
+  "no concept in this class is covered" to "any concept in this class is uncovered" — i.e. back to
+  the concept-level cut — kills **12 of 18**. It previously killed ZERO, over the entire 8,049-test
+  gate, because ``test_a_missing_entity_concept_never_refuses_a_catalog_whose_class_is_covered``
+  built ONE catalog: with nothing to point at, sentence 5 dropped the breach and the test passed
+  under both cuts. One fixture line — a second catalog carrying ``account_id`` — is the whole fix,
+  and it is called out in that test's own docstring so it cannot be removed as decoration.
+* **The bar (strict majority).** Relaxing ``>`` to ``>=`` kills **exactly 1 of 18**:
+  ``test_an_exact_fifty_percent_tie_serves_rather_than_refuses``. That test had to be rewritten to
+  earn it — the earlier version used ``customer.clv`` (5 eligible, floor ``5//2`` = 2, measure
+  2/5 = 40%), where a ``>=`` mutant means "at or below half refuses" rather than "a tie refuses".
+  It now uses ``credit.collections.workout``: EIGHT eligible, floor 4, measure exactly 4 = 50.0%.
 """
 from __future__ import annotations
 
