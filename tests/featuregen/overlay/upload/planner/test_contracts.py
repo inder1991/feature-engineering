@@ -159,12 +159,26 @@ def test_make_binding_plan_rejects_over_budget_bridges():
 
 # ---- 3B.3c (Task C1): version split + contract/declaration axes + contract_id identity ----
 
-# Captured from HEAD (99e9bb5) BEFORE the version split, by running make_binding_plan on the
-# pre-change code with exactly the inputs below. Proves the plan_id->physical_plan_id rename and
-# the PLAN_CONTRACT_VERSION bump moved NO physical id (F1): the material tail swapped from
-# PLAN_CONTRACT_VERSION ("3b3b.1.0.0" at capture time) to the frozen PHYSICAL_PLAN_VERSION,
-# which is byte-identical.
-_PINNED_3B3B_ID = "bp_60a22f0fbec4b0e6"
+# REGENERATED at A5 (cross-catalog Stage 1), 2026-08-26 — a DECLARED identity change, in the same
+# commit as the change that caused it. A5 made the transition physics cross a governed bridge over
+# its COMPLETE ordered endpoint tuples instead of a single collapsed member, which moves WHICH
+# paths the frontier enumerates, so PLANNER_VERSION bumped 3b3a.1.0.0 -> 3b3a.2.0.0 and every
+# physical id minted under it moved ONCE, deliberately.
+#
+#   pre-A5 (captured from HEAD 99e9bb5, before the 3B.3c version split): bp_60a22f0fbec4b0e6
+#   post-A5 (this pin):                                                  bp_1590383d27f56ac3
+#
+# What the pin STILL proves is unchanged and is the reason it is kept rather than deleted: with
+# PLANNER_VERSION held fixed, the plan_id->physical_plan_id rename and PLAN_CONTRACT_VERSION bumps
+# move NO physical id (F1) — the assertions below hold PHYSICAL_PLAN_VERSION and
+# PLAN_CONTRACT_VERSION at their frozen values, so a bump of either would fail here, and only a
+# deliberate PLANNER_VERSION change (which is itself pinned, in
+# `test_logical_resolution.py::test_the_planner_version_bumped_with_the_composite_crossing_change`)
+# may move this literal.
+_PINNED_3B3B_ID = "bp_1590383d27f56ac3"
+#: The pre-A5 value, named so a silent revert of the declared bump fails loudly instead of
+#: quietly restoring ids the planner no longer produces.
+_PRE_A5_3B3B_ID = "bp_60a22f0fbec4b0e6"
 
 
 def _dt(y, m, d):
@@ -201,8 +215,11 @@ def test_version_split_keeps_physical_id_stable():
         path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,
         primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
         preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.selected)
-    # this exact id was recorded from HEAD before the version split — proves the rename+bump didn't move it
+    # This exact id is recorded at the CURRENT PLANNER_VERSION: with the two frozen versions above
+    # held, the rename and every PLAN_CONTRACT_VERSION bump move nothing. It moved once, at A5,
+    # with the declared PLANNER_VERSION bump — and never silently back.
     assert p.physical_plan_id == _PINNED_3B3B_ID
+    assert p.physical_plan_id != _PRE_A5_3B3B_ID
     assert p.contract_resolution_status is c.ContractResolutionStatus.not_compiled
     assert p.declaration_status is c.DeclarationStatus.not_compiled
     assert p.audit_envelope is None

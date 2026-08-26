@@ -24,7 +24,15 @@ from featuregen.overlay.upload.taxonomy.versions import (
     RECIPE_REGISTRY_VERSION as RECIPE_REGISTRY_VERSION,
 )
 
-PLANNER_VERSION = "3b3a.1.0.0"
+# A5 (cross-catalog Stage 1) — DECLARED IDENTITY CHANGE, 3b3a.1.0.0 -> 3b3a.2.0.0. The transition
+# physics now cross a bridge over its COMPLETE ordered endpoint tuples instead of a single
+# collapsed member, so WHICH plans exist and WHAT a `governed_bridge` segment says both moved: a
+# composite link that used to be crossed on its first member pair alone (or not at all, when that
+# member was not the entity key) is now crossed as one composite join, or refused. A planner whose
+# path enumeration changed may not keep the version every stored physical id was minted under —
+# that is exactly the masquerade PLANNER_VERSION exists to prevent — so every `bp_`/`cc_` moves
+# ONCE, deliberately, with regenerated literal pins in the same commit.
+PLANNER_VERSION = "3b3a.2.0.0"
 # The BindingPlanV1 SCHEMA version (contract shape). 3B.3c split it out of the physical-id
 # material: it may bump freely as fields are added without moving any physical_plan_id.
 PLAN_CONTRACT_VERSION = "3b3c.2.0.0"
@@ -407,6 +415,16 @@ class BindingPathSegmentV1:
     bridge_to_catalog_source: str | None = None
     bridge_to_object_ref: str | None = None
     bridge_realization_revision: BridgeJoinRealizationRevisionV1 | None = None
+    # A5 — the crossing's COMPLETE ordered endpoint tuples, as graph object refs
+    # (`schema.table.column`, the spelling the two thin fields above use), paired POSITIONALLY:
+    # `bridge_from_member_refs[i]` joins `bridge_to_member_refs[i]`. A composite link is one join
+    # over N column pairs, and collapsing it to `members[0]` silently plans a DIFFERENT join —
+    # measured by a probe against the pre-A5 assembler. The two thin `*_object_ref` fields stay as
+    # the first-member compat surface (exact for a single-member link). Defaulted + appended, and
+    # deliberately NOT physical-id material: `_segment_physical_identity` hashes the realization
+    # revision / realization ref / bridge fact key, never an endpoint address.
+    bridge_from_member_refs: tuple[str, ...] = ()
+    bridge_to_member_refs: tuple[str, ...] = ()
 
 
 # ---- 3B.3c contract-compiler evidence (computed onto the plan; persisted only in 3B.4) ----

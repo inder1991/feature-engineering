@@ -358,11 +358,26 @@ def test_no_compile_ctx_leaves_every_plan_not_compiled(db):
 # from ONE shared material builder so the two can never drift apart.
 # ---------------------------------------------------------------------------------------------
 
-# Identity pins captured on the PRE-change checkout (task S1A-4a), by running the `_c8_fixture`
-# compile flow below before `output_grain_ref` / `anchor_catalog_source` existed. Both new fields
-# are non-identity-bearing: neither may move a physical plan id or a contract id.
-_PINNED_C8_CROSS_PHYSICAL_PLAN_ID = "bp_0adcb0a8c5748e1a"
-_PINNED_C8_CROSS_CONTRACT_ID = "cc_095c221534f53e67"
+# Identity pins over the `_c8_fixture` compile flow below.
+#
+# REGENERATED at A5 (cross-catalog Stage 1), 2026-08-26 — a DECLARED identity change, in the same
+# commit as the change that caused it. A5 crosses a governed bridge over its COMPLETE ordered
+# endpoint tuples instead of a single collapsed member, which changes WHICH paths the frontier
+# enumerates, so PLANNER_VERSION bumped 3b3a.1.0.0 -> 3b3a.2.0.0. `PLANNER_VERSION` is inside
+# `_physical_plan_material`, so every `bp_` moved; `make_contract_id` anchors on the
+# physical_plan_id, so every `cc_` moved with it. ONE deliberate move, not a drift:
+#
+#   pre-A5:  bp_0adcb0a8c5748e1a / cc_095c221534f53e67   (captured on the S1A-4a pre-change checkout)
+#   post-A5: bp_8dd6d5d4fb15b1e0 / cc_9d4c09656e1e0e72
+#
+# What these pins prove is UNCHANGED and is why they are regenerated rather than deleted: at a
+# FIXED planner version, the non-identity plan facts (`output_grain_ref`, `anchor_catalog_source`,
+# `unmet_hop`) and A5's own new segment fields (`bridge_from_member_refs` /
+# `bridge_to_member_refs`) may not move a physical plan id or a contract id. That property is
+# measured by these literals every run — this fixture's link is single-member, so its segment
+# gained populated member tuples and its id still comes only from the planner-version tail.
+_PINNED_C8_CROSS_PHYSICAL_PLAN_ID = "bp_8dd6d5d4fb15b1e0"
+_PINNED_C8_CROSS_CONTRACT_ID = "cc_9d4c09656e1e0e72"
 
 
 def test_resolved_cross_catalog_plan_carries_a_qualified_output_grain(db):

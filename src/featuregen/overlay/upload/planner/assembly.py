@@ -187,16 +187,62 @@ def _scoped_bridges(conn, entity_id: str, scope: CatalogScopeV1) -> tuple[Active
                  and b.left_catalog_source in allowed and b.right_catalog_source in allowed)
 
 
-def _other_endpoint(bridge: ActiveBridgeV1, catalog: str, column_ref: str) -> tuple[str, str] | None:
-    """The bridge endpoint OPPOSITE ``(catalog, column_ref)``. Bridges are UNORDERED/symmetric —
-    the current endpoint may be stored left OR right — so both storage orders are normalized.
-    None when neither endpoint is the current column (exact continuity: an endpoint on any other
-    table/column is unusable from here)."""
-    if (bridge.left_catalog_source, bridge.left_object_ref) == (catalog, column_ref):
-        return bridge.right_catalog_source, bridge.right_object_ref
-    if (bridge.right_catalog_source, bridge.right_object_ref) == (catalog, column_ref):
-        return bridge.left_catalog_source, bridge.left_object_ref
+def _member_refs(refs: tuple[str, ...], thin_ref: str) -> tuple[str, ...]:
+    """One endpoint's ORDERED members as graph object refs (``schema.table.column``).
+
+    ``ActiveBridgeV1.left_member_refs`` / ``right_member_refs`` are canonical logical refs
+    (``source::schema.table.column``); the catalog rides separately on the endpoint, exactly as it
+    does for the thin ``*_object_ref`` fields and for ``_table_columns``' rows, so it is stripped
+    here rather than compared twice. A value carrying NO tuples is a hand-built thin
+    ``ActiveBridgeV1`` (never one from ``active_bridges``): it degrades to its single legacy ref,
+    which is the whole of what such a value says — no composite information is being discarded,
+    because none was ever carried."""
+    if not refs:
+        return (thin_ref,)
+    return tuple(ref.split("::", 1)[-1] for ref in refs)
+
+
+def _crossing_endpoints(bridge: ActiveBridgeV1, catalog: str, present_columns: frozenset[str],
+                        ) -> tuple[tuple[str, ...], str, tuple[str, ...]] | None:
+    """The bridge's NEAR and FAR endpoints seen from a position at ``catalog`` whose table exposes
+    ``present_columns`` — with BOTH endpoints' COMPLETE ordered member tuples.
+
+    A5. This replaces the single-column ``_other_endpoint`` match, which asked only whether ONE
+    column was AN endpoint. A composite link (``source_system`` + ``customer_number``) has one
+    endpoint made of several columns, and matching a single member of it plans a DIFFERENT,
+    weaker join — one column pair instead of the declared key — while silently discarding the
+    rest. So the near endpoint matches only when EVERY one of its ordered members is a column of
+    the CURRENT table: the whole key must live here, or the crossing is not available from here.
+
+    Bridges stay UNORDERED/symmetric — the current side may be stored left OR right, and both
+    storage orders are normalized. Fail-closed, never a guess:
+
+    * an endpoint whose members are not all present is not the near side;
+    * endpoints of DIFFERENT arity have no positional pairing, so the bridge is unusable here (the
+      same refusal ``bridge_projection.ordered_member_pairs`` makes rather than inventing a
+      mapping);
+    * neither endpoint matching returns ``None`` (exact physical continuity, as before).
+
+    Returns ``(near_member_refs, far_catalog_source, far_member_refs)`` — ordered, paired
+    positionally, and complete."""
+    left = _member_refs(bridge.left_member_refs, bridge.left_object_ref)
+    right = _member_refs(bridge.right_member_refs, bridge.right_object_ref)
+    if len(left) != len(right):
+        return None
+    if bridge.left_catalog_source == catalog and all(r in present_columns for r in left):
+        return left, bridge.right_catalog_source, right
+    if bridge.right_catalog_source == catalog and all(r in present_columns for r in right):
+        return right, bridge.left_catalog_source, left
     return None
+
+
+def _far_endpoint_table(far_refs: tuple[str, ...]) -> str | None:
+    """The ONE table every far member lives on, or ``None`` when they are spread across tables.
+
+    A composite endpoint whose members sit on different tables describes no single join to land
+    on, so the crossing is refused rather than resolved to whichever table happened to be first."""
+    tables = {table_of(ref) for ref in far_refs}
+    return tables.pop() if len(tables) == 1 else None
 
 
 def realize_in_place(conn, pos: _Position, hop: EntityRelationshipRefV1,
@@ -237,10 +283,18 @@ def rollup_bridges(conn, pos: _Position, hop: EntityRelationshipRefV1,
     """(B) Enumerate a provisional semantic hop by CROSSING catalogs: the current table holds a
     ``hop.to_entity``-keyed FK column, an AVAILABLE in-scope bridge at that entity is anchored on
     exactly that column, and the far endpoint's table is genuinely ``hop.to_entity``-grain.
-    Emits ``semantic_rollup`` + ``governed_bridge`` (with the bridge's fact_key). Deterministic:
-    sorted by ``(far_catalog, far_column_ref, fact_key)``. ``()`` when nothing matches. The
-    returned crossing is not production-executable until
-    :func:`attach_executable_bridge_realizations` binds an exact directional realization."""
+    Emits ``semantic_rollup`` + ``governed_bridge`` (with the bridge's fact_key AND both
+    endpoints' COMPLETE ordered member tuples). Deterministic: sorted by ``(far_catalog,
+    first far member ref, fact_key)``. ``()`` when nothing matches. The returned crossing is not
+    production-executable until :func:`attach_executable_bridge_realizations` binds an exact
+    directional realization.
+
+    A5 — the crossing is enumerated per BRIDGE over :func:`_crossing_endpoints`, not per column:
+    the near endpoint's whole ordered key must live on the current table, and at least one of its
+    members must be governed as an ``hop.to_entity`` key (the FK reading, unchanged — for a
+    single-member endpoint this is the identical condition the per-column walk applied). A
+    composite endpoint therefore either crosses as ONE join over all its column pairs, or does not
+    cross at all; it can no longer cross as its first member alone."""
     if pos.entity != hop.from_entity:
         return ()   # self-guard: the physics never realizes a hop from a mismatched position
     if pos.catalog not in scope.authorized_catalog_sources:
@@ -248,40 +302,45 @@ def rollup_bridges(conn, pos: _Position, hop: EntityRelationshipRefV1,
     bridges = _scoped_bridges(conn, hop.to_entity, scope)
     if not bridges:
         return ()
+    present = frozenset(col_ref for col_ref, _is_grain
+                        in _table_columns(conn, pos.catalog, pos.table_ref))
     keyed: list[tuple[tuple[str, str, str], _Move]] = []
-    for col_ref, _is_grain in _table_columns(conn, pos.catalog, pos.table_ref):
-        if key_entity(conn, pos.catalog, col_ref) != hop.to_entity:
-            continue                        # not an E2-keyed FK on the CURRENT table
-        for b in bridges:
-            other = _other_endpoint(b, pos.catalog, col_ref)
-            if other is None:
-                continue                    # not anchored on this exact column (continuity)
-            cat2, k2 = other
-            far_table = table_of(k2)
-            if object_grain(conn, cat2, far_table) != hop.to_entity:
-                continue                    # the far table is not genuinely E2-grain
-            keyed.append((
-                (cat2, k2, b.fact_key),
-                _Move(
-                    next_position=_Position(hop.to_entity, cat2, far_table),
-                    segments=(
-                        BindingPathSegmentV1(
-                            segment_kind=SegmentKind.semantic_rollup, catalog_source=pos.catalog,
-                            from_entity=hop.from_entity, to_entity=hop.to_entity,
-                            cardinality=hop.cardinality,
-                            # 3B.3c C7 (F16): audit evidence only — never plan-id material
-                            relationship_id=hop.relationship_id,
-                            relationship_version=hop.relationship_version),
-                        BindingPathSegmentV1(
-                            segment_kind=SegmentKind.governed_bridge, catalog_source=cat2,
-                            from_entity=hop.from_entity, to_entity=hop.to_entity,
-                            bridge_fact_key=b.fact_key,
-                            bridge_from_catalog_source=pos.catalog,
-                            bridge_from_object_ref=col_ref,
-                            bridge_to_catalog_source=cat2,
-                            bridge_to_object_ref=k2),
-                    ),
-                    bridge_fact_key=b.fact_key)))
+    for b in bridges:
+        endpoints = _crossing_endpoints(b, pos.catalog, present)
+        if endpoints is None:
+            continue                        # not anchored HERE, or unpairable (continuity)
+        near_refs, cat2, far_refs = endpoints
+        if not any(key_entity(conn, pos.catalog, ref) == hop.to_entity for ref in near_refs):
+            continue                        # no E2-keyed FK member on the CURRENT table
+        far_table = _far_endpoint_table(far_refs)
+        if far_table is None:
+            continue                        # a far key spread over tables lands nowhere
+        if object_grain(conn, cat2, far_table) != hop.to_entity:
+            continue                        # the far table is not genuinely E2-grain
+        keyed.append((
+            (cat2, far_refs[0], b.fact_key),
+            _Move(
+                next_position=_Position(hop.to_entity, cat2, far_table),
+                segments=(
+                    BindingPathSegmentV1(
+                        segment_kind=SegmentKind.semantic_rollup, catalog_source=pos.catalog,
+                        from_entity=hop.from_entity, to_entity=hop.to_entity,
+                        cardinality=hop.cardinality,
+                        # 3B.3c C7 (F16): audit evidence only — never plan-id material
+                        relationship_id=hop.relationship_id,
+                        relationship_version=hop.relationship_version),
+                    BindingPathSegmentV1(
+                        segment_kind=SegmentKind.governed_bridge, catalog_source=cat2,
+                        from_entity=hop.from_entity, to_entity=hop.to_entity,
+                        bridge_fact_key=b.fact_key,
+                        bridge_from_catalog_source=pos.catalog,
+                        bridge_from_object_ref=near_refs[0],
+                        bridge_to_catalog_source=cat2,
+                        bridge_to_object_ref=far_refs[0],
+                        bridge_from_member_refs=near_refs,
+                        bridge_to_member_refs=far_refs),
+                ),
+                bridge_fact_key=b.fact_key)))
     keyed.sort(key=lambda kv: kv[0])
     return tuple(m for _, m in keyed)
 
@@ -291,40 +350,53 @@ def reposition_bridges(conn, pos: _Position, scope: CatalogScopeV1) -> tuple[_Mo
     hop. Anchored on the current table's grain-key column (``is_grain`` AND keyed to
     ``pos.entity``); the far endpoint's table must be the same grain. Emits ONE
     ``governed_bridge`` segment (from_entity == to_entity == pos.entity, with the bridge's
-    fact_key). Deterministic: sorted by ``(far_catalog, far_column_ref, fact_key)``. ``()`` when
-    nothing matches."""
+    fact_key AND both endpoints' COMPLETE ordered member tuples). Deterministic: sorted by
+    ``(far_catalog, first far member ref, fact_key)``. ``()`` when nothing matches.
+
+    A5 — the same composite law as :func:`rollup_bridges`: the near endpoint's WHOLE ordered key
+    must live on the current table, and at least one of its members must be the table's governed
+    grain key. For a single-member endpoint that is the identical condition the per-column walk
+    applied; for a composite one the crossing is ONE join over every column pair, never its first
+    member alone."""
     if pos.catalog not in scope.authorized_catalog_sources:
         return ()
     bridges = _scoped_bridges(conn, pos.entity, scope)
     if not bridges:
         return ()
+    columns = _table_columns(conn, pos.catalog, pos.table_ref)
+    present = frozenset(col_ref for col_ref, _is_grain in columns)
+    grain_columns = frozenset(col_ref for col_ref, is_grain in columns if is_grain)
     keyed: list[tuple[tuple[str, str, str], _Move]] = []
-    for col_ref, is_grain in _table_columns(conn, pos.catalog, pos.table_ref):
-        if not is_grain or key_entity(conn, pos.catalog, col_ref) != pos.entity:
+    for b in bridges:
+        endpoints = _crossing_endpoints(b, pos.catalog, present)
+        if endpoints is None:
+            continue
+        near_refs, cat2, far_refs = endpoints
+        if not any(ref in grain_columns and key_entity(conn, pos.catalog, ref) == pos.entity
+                   for ref in near_refs):
             continue                        # only THE grain-key column identifies rows to recross
-        for b in bridges:
-            other = _other_endpoint(b, pos.catalog, col_ref)
-            if other is None:
-                continue
-            cat2, k2 = other
-            far_table = table_of(k2)
-            if object_grain(conn, cat2, far_table) != pos.entity:
-                continue                    # the far table must hold the SAME grain
-            keyed.append((
-                (cat2, k2, b.fact_key),
-                _Move(
-                    next_position=_Position(pos.entity, cat2, far_table),
-                    segments=(
-                        BindingPathSegmentV1(
-                            segment_kind=SegmentKind.governed_bridge, catalog_source=cat2,
-                            from_entity=pos.entity, to_entity=pos.entity,
-                            bridge_fact_key=b.fact_key,
-                            bridge_from_catalog_source=pos.catalog,
-                            bridge_from_object_ref=col_ref,
-                            bridge_to_catalog_source=cat2,
-                            bridge_to_object_ref=k2),
-                    ),
-                    bridge_fact_key=b.fact_key)))
+        far_table = _far_endpoint_table(far_refs)
+        if far_table is None:
+            continue                        # a far key spread over tables lands nowhere
+        if object_grain(conn, cat2, far_table) != pos.entity:
+            continue                        # the far table must hold the SAME grain
+        keyed.append((
+            (cat2, far_refs[0], b.fact_key),
+            _Move(
+                next_position=_Position(pos.entity, cat2, far_table),
+                segments=(
+                    BindingPathSegmentV1(
+                        segment_kind=SegmentKind.governed_bridge, catalog_source=cat2,
+                        from_entity=pos.entity, to_entity=pos.entity,
+                        bridge_fact_key=b.fact_key,
+                        bridge_from_catalog_source=pos.catalog,
+                        bridge_from_object_ref=near_refs[0],
+                        bridge_to_catalog_source=cat2,
+                        bridge_to_object_ref=far_refs[0],
+                        bridge_from_member_refs=near_refs,
+                        bridge_to_member_refs=far_refs),
+                ),
+                bridge_fact_key=b.fact_key)))
     keyed.sort(key=lambda kv: kv[0])
     return tuple(m for _, m in keyed)
 
@@ -374,6 +446,14 @@ def _realization_matches_segment(
     realization: CurrentBridgeRealizationV1,
     segment: BindingPathSegmentV1,
 ) -> bool:
+    """Does this directional realization realize EXACTLY this crossing?
+
+    A5 tightened the endpoint test from membership to ORDERED EQUALITY. The pre-A5 check asked
+    whether the segment's single ``bridge_from_object_ref`` was AMONG the revision's from-members,
+    which a realization of a WIDER composite key satisfies — binding a two-column realization to a
+    one-column crossing, the physical-side twin of the discovery defect the composite segment
+    tuples close. The segment now carries its complete ordered key, so the two are compared as
+    ordered tuples: same members, same declared pair order, or no match."""
     revision = realization.revision
     if (
         segment.bridge_fact_key != revision.bridge_fact_key
@@ -383,21 +463,25 @@ def _realization_matches_segment(
         or segment.bridge_to_object_ref is None
     ):
         return False
-    from_refs = {
+    from_refs = tuple(
         member.logical_column_ref.split("::", 1)[-1]
         for member in revision.from_endpoint.members
-    }
-    to_refs = {
+    )
+    to_refs = tuple(
         member.logical_column_ref.split("::", 1)[-1]
         for member in revision.to_endpoint.members
-    }
+    )
+    # A segment carrying no member tuples is a pre-A5/hand-built value that says only its first
+    # pair; it is compared as the single-member key it declares — never widened to "any member of".
+    segment_from = segment.bridge_from_member_refs or (segment.bridge_from_object_ref,)
+    segment_to = segment.bridge_to_member_refs or (segment.bridge_to_object_ref,)
     return (
         revision.from_endpoint.logical_table_ref.split("::", 1)[0]
         == segment.bridge_from_catalog_source
         and revision.to_endpoint.logical_table_ref.split("::", 1)[0]
         == segment.bridge_to_catalog_source
-        and segment.bridge_from_object_ref in from_refs
-        and segment.bridge_to_object_ref in to_refs
+        and segment_from == from_refs
+        and segment_to == to_refs
     )
 
 

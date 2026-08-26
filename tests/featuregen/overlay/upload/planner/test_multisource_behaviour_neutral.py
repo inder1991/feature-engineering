@@ -272,12 +272,64 @@ _MODULE_BODY = "<module-level statements and imports>"
 #     read either: the near-side walk is ONE batched `key_entities_for` query per (catalog, table,
 #     entity), pinned by `test_the_near_side_walk_is_one_batched_read_not_one_per_column`.
 #   * Proof 2 (RUNTIME) compares no value any of this touches, and still passes.
+#
+# A5, THE COMPOSITE CROSSING (cross-catalog Stage 1). A reviewer's empirical probe — re-run against
+# this branch's merge base before the change, and recorded in the A5 report — proved the transition
+# physics crossed a COMPOSITE governed link on its first member pair alone: with the entity key
+# declared first, ``rollup_bridges`` emitted a governed_bridge segment carrying
+# ``(account_id, account_id)`` and silently discarded ``source_system``; with the key declared
+# second, the same link produced NO crossing at all. Both outcomes are order-dependent accidents of
+# matching ``ActiveBridgeV1``'s thin ``members[0]`` flattening column by column. A2 put the COMPLETE
+# ordered endpoint tuples on the projection; A5 consumes them. The changed symbols:
+#
+#   `_other_endpoint` / `_crossing_endpoints` / `_member_refs` / `_far_endpoint_table`
+#                        — the single-column endpoint match is REPLACED by an endpoint-level one:
+#                          the near endpoint matches only when EVERY ordered member is a column of
+#                          the current table, endpoints of different arity are refused (no
+#                          positional pairing exists — the same refusal
+#                          `bridge_projection.ordered_member_pairs` makes), and a far key spread
+#                          across tables lands nowhere. The RENAME is why the old name appears:
+#                          it is gone from the head file, so the per-symbol differ reports both
+#                          halves of one change.
+#   `rollup_bridges` / `reposition_bridges`
+#                        — enumerate per BRIDGE over that helper instead of per column, and stamp
+#                          both endpoints' ordered tuples on the segment. For a SINGLE-member link
+#                          the condition is identical term for term (its one member is the anchor
+#                          column, and "at least one member is entity-keyed / is the grain key" is
+#                          "the anchor column is"), so the far-and-away common shape is unmoved —
+#                          pinned by `test_composite_bridge_crossings.py::
+#                          test_a_single_member_link_is_exactly_what_it_always_was`.
+#   `_realization_matches_segment`
+#                        — the physical-side twin: the endpoint test moved from MEMBERSHIP
+#                          (`segment.bridge_from_object_ref in from_refs`, which a WIDER composite
+#                          realization satisfies for a one-column crossing) to ordered equality.
+#
+# The basis, stated so it is checkable rather than asserted:
+#
+#   * SINGLE-SOURCE `plan_bindings` IS UNTOUCHED. Every changed symbol is reachable only from a
+#     CROSSING — a governed bridge is by construction cross-catalog — and proof 2 (RUNTIME), which
+#     runs a single-catalog `plan_bindings` in a fresh subprocess and compares identity-bearing
+#     fields byte for byte, still passes.
+#   * THE NEW SEGMENT FIELDS ARE NOT IDENTITY MATERIAL. `bridge_from_member_refs` /
+#     `bridge_to_member_refs` are defaulted, appended `BindingPathSegmentV1` fields;
+#     `_segment_physical_identity` hashes the realization revision / realization ref / bridge fact
+#     key and no endpoint address, so a crossing's id comes from the same material it always did —
+#     measured by the regenerated literals in `test_plan.py::test_new_plan_facts_move_no_identity`,
+#     whose single-member fixture segment now DOES carry populated tuples.
+#   * THE PLANNER VERSION MOVED, DELIBERATELY AND ONCE. Which plans exist did change (a composite
+#     link is now crossed whole, or not at all), so PLANNER_VERSION bumped 3b3a.1.0.0 ->
+#     3b3a.2.0.0 in the same commit, with every `bp_`/`cc_` literal regenerated beside it. That is
+#     the sanctioned way to move an identity, not a neutrality violation — and it is why
+#     `contracts.py`'s additive-only guard below carries a one-line exception.
 _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
     "src/featuregen/overlay/upload/planner/assembly.py": frozenset({
         "_grain_key_ref", "assemble_paths",
         "_hop_realizable_elsewhere", "_hop_realizers", "_near_side_key_refs",
         "MAX_NEAR_SIDE_COLUMNS_WALKED", "NEAR_SIDE_WALKED", "NEAR_SIDE_CAPPED",
         "NEAR_SIDE_DEADLINE_SKIPPED", "NEAR_SIDE_NOT_COLLECTED",
+        # A5 — the composite crossing (see the block above)
+        "_other_endpoint", "_member_refs", "_crossing_endpoints", "_far_endpoint_table",
+        "rollup_bridges", "reposition_bridges", "_realization_matches_segment",
     }),
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
         "compile_temporal",
@@ -479,18 +531,33 @@ def test_contracts_file_branch_diff_is_additive_only():
 -                f"|{path_resolution_status}|{PLANNER_VERSION}|{PHYSICAL_PLAN_VERSION}")
 -        path_resolution_status=path_resolution_status, candidate_role=candidate_role)
 '''.splitlines())
+    # A5, THE DECLARED PLANNER IDENTITY CHANGE (cross-catalog Stage 1). A5 makes the transition
+    # physics cross a governed bridge over its COMPLETE ordered endpoint tuples rather than a
+    # single collapsed member, which changes WHICH paths the frontier enumerates — a planner that
+    # enumerates different paths may NOT keep the version every stored physical id was minted
+    # under, or a new id masquerades as an old one. So exactly ONE existing line changes here: the
+    # PLANNER_VERSION constant. Every `bp_`/`cc_` literal in the tree is regenerated in the SAME
+    # commit (`test_plan.py`, `test_contracts.py`), and the new value is itself pinned by
+    # `test_logical_resolution.py::test_the_planner_version_bumped_with_the_composite_crossing_change`,
+    # so neither the bump nor a silent revert of it can pass unnoticed. Everything A5 adds to this
+    # file — the two `BindingPathSegmentV1` member-tuple fields — is an APPEND and needs no
+    # exception. Listed as an EXACT line so this cannot cover any other edit to the constants.
+    allowed_declared_planner_identity_bump = {'-PLANNER_VERSION = "3b3a.1.0.0"'}
     removed = [
         line for line in _removed_lines(diff)
-        if line not in allowed_version_source_move | allowed_shared_material_extraction
+        if line not in (allowed_version_source_move | allowed_shared_material_extraction
+                        | allowed_declared_planner_identity_bump)
     ]
     assert not removed, (
         f"NEUTRALITY VIOLATION: {_CONTRACTS_FILE} removed or changed an existing line that no "
-        "exception covers. This branch may only APPEND to it (design §12), plus exactly two "
+        "exception covers. This branch may only APPEND to it (design §12), plus exactly three "
         "reviewed exceptions, each an EXACT-LINE allow-set defined in this test: "
         "`allowed_version_source_move` (three released input versions centralized into "
-        "taxonomy.versions) and `allowed_shared_material_extraction` (S1A-4a: the physical-id "
+        "taxonomy.versions), `allowed_shared_material_extraction` (S1A-4a: the physical-id "
         "material moved into `_physical_plan_material` so `make_binding_plan` and "
-        "`full_physical_plan_hash` cannot drift apart). Anything else is an escalation — add a "
+        "`full_physical_plan_hash` cannot drift apart), and "
+        "`allowed_declared_planner_identity_bump` (A5: the one PLANNER_VERSION line, with every "
+        "bp_/cc_ literal regenerated in the same commit). Anything else is an escalation — add a "
         "line to an allow-set only with an owner-directed reason, never to make this pass. "
         f"Removed/changed lines:\n" + "\n".join(removed))
     # Sanity when this test is run on the original A branch: the branch appended the capability
