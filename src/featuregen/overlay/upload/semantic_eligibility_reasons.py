@@ -173,6 +173,16 @@ TRANSACTION_IDENTITY_NOT_UNIQUE = "TRANSACTION_IDENTITY_NOT_UNIQUE"
 ALLOCATION_POLICY_REQUIRED = "ALLOCATION_POLICY_REQUIRED"
 # S2-P6 split: source compatibility blocks EXECUTE_SANDBOX, never GENERATE_PREVIEW.
 EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN = "EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN"
+# A6 / G2: the platform's TWO governed authorities on what an operand contributes to a join —
+# the recipe author's `operand_class` (projected by `planner/requests`) and the concept
+# registry's `entity_link`/`pit_role` ladder (`need_metadata._derive_one`) — disagree about this
+# operand, or neither yields a role at all. Today that divergence is SILENT: `_derive_one`
+# defaults a status/dimension/direction to MEASURE and `compile_aggregation` short-circuits
+# before the additivity matrix runs, so an operand nobody meant to aggregate is staged as one
+# the moment a cardinality attaches. Serving it would mean serving a feature whose meaning the
+# platform cannot state, so it BLOCKS every action while the card stays visible as setup work.
+# The cure is a RULING per operand — G2's chartered work — expressed as a declared `join_role`.
+OPERAND_ROLE_UNRESOLVED = "OPERAND_ROLE_UNRESOLVED"
 
 # Deployment-capability facts — SERVER-OWNED, folded by the same six-action service (never a
 # route-local switch). Each gates exactly the action it names; PUBLISH_SANDBOX is TWO DISTINCT
@@ -286,6 +296,11 @@ REASON_FAMILIES: dict[str, str] = {
     ALLOCATION_POLICY_REQUIRED: "needs_setup",
     # Unproven, and a measurement would settle it — the definition of needs_data_check.
     EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN: "needs_data_check",
+    # No measurement settles a disagreement between two DECLARATIONS, and the binding is not
+    # wrong — it is unruled. The remedy is governance work with an owner (declare the operand's
+    # join role, or reconcile the concept registry), which is `needs_setup` — the family every
+    # other `*_UNRESOLVED` code in this vocabulary already carries.
+    OPERAND_ROLE_UNRESOLVED: "needs_setup",
     # Platform capability releases: governance work with an owner (the PUBLICATION_CAPABILITY_
     # MISSING precedent), never a defect of the candidate.
     SANDBOX_EXECUTION_NOT_RELEASED: "needs_setup",

@@ -224,6 +224,12 @@ _ROWS: dict[str, dict[ActionV1, Disposition]] = {
     # authoring fact (DROP); warns from preview (an artifact is on the way — the certificate
     # pattern); refuses from the first act that would run against the source.
     R.EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN: _row(_D, _W, _B, _B, _B, _B),
+    # A6/G2: the two governed authorities on what this operand contributes DISAGREE, so the
+    # platform cannot state the feature's meaning. Unlike the link/policy rows above — whose
+    # Formula column is Allow because the FORMULA is still honest and only the computation over
+    # the join is not — an unruled operand role makes the formula itself unauthorable: it would
+    # be written over a slot whose contribution nobody has decided. BLOCK × six.
+    R.OPERAND_ROLE_UNRESOLVED: _row(_B, _B, _B, _B, _B, _B),
     # ── Deployment-capability facts: each gates EXACTLY the action it names (the six-action
     # availability block). PUBLISH_SANDBOX is TWO facts, never one explanation (round-13 P1-10):
     # capability unreleased vs capability present but THIS artifact unverified — the second

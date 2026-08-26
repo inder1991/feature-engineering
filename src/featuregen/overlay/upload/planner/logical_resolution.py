@@ -36,6 +36,19 @@ carries :attr:`LogicalResolutionV1.plan_variant_address` — ``H(logical_digest 
 ordered path)``, the plan's §10/C3 ``served_plan_variant_id`` material — which separates them
 whether or not their temporal meaning has been declared. ``is_complete`` says, in one property,
 whether anything was left undeclared.
+
+**A6 — the G2 operand-role serving gate.** This entry is where a plan becomes a SERVED identity,
+and it already holds both halves the gate needs: the request's governed operand declarations and
+the plan's actual bindings. So every option that could be served passes through
+:func:`planner.operand_role_gate.unresolved_operand_roles` here, and an operand whose governed
+join role the platform's two authorities do not settle mints an
+:data:`OPERAND_ROLE_UNRESOLVED` absence. Like R14's, it is an ABSENCE and not a refusal — the card
+stays visible as setup work — and the registered disposition (BLOCK × all six) is what refuses the
+actions. G2 itself is untouched: nothing here re-classifies an operand.
+
+:func:`serving_action_facts` projects a resolution's absences into the canonical decision
+service's :class:`ActionFactsV1`, so a consumer never re-derives which codes a served option
+carries — and never decides what they mean, which is the §5 disposition table's job alone.
 """
 from __future__ import annotations
 
@@ -43,6 +56,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from featuregen.materialize.action_facts import ActionFactsV1
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.upload.feature_planning_contracts import FeaturePlanningRequestV1
 from featuregen.overlay.upload.field_resolution import current_resolution_pins
@@ -64,6 +78,14 @@ from featuregen.overlay.upload.planner.logical_plan_v2 import (
     logical_digest,
 )
 
+# A6 — the G2 serving gate. It lives beside this entry rather than inside it because the
+# derivation is about the REQUEST's governed declarations, not about a resolved plan; this module
+# is the seam that turns its facts into a served option's absences.
+from featuregen.overlay.upload.planner.operand_role_gate import (
+    OPERAND_ROLE_UNRESOLVED,
+    unresolved_operand_roles,
+)
+
 # R14's consuming-layer refusal has ONE spelling, and A1 already registered it: the reason
 # vocabulary owns it (`semantic_eligibility_reasons.TEMPORAL_JOIN_POLICY_MISSING`), the reason
 # FAMILY maps it, and `action_dispositions` carries its disposition row. It is IMPORTED and
@@ -78,6 +100,7 @@ __all__ = [
     "GOVERNED_SEMANTIC_REVISION_MISSING",
     "INTRA_CATALOG_REALIZATION_NOT_PROJECTED",
     "LOGICAL_PATH_NOT_RESOLVED",
+    "OPERAND_ROLE_UNRESOLVED",
     "LogicalResolutionAbsenceV1",
     "LogicalResolutionRefused",
     "LogicalResolutionV1",
@@ -89,6 +112,7 @@ __all__ = [
     "resolve_logical_plan",
     "select_logical_plan_candidate",
     "semantic_revisions_for_plan",
+    "serving_action_facts",
 ]
 
 #: An intra-catalog realization segment is a real relationship hop, but the segment carries only
@@ -236,6 +260,34 @@ def grain_refs_from_logical_plan(plan: LogicalFeaturePlanV2) -> tuple[tuple[str,
     return tuple(out)
 
 
+def serving_action_facts(
+    resolution: LogicalResolutionV1, *, member_name: str | None = None,
+) -> ActionFactsV1:
+    """This option's absences as the canonical decision service's FACTS — never a verdict.
+
+    Every absence code goes to ``member_blockers`` verbatim. Which of them refuse WHICH action is
+    the §5 disposition table's answer and nobody else's (``fold_member_codes`` escalates and
+    downgrades a caller's channel precisely so a producer cannot launder one), so this deliberately
+    filters nothing: ``TEMPORAL_JOIN_POLICY_MISSING`` warns at AUTHOR_FORMULA and blocks preview,
+    ``OPERAND_ROLE_UNRESOLVED`` blocks everywhere, and this function does not know or care.
+
+    ``member_name`` defaults to the logical digest — §10/C3's ``semantic_feature_id``, which is
+    what this option IS. ``evidence_pins`` are the revisions whose movement changes the answer:
+    the digest, the plan-variant address, and each operand's governed semantic revision.
+    """
+    name = member_name or resolution.logical_digest
+    pins = {
+        "logical_digest": resolution.logical_digest,
+        "plan_variant_address": resolution.plan_variant_address,
+    }
+    for binding in resolution.plan.operand_bindings:
+        pins[f"governed_semantic_revision:{binding.role}"] = binding.governed_semantic_revision_id
+    return ActionFactsV1(
+        member_names=(name,),
+        member_blockers={name: tuple(absence.code for absence in resolution.absences)},
+        evidence_pins=pins)
+
+
 def _qualified(catalog: str | None, ref: str) -> str:
     if not catalog:
         raise LogicalResolutionRefused(
@@ -352,9 +404,20 @@ def resolve_logical_plan(
             logical_column_ref=qualify_object_ref(*key),
             governed_semantic_revision_id=revision))
 
+    absences: list[LogicalResolutionAbsenceV1] = []
+    # ── A6: the G2 serving gate ───────────────────────────────────────────────────────────────
+    # An operand whose governed join role the platform's two authorities do not settle is a
+    # feature whose MEANING cannot be stated, so it may not be served silently. It is an ABSENCE,
+    # not a refusal: the plan is still resolved and the card may still be shown as setup work —
+    # `OPERAND_ROLE_UNRESOLVED`'s registered disposition is what blocks all six actions.
+    # Scoped to the operands this option actually BINDS: a slot nobody reads is not this option's.
+    for unresolved in unresolved_operand_roles(
+            request, roles=frozenset(b.need_role for b in plan.ingredient_bindings)):
+        absences.append(LogicalResolutionAbsenceV1(
+            code=OPERAND_ROLE_UNRESOLVED, subject=unresolved.role, detail=unresolved.detail))
+
     declared = dict(temporal_semantics or {})
     path: list[ResolvedRelationshipSegmentV1] = []
-    absences: list[LogicalResolutionAbsenceV1] = []
     for segment in plan.path_segments:
         if segment.segment_kind is SegmentKind.governed_bridge:
             crossing = _crossing(segment, declared)
