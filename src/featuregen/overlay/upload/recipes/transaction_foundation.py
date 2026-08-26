@@ -21,7 +21,10 @@ rollups are separate recipes with an allocation policy, per the plan).
 """
 from __future__ import annotations
 
+import dataclasses
+
 from featuregen.formula.schema_v3 import SelectionKind, SemanticRowSelectionV1
+from featuregen.overlay.upload.binding_roles import JoinRole
 from featuregen.overlay.upload.recipe_contract_v2 import (
     EligibilitySpecV2,
     FormulaReferenceV2,
@@ -153,9 +156,31 @@ _REVERSAL_ELIGIBILITY = EligibilitySpecV2(
     excluded="posted activity (the posted recipes' population — never double-counted here)",
     policy_refs=(TXN_REVERSALS,))
 
+#: ── The G2 RULING for this pack's two identifier-valued `dimension` slots ─────────────────────
+#: `transaction` (concept ``transaction_id``) and `original_txn` (concept
+#: ``original_transaction_id``) are authored as ``dimension`` — the author's statement that the
+#: slot carries a VALUE the recipe reads, not an aggregate. But both concepts are ENTITY-LINKED
+#: (``transaction``), so ``need_metadata._derive_one`` derives ``intermediate_entity_key`` while
+#: the class-keyed projection derives ``measure``. Two governed authorities, two answers, and
+#: nobody had ruled: A6's serving gate names that ``OPERAND_ROLE_UNRESOLVED`` and refuses to
+#: compute over the join until it is settled.
+#:
+#: **Settled here, and the ladder wins.** These slots hold the transaction's IDENTITY. Staged as
+#: a MEASURE — which is what the platform silently does today — an identifier would be handed to
+#: the additivity matrix as something to aggregate, which is meaningless for a key and is exactly
+#: the mis-classification G2 names; ``recipe_operand_policy``'s own ``IDENTIFIER_NOT_A_MEASURE``
+#: law says the same thing from the binder's side. So both DECLARE
+#: ``join_role="intermediate_entity_key"``: a declaration is the platform's first rung
+#: (``planner/requests._projected_roles``), it beats both derivations, and it is what a ruling
+#: looks like. Nothing else about either operand changes, and no formula reads either slot — the
+#: reviewed gold exemplar (``gold_v2/30_posted_debit_amount_exemplar.json``) reads only
+#: direction / amount / booking time / account.
+_IDENTIFIER_KEY_ROLE = str(JoinRole.INTERMEDIATE_ENTITY_KEY)
+
 _CORRECTION_LINK = OperandSpecV2(
     role="original_txn", concept="original_transaction_id", operand_class="dimension",
-    required=False, allowed_source_grains=("transaction",))
+    required=False, allowed_source_grains=("transaction",),
+    join_role=_IDENTIFIER_KEY_ROLE)
 
 
 TRANSACTION_FOUNDATION_RECIPES: tuple[RecipeDefinitionV2, ...] = (
@@ -170,7 +195,9 @@ TRANSACTION_FOUNDATION_RECIPES: tuple[RecipeDefinitionV2, ...] = (
             output=_amount_output("posted_debit_amount", "Posted debit amount"),
             result_class="sum",
             operands=_base_operands(with_amount=True, with_direction=True, extra=(
-                dim("transaction", "transaction_id", "transaction"),
+                # the G2 ruling above: an identifier-valued slot is a KEY, never a measure
+                dataclasses.replace(dim("transaction", "transaction_id", "transaction"),
+                                    join_role=_IDENTIFIER_KEY_ROLE),
                 _CORRECTION_LINK,
                 event_ts("transaction", role="booking_ts", concept="booking_date",
                          group="txn_times"),

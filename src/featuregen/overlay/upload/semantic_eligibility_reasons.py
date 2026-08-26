@@ -179,9 +179,12 @@ EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN = "EXECUTION_SOURCE_COMPATIBILITY_UNPROV
 # operand, or neither yields a role at all. Today that divergence is SILENT: `_derive_one`
 # defaults a status/dimension/direction to MEASURE and `compile_aggregation` short-circuits
 # before the additivity matrix runs, so an operand nobody meant to aggregate is staged as one
-# the moment a cardinality attaches. Serving it would mean serving a feature whose meaning the
-# platform cannot state, so it BLOCKS every action while the card stays visible as setup work.
-# The cure is a RULING per operand — G2's chartered work — expressed as a declared `join_role`.
+# the moment a cardinality attaches. The harm is AT THE JOIN — the disputed slot decides hop KEY
+# versus staged MEASURE — so this follows the owner's matrix like every other link/join fact:
+# authoring proceeds with the caller told, and every act that would COMPUTE over the crossing
+# refuses, while the card stays visible as setup work. The cure is a RULING per operand — G2's
+# chartered work — expressed as a declared `join_role` (see `recipes/transaction_foundation.py`
+# for the first two rulings taken).
 OPERAND_ROLE_UNRESOLVED = "OPERAND_ROLE_UNRESOLVED"
 
 # Deployment-capability facts — SERVER-OWNED, folded by the same six-action service (never a
@@ -193,6 +196,34 @@ SANDBOX_PUBLICATION_NOT_RELEASED = "SANDBOX_PUBLICATION_NOT_RELEASED"
 VERIFIED_OUTPUT_REQUIRED = "VERIFIED_OUTPUT_REQUIRED"
 PRODUCTION_MATERIALIZATION_NOT_RELEASED = "PRODUCTION_MATERIALIZATION_NOT_RELEASED"
 PRODUCTION_PUBLICATION_NOT_RELEASED = "PRODUCTION_PUBLICATION_NOT_RELEASED"
+
+#: The owner's binding CAPABILITY MATRIX, as a set: every link / join / policy fact a served
+#: cross-catalog option can carry. The matrix's Formula column reads "Allow" in EVERY row, so the
+#: law over this set is structural — **no member may BLOCK at AUTHOR_FORMULA**. The harm each of
+#: them names happens at the JOIN, which is why they gate from GENERATE_PREVIEW, the first act
+#: that computes over one.
+#:
+#: It lives HERE, beside the codes it groups, rather than as a copy inside a test: the previous
+#: spelling of that law iterated a hardcoded tuple in `test_action_dispositions.py`, so a newly
+#: registered code simply escaped it — which is exactly how A6's own row shipped as BLOCK × six
+#: without failing anything. Adding a cross-catalog serving code means adding it here, and CI
+#: then enforces the matrix law on it, checks it is a real vocabulary code, and fails on a silent
+#: removal. (Residual: a brand-new code still has to be added to this set — the improvement is
+#: that there is now ONE place to add it, next to the constants, instead of a duplicate list in a
+#: test file nobody reads when registering a code.)
+SERVING_CAPABILITY_MATRIX_CODES: frozenset[str] = frozenset({
+    DIRECTIONAL_REALIZATION_MISSING,
+    DIRECTIONAL_MAPPING_INCOMPLETE,
+    JOIN_NULL_POLICY_MISSING,
+    JOIN_COVERAGE_POLICY_MISSING,
+    MAX_MATCH_POLICY_MISSING,
+    TEMPORAL_JOIN_POLICY_MISSING,
+    ALLOCATION_POLICY_REQUIRED,
+    TRANSACTION_IDENTITY_NOT_UNIQUE,
+    EXECUTION_CONTEXT_MISSING,
+    EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN,
+    OPERAND_ROLE_UNRESOLVED,
+})
 
 #: code -> product family. A code absent from this table cannot ship — the pin test enforces.
 REASON_FAMILIES: dict[str, str] = {

@@ -224,12 +224,22 @@ _ROWS: dict[str, dict[ActionV1, Disposition]] = {
     # authoring fact (DROP); warns from preview (an artifact is on the way — the certificate
     # pattern); refuses from the first act that would run against the source.
     R.EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN: _row(_D, _W, _B, _B, _B, _B),
-    # A6/G2: the two governed authorities on what this operand contributes DISAGREE, so the
-    # platform cannot state the feature's meaning. Unlike the link/policy rows above — whose
-    # Formula column is Allow because the FORMULA is still honest and only the computation over
-    # the join is not — an unruled operand role makes the formula itself unauthorable: it would
-    # be written over a slot whose contribution nobody has decided. BLOCK × six.
-    R.OPERAND_ROLE_UNRESOLVED: _row(_B, _B, _B, _B, _B, _B),
+    # A6/G2: the two governed authorities on what this operand contributes DISAGREE — the
+    # recipe author's `operand_class` and the concept registry's `entity_link`/`pit_role` ladder.
+    #
+    # ▲ CONTROLLER RULING (fix round): this row was BLOCK × six, and that was wrong. The harm an
+    # unruled role does is AT THE JOIN, not in the formula text: the disputed slot is what decides
+    # whether the operand is a hop KEY (grouping/traversal) or a MEASURE staged across the
+    # crossing, and `compile_aggregation` is where that becomes a wrong answer. The formula itself
+    # is unaffected — the reviewed gold for the exemplar
+    # (`tests/featuregen/formula/gold_v2/30_posted_debit_amount_exemplar.json`) reads only
+    # `direction`/`txn_amt`/`booking_ts`/`acct_id` and never touches the disputed slots. So the
+    # owner's binding capability matrix governs, and its Formula column is Allow in EVERY row:
+    # WARN at authoring (proceeds, caller told — the §5.1 policy-row pattern), BLOCK from
+    # GENERATE_PREVIEW onward, exactly like TEMPORAL_JOIN_POLICY_MISSING and
+    # ALLOCATION_POLICY_REQUIRED. `SERVING_CAPABILITY_MATRIX_CODES` names this row as one the
+    # matrix's Formula-Allow law covers, and CI enforces the law over that set.
+    R.OPERAND_ROLE_UNRESOLVED: _row(_W, _B, _B, _B, _B, _B),
     # ── Deployment-capability facts: each gates EXACTLY the action it names (the six-action
     # availability block). PUBLISH_SANDBOX is TWO facts, never one explanation (round-13 P1-10):
     # capability unreleased vs capability present but THIS artifact unverified — the second

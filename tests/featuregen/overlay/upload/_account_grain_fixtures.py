@@ -38,7 +38,6 @@ from typing import Any
 
 from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
 
-from featuregen.overlay.upload.binding_roles import JoinRole
 from featuregen.overlay.upload.bridge_assessment import (
     IdentifierColumnMemberV1,
     IdentifierEndpointV1,
@@ -78,14 +77,25 @@ ACCOUNT_GRAIN_HYPOTHESIS = "Find accounts with high posted debit outflows in the
 #: The registry recipe whose identity the fixture request borrows (§V9's grain law).
 DONOR_RECIPE_ID = "posted_debit_amount"
 
-#: The operands the fixture request DROPS from the donor recipe, and why. Both are `dimension`
-#: operands on an ENTITY-LINKED concept (`transaction_id` / `original_transaction_id` both link
-#: the `transaction` entity), so they are two of the G2 worklist's 82 divergences: the recipe
-#: author declared a value, the concept registry declares a key. A6's serving gate flags exactly
-#: that, and A6 may not settle it (G2's ruling is chartered) — so the journey fixture computes the
-#: same account-grain sum WITHOUT them rather than declaring a role nobody ruled on.
-#: `test_the_donor_recipe_itself_carries_the_g2_divergence` pins that these are the two.
-G2_DIVERGENT_DONOR_ROLES = ("transaction", "original_txn")
+#: The donor operand roles this fixture does NOT carry. **Empty, and that is the point.**
+#:
+#: A6's first cut carried five of the donor's nine operands and named two of the four missing ones
+#: as "the operands the fixture drops" — a constant that was wrong by half, and a fixture that
+#: quietly answered a smaller question than `posted_debit_amount` asks. Both halves are now fixed:
+#: the three columns the remaining operands need are seeded (`transaction_rows`), and the two
+#: genuinely divergent slots were RULED ON rather than dropped (`recipes/transaction_foundation.py`
+#: declares `join_role="intermediate_entity_key"` for `transaction` and `original_txn`). So the
+#: fixture request carries the donor's operand set VERBATIM and drops nothing.
+#:
+#: `test_the_fixture_drops_exactly_what_this_constant_says` pins the constant against what is
+#: actually dropped, in both directions — the guard the first cut lacked.
+DROPPED_DONOR_ROLES: tuple[str, ...] = ()
+
+#: The donor operand roles whose G2 divergence was RULED ON (in the recipe, not here): both are
+#: identifier-valued `dimension` slots on an entity-linked concept, and both now declare
+#: ``join_role="intermediate_entity_key"``. See `recipes/transaction_foundation.py` for the
+#: rationale. Named here so the fixture's tests can assert the ruling is load-bearing.
+RULED_DONOR_ROLES: tuple[str, ...] = ("transaction", "original_txn")
 
 
 def seed_catalog(db, source: str, rows: tuple[tuple[CanonicalRow, str], ...]) -> None:
@@ -121,8 +131,18 @@ def seed_catalog(db, source: str, rows: tuple[tuple[CanonicalRow, str], ...]) ->
 def transaction_rows(
     extra: tuple[tuple[CanonicalRow, str], ...] = (),
 ) -> tuple[tuple[CanonicalRow, str], ...]:
-    """The transaction event log's governed columns. ``extra`` is the extension seam — a later
-    journey adds ``cif_id`` here instead of editing this tuple."""
+    """The transaction event log's governed columns — one per operand the donor recipe declares,
+    so the fixture request can carry ``posted_debit_amount``'s operand set VERBATIM rather than a
+    convenient subset of it.
+
+    The last three (``booking_ts``, ``value_ts``, ``original_txn_id``) exist for exactly that
+    reason: without them the donor's `booking_ts` / `value_ts` / `original_txn` operands have
+    nothing to bind, and the fixture silently answers a smaller question than the recipe asks —
+    including dropping the booking timestamp the reviewed gold's window anchors on and the
+    correction link the recipe's `reversal_correction` eligibility policy names.
+
+    ``extra`` is the extension seam — a later journey adds ``cif_id`` here instead of editing
+    this tuple."""
     def row(column: str, type_: str, **kw: Any) -> CanonicalRow:
         return CanonicalRow(TRANSACTION_CATALOG, TRANSACTION_TABLE, column, type_, **kw)
 
@@ -133,6 +153,9 @@ def transaction_rows(
         (row("direction", "text"), "debit_credit_indicator"),
         (row("status", "text"), "booking_status"),
         (row("event_ts", "timestamp"), "event_timestamp"),
+        (row("booking_ts", "timestamp"), "booking_date"),
+        (row("value_ts", "timestamp"), "value_date"),
+        (row("original_txn_id", "text"), "original_transaction_id"),
         *extra,
     )
 
@@ -220,36 +243,38 @@ def account_grain_scope(scope_id: str = "s_a6_account_grain") -> CatalogScopeV1:
 
 
 def account_grain_operands() -> tuple[RequiredOperandV1, ...]:
-    """The donor recipe's BASE operand set — account anchor, event time, amount, direction,
-    status — with the two roles the journey drops (see :data:`G2_DIVERGENT_DONOR_ROLES`).
+    """The donor recipe's operand set, VERBATIM — all nine, through the registry's own
+    projection (``planning_request_from_recipe``), never a hand-retyped subset.
 
-    ``account`` and ``amount`` DECLARE their join role, which is the platform's own first rung
-    (``requests._projected_roles``: a non-empty declaration wins outright). ``direction`` and
-    ``status`` deliberately declare NOTHING — the two governed authorities already agree on them,
-    and leaving them bare is what proves A6's gate does not fire on an agreeing operand."""
-    return (
-        RequiredOperandV1(role="account", concept="account_id", operand_class="entity_key",
-                          allowed_source_grains=("transaction",),
-                          join_role=str(JoinRole.SOURCE_ENTITY_KEY)),
-        RequiredOperandV1(role="event_ts", concept="event_timestamp",
-                          operand_class="event_timestamp",
-                          allowed_source_grains=("transaction",)),
-        RequiredOperandV1(role="amount", concept="monetary_flow", operand_class="measure",
-                          allowed_source_grains=("transaction",),
-                          join_role=str(JoinRole.MEASURE)),
-        RequiredOperandV1(role="direction", concept="debit_credit_indicator",
-                          operand_class="direction", allowed_source_grains=("transaction",)),
-        RequiredOperandV1(role="status", concept="booking_status", operand_class="status",
-                          allowed_source_grains=("transaction",)),
-    )
+    Taking them from the registry is what keeps the fixture honest as the recipe moves: A6's
+    first cut retyped five of the nine by hand, which silently changed the question the journey
+    asks and left the drop list to rot. Nothing here declares a role — every declaration these
+    operands carry is the RECIPE's own, including the two `join_role` rulings G2 settled for
+    `transaction` and `original_txn`. `direction` and `status` still declare nothing, so the
+    fixture continues to prove A6's gate does not fire where the two authorities agree."""
+    return donor_recipe_request().operands
 
 
 def account_grain_request(**overrides: Any) -> FeaturePlanningRequestV1:
     """The journey's planning request: ``posted_debit_amount``'s identity at ACCOUNT grain.
 
-    Output spec, temporal spec, objective, eligibility and formula reference are taken VERBATIM
-    from the shipped V2 recipe, so this is a shape the platform genuinely produces rather than
-    one invented for a test. ``**overrides`` is the extension seam."""
+    Output spec, temporal spec, objective, eligibility, operands and formula reference are taken
+    VERBATIM from the shipped V2 recipe, so this is a shape the platform genuinely produces
+    rather than one invented for a test. ``**overrides`` is the extension seam.
+
+    ▲ **The formula reference is borrowed for SHAPE; it is not a claim that this request satisfies
+    the reviewed expectation.** ``donor.formula.expectation_ref == "posted_debit_amount"`` is a
+    registered v2 expectation, so ``has_reviewed_expectation`` answers True for this request — but
+    what that registry entry actually reviewed is the gold fixture
+    ``gold_v2/30_posted_debit_amount_exemplar.json``, authored against the REAL recipe over real
+    columns, and no part of A6 re-verifies this request's plan against it. Carrying the donor's
+    full operand set (rather than the subset A6 first shipped) removes the two concrete
+    divergences that made the borrowing actively misleading — the gold's window anchors on a
+    booking timestamp, and the recipe's ``reversal_correction`` eligibility policy names the
+    correction link, both of which the subset had dropped — but "borrowed, not satisfied" remains
+    the honest statement. A journey that needs the expectation genuinely met must author against
+    the recipe itself.
+    """
     from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
 
     donor = v2_recipe_by_id(DONOR_RECIPE_ID)

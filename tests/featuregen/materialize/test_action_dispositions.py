@@ -201,10 +201,29 @@ def test_PUBLISH_SANDBOX_has_TWO_distinct_facts_never_one_explanation():
 
 def test_the_formula_column_is_ALLOW_for_every_matrix_link_condition():
     """The owner's matrix: no link/join/policy fact ever refuses AUTHOR_FORMULA — authoring is
-    allowed under every condition; the join facts gate from the first computing act."""
-    for code in (R.DIRECTIONAL_REALIZATION_MISSING, R.DIRECTIONAL_MAPPING_INCOMPLETE,
-                 R.JOIN_NULL_POLICY_MISSING, R.JOIN_COVERAGE_POLICY_MISSING,
-                 R.MAX_MATCH_POLICY_MISSING, R.TEMPORAL_JOIN_POLICY_MISSING,
-                 R.ALLOCATION_POLICY_REQUIRED, R.TRANSACTION_IDENTITY_NOT_UNIQUE,
-                 R.EXECUTION_CONTEXT_MISSING, R.EXECUTION_SOURCE_COMPATIBILITY_UNPROVEN):
+    allowed under every condition; the join facts gate from the first computing act.
+
+    ▲ The set is DERIVED from `R.SERVING_CAPABILITY_MATRIX_CODES`, the vocabulary's own grouping,
+    not from a tuple copied into this file. The copy was how a new code escaped the law: A6's
+    `OPERAND_ROLE_UNRESOLVED` shipped as BLOCK × six and this test — which states the law in its
+    own docstring — passed, because the code was simply not in the local list. Now registering a
+    cross-catalog code beside its siblings is what puts it under the law.
+    """
+    assert R.SERVING_CAPABILITY_MATRIX_CODES, "the matrix set may never be empty"
+    for code in sorted(R.SERVING_CAPABILITY_MATRIX_CODES):
         assert ACTION_DISPOSITIONS[(code, _A.AUTHOR_FORMULA)] is not Disposition.BLOCK, code
+
+
+def test_the_matrix_code_set_is_real_and_does_not_silently_shrink():
+    """Both failure modes of a declared grouping, closed: a phantom member (a code that is not in
+    the closed vocabulary at all) and a QUIET REMOVAL — dropping a code from the set would make
+    the law above vacuous for it without any test going red."""
+    assert R.SERVING_CAPABILITY_MATRIX_CODES <= set(R.REASON_FAMILIES), (
+        R.SERVING_CAPABILITY_MATRIX_CODES - set(R.REASON_FAMILIES))
+    # Removing one is a deliberate act that edits this number and says why.
+    assert len(R.SERVING_CAPABILITY_MATRIX_CODES) == 11
+    # Every member must also carry a full six-action row — the same closed-product law, restated
+    # for this subset so a member cannot be grouped here and left undisposed.
+    for code in sorted(R.SERVING_CAPABILITY_MATRIX_CODES):
+        for action in _A:
+            assert (code, action) in ACTION_DISPOSITIONS, (code, action)

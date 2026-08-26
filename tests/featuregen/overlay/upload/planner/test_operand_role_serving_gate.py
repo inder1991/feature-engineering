@@ -7,15 +7,24 @@ governed authorities agree on 1113 of the registry's 1195 operands and DISAGREE 
 disagreement is invisible, because ``compile_aggregation`` short-circuits on ``card is None``
 before the additivity matrix runs; it unmasks the moment a cardinality attaches.
 
-A6 does NOT close G2 — that ruling is chartered. A6 makes the divergence a NAMED, BLOCKING
+A6 does NOT close G2 as a class — that ruling is chartered. A6 makes the divergence a NAMED
 serving fact instead of a silent mis-classification: an option whose operand roles are not
-resolved carries ``OPERAND_ROLE_UNRESOLVED``, which blocks every one of the six actions while the
-card may still be shown under "Discoveries requiring setup".
+resolved carries ``OPERAND_ROLE_UNRESOLVED``, which WARNS at AUTHOR_FORMULA (the owner's matrix
+allows authoring under every link condition) and BLOCKS every act that would compute over the
+crossing, while the card may still be shown under "Discoveries requiring setup".
 
-The gate is DERIVED, never listed: it re-asks the same two governed authorities the 82-operand
-worklist counted, so it stays correct as the recipe registry and the concept registry move.
+The gate is DERIVED, never listed: it re-asks the same two governed authorities the worklist
+counted, so it stays correct as the recipe registry and the concept registry move.
 ``test_the_gate_is_the_worklists_own_criterion_recomputed`` proves that by recomputing the
 divergence independently, over the whole registry, and demanding set equality.
+
+**The fix round took the first two rulings.** ``posted_debit_amount``'s ``transaction`` and
+``original_txn`` — identifier-valued ``dimension`` slots on entity-linked concepts — now DECLARE
+``join_role="intermediate_entity_key"`` in the recipe. That is what a G2 ruling looks like: a
+declaration, on the platform's own first rung, not a new mechanism. It cleared 6 operands across
+5 recipes (``original_txn`` is a shared operand constant), taking the census from 82/76 to 76/71,
+and it did not disturb the exemplar's reviewed Formula-v2 expectation — which is keyed on the
+expectation REF, never on the recipe hash.
 """
 from __future__ import annotations
 
@@ -29,7 +38,8 @@ from tests.featuregen.overlay.upload._account_grain_fixtures import (
     ACCOUNT_LINK_COLUMN,
     ACCOUNT_TABLE,
     DONOR_RECIPE_ID,
-    G2_DIVERGENT_DONOR_ROLES,
+    DROPPED_DONOR_ROLES,
+    RULED_DONOR_ROLES,
     TRANSACTION_CATALOG,
     TRANSACTION_LINK_COLUMN,
     TRANSACTION_TABLE,
@@ -126,14 +136,36 @@ def _worklist_divergence(request) -> set[str]:
 # ── 1. THE REGISTRATION (three-part commit) ───────────────────────────────────────────────────
 
 
-def test_the_code_is_registered_with_a_family_and_blocks_all_six_actions():
-    """The plan's disposition-matrix row: ``OPERAND_ROLE_UNRESOLVED`` × all six = BLOCK. An
-    operand whose governed role nobody has ruled on is not a warning at authoring: the formula
-    would be authored over a slot the platform cannot say the meaning of."""
+def test_the_code_warns_at_authoring_and_blocks_every_computing_act():
+    """The owner's binding capability matrix, whose Formula column reads "Allow" in EVERY row.
+
+    A6 first shipped this row as BLOCK × six, reasoning that an unruled slot makes the formula
+    unauthorable. The controller ruled otherwise and the ruling is right: the harm is AT THE
+    JOIN — the disputed slot decides hop KEY versus staged MEASURE, which is `compile_aggregation`'s
+    question, not the formula text's. The reviewed gold for the exemplar reads only
+    direction/amount/booking time/account and never touches a disputed slot. So authoring proceeds
+    with the caller told, and every act that would COMPUTE over the crossing refuses — the same
+    row shape as TEMPORAL_JOIN_POLICY_MISSING and ALLOCATION_POLICY_REQUIRED."""
     assert R.OPERAND_ROLE_UNRESOLVED == "OPERAND_ROLE_UNRESOLVED"
     assert R.reason_family(R.OPERAND_ROLE_UNRESOLVED) == "needs_setup"
+    assert ACTION_DISPOSITIONS[
+        (R.OPERAND_ROLE_UNRESOLVED, ActionV1.AUTHOR_FORMULA)] is Disposition.WARN
     for action in ActionV1:
+        if action is ActionV1.AUTHOR_FORMULA:
+            continue
         assert ACTION_DISPOSITIONS[(R.OPERAND_ROLE_UNRESOLVED, action)] is Disposition.BLOCK
+    # It is the SAME row the matrix's other join facts carry — pinned by comparison, not by a
+    # second hand-written expectation.
+    for action in ActionV1:
+        assert (ACTION_DISPOSITIONS[(R.OPERAND_ROLE_UNRESOLVED, action)]
+                is ACTION_DISPOSITIONS[(R.TEMPORAL_JOIN_POLICY_MISSING, action)]), action
+
+
+def test_the_code_is_under_the_matrix_law_that_a_hardcoded_list_let_it_escape():
+    """The registration bug this row exposed, closed at the source. `SERVING_CAPABILITY_MATRIX_CODES`
+    is the vocabulary's own grouping and `test_the_formula_column_is_ALLOW_for_every_matrix_link_condition`
+    derives its set from it, so this code is now covered by the law it originally slipped past."""
+    assert R.OPERAND_ROLE_UNRESOLVED in R.SERVING_CAPABILITY_MATRIX_CODES
 
 
 def test_the_gate_module_reuses_the_registered_spelling_never_a_second_one():
@@ -163,10 +195,17 @@ def test_the_gate_is_the_worklists_own_criterion_recomputed():
         gated_total += len(gated)
         recipes_gated += 1 if gated else 0
 
-    # The 82 is a MEASUREMENT, not a constant (§V2) — asserted as a floor with the shape pinned
-    # above, so a registry that grows does not fail this test spuriously.
-    assert gated_total >= 82, gated_total
-    assert recipes_gated < len(V2_RECIPES) // 2, (
+    # ▲ The census is pinned in BOTH directions, and the shrink direction is the one that
+    # matters. A one-sided floor (`>= 76`) would let a legitimate G2 ruling — the very act this
+    # gate exists to provoke — land silently; a one-sided ceiling would hide a new divergence.
+    # 76 operands across 71 recipes, measured after A6's ruling on `transaction`/`original_txn`
+    # cleared 6 operands across 5 recipes (pre-ruling: 82 across 76). Moving either number is a
+    # deliberate edit that says which ruling moved it.
+    assert (gated_total, recipes_gated) == (76, 71), (
+        f"the G2 census moved to {gated_total} operands across {recipes_gated} recipes. A "
+        f"DECREASE means a ruling landed — record which, and update these numbers. An INCREASE "
+        f"means a new divergence entered the registry — that needs a ruling, not a new number.")
+    assert recipes_gated * 4 < len(V2_RECIPES), (
         f"{recipes_gated}/{len(V2_RECIPES)} recipes gated — the gate has widened into the "
         f"healthy population")
 
@@ -187,20 +226,59 @@ def test_a_fully_resolved_registry_recipe_is_not_gated():
         assert all(r.resolved for r in operand_role_resolutions(request)), recipe.recipe_id
 
 
-def test_the_donor_recipe_itself_carries_the_g2_divergence():
-    """``posted_debit_amount`` — the plan's own §V9 exemplar — has TWO divergent operands, both
-    ``dimension``-classed on an ENTITY-LINKED concept. The fixture request drops exactly these
-    two (``G2_DIVERGENT_DONOR_ROLES``), and this pins that the drop list is not stale."""
-    flagged = {r.role for r in unresolved_operand_roles(donor_recipe_request())}
-    assert flagged == set(G2_DIVERGENT_DONOR_ROLES), flagged
+def test_the_donor_recipes_two_divergent_slots_are_now_RULED_not_dropped():
+    """``posted_debit_amount`` — the plan's own §V9 exemplar — carried TWO divergent operands,
+    both ``dimension``-classed on an ENTITY-LINKED concept (`transaction_id` /
+    `original_transaction_id`). A6's first cut dropped them from the fixture; the fix round RULES
+    on them instead, in the recipe, the way G2's ruling is meant to be expressed.
+
+    The exemplar is therefore no longer gated at all, and the cure is the platform's own first
+    rung rather than a new mechanism."""
+    assert unresolved_operand_roles(donor_recipe_request()) == ()
 
     by_role = {r.role: r for r in operand_role_resolutions(donor_recipe_request())}
-    for role in G2_DIVERGENT_DONOR_ROLES:
+    for role in RULED_DONOR_ROLES:
         resolution = by_role[role]
         assert resolution.operand_class == "dimension"
-        assert resolution.projected_join_role is JoinRole.MEASURE
-        assert resolution.concept_ladder_join_role is JoinRole.INTERMEDIATE_ENTITY_KEY
-        assert "authorities" in resolution.detail.lower()
+        assert resolution.declared_join_role == str(JoinRole.INTERMEDIATE_ENTITY_KEY)
+        assert resolution.projected_join_role is JoinRole.INTERMEDIATE_ENTITY_KEY
+        assert resolution.resolved and "DECLARES" in resolution.detail
+    # And the ruling is load-bearing: strip the declaration and the divergence returns, with the
+    # ladder and the class saying exactly what they said before.
+    import dataclasses
+
+    stripped = account_grain_request(operands=tuple(
+        dataclasses.replace(op, join_role="") if op.role in RULED_DONOR_ROLES else op
+        for op in donor_recipe_request().operands))
+    reverted = {r.role: r for r in unresolved_operand_roles(stripped)}
+    assert set(reverted) == set(RULED_DONOR_ROLES)
+    for role in RULED_DONOR_ROLES:
+        assert reverted[role].projected_join_role is JoinRole.MEASURE
+        assert reverted[role].concept_ladder_join_role is JoinRole.INTERMEDIATE_ENTITY_KEY
+        assert "authorities" in reverted[role].detail.lower()
+
+
+def test_the_ruling_reached_every_recipe_that_shares_the_ruled_operand():
+    """A disclosed consequence, pinned rather than left as a surprise: `original_txn` is a SHARED
+    module-level operand constant (`_CORRECTION_LINK`), so ruling on it cleared four sibling
+    recipes in the same pack as well as the exemplar. That is correct — one slot, one concept,
+    one ruling — but it must be visible, because it is why the census moved by 6 and not 2."""
+    from featuregen.overlay.upload.feature_planning_contracts import planning_request_from_recipe
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+    for recipe_id in ("posted_debit_amount", "refund_amount", "refund_count",
+                      "reversal_amount", "reversal_count"):
+        recipe = v2_recipe_by_id(recipe_id)
+        assert recipe is not None, recipe_id
+        assert unresolved_operand_roles(planning_request_from_recipe(recipe)) == (), recipe_id
+
+    # NOT ruled: `chargeback_rate` declares its own `original_txn` operand in `recipes/payments.py`
+    # rather than reusing the foundation constant, so it is still gated. The ruling is per
+    # DECLARATION, and A6's brief scoped it to the transaction-foundation pack.
+    chargeback = v2_recipe_by_id("chargeback_rate")
+    assert chargeback is not None
+    assert {r.role for r in unresolved_operand_roles(
+        planning_request_from_recipe(chargeback))} == {"original_txn"}
 
 
 def test_a_declared_join_role_resolves_the_operand_and_a_nonsense_one_does_not():
@@ -254,10 +332,13 @@ def test_an_ambiguous_source_anchor_fails_CLOSED_not_open():
 # ── 3. THE SERVING GATE, THROUGH THE CANONICAL DECISION SERVICE ───────────────────────────────
 
 
-def test_an_unresolved_operand_role_blocks_every_action_through_the_canonical_service(db):
+def test_an_unresolved_operand_role_warns_at_authoring_and_blocks_every_computing_act(db):
     """The whole point, asserted where the platform actually decides: the resolution's facts go
-    to ``action_decision.ask`` and the §5 disposition table refuses all six. Nothing here
-    re-implements the policy — the codes are FACTS and ``ask`` is the only verdict."""
+    to ``action_decision.ask`` and the §5 disposition table decides. Nothing here re-implements
+    the policy — the codes are FACTS and ``ask`` is the only verdict.
+
+    AUTHOR_FORMULA proceeds with the code carried as a WARNING (the owner's matrix); every act
+    that would compute over the crossing refuses with it as a BLOCKER."""
     seed_account_grain_world(db)
     request = account_grain_request(operands=(
         *account_grain_operands(),
@@ -274,9 +355,15 @@ def test_an_unresolved_operand_role_blocks_every_action_through_the_canonical_se
     for action in ActionV1:
         decision = ask(db, facts.request(
             action=action, resource_identity_hash=resolution.plan_variant_address))
-        assert not decision.allowed, action
         member = decision.per_member[0]
-        assert OPERAND_ROLE_UNRESOLVED in member.blockers, (action, member)
+        if action is ActionV1.AUTHOR_FORMULA:
+            # Allowed, and the caller is TOLD (D3) — never silently.
+            assert decision.allowed, decision
+            assert OPERAND_ROLE_UNRESOLVED in member.warnings, member
+            assert OPERAND_ROLE_UNRESOLVED not in member.blockers, member
+        else:
+            assert not decision.allowed, action
+            assert OPERAND_ROLE_UNRESOLVED in member.blockers, (action, member)
 
 
 def test_a_resolved_option_carries_no_operand_role_gate(db):
@@ -298,14 +385,16 @@ def test_the_gate_covers_only_the_operands_the_option_actually_binds(db):
     """An operand the plan never bound is not part of the served option, so it is not gated —
     the check is about THIS option's operands, not about every slot the request declares."""
     seed_account_grain_world(db)
+    # `customer_id` is entity-linked (so a `dimension` on it IS divergent) and NO column in
+    # either fixture catalog carries that concept, so nothing binds it.
     unbindable = RequiredOperandV1(
-        role="txn_ref", concept="original_transaction_id", operand_class="dimension",
+        role="cust_ref", concept="customer_id", operand_class="dimension",
         required=False, allowed_source_grains=("transaction",))
     request = account_grain_request(operands=(*account_grain_operands(), unbindable))
 
-    assert {r.role for r in unresolved_operand_roles(request)} == {"txn_ref"}   # it IS divergent
+    assert {r.role for r in unresolved_operand_roles(request)} == {"cust_ref"}  # it IS divergent
     _result, plan, resolution = _resolve(db, request)
-    assert "txn_ref" not in {b.need_role for b in plan.ingredient_bindings}     # …but unbound
+    assert "cust_ref" not in {b.need_role for b in plan.ingredient_bindings}    # …but unbound
     assert [a.code for a in resolution.absences] == []
 
 
@@ -407,6 +496,32 @@ def test_a_customer_uoa_over_the_account_grain_recipe_refuses_UOA_MISMATCH():
     plan, refusals = fold_frozen_binding_plan(
         request, verdicts, story, "pit", "", TRANSACTION_CATALOG, uoa_entity="Account")
     assert refusals == () and plan is not None
+
+
+def test_the_fixture_drops_exactly_what_this_constant_says():
+    """The guard A6's first cut lacked. `DROPPED_DONOR_ROLES` claimed two roles while the fixture
+    actually dropped FOUR — including `booking_ts` and `value_ts`, which are ungated (both
+    authorities say TIME) and were simply missing columns. A constant describing the fixture must
+    be checked AGAINST the fixture, in both directions, or it drifts into decoration."""
+    donor_roles = [op.role for op in donor_recipe_request().operands]
+    fixture_roles = [op.role for op in account_grain_request().operands]
+
+    assert set(DROPPED_DONOR_ROLES) == set(donor_roles) - set(fixture_roles)
+    assert DROPPED_DONOR_ROLES == ()          # nothing is dropped any more
+    assert fixture_roles == donor_roles       # …because the operand set is the donor's, verbatim
+    assert len(donor_roles) == 9
+
+
+def test_every_fixture_operand_has_a_column_to_bind(db):
+    """The other half of "drops nothing": carrying all nine operands is only honest if the
+    catalog can BIND all nine. The three columns the fix round seeded (`booking_ts`, `value_ts`,
+    `original_txn_id`) are exactly what makes that true."""
+    seed_account_grain_world(db)
+    _result, plan, _resolution = _resolve(db, account_grain_request())
+
+    bound = {b.need_role for b in plan.ingredient_bindings}
+    assert {op.role for op in account_grain_request().operands} <= bound
+    assert {"booking_ts", "value_ts", "original_txn", "transaction"} <= bound
 
 
 def test_the_account_grain_hypothesis_is_a_level_never_a_spike():

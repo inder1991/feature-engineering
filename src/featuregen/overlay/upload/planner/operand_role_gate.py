@@ -46,8 +46,14 @@ import dataclasses
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.binding_roles import JoinRole
-from featuregen.overlay.upload.feature_planning_contracts import FeaturePlanningRequestV1
-from featuregen.overlay.upload.need_metadata import derive_need_metadata
+from featuregen.overlay.upload.feature_planning_contracts import (
+    FeaturePlanningRequestV1,
+    RequiredOperandV1,
+)
+from featuregen.overlay.upload.need_metadata import (
+    derive_need_metadata,
+    validate_template_anchor,
+)
 from featuregen.overlay.upload.planner.requests import planning_probe
 
 # ONE spelling, imported from the vocabulary that owns it — the precedent
@@ -86,8 +92,8 @@ class OperandRoleResolutionV1:
     detail: str
 
 
-def _resolution(operand, projected: JoinRole | None, ladder: JoinRole | None,
-                ) -> OperandRoleResolutionV1:
+def _resolution(operand: RequiredOperandV1, projected: JoinRole | None,
+                ladder: JoinRole | None) -> OperandRoleResolutionV1:
     declared = operand.join_role or ""
 
     def built(resolved: bool, detail: str) -> OperandRoleResolutionV1:
@@ -139,20 +145,22 @@ def operand_role_resolutions(
     database — a role is a governed DECLARATION question, never a physical one."""
     probe = planning_probe(request)
     projected = {need.role: need.join_role for need in probe.needs}
+    stripped = dataclasses.replace(probe, needs=tuple(
+        dataclasses.replace(need, join_role=None, temporal_role=None) for need in probe.needs))
+    # ▲ ONLY the anchor validator is guarded, and it is called explicitly rather than reached
+    # through `derive_need_metadata`. A blanket `except ValueError` around the whole derivation
+    # would report "the source anchor is ambiguous" for any ValueError raised anywhere beneath
+    # it — a diagnosis the gate would not have earned. Anything else propagates.
     try:
-        ladder = {
-            meta.role: meta.join_role
-            for meta in derive_need_metadata(dataclasses.replace(probe, needs=tuple(
-                dataclasses.replace(need, join_role=None, temporal_role=None)
-                for need in probe.needs)))}
+        validate_template_anchor(stripped)
     except ValueError as exc:
-        # `validate_template_anchor` refuses an ambiguous source anchor. The gate may not swallow
-        # that into "resolved": if the concept ladder cannot answer for the request at all, no
-        # operand of it has a settled role.
+        # The ladder cannot answer for this request at all, so no operand of it has a settled
+        # role. Fail CLOSED: never swallowed into "resolved".
         return _all_unresolved(request, (
             f"the concept registry's ladder cannot resolve roles for this request at all — its "
             f"source anchor is ambiguous ({exc}); every operand is unresolved until the request "
             f"names one"))
+    ladder = {meta.role: meta.join_role for meta in derive_need_metadata(stripped)}
     return tuple(
         _resolution(operand, projected.get(operand.role), ladder.get(operand.role))
         for operand in request.operands)
