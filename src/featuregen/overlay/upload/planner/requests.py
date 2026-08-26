@@ -125,8 +125,9 @@ def _derived_roles(request: FeaturePlanningRequestV1, operand: RequiredOperandV1
     `_source_anchor` chose, and the governed concept registry's `entity_link` / `pit_role`. Never
     an operand name, never prose, never tuple position.
 
-    This is CLASS-keyed where `_derive_one`'s ladder is CONCEPT-keyed, so the two agree on 1113 of
-    the 1195 V2 operands and disagree on 82 (measured at 1c656743) — every one an operand whose
+    This is CLASS-keyed where `_derive_one`'s ladder is CONCEPT-keyed, so the two disagreed on 82
+    of the 1195 V2 operands when G2 was first measured (at 1c656743; the rulings taken since have
+    moved that census, which the gate's own test pins) — every one an operand whose
     authored class and whose concept's governed facts say different things (a `dimension` on an
     entity-linked or pit-bearing concept, and `device_sharing_velocity`'s two). The class is the
     RECIPE AUTHOR's declaration about the slot, so the projection honors it rather than overruling
@@ -190,11 +191,13 @@ def planning_probe(request: FeaturePlanningRequestV1) -> Template:
     identity keyed on the request's own source definition id.
 
     S1A-4c: each projected need also DECLARES its binding roles. `request_contract` metadata
-    resolution deliberately bypasses the legacy resolved-need registry, and 0 of the 1195 operands
-    in the V2 registry declare a `join_role` (measured at 1c656743), so before this the planner saw
-    needs with no roles at all — and `plan._assemble_rollups` starts a roll-up ONLY from a binding
-    whose join role is `source_entity_key`, so no recipe-origin request ever reached its first
-    cross-catalog hop.
+    resolution deliberately bypasses the legacy resolved-need registry, and at the time NONE of the
+    V2 registry's operands declared a `join_role` (0 of 1195, measured at 1c656743), so before this
+    the planner saw needs with no roles at all — and `plan._assemble_rollups` starts a roll-up ONLY
+    from a binding whose join role is `source_entity_key`, so no recipe-origin request ever reached
+    its first cross-catalog hop. A handful declare one NOW (7 of 1196), and every one is a G2
+    RULING taken in the recipe — the declaration rung exists to settle a slot's meaning, never to
+    compensate for a projection that cannot derive it.
     """
     source_entity, anchor_role = _source_anchor(request)
     roles = {operand.role: _projected_roles(request, operand, anchor_role)

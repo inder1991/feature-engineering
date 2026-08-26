@@ -68,9 +68,14 @@ _POSTED_ELIGIBILITY = EligibilitySpecV2(
 
 
 def _base_operands(*, with_amount: bool = False, with_direction: bool = False,
+                   event_time: OperandSpecV2 | None = None,
                    extra: tuple[OperandSpecV2, ...] = ()) -> tuple[OperandSpecV2, ...]:
+    """The pack's shared slots. ``event_time`` REPLACES the generic event clock rather than adding
+    a second one: a recipe whose window rides a specific timestamp (A6b's posting window) would
+    otherwise carry a required generic ``event_timestamp`` slot that must be bound and is never
+    read — a binding demand with no computation behind it."""
     ops = [entity("account", "account_id", "transaction"),
-           event_ts("transaction")]
+           event_time or event_ts("transaction")]
     if with_amount:
         ops.append(OperandSpecV2(
             role="amount", concept="monetary_flow", operand_class="measure",
@@ -133,16 +138,18 @@ def _recipe(recipe_id: str, *, definition: str, context: str, output: OutputSpec
             objective: str = PAY_BEHAVIOUR,
             eligibility: EligibilitySpecV2 = _POSTED_ELIGIBILITY,
             readiness: str = "FORMULA_BLOCKED",
+            revision: int = 1,
             row_selections: tuple[SemanticRowSelectionV1, ...] = (),
+            event_time_role: str = "event_ts",
             expectation_ref: str | None = None) -> RecipeDefinitionV2:
     return RecipeDefinitionV2(
-        recipe_id=recipe_id, revision=1, family="transaction_foundation",
+        recipe_id=recipe_id, revision=revision, family="transaction_foundation",
         primary_objective=objective,
         business_definition=definition, decision_context=context,
         computation_kind="deterministic_formula",
         output=output, operands=operands, row_selections=row_selections,
         source_grain="transaction", output_grain="account",
-        temporal=event_window(),
+        temporal=event_window(event_time_role),
         readiness=readiness, parameters=(_WINDOW,),
         eligibility=eligibility,
         formula=FormulaReferenceV2(
@@ -156,7 +163,7 @@ _REVERSAL_ELIGIBILITY = EligibilitySpecV2(
     excluded="posted activity (the posted recipes' population — never double-counted here)",
     policy_refs=(TXN_REVERSALS,))
 
-#: ── The G2 RULING for this pack's two identifier-valued `dimension` slots ─────────────────────
+#: ── The G2 RULING for this pack's identifier-valued `dimension` slots ─────────────────────────
 #: `transaction` (concept ``transaction_id``) and `original_txn` (concept
 #: ``original_transaction_id``) are authored as ``dimension`` — the author's statement that the
 #: slot carries a VALUE the recipe reads, not an aggregate. But both concepts are ENTITY-LINKED
@@ -174,8 +181,31 @@ _REVERSAL_ELIGIBILITY = EligibilitySpecV2(
 #: (``planner/requests._projected_roles``), it beats both derivations, and it is what a ruling
 #: looks like. Nothing else about either operand changes, and no formula reads either slot — the
 #: reviewed gold exemplar (``gold_v2/30_posted_debit_amount_exemplar.json``) reads only
-#: direction / amount / booking time / account.
+#: direction / amount / booking time / account, and A6b's count recipe aggregates with COUNT_ROWS,
+#: which consumes no operand at all. Both slots live as SHARED constants below, so the ruling is
+#: made once and reaches every recipe that uses them.
 _IDENTIFIER_KEY_ROLE = str(JoinRole.INTERMEDIATE_ENTITY_KEY)
+
+#: The GOVERNED CANONICAL TRANSACTION IDENTITY — one declaration, shared by every recipe that
+#: needs it, on the ``_CORRECTION_LINK`` precedent (one slot, one concept, one ruling: A6's
+#: ruling on ``original_txn`` reached five recipes at once precisely because it was shared).
+#:
+#: **Ruling R13 lives on this slot.** ``COUNT_ROWS`` requires a governed transaction identity, and
+#: a violated uniqueness produces ``TRANSACTION_IDENTITY_NOT_UNIQUE`` and NO count: preview renders
+#: the guard, the fixture/run refuses. The operand exists so uniqueness can be **CHECKED** — it is
+#: NOT a de-duplication argument, and nothing may quietly hand it to ``COUNT_DISTINCT``, which
+#: would turn "refuse duplicates" into "count them once". Deduplication is chartered work (an
+#: immutable ``TransactionDeduplicationPolicyRevision`` plus a typed survivor operator), not a
+#: substitution. The COMPILED guard is the compiler/IR increment's ("transaction uniqueness guard
+#: (R13)" in its pipeline); what a recipe owns is naming the identity the guard checks.
+_TRANSACTION_IDENTITY = dataclasses.replace(
+    dim("transaction", "transaction_id", "transaction"), join_role=_IDENTIFIER_KEY_ROLE)
+
+#: The POSTING clock. ``event_timestamp`` is the generic "something happened then" concept; a
+#: POSTED-activity recipe's window is a claim about when the entry was BOOKED, which is the
+#: platform's ``booking_date`` concept (the journey's frozen column ``pstd_date`` carries exactly
+#: it, and the reviewed gold exemplar's own window already reads ``booking_ts``).
+_POSTING_TS = event_ts("transaction", role="booking_ts", concept="booking_date")
 
 _CORRECTION_LINK = OperandSpecV2(
     role="original_txn", concept="original_transaction_id", operand_class="dimension",
@@ -196,8 +226,7 @@ TRANSACTION_FOUNDATION_RECIPES: tuple[RecipeDefinitionV2, ...] = (
             result_class="sum",
             operands=_base_operands(with_amount=True, with_direction=True, extra=(
                 # the G2 ruling above: an identifier-valued slot is a KEY, never a measure
-                dataclasses.replace(dim("transaction", "transaction_id", "transaction"),
-                                    join_role=_IDENTIFIER_KEY_ROLE),
+                _TRANSACTION_IDENTITY,
                 _CORRECTION_LINK,
                 event_ts("transaction", role="booking_ts", concept="booking_date",
                          group="txn_times"),
@@ -219,12 +248,32 @@ TRANSACTION_FOUNDATION_RECIPES: tuple[RecipeDefinitionV2, ...] = (
             operands=_base_operands(with_amount=True, with_direction=True),
             eligibility=_POSTED_DIRECTIONAL_ELIGIBILITY,
             row_selections=(_DIRECTION_SELECTION("credit"),)),
+    # ── A6b: the count recipe, made structurally honest under ruling R13 ────────────────────────
+    # Revision 2. It said "debit" in its NAME and its prose while declaring no row selection; it
+    # named no transaction identity, so "count of transactions" had nothing to be a count OF; and
+    # its window rode the generic event clock while the thing counted is a POSTED transaction.
+    # All three are now DECLARED — which is a semantic revision of the feature, hence the bump
+    # (contrast A6's ruling on `posted_debit_amount`, which declared a `join_role` and did NOT
+    # bump: a declaration settles what an existing slot already meant; a row selection, a new
+    # required operand and a re-bound window change the feature itself).
     _recipe("posted_debit_transaction_count",
-            definition="Count of eligible posted debit transactions over the window.",
+            definition=("Count of eligible posted DEBIT transactions per account over the "
+                        "trailing POSTING window — direction from the governed authority, "
+                        "reversals and failures excluded by policy, each row carrying the "
+                        "governed transaction identity the uniqueness guard checks (a violated "
+                        "identity refuses the run and produces no values; duplicates are never "
+                        "silently de-duplicated); an empty window returns zero."),
             context="spend activity volume",
             output=_count_output("posted_debit_transaction_count", "Posted debit count"),
             result_class="count",
-            operands=_base_operands(with_direction=True)),
+            revision=2,
+            operands=_base_operands(with_direction=True, event_time=_POSTING_TS,
+                                    extra=(_TRANSACTION_IDENTITY,)),
+            eligibility=_POSTED_DIRECTIONAL_ELIGIBILITY,
+            row_selections=(_DIRECTION_SELECTION("debit"),),
+            # ONE source for the role name: the window names the operand it binds, so the two
+            # cannot drift apart into `event_time_role_unbound`.
+            event_time_role=_POSTING_TS.role),
     _recipe("posted_credit_transaction_count",
             definition="Count of eligible posted credit transactions over the window.",
             context="income activity volume",

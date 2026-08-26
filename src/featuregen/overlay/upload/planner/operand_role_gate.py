@@ -8,16 +8,20 @@ are not the same reading:
 * the **concept registry's ladder** — ``need_metadata._derive_one``: ``entity_link`` first, then
   ``pit_role``, then ``JoinRole.MEASURE`` as the template default (concept-keyed).
 
-They agree on 1113 of the V2 registry's 1195 operands and DISAGREE on 82 (§V fact V2, measured at
-``1c656743``). That divergence is G2. It is invisible today because ``compile_aggregation``
-short-circuits on ``card is None`` (``declarations.py``) before the additivity matrix runs, so an
-operand nobody intended to aggregate is staged as a measure and the mis-classification only
-surfaces when a cardinality attaches.
+They DISAGREED on 82 of the V2 registry's 1195 operands when G2 was first measured (§V fact V2, at
+``1c656743``); the rulings taken since have brought that census to **76 operands across 71
+recipes** — the number ``test_the_gate_is_the_worklists_own_criterion_recomputed`` pins, in both
+directions, and the only place it should ever be read from. That divergence is G2. It is invisible
+today because ``compile_aggregation`` short-circuits on ``card is None`` (``declarations.py``)
+before the additivity matrix runs, so an operand nobody intended to aggregate is staged as a
+measure and the mis-classification only surfaces when a cardinality attaches.
 
 **This module does NOT settle G2** — the ruling is chartered. It makes the divergence a NAMED
-serving fact: :data:`OPERAND_ROLE_UNRESOLVED`, whose registered disposition BLOCKS all six
-actions while leaving the card visible as setup work. The narrow "correctly classify a dimension"
-fix is deliberately not taken here; taking it would decide, per operand, a question with an owner.
+serving fact: :data:`OPERAND_ROLE_UNRESOLVED`, whose registered disposition WARNS at
+AUTHOR_FORMULA and BLOCKS from GENERATE_PREVIEW onward (the owner's capability matrix reads Allow
+in its Formula column under every link condition — the harm an unruled role does is at the JOIN),
+while the card stays visible as setup work. The narrow "correctly classify a dimension" fix is
+deliberately not taken here; taking it would decide, per operand, a question with an owner.
 
 **Derived, never listed.** The check re-asks the same two authorities the 82-operand worklist
 counted — ``planning_probe`` (which applies ``_projected_roles``, i.e. declaration-first then the

@@ -43,8 +43,9 @@ the plan's actual bindings. So every option that could be served passes through
 :func:`planner.operand_role_gate.unresolved_operand_roles` here, and an operand whose governed
 join role the platform's two authorities do not settle mints an
 :data:`OPERAND_ROLE_UNRESOLVED` absence. Like R14's, it is an ABSENCE and not a refusal — the card
-stays visible as setup work — and the registered disposition (BLOCK × all six) is what refuses the
-actions. G2 itself is untouched: nothing here re-classifies an operand.
+stays visible as setup work — and the registered disposition (WARN at AUTHOR_FORMULA, BLOCK from
+GENERATE_PREVIEW onward, the owner's matrix row) is what decides the actions. G2 itself is
+untouched: nothing here re-classifies an operand.
 
 :func:`serving_action_facts` projects a resolution's absences into the canonical decision
 service's :class:`ActionFactsV1`, so a consumer never re-derives which codes a served option
@@ -268,8 +269,10 @@ def serving_action_facts(
     Every absence code goes to ``member_blockers`` verbatim. Which of them refuse WHICH action is
     the §5 disposition table's answer and nobody else's (``fold_member_codes`` escalates and
     downgrades a caller's channel precisely so a producer cannot launder one), so this deliberately
-    filters nothing: ``TEMPORAL_JOIN_POLICY_MISSING`` warns at AUTHOR_FORMULA and blocks preview,
-    ``OPERAND_ROLE_UNRESOLVED`` blocks everywhere, and this function does not know or care.
+    filters nothing: ``TEMPORAL_JOIN_POLICY_MISSING`` and ``OPERAND_ROLE_UNRESOLVED`` warn at
+    AUTHOR_FORMULA and block from preview, ``TRANSACTION_IDENTITY_NOT_UNIQUE`` warns at preview too
+    (R13: the guard is RENDERED, and the run is what refuses), and this function does not know or
+    care — which is the point: the rows differ, and a producer that filtered would have to know how.
 
     ``member_name`` defaults to the logical digest — §10/C3's ``semantic_feature_id``, which is
     what this option IS. ``evidence_pins`` are the revisions whose movement changes the answer:
@@ -409,7 +412,8 @@ def resolve_logical_plan(
     # An operand whose governed join role the platform's two authorities do not settle is a
     # feature whose MEANING cannot be stated, so it may not be served silently. It is an ABSENCE,
     # not a refusal: the plan is still resolved and the card may still be shown as setup work —
-    # `OPERAND_ROLE_UNRESOLVED`'s registered disposition is what blocks all six actions.
+    # `OPERAND_ROLE_UNRESOLVED`'s registered disposition is what decides the actions (WARN at
+    # AUTHOR_FORMULA, BLOCK from GENERATE_PREVIEW onward — the owner's matrix row).
     # Scoped to the operands this option actually BINDS: a slot nobody reads is not this option's.
     for unresolved in unresolved_operand_roles(
             request, roles=frozenset(b.need_role for b in plan.ingredient_bindings)):

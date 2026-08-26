@@ -27,9 +27,11 @@ in this module, and this module may not fix them (it owns no planner file):
 * **G1 — CLOSED.** ``planning_probe`` no longer projects the operands' ``join_role`` /
   ``temporal_role`` verbatim: it DECLARES them at projection time from the request's own facts —
   the V2 ``operand_class`` vocabulary plus the concept registry's ``entity_link`` / ``pit_role``.
-  Still ZERO of the 1195 operands in the 317-recipe registry declares a role (no recipe was
-  re-authored, and none needs to be), yet a request built by ``planning_request_from_recipe``
-  ALONE now yields ``account → source_entity_key`` and ``event_ts → time/event_time``,
+  Almost no operand in the 317-recipe registry declares a role — 7 of 1196 do, and every one of
+  them is a G2 RULING (A6's on the identifier-valued ``transaction``/``original_txn`` slots, A6b's
+  on the count recipe's transaction identity), never a compensation for the projection — yet a
+  request built by ``planning_request_from_recipe`` ALONE yields
+  ``account → source_entity_key`` and its event clock ``→ time/event_time``,
   ``plan._assemble_rollups`` starts its frontier, and a roll-up spanning both catalogs is
   assembled. ``test_as_shipped_recipe_request_reaches_the_g3_boundary`` pins the shipped request's
   whole projection.
@@ -51,10 +53,12 @@ in this module, and this module may not fix them (it owns no planner file):
 **Both are CHARTERED, not fixed here.** ``assembly.attach_executable_bridge_realizations`` has zero
 callers and attaching a revision moves SEGMENT identity, so G3 is a follow-on decided at the
 Stage-1C report with the realization-gap queue's evidence in hand — deliberately not ridden along
-with a projection change. G2 rides the same charter and carries an 82-OPERAND WORKLIST: the
-class-keyed projection and ``_derive_one``'s concept-keyed ladder agree on 1113 of the 1195 V2
-operands and DISAGREE on 82 (measured at ``1c656743``) — 63 value-classed operands on an
-entity-linked concept, 17 on a pit-bearing one, and ``device_sharing_velocity``'s two.
+with a projection change. G2 rides the same charter and carries an OPERAND WORKLIST: the
+class-keyed projection and ``_derive_one``'s concept-keyed ladder DISAGREED on 82 of the 1195 V2
+operands when first measured (at ``1c656743``) — 63 value-classed operands on an entity-linked
+concept, 17 on a pit-bearing one, and ``device_sharing_velocity``'s two. The rulings taken since
+(A6's, A6b's) moved that census to 76 across 71 recipes; the gate's own test is where it is
+PINNED, and any count quoted in prose is a snapshot rather than the authority.
 ``test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_g2_lives``
 (``planner/test_requests.py``) pins that divergence BY SHAPE in both directions, so the worklist
 G2's ruling has to decide stays self-maintaining rather than rotting silently.

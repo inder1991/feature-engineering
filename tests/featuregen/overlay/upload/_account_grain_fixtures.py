@@ -300,9 +300,12 @@ def account_grain_request(**overrides: Any) -> FeaturePlanningRequestV1:
 
 
 def donor_recipe_request() -> FeaturePlanningRequestV1:
-    """``posted_debit_amount`` projected VERBATIM — the registry's own request, G2 divergences
-    and all. This is what A6's gate test uses: the divergence it catches is a real shipped
-    recipe's, never a shape invented to make the gate fire."""
+    """``posted_debit_amount`` projected VERBATIM — the registry's own request, nine operands and
+    all. This is what A6's gate test uses: it carried the two divergences the gate was built to
+    catch until A6's fix round RULED on them in the recipe, so the request is now UNGATED and the
+    test's job is to prove the ruling load-bearing (strip the declaration and the divergence
+    returns) rather than to watch the gate fire. Either way the shape is a real shipped recipe's,
+    never one invented to make the gate say something."""
     from featuregen.overlay.upload.feature_planning_contracts import planning_request_from_recipe
     from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
 

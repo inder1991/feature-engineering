@@ -3,7 +3,8 @@
 G2 (§V fact V2): ``need_metadata._derive_one`` resolves any operand whose concept links no entity
 and carries no ``pit_role`` — a status, a dimension, a direction — to ``JoinRole.MEASURE``, and
 ``planner/requests._derived_roles`` instead honours the recipe author's ``operand_class``. The two
-governed authorities agree on 1113 of the registry's 1195 operands and DISAGREE on 82. Today the
+governed authorities DISAGREED on 82 of the registry's 1195 operands when G2 was first measured
+(the census below is the current, pinned figure — read it there, never from prose). The
 disagreement is invisible, because ``compile_aggregation`` short-circuits on ``card is None``
 before the additivity matrix runs; it unmasks the moment a cardinality attaches.
 
@@ -195,12 +196,17 @@ def test_the_gate_is_the_worklists_own_criterion_recomputed():
         gated_total += len(gated)
         recipes_gated += 1 if gated else 0
 
-    # ▲ The census is pinned in BOTH directions, and the shrink direction is the one that
-    # matters. A one-sided floor (`>= 76`) would let a legitimate G2 ruling — the very act this
-    # gate exists to provoke — land silently; a one-sided ceiling would hide a new divergence.
-    # 76 operands across 71 recipes, measured after A6's ruling on `transaction`/`original_txn`
-    # cleared 6 operands across 5 recipes (pre-ruling: 82 across 76). Moving either number is a
-    # deliberate edit that says which ruling moved it.
+    # ▲ The census is pinned in BOTH directions, because each one-sided form is blind to the
+    # opposite move. A floor (`>= 76`) catches a SHRINK and hides GROWTH: a new divergence
+    # entering the registry passes it silently. A ceiling (`<= 76`) is the mirror: it catches
+    # growth and lets a ruling land unrecorded. (The earlier round's note had this backwards —
+    # the pre-ruling floor `>= 82` would have failed on this very shrink, since `76 >= 82` is
+    # False. The code was right; only the reason was wrong.) Equality is the only form that
+    # forces BOTH moves to be stated. 76 operands across 71 recipes, measured after A6's ruling on
+    # `transaction`/`original_txn` cleared 6 operands across 5 recipes (pre-ruling: 82 across 76);
+    # A6b's declaration on the count recipe's own identity slot added an operand WITH its ruling
+    # already made, so it moved neither number. Moving either is a deliberate edit that says which
+    # ruling moved it.
     assert (gated_total, recipes_gated) == (76, 71), (
         f"the G2 census moved to {gated_total} operands across {recipes_gated} recipes. A "
         f"DECREASE means a ruling landed — record which, and update these numbers. An INCREASE "

@@ -8,7 +8,8 @@ The short version, because it shapes every fixture below:
 * the governed cross-catalog path resolves for a request whose operands carry binding roles
   (``join_role`` / ``temporal_role``) — an LLM intent may declare them, and the platform's own
   ``need_metadata.derive_need_metadata`` derives them for any probe;
-* no V2 recipe declares one (0 of 1195 operands across the 317-recipe registry) and
+* virtually no V2 recipe declares one (0 of 1195 operands when this suite was written; 7 of 1196
+  today, each a G2 ruling taken in a recipe by A6/A6b — none of them this suite's recipe) and
   ``metadata_resolution_mode="request_contract"`` deliberately does not consult the legacy
   resolved-need registry — so **S1A-4c made ``planning_probe`` declare them at PROJECTION time**
   from the request's own facts. That closed G1: a recipe-origin request built by
@@ -343,7 +344,8 @@ def test_as_shipped_recipe_request_reaches_the_g3_boundary(db):
     shipped = governed_requests_for_scope(db, eligible_recipe_ids=frozenset({RECIPE_ID}))
     assert [r.source_definition_id for r in shipped] == [RECIPE_ID]
     # the REQUEST still declares nothing — the roles are the PROJECTION's, which is the whole
-    # point: no recipe was re-authored, and 0 of the 1195 V2 operands gained a declaration.
+    # point: THIS recipe was never re-authored. (Registry-wide, 7 of 1196 operands do declare a
+    # role now; all 7 are G2 rulings in the transaction-foundation pack, and none is here.)
     assert all(op.join_role == "" and op.temporal_role == "" for op in shipped[0].operands)
     probe = planning_probe(shipped[0])
     assert [(n.role, n.join_role, n.temporal_role) for n in probe.needs] == [
