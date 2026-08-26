@@ -448,12 +448,17 @@ def _realization_matches_segment(
 ) -> bool:
     """Does this directional realization realize EXACTLY this crossing?
 
-    A5 tightened the endpoint test from membership to ORDERED EQUALITY. The pre-A5 check asked
-    whether the segment's single ``bridge_from_object_ref`` was AMONG the revision's from-members,
-    which a realization of a WIDER composite key satisfies — binding a two-column realization to a
-    one-column crossing, the physical-side twin of the discovery defect the composite segment
-    tuples close. The segment now carries its complete ordered key, so the two are compared as
-    ordered tuples: same members, same declared pair order, or no match."""
+    A5 tightened the endpoint test from MEMBERSHIP to ordered PAIR equality. The pre-A5 check
+    asked whether the segment's single ``bridge_from_object_ref`` was AMONG the revision's
+    from-members, which a realization of a WIDER composite key satisfies — binding a two-column
+    realization to a one-column crossing, the physical-side twin of the discovery defect the
+    composite segment tuples close.
+
+    The comparison is against ``revision.column_pairs``, NOT the endpoint member tuples. The pairs
+    are the authoritative mapping: ``build_physical_read_set`` reads them, and the revision's own
+    validation checks pairs against members as SETS, so two realizations that cross-pair the same
+    members (``a↔y, b↔x`` vs ``a↔x, b↔y``) have identical member tuples and describe DIFFERENT
+    joins. Comparing members would match either one against a segment declaring straight pairs."""
     revision = realization.revision
     if (
         segment.bridge_fact_key != revision.bridge_fact_key
@@ -463,25 +468,23 @@ def _realization_matches_segment(
         or segment.bridge_to_object_ref is None
     ):
         return False
-    from_refs = tuple(
-        member.logical_column_ref.split("::", 1)[-1]
-        for member in revision.from_endpoint.members
-    )
-    to_refs = tuple(
-        member.logical_column_ref.split("::", 1)[-1]
-        for member in revision.to_endpoint.members
+    revision_pairs = tuple(
+        (pair.from_logical_column_ref.split("::", 1)[-1],
+         pair.to_logical_column_ref.split("::", 1)[-1])
+        for pair in revision.column_pairs
     )
     # A segment carrying no member tuples is a pre-A5/hand-built value that says only its first
     # pair; it is compared as the single-member key it declares — never widened to "any member of".
     segment_from = segment.bridge_from_member_refs or (segment.bridge_from_object_ref,)
     segment_to = segment.bridge_to_member_refs or (segment.bridge_to_object_ref,)
+    if len(segment_from) != len(segment_to):
+        return False    # an unpairable segment realizes nothing (the assembler never emits one)
     return (
         revision.from_endpoint.logical_table_ref.split("::", 1)[0]
         == segment.bridge_from_catalog_source
         and revision.to_endpoint.logical_table_ref.split("::", 1)[0]
         == segment.bridge_to_catalog_source
-        and segment_from == from_refs
-        and segment_to == to_refs
+        and tuple(zip(segment_from, segment_to, strict=True)) == revision_pairs
     )
 
 

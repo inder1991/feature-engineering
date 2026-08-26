@@ -52,6 +52,7 @@ from featuregen.overlay.upload.planner.logical_plan_v2 import (
 )
 from featuregen.overlay.upload.planner.logical_resolution import (
     BRIDGE_ENDPOINT_TUPLES_MISSING,
+    CANONICAL_DEFINITION_REVISION_MISSING,
     GOVERNED_SEMANTIC_REVISION_MISSING,
     LOGICAL_PATH_NOT_RESOLVED,
     TEMPORAL_JOIN_POLICY_MISSING,
@@ -409,6 +410,37 @@ def test_an_operand_with_no_governed_semantic_revision_is_refused(db):
         resolve_logical_plan(request=request, plan=plan, semantic_revisions={},
                              temporal_semantics={_BRIDGE: _semantics()})
     assert excinfo.value.code == GOVERNED_SEMANTIC_REVISION_MISSING
+
+
+def test_a_blank_canonical_definition_revision_is_refused_not_substituted(db):
+    """``source_revision`` is a REQUIRED field of the request and every production builder
+    populates it, so a blank one is a caller defect. Refused under its own name — substituting the
+    content hash would give "which revision of the definition" a second address."""
+    _two_catalogs(db)
+    request = _request()
+    result = _plan_result(db, request, compile_it=False)
+    plan = select_logical_plan_candidate(result)
+    assert plan is not None
+    import dataclasses
+
+    blank = dataclasses.replace(request, source_revision="   ")
+    with pytest.raises(LogicalResolutionRefused) as excinfo:
+        resolve_logical_plan(request=blank, plan=plan,
+                             semantic_revisions=_stub_revisions(plan),
+                             temporal_semantics={_BRIDGE: _semantics()})
+    assert excinfo.value.code == CANONICAL_DEFINITION_REVISION_MISSING
+
+
+def test_the_temporal_refusal_code_is_the_registered_one_not_a_second_spelling(db):
+    """A1 registered ``TEMPORAL_JOIN_POLICY_MISSING`` in the reason vocabulary three commits
+    earlier. This module IMPORTS and re-exports it — the `ALLOCATION_POLICY_REQUIRED` precedent —
+    so the two can never drift into two spellings of one refusal."""
+    del db
+    from featuregen.materialize.action_dispositions import ACTION_DISPOSITIONS
+    from featuregen.overlay.upload import semantic_eligibility_reasons as vocabulary
+
+    assert TEMPORAL_JOIN_POLICY_MISSING is vocabulary.TEMPORAL_JOIN_POLICY_MISSING
+    assert any(reason == TEMPORAL_JOIN_POLICY_MISSING for reason, _action in ACTION_DISPOSITIONS)
 
 
 def test_a_path_that_did_not_resolve_has_no_logical_meaning(db):

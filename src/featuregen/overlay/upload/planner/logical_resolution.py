@@ -64,8 +64,17 @@ from featuregen.overlay.upload.planner.logical_plan_v2 import (
     logical_digest,
 )
 
+# R14's consuming-layer refusal has ONE spelling, and A1 already registered it: the reason
+# vocabulary owns it (`semantic_eligibility_reasons.TEMPORAL_JOIN_POLICY_MISSING`), the reason
+# FAMILY maps it, and `action_dispositions` carries its disposition row. It is IMPORTED and
+# re-exported here — never re-declared — by the precedent that vocabulary file states in its own
+# comment and that `planner/physical_plan_v1` follows for `ALLOCATION_POLICY_REQUIRED`: a second
+# module-local literal is a second spelling waiting to drift.
+from featuregen.overlay.upload.semantic_eligibility_reasons import TEMPORAL_JOIN_POLICY_MISSING
+
 __all__ = [
     "BRIDGE_ENDPOINT_TUPLES_MISSING",
+    "CANONICAL_DEFINITION_REVISION_MISSING",
     "GOVERNED_SEMANTIC_REVISION_MISSING",
     "INTRA_CATALOG_REALIZATION_NOT_PROJECTED",
     "LOGICAL_PATH_NOT_RESOLVED",
@@ -82,11 +91,6 @@ __all__ = [
     "semantic_revisions_for_plan",
 ]
 
-#: R14's consuming-layer refusal, minted HERE for the first time (the step-3 contracts refuse
-#: construction instead and name the code only in prose). A crossing with no declared temporal
-#: meaning carries this absence; nothing downstream may default a policy in its place.
-TEMPORAL_JOIN_POLICY_MISSING = "TEMPORAL_JOIN_POLICY_MISSING"
-
 #: An intra-catalog realization segment is a real relationship hop, but the segment carries only
 #: the realization's REF — never its endpoint columns — so projecting it would mean inventing the
 #: columns it joins on. Named, not silently dropped: a consumer can see that the logical path it
@@ -99,6 +103,7 @@ LOGICAL_PATH_NOT_RESOLVED = "LOGICAL_PATH_NOT_RESOLVED"
 OUTPUT_GRAIN_UNRESOLVED = "OUTPUT_GRAIN_UNRESOLVED"
 GOVERNED_SEMANTIC_REVISION_MISSING = "GOVERNED_SEMANTIC_REVISION_MISSING"
 BRIDGE_ENDPOINT_TUPLES_MISSING = "BRIDGE_ENDPOINT_TUPLES_MISSING"
+CANONICAL_DEFINITION_REVISION_MISSING = "CANONICAL_DEFINITION_REVISION_MISSING"
 
 PLAN_VARIANT_ADDRESS_CONTRACT = "logical_plan_variant_address_v1"
 _SEGMENT_CONTRACT = "resolved_relationship_segment_v1"
@@ -305,8 +310,9 @@ def resolve_logical_plan(
     :data:`TEMPORAL_JOIN_POLICY_MISSING` absence.
 
     Refuses (:class:`LogicalResolutionRefused`) rather than approximating: a path that did not
-    resolve source→target, a plan with no governed output grain, an operand bound to a column no
-    governed semantic revision covers, and a crossing missing its ordered endpoint tuples.
+    resolve source→target, a plan with no governed output grain, a request with a blank canonical
+    definition revision, an operand bound to a column no governed semantic revision covers, and a
+    crossing missing its ordered endpoint tuples.
 
     Physical facts are not read at ALL — not the contract status, not a cardinality, not a
     realization revision, not the physical read set. An AI-proposed link nobody has realized
@@ -321,6 +327,15 @@ def resolve_logical_plan(
             f"plan {plan.physical_plan_id} reports no governed output grain; the ordered output "
             "grain is R9 identity material and is never guessed from a table name",
             code=OUTPUT_GRAIN_UNRESOLVED)
+    if not request.source_revision.strip():
+        # `source_revision` is a required field of the request and every production builder
+        # populates it, so a blank one is a caller defect — refused under its own name rather than
+        # silently substituted with the content hash. Two different addresses for "which revision
+        # of the definition" is how a canonical identity quietly acquires a second spelling.
+        raise LogicalResolutionRefused(
+            f"request {request.source_definition_id!r} carries a blank source_revision; R9's "
+            "canonical definition REVISION is identity material and has no substitute",
+            code=CANONICAL_DEFINITION_REVISION_MISSING)
 
     bindings: list[LogicalOperandBindingV1] = []
     for binding in plan.ingredient_bindings:
@@ -359,7 +374,7 @@ def resolve_logical_plan(
 
     resolved_plan = LogicalFeaturePlanV2(
         canonical_definition_content_hash=request.source_content_hash,
-        canonical_definition_revision_id=request.source_revision or request.source_content_hash,
+        canonical_definition_revision_id=request.source_revision,
         operation=request.computation_kind,
         operand_bindings=tuple(bindings),
         output_grain_key_refs=(qualify_object_ref(*plan.output_grain_ref),),

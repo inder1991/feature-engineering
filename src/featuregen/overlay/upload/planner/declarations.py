@@ -860,7 +860,8 @@ def build_physical_read_set(ctx: CompilerContext, plan: BindingPlanV1) -> Physic
     """The immutable inventory of every column the plan's contract would read, MULTI-ROLE: each
     ingredient's bound column (+ ``join_key`` when its join_role is an entity-key role, +
     ``temporal_anchor`` when it carries a real temporal role), each path realization's from/to
-    key (``join_key``), and each bridge segment's BOTH endpoint columns (``bridge_key``).
+    key (``join_key``), and each bridge segment's BOTH endpoints in FULL — every ordered member of
+    a composite key, never just the first of each side (``bridge_key``).
     Duplicate ``(catalog, object_ref)`` reads merge into ONE ``PhysicalColumnReadV1`` with the
     UNION of roles; per-column safety + reason from :func:`safety_of_ref`. A segment whose
     realization ref the context cannot resolve contributes no reads. An available provisional
@@ -919,16 +920,23 @@ def build_physical_read_set(ctx: CompilerContext, plan: BindingPlanV1) -> Physic
                 and seg.bridge_to_catalog_source is not None
                 and seg.bridge_to_object_ref is not None
             ):
-                _read(
-                    seg.bridge_from_catalog_source,
-                    seg.bridge_from_object_ref,
-                    ColumnRole.bridge_key,
-                )
-                _read(
-                    seg.bridge_to_catalog_source,
-                    seg.bridge_to_object_ref,
-                    ColumnRole.bridge_key,
-                )
+                # A5: EVERY ordered member of BOTH endpoints, not the first of each. Since path
+                # assembly began crossing composite links whole, a segment with no realization
+                # revision describes an N-column join, and inventorying only the thin
+                # `*_object_ref` fields left the remaining members OUT of the read set — where
+                # `stage_safety` cannot see them, so a leakage anchor or protected attribute
+                # sitting in a composite key's second member would be joined on and reported SAFE.
+                # The member tuples carry exactly what this law ("each bridge segment's BOTH
+                # endpoint columns") always meant; the thin fields remain the fallback for a
+                # pre-A5 or hand-built segment, which declares only one pair per side.
+                for catalog, refs, thin in (
+                    (seg.bridge_from_catalog_source, seg.bridge_from_member_refs,
+                     seg.bridge_from_object_ref),
+                    (seg.bridge_to_catalog_source, seg.bridge_to_member_refs,
+                     seg.bridge_to_object_ref),
+                ):
+                    for ref in (refs or (thin,)):
+                        _read(catalog, ref, ColumnRole.bridge_key)
             else:
                 bridge = next(
                     (
@@ -939,16 +947,17 @@ def build_physical_read_set(ctx: CompilerContext, plan: BindingPlanV1) -> Physic
                     None,
                 )
                 if bridge is not None:
-                    _read(
-                        bridge.left_catalog_source,
-                        bridge.left_object_ref,
-                        ColumnRole.bridge_key,
-                    )
-                    _read(
-                        bridge.right_catalog_source,
-                        bridge.right_object_ref,
-                        ColumnRole.bridge_key,
-                    )
+                    # A5, same law as the branch above: the projection's COMPLETE ordered member
+                    # tuples, with the thin `members[0]` flattening as the fallback for a bridge
+                    # value that carries none.
+                    for catalog, refs, thin in (
+                        (bridge.left_catalog_source, bridge.left_member_refs,
+                         bridge.left_object_ref),
+                        (bridge.right_catalog_source, bridge.right_member_refs,
+                         bridge.right_object_ref),
+                    ):
+                        for ref in (refs or (thin,)):
+                            _read(catalog, ref.split("::", 1)[-1], ColumnRole.bridge_key)
 
     columns: list[PhysicalColumnReadV1] = []
     for catalog, ref in sorted(roles_of):

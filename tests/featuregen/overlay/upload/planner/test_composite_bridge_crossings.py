@@ -232,7 +232,91 @@ def test_a_single_member_link_is_exactly_what_it_always_was(db):
     assert bridge.bridge_to_member_refs == ("public.accounts.account_id",)
 
 
-# ── 3. THE PHYSICAL-SIDE TWIN: exact ordered realization matching ─────────────────────────────
+# ── 3. THE READ SET SEES EVERY MEMBER — or safety is fail-OPEN ────────────────────────────────
+#
+# `build_physical_read_set` states the law itself: "each bridge segment's BOTH endpoints in FULL".
+# Once path assembly emits a two-column join, inventorying only the thin `bridge_*_object_ref`
+# fields breaks it — and `stage_safety` can only inspect columns that are IN the set, so a leakage
+# anchor or protected attribute sitting in a composite key's SECOND member would be joined on and
+# reported SAFE. These two tests are the pin: the whole key is inventoried, and a leakage anchor
+# hiding in a second member is SEEN.
+
+
+def _txn_template():
+    from featuregen.overlay.upload.binding_roles import JoinRole
+    from featuregen.overlay.upload.templates import Need, Template
+
+    return Template(id="t_a5_readset", family="f", intent="i",
+                    needs=(Need(role="txn", concept="transaction_id",
+                                join_role=JoinRole.SOURCE_ENTITY_KEY),),
+                    params={}, aggregation="sum", additivity="additive", explain="M",
+                    use_cases=(), pit="trailing", source_entity_need_role="txn")
+
+
+def _cross_plan(db):
+    from datetime import UTC, datetime
+
+    from featuregen.overlay.upload.planner.contracts import PathResolutionStatus
+    from featuregen.overlay.upload.planner.declarations import build_compiler_context
+    from featuregen.overlay.upload.planner.plan import plan_bindings
+
+    now = datetime(2026, 8, 26, tzinfo=UTC)
+    scope = _scope("ops", "rev")
+    result = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
+                           roles=(), now=now, compile_ctx=build_compiler_context(db, scope, (), now))
+    (cross,) = [p for p in result.candidate_plans
+                if p.path_resolution_status is PathResolutionStatus.source_to_target_resolved]
+    return cross
+
+
+def test_a_composite_crossings_read_set_carries_every_member_on_both_sides(db):
+    _composite_split(db)
+    _seed_composite_bridge(db, "bfk_readset", left_source="ops", left_table="transactions",
+                           right_source="rev", right_table="accounts",
+                           columns=("account_id", "source_system"))
+    cross = _cross_plan(db)
+    assert cross.physical_read_set is not None
+    from featuregen.overlay.upload.planner.contracts import ColumnRole
+
+    bridge_keys = {(c.catalog_source, c.object_ref) for c in cross.physical_read_set.columns
+                   if ColumnRole.bridge_key in c.roles}
+    # BOTH members, on BOTH sides — the second member is exactly what the thin fields dropped
+    assert bridge_keys == {
+        ("ops", "public.transactions.account_id"),
+        ("ops", "public.transactions.source_system"),
+        ("rev", "public.accounts.account_id"),
+        ("rev", "public.accounts.source_system"),
+    }
+
+
+def test_a_leakage_anchor_in_a_second_key_member_is_seen_not_reported_safe(db):
+    """The fail-open this closes: a column the plan genuinely JOINS ON, invisible to safety merely
+    because it was the second member of a composite key. ``fraud_flag`` is a governed leakage
+    anchor; joining on it leaks exactly as much as reading it as an ingredient."""
+    _composite_split(
+        db,
+        extra_ops=[(CanonicalRow("ops", "transactions", "fraud_flag", "boolean"), "fraud_flag")],
+        extra_rev=[(CanonicalRow("rev", "accounts", "fraud_flag", "boolean"), "fraud_flag")])
+    _seed_composite_bridge(db, "bfk_leak", left_source="ops", left_table="transactions",
+                           right_source="rev", right_table="accounts",
+                           columns=("account_id", "fraud_flag"))
+    cross = _cross_plan(db)
+    from featuregen.overlay.upload.planner.contracts import BindingSafety, ReasonCode
+    from featuregen.overlay.upload.planner.declarations import stage_safety
+
+    assert cross.physical_read_set is not None
+    anchor = next(c for c in cross.physical_read_set.columns
+                  if (c.catalog_source, c.object_ref) == ("ops", "public.transactions.fraud_flag"))
+    assert anchor.safety is BindingSafety.unsafe
+    assert ReasonCode.leakage_anchor_read in anchor.reason_codes
+    verdict, codes = stage_safety(cross.physical_read_set)
+    assert verdict is BindingSafety.unsafe
+    assert ReasonCode.leakage_anchor_read in codes
+    # …and it reaches the compiled contract rather than dying in the read set
+    assert ReasonCode.leakage_anchor_read in cross.contract_reason_codes
+
+
+# ── 4. THE PHYSICAL-SIDE TWIN: exact ordered realization matching ─────────────────────────────
 
 
 def _member(source: str, table: str, column: str) -> IdentifierColumnMemberV1:
@@ -263,7 +347,12 @@ def _bound_endpoint(source: str, table: str, columns: tuple[str, ...]) -> Identi
         binding_revision_id=binding.binding_revision_id)
 
 
-def _revision(*, from_columns: tuple[str, ...], to_columns: tuple[str, ...]):
+def _revision(*, from_columns: tuple[str, ...], to_columns: tuple[str, ...],
+              pair_with: tuple[str, ...] | None = None):
+    """``pair_with`` re-pairs the SAME members without reordering either endpoint's member tuple —
+    the cross-paired realization (``a↔y, b↔x`` where the segment declares ``a↔x, b↔y``). It is the
+    case a members-only comparison cannot see: the revision validates pairs against members as
+    SETS, so both realizations have identical member tuples and describe different joins."""
     from featuregen.overlay.upload.bridge_realization import (
         BridgeJoinRealizationRevisionV1,
         CardinalityBasis,
@@ -280,7 +369,7 @@ def _revision(*, from_columns: tuple[str, ...], to_columns: tuple[str, ...]):
         column_pairs=tuple(
             ColumnPairV1(normalize_ref("ops", "public", "transactions", f),
                          normalize_ref("rev", "public", "accounts", t))
-            for f, t in zip(from_columns, to_columns, strict=True)),
+            for f, t in zip(from_columns, pair_with or to_columns, strict=True)),
         predicates=(),
         applicability_scope=RealizationApplicabilityScopeV1(
             scope_id="a5-scope", execution_tier=ExecutionTier.SANDBOX,
@@ -353,3 +442,14 @@ def test_the_realization_matcher_compares_ordered_tuples_not_membership(db):
     reordered = _realization(_revision(from_columns=("source_system", "account_id"),
                                        to_columns=("source_system", "account_id")))
     assert not _realization_matches_segment(reordered, composite_segment)
+    # THE CASE A MEMBERS-ONLY COMPARISON CANNOT SEE: the same members on both sides, in the same
+    # tuple order, CROSS-PAIRED (account_id↔source_system, source_system↔account_id). The
+    # revision's own validation checks pairs against members as SETS, so its member tuples are
+    # byte-identical to `composite`'s — only `column_pairs` distinguishes the two joins.
+    cross_paired = _realization(_revision(
+        from_columns=("account_id", "source_system"), to_columns=("account_id", "source_system"),
+        pair_with=("source_system", "account_id")))
+    assert (tuple(m.logical_column_ref for m in cross_paired.revision.to_endpoint.members)
+            == tuple(m.logical_column_ref for m in composite.revision.to_endpoint.members)), (
+        "the control: this realization differs from `composite` ONLY in its column_pairs")
+    assert not _realization_matches_segment(cross_paired, composite_segment)

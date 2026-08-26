@@ -333,6 +333,18 @@ _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
     }),
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
         "compile_temporal",
+        # A5 REVIEW FIX — `build_physical_read_set` inventoried only the FIRST member of each
+        # bridge endpoint (the thin `bridge_*_object_ref` fields). Harmless while every crossing
+        # was one column; a fail-OPEN the moment path assembly began emitting composite joins,
+        # because `stage_safety` can only inspect columns that are IN the read set — a leakage
+        # anchor or protected attribute in a composite key's SECOND member was joined on and
+        # reported SAFE. It now reads every ordered member of both endpoints (and, in the
+        # active-bridge fallback, the projection's tuples), which is what the function's own
+        # stated law always meant. Fail-CLOSED direction, single-source unaffected (the branch is
+        # inside `seg.bridge_fact_key is not None`, and a bridge is by construction
+        # cross-catalog), pinned by `test_composite_bridge_crossings.py::
+        # test_a_leakage_anchor_in_a_second_key_member_is_seen_not_reported_safe`.
+        "build_physical_read_set",
     }),
     "src/featuregen/overlay/upload/planner/plan.py": frozenset({
         "_assemble_rollups",
