@@ -324,6 +324,10 @@ def test_the_1134_tables_exist(db, table) -> None:
 
 
 # ── round-trip fidelity, layer by layer ───────────────────────────────────────────────────────
+# THE LAW these assert is payload-and-digest equality, not dataclass equality: the loaded value is
+# the CANONICAL REPRESENTATIVE of its identity, so `==` against the caller's object holds only when
+# the caller happened to declare the order-insensitive fields already sorted. The scramble tests
+# below demonstrate the difference rather than leaving it to fixture luck.
 def test_logical_plan_round_trip_is_the_same_contract(db) -> None:
     plan = _logical()
     record = ensure_logical_feature_plan(db, plan=plan)
@@ -334,9 +338,9 @@ def test_logical_plan_round_trip_is_the_same_contract(db) -> None:
 
     loaded = load_logical_feature_plan(db, record.revision_id,
                                       provenance_id=record.provenance_id)
-    assert loaded == plan
     assert loaded.content_payload() == plan.content_payload()
     assert logical_digest(loaded) == record.logical_digest
+    assert loaded.provenance == plan.provenance
 
 
 def test_physical_plan_round_trip_is_the_same_contract(db) -> None:
@@ -346,7 +350,6 @@ def test_physical_plan_round_trip_is_the_same_contract(db) -> None:
     assert revision_id == PHYSICAL_PLAN_ID_PREFIX + physical_digest(plan)
 
     loaded = load_physical_execution_plan(db, revision_id)
-    assert loaded == plan
     assert loaded.content_payload() == plan.content_payload()
     assert physical_digest(loaded) == physical_digest(plan)
 
@@ -356,7 +359,7 @@ def test_render_profile_round_trip_is_the_same_contract(db) -> None:
     revision_id = ensure_render_profile(db, profile=profile)
     assert revision_id == RENDER_PROFILE_ID_PREFIX + render_digest(profile)
     loaded = load_render_profile(db, revision_id)
-    assert loaded == profile
+    assert loaded.content_payload() == profile.content_payload()
     assert render_digest(loaded) == render_digest(profile)
 
 
@@ -366,12 +369,14 @@ def test_generation_configuration_round_trip_is_the_same_contract(db) -> None:
     assert revision_id == (
         GENERATION_CONFIGURATION_ID_PREFIX + generation_configuration_digest(configuration))
     loaded = load_generation_configuration(db, revision_id)
-    assert loaded == configuration
+    assert loaded.content_payload() == configuration.content_payload()
     assert generation_configuration_digest(loaded) == generation_configuration_digest(
         configuration)
 
 
 def test_member_output_contract_round_trip_is_the_same_contract(db) -> None:
+    """The ONE layer with no order-insensitive field: dataclass equality is unconditional here,
+    and asserted as such."""
     contract = _output_contract()
     revision_id = ensure_member_output_contract(db, contract=contract)
     assert revision_id.startswith(MEMBER_OUTPUT_CONTRACT_ID_PREFIX)
@@ -416,6 +421,52 @@ def test_a_scrambled_declaration_order_persists_as_the_canonical_representative(
     assert loaded is not None
     assert loaded.content_payload() == scrambled.content_payload() == plan.content_payload()
     assert loaded.operand_bindings == plan.operand_bindings
+    # ...and the caveat itself, demonstrated: the loaded value is NOT the scrambled object.
+    assert loaded != scrambled
+
+
+def test_a_scrambled_physical_plan_loads_as_the_canonical_representative(db) -> None:
+    ensure_logical_feature_plan(db, plan=_logical())
+    context = _context(db)
+    plan = _physical(context)
+    scrambled = _physical(context,
+                          source_binding_revisions=tuple(reversed(plan.source_binding_revisions)))
+    assert physical_digest(scrambled) == physical_digest(plan)
+    revision_id = ensure_physical_execution_plan(db, plan=scrambled)
+    loaded = load_physical_execution_plan(db, revision_id)
+    assert loaded.content_payload() == scrambled.content_payload()
+    assert physical_digest(loaded) == physical_digest(scrambled)
+    assert loaded != scrambled
+    assert loaded.source_binding_revisions == plan.source_binding_revisions
+
+
+def test_a_scrambled_render_profile_loads_as_the_canonical_representative(db) -> None:
+    profile = _render_profile()
+    scrambled = _render_profile(template_versions=tuple(reversed(profile.template_versions)))
+    assert render_digest(scrambled) == render_digest(profile)
+    loaded = load_render_profile(db, ensure_render_profile(db, profile=scrambled))
+    assert loaded.content_payload() == scrambled.content_payload()
+    assert render_digest(loaded) == render_digest(scrambled)
+    assert loaded != scrambled
+    assert loaded.template_versions == profile.template_versions
+
+
+def test_a_scrambled_generation_configuration_loads_as_the_canonical_representative(db) -> None:
+    configuration = _genconfig(
+        policy_realization_revision_ids=("prr_amount_1", "prr_direction_1"),
+        engine_settings=(("executor_memory", "4g"), ("shuffle_partitions", 16)))
+    scrambled = _genconfig(
+        policy_realization_revision_ids=tuple(
+            reversed(configuration.policy_realization_revision_ids)),
+        engine_settings=tuple(reversed(configuration.engine_settings)))
+    assert generation_configuration_digest(scrambled) == generation_configuration_digest(
+        configuration)
+    loaded = load_generation_configuration(
+        db, ensure_generation_configuration(db, configuration=scrambled))
+    assert loaded.content_payload() == scrambled.content_payload()
+    assert generation_configuration_digest(loaded) == generation_configuration_digest(scrambled)
+    assert loaded != scrambled
+    assert loaded.engine_settings == configuration.engine_settings
 
 
 # ── content-addressed idempotency ─────────────────────────────────────────────────────────────
@@ -558,6 +609,9 @@ def test_truncate_refuses(db, table) -> None:
         with db.transaction():
             db.execute(f"TRUNCATE {table}")
     assert "append-only" in str(excinfo.value)
+    # The raiser must name what it caught — and a foreign key added onto this table later would
+    # refuse with FeatureNotSupported here instead, breaking this assertion by name.
+    assert table in str(excinfo.value)
 
 
 # ── the digest columns are the join points, and cannot drift from their content ───────────────
@@ -661,6 +715,57 @@ def test_a_physical_plan_pinning_an_unpersisted_logical_plan_refuses(db) -> None
         ensure_physical_execution_plan(db, plan=_physical(_context(db)))
     assert "logical" in str(excinfo.value)
     assert _count(db, "physical_execution_plan_revision") == 0
+
+
+def test_a_physical_plan_pinning_an_UNSERVABLE_logical_row_refuses(db) -> None:
+    """Existence is not enough: the pinned row must LOAD. A logical row whose stored content is a
+    different plan can never be served, so nothing may pin it — the check is a verifying load, not
+    a bare ``SELECT 1``."""
+    plan = _logical()
+    digest = logical_digest(plan)
+    db.execute(
+        "INSERT INTO logical_feature_plan_revision "
+        "  (revision_id, logical_digest, content, content_hash) VALUES (%s, %s, %s, %s)",
+        (LOGICAL_PLAN_ID_PREFIX + digest, digest,
+         Jsonb(_logical(operation="mean_window_delta").content_payload()), digest))
+    with pytest.raises(IdentityStoreConflict):
+        ensure_physical_execution_plan(db, plan=_physical(_context(db)))
+    assert _count(db, "physical_execution_plan_revision") == 0
+
+
+def test_a_chain_stage_pinning_an_UNSERVABLE_predecessor_refuses(db) -> None:
+    """The same verifying load guards every chain predecessor this store owns."""
+    record = ensure_logical_feature_plan(db, plan=_logical())
+    tampered = _render_profile(renderer_version="renderer-9.9.9").content_payload()
+    forged = "6" * 64
+    db.execute(
+        "INSERT INTO render_profile_revision "
+        "  (revision_id, render_profile_digest, content, content_hash) VALUES (%s, %s, %s, %s)",
+        (RENDER_PROFILE_ID_PREFIX + forged, forged, Jsonb(tampered), forged))
+    binding = record_identity_digest(db, stage=STAGE_FORMULA_BINDING, inputs={
+        "logical_digest": record.logical_digest, "formula_content_hash": "9" * 64,
+        "formula_method_identity": "llm_authoring_v1"})
+    configuration = _genconfig()
+    ensure_generation_configuration(db, configuration=configuration)
+    contract = _output_contract()
+    ensure_member_output_contract(db, contract=contract)
+    ensure_physical_execution_plan(db, plan=_physical(_context(db)))
+    execution_input = record_identity_digest(db, stage=STAGE_MEMBER_EXECUTION_INPUT, inputs={
+        "formula_binding_digest": binding.digest,
+        "physical_digest": physical_digest(_physical(_context(db))),
+        "member_output_contract": contract.content_payload()})
+    compiled = record_identity_digest(db, stage=STAGE_MEMBER_COMPILE, inputs={
+        "member_execution_input_digest": execution_input.digest, "ir_hash": "ir_hash_1",
+        "policy_occurrence_bindings": [["occurrence_1", "prr_direction_1"]]})
+    build = record_identity_digest(db, stage=STAGE_BUILD_COMPILATION, inputs={
+        "target_and_spine_revision": "tsr_1",
+        "ordered_member_compile_digests": [compiled.digest],
+        "generation_configuration_digest": generation_configuration_digest(configuration)})
+    with pytest.raises(IdentityStoreConflict):
+        record_identity_digest(db, stage=STAGE_SEALED_ARTIFACT, inputs={
+            "build_compilation_digest": build.digest,
+            "render_profile_digest": forged,
+            "project_digest": "project_digest_bytes_1"})
 
 
 def test_a_physical_plan_pinning_an_unpersisted_context_refuses(db) -> None:
@@ -776,6 +881,38 @@ def test_recording_the_same_stage_twice_is_one_row(db) -> None:
     assert _count(db, "identity_digest_record") == 1
 
 
+def test_policy_occurrence_refs_are_stripped_the_way_the_chain_hashes_them(db) -> None:
+    """``member_compile_digest`` hashes occurrence refs through a STRIPPING validator, so the
+    stored inputs must be stripped too: otherwise ``'occ_1 '`` and ``'occ_1'`` produce one digest
+    under two content ids — one identity, two rows, and the second write landing as a raw UNIQUE
+    violation that poisons the caller's transaction instead of a typed refusal."""
+    c = _chain(db)
+    padded = record_identity_digest(db, stage=STAGE_MEMBER_COMPILE, inputs={
+        "member_execution_input_digest": c["execution_input"].digest,
+        "ir_hash": "ir_hash_1",
+        "policy_occurrence_bindings": [["  occurrence_1  ", " prr_direction_1 "]],
+    })
+    assert padded.digest == c["compile"].digest
+    assert padded.digest_id == c["compile"].digest_id
+    assert padded.inputs["policy_occurrence_bindings"] == [["occurrence_1", "prr_direction_1"]]
+    assert _count(db, "identity_digest_record") == 5
+
+
+@pytest.mark.parametrize("bindings", [
+    [[None, 7]],
+    [["occurrence_1", ""]],
+    [["   ", "prr_direction_1"]],
+    [["occurrence_1"]],
+    [["occurrence_1", "prr_direction_1", "extra"]],
+])
+def test_policy_occurrence_bindings_are_validated_never_coerced(bindings) -> None:
+    """``str()`` would have turned ``None`` into the ref ``'None'`` and hashed it."""
+    with pytest.raises(IdentityPersistenceDefect):
+        record_identity_digest(_NeverTouched(), stage=STAGE_MEMBER_COMPILE, inputs={
+            "member_execution_input_digest": "a" * 64, "ir_hash": "ir_hash_1",
+            "policy_occurrence_bindings": bindings})
+
+
 def test_the_stage_vocabulary_is_closed_in_the_database_too(db) -> None:
     assert IDENTITY_DIGEST_STAGES == (
         STAGE_FORMULA_BINDING, STAGE_MEMBER_EXECUTION_INPUT, STAGE_MEMBER_COMPILE,
@@ -837,7 +974,9 @@ def test_a_stage_whose_predecessor_was_never_persisted_refuses(db, stage, missin
         inputs[missing_input] = absent
     with pytest.raises(IdentityPersistenceDefect) as excinfo:
         record_identity_digest(db, stage=stage, inputs=inputs)
-    assert missing_input.rstrip("s") in str(excinfo.value) or "persisted" in str(excinfo.value)
+    # The refusal must name the INPUT that was not persisted — "something was missing" is not a
+    # usable message for the caller that has five of them.
+    assert f"'{missing_input}'" in str(excinfo.value)
 
 
 def test_a_tampered_digest_record_refuses_to_load(db) -> None:

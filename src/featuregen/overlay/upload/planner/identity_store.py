@@ -640,10 +640,8 @@ def ensure_physical_execution_plan(conn: DbConn, *, plan: PhysicalExecutionPlanV
     realizing a meaning nobody persisted, or adopted in a context nobody minted, is a dangling
     identity. Writing it touches NO logical row (R2/R9)."""
     _instance(plan, PhysicalExecutionPlanV1, what="plan")
-    if conn.execute(
-        "SELECT 1 FROM logical_feature_plan_revision WHERE logical_digest = %s",
-        (plan.logical_digest_ref,),
-    ).fetchone() is None:
+    if load_logical_feature_plan(
+            conn, f"{LOGICAL_PLAN_ID_PREFIX}{plan.logical_digest_ref}") is None:
         raise IdentityPersistenceDefect(
             f"the logical plan {plan.logical_digest_ref} this physical plan realizes was never "
             "persisted — a physical plan pins a meaning that exists, never one it would have to "
@@ -797,12 +795,22 @@ def _hex(inputs: Mapping[str, Any], key: str) -> str:
     return value
 
 
-def _text(inputs: Mapping[str, Any], key: str) -> str:
-    value = inputs[key]
+def _text_value(value: object, *, what: str) -> str:
+    """Validate — never coerce — one non-empty string input, and STRIP it.
+
+    Stripping here is not cosmetic: ``identity_chain``'s ``_non_empty`` strips before it hashes, so
+    a stored input that kept its whitespace would produce the same digest under a different
+    ``digest_id`` — one identity, two content-addressed rows, and the second write landing as a raw
+    UNIQUE violation instead of a typed refusal. Every text input entering the chain goes through
+    this one door."""
     if not isinstance(value, str) or not value.strip():
         raise IdentityPersistenceDefect(
-            f"chain input {key!r} must be a non-empty string, got {value!r}")
+            f"{what} must be a non-empty string, got {value!r}")
     return value.strip()
+
+
+def _text(inputs: Mapping[str, Any], key: str) -> str:
+    return _text_value(inputs[key], what=f"chain input {key!r}")
 
 
 def _formula_binding_stage(inputs: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
@@ -830,7 +838,8 @@ def _member_execution_input_stage(inputs: Mapping[str, Any]) -> tuple[dict[str, 
 
 def _member_compile_stage(inputs: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
     bindings = tuple(
-        (str(occurrence), str(realization))
+        (_text_value(occurrence, what="policy occurrence ref"),
+         _text_value(realization, what=f"policy realization for occurrence {occurrence!r}"))
         for occurrence, realization in (
             _pair(item, what="policy occurrence binding")
             for item in _sequence(inputs["policy_occurrence_bindings"],
@@ -941,69 +950,81 @@ class IdentityDigestRecordV1:
         object.__setattr__(self, "digest_id", f"{IDENTITY_DIGEST_ID_PREFIX}{content_hash}")
 
 
-def _require_persisted(conn: DbConn, sql: str, params: tuple, *, what: str) -> None:
-    if conn.execute(sql, params).fetchone() is None:
+def _require_loaded(loaded: object, *, what: str) -> None:
+    """``None`` from a verifying loader means the pinned identity was never persisted.
+
+    The loaders raise :class:`IdentityStoreConflict` on a row that cannot reproduce its own
+    identity, so a corrupt predecessor STOPS the write rather than being pinned by it."""
+    if loaded is None:
         raise IdentityPersistenceDefect(
             f"{what} was never persisted — a chain record pins identities that exist, never ones "
             "it would have to invent")
 
 
 def _check_predecessors(conn: DbConn, record: IdentityDigestRecordV1) -> None:
-    """Every input this store OWNS must already be persisted. No foreign key can express it (the
-    tables are append-only, and an FK would replace their TRUNCATE guard); this read does.
+    """Every input this store OWNS must already be persisted AND loadable. No foreign key can
+    express it (the tables are append-only, and an FK would replace their TRUNCATE guard); a
+    VERIFYING LOAD does, and does more than an FK could — it proves the referenced row can still
+    rebuild its own contract and reproduce its own digest, so a chain never pins a row that could
+    never be served.
+
+    Every check addresses its row by the DERIVABLE PRIMARY KEY (``'<prefix>' || digest``, and for
+    the chain records the unique ``(stage, digest)``), so these are index lookups, never scans over
+    the digest columns.
 
     Externally minted identities — the formula content hash and method identity, the IR hash, the
     target/spine revision, ``project_digest`` — are NOT checked here: their owners are elsewhere,
     and inventing a check would be inventing an authority."""
     inputs = record.inputs
     if record.stage == STAGE_FORMULA_BINDING:
-        _require_persisted(
-            conn, "SELECT 1 FROM logical_feature_plan_revision WHERE logical_digest = %s",
-            (inputs["logical_digest"],),
+        _require_loaded(
+            load_logical_feature_plan(
+                conn, f"{LOGICAL_PLAN_ID_PREFIX}{inputs['logical_digest']}"),
             what=f"the logical plan {inputs['logical_digest']} (input 'logical_digest')")
     elif record.stage == STAGE_MEMBER_EXECUTION_INPUT:
-        _require_persisted(
-            conn, "SELECT 1 FROM identity_digest_record WHERE stage = %s AND digest = %s",
-            (STAGE_FORMULA_BINDING, inputs["formula_binding_digest"]),
+        _require_loaded(
+            resolve_identity_digest(conn, stage=STAGE_FORMULA_BINDING,
+                                    digest=inputs["formula_binding_digest"]),
             what=(f"the formula binding {inputs['formula_binding_digest']} "
                   "(input 'formula_binding_digest')"))
-        _require_persisted(
-            conn, "SELECT 1 FROM physical_execution_plan_revision WHERE physical_digest = %s",
-            (inputs["physical_digest"],),
+        _require_loaded(
+            load_physical_execution_plan(
+                conn, f"{PHYSICAL_PLAN_ID_PREFIX}{inputs['physical_digest']}"),
             what=f"the physical plan {inputs['physical_digest']} (input 'physical_digest')")
-        _require_persisted(
-            conn, "SELECT 1 FROM member_output_contract_revision WHERE content_hash = %s",
-            (materialize_hash(inputs["member_output_contract"]),),
+        _require_loaded(
+            load_member_output_contract(
+                conn,
+                f"{MEMBER_OUTPUT_CONTRACT_ID_PREFIX}"
+                f"{materialize_hash(inputs['member_output_contract'])}"),
             what="the member output contract (input 'member_output_contract')")
     elif record.stage == STAGE_MEMBER_COMPILE:
-        _require_persisted(
-            conn, "SELECT 1 FROM identity_digest_record WHERE stage = %s AND digest = %s",
-            (STAGE_MEMBER_EXECUTION_INPUT, inputs["member_execution_input_digest"]),
+        _require_loaded(
+            resolve_identity_digest(conn, stage=STAGE_MEMBER_EXECUTION_INPUT,
+                                    digest=inputs["member_execution_input_digest"]),
             what=(f"the member execution input {inputs['member_execution_input_digest']} "
                   "(input 'member_execution_input_digest')"))
     elif record.stage == STAGE_BUILD_COMPILATION:
         for digest in inputs["ordered_member_compile_digests"]:
-            _require_persisted(
-                conn, "SELECT 1 FROM identity_digest_record WHERE stage = %s AND digest = %s",
-                (STAGE_MEMBER_COMPILE, digest),
+            _require_loaded(
+                resolve_identity_digest(conn, stage=STAGE_MEMBER_COMPILE, digest=digest),
                 what=(f"the member compile {digest} (input "
                       "'ordered_member_compile_digests')"))
-        _require_persisted(
-            conn,
-            "SELECT 1 FROM generation_configuration_revision "
-            "WHERE generation_configuration_digest = %s",
-            (inputs["generation_configuration_digest"],),
+        _require_loaded(
+            load_generation_configuration(
+                conn,
+                f"{GENERATION_CONFIGURATION_ID_PREFIX}"
+                f"{inputs['generation_configuration_digest']}"),
             what=(f"the generation configuration {inputs['generation_configuration_digest']} "
                   "(input 'generation_configuration_digest')"))
     elif record.stage == STAGE_SEALED_ARTIFACT:
-        _require_persisted(
-            conn, "SELECT 1 FROM identity_digest_record WHERE stage = %s AND digest = %s",
-            (STAGE_BUILD_COMPILATION, inputs["build_compilation_digest"]),
+        _require_loaded(
+            resolve_identity_digest(conn, stage=STAGE_BUILD_COMPILATION,
+                                    digest=inputs["build_compilation_digest"]),
             what=(f"the build compilation {inputs['build_compilation_digest']} "
                   "(input 'build_compilation_digest')"))
-        _require_persisted(
-            conn, "SELECT 1 FROM render_profile_revision WHERE render_profile_digest = %s",
-            (inputs["render_profile_digest"],),
+        _require_loaded(
+            load_render_profile(
+                conn, f"{RENDER_PROFILE_ID_PREFIX}{inputs['render_profile_digest']}"),
             what=(f"the render profile {inputs['render_profile_digest']} "
                   "(input 'render_profile_digest')"))
 
