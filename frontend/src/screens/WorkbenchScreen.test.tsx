@@ -2457,35 +2457,30 @@ describe('Gate #1 scope confirmation', () => {
       .toBeInTheDocument()
   })
 
-  it('flag ON: shows the proposed dimensions and confirm sends them', async () => {
+  it('flag ON: the entity is proposed and confirmable; a proposed CONTEXT is neither', async () => {
+    // The entity half is unchanged — proposed, editable, threaded through on confirm.
+    //
+    // The context half is the honesty proof. This recognition proposes `ifrs9`. The control that
+    // let a person accept or reject it is gone (its only consumer, the ranker, is behind a flag
+    // this deployment leaves unset), so the proposal must NOT ride through as a confirmed value:
+    // `confirmed_scope_dimension` would then record an LLM guess as human-confirmed, which is
+    // precisely the claim that record exists to make truthfully. The proposal itself survives
+    // where it belongs, on `intent_recognition_attempt`.
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
     contractRecognitions.mockResolvedValue(RECOGNITION)
     contractConsideredSet.mockResolvedValue(scopedConsidered())
     await generateFlagOn()
-    // The proposed context chip + the proposed target entity render for confirm/override.
-    expect(await screen.findByText('ifrs9')).toBeInTheDocument()
-    expect(screen.getByLabelText('Target entity')).toHaveValue('customer')
+    expect(await screen.findByLabelText('Target entity')).toHaveValue('customer')
+    expect(screen.queryByText('ifrs9')).toBeNull()
+    expect(screen.queryByLabelText('Add modelling context')).toBeNull()
     await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
       expect.objectContaining({
         confirmedScope: expect.objectContaining({
-          modellingContexts: ['ifrs9'], targetEntity: 'customer',
+          modellingContexts: [], targetEntity: 'customer',
         }),
       }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
-  })
-
-  it('flag ON: removing the context chip drops it from the confirmed dimensions', async () => {
-    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
-    contractRecognitions.mockResolvedValue(RECOGNITION)
-    contractConsideredSet.mockResolvedValue(scopedConsidered())
-    await generateFlagOn()
-    await userEvent.click(await screen.findByRole('button', { name: 'Remove context ifrs9' }))
-    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
-    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
-      expect.objectContaining({
-        confirmedScope: expect.objectContaining({ modellingContexts: [] }),
-      }))
   })
 
   it('flag ON: clearing the entity sends a null target entity', async () => {
@@ -2501,29 +2496,13 @@ describe('Gate #1 scope confirmation', () => {
       }))
   })
 
-  it('flag ON: adding a context via the select threads it into the confirmed dimensions', async () => {
-    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
-    contractRecognitions.mockResolvedValue(RECOGNITION)
-    contractConsideredSet.mockResolvedValue(scopedConsidered())
-    await generateFlagOn()
-    await userEvent.selectOptions(
-      await screen.findByLabelText('Add modelling context'), 'frtb')
-    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
-    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
-      expect.objectContaining({
-        confirmedScope: expect.objectContaining({
-          modellingContexts: expect.arrayContaining(['frtb']),
-        }),
-      }))
-  })
-
   it('flag ON: a recognizer dimension warning renders a non-fatal hint', async () => {
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
     contractRecognitions.mockResolvedValue({ ...RECOGNITION, warnings: ['UNKNOWN_TARGET_ENTITY'] })
     contractConsideredSet.mockResolvedValue(scopedConsidered())
     await generateFlagOn()
     expect(await screen.findByText(
-      /couldn.t map part of what you described to a known context or entity/i)).toBeInTheDocument()
+      /couldn.t map part of what you described to a known entity/i)).toBeInTheDocument()
   })
 
   it('flag ON + lens: groups an eligible and an out-of-scope recipe under their headings', async () => {
@@ -2991,6 +2970,56 @@ describe('Intake target confirmation', () => {
     await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
       expect.objectContaining({ targetRef: 'public.labels.churned' }))
+  })
+
+  it('the label window is EDITABLE and the edited value is what gets signed', async () => {
+    // It was the one signed field nobody could correct. That matters more than tidiness: the
+    // window is what the near-label leakage critic runs on, so an uncorrectable wrong window (or
+    // an uncorrectable ABSENT one) silently switches that check off.
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    const box = screen.getByLabelText('Label window (days)')
+    expect(box).toHaveValue(90)                       // seeded from the reading
+    await userEvent.clear(box)
+    await userEvent.type(box, '30')
+    await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+    expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'confirmed',
+      expect.objectContaining({ targetWindowDays: 30 }))
+  })
+
+  it('a window the reading never produced can be supplied by hand', async () => {
+    // The server's own contradiction refusal ends with "state the horizon on the confirm screen".
+    // There was no control to state it with, so that instruction was a dead end.
+    contractIntake.mockResolvedValue({
+      ...INTAKE, ticket: { ...TICKET, target_window_days: null, window_source: 'unstated' },
+    })
+    contractIntakeTarget.mockResolvedValue(READING)
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    const box = screen.getByLabelText('Label window (days)')
+    expect(box).toHaveValue(null)
+    await userEvent.type(box, '45')
+    await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+    expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'confirmed',
+      expect.objectContaining({ targetWindowDays: 45 }))
+  })
+
+  it('no modelling-context control is offered, and none is sent as confirmed', async () => {
+    // The control was removed because nothing consumes it in this deployment (the ranking flag is
+    // off, and ranking is its only consumer). The SEEDING had to go with it: leaving the
+    // recogniser's proposal to ride through an absent control would have recorded an LLM guess as
+    // a human-confirmed dimension, which is the one thing the scope record must never say.
+    contractIntake.mockResolvedValue(INTAKE)
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    expect(screen.queryByLabelText('Add modelling context')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({ modellingContexts: [] }),
+      }))
   })
 
   it('says when a reading came from cache rather than fresh analysis', async () => {
