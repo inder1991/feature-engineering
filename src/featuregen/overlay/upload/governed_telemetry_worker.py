@@ -663,10 +663,13 @@ def _realization_states(conn: DbConn, rejection: dict, *,
     reason. The second read is the A7 one, and it only runs when the first found nothing:
 
     * something CURRENT and executable → ``revision_exists_unattached`` (wire up what exists);
-    * otherwise, a stored revision no pointer publishes — A4c's shape. UNKNOWN cardinality is the
-      distinct work item (``provisional_unknown_cardinality``: measure it); a known-cardinality
-      revision with no pointer is still "one exists, unattached", which is what it always was;
-    * nothing stored at all → ``no_revision_exists`` (build one).
+    * nothing stored at all → ``no_revision_exists`` (build one);
+    * otherwise, stored revisions no pointer publishes — A4c's shape — and the state names the MOST
+      ADVANCED work available, because a bridge normally has SEVERAL revisions (A4c mints an
+      immutable one per candidate). ANY revision with proven cardinality → still
+      ``revision_exists_unattached``: the measurement is done and what remains is attaching. Only
+      when EVERY stored revision is unproven is the work a measurement
+      (``provisional_unknown_cardinality``).
     """
     from featuregen.overlay.upload.bridge_store import (
         executable_bridge_realizations,
@@ -697,10 +700,18 @@ def _realization_states(conn: DbConn, rejection: dict, *,
             continue
         if found:
             states[key] = REALIZATION_EXISTS_UNATTACHED
-        elif any(not revision.cardinality.known for revision in stored):
-            states[key] = REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY
+        elif not stored:
+            states[key] = REALIZATION_NONE
+        elif any(revision.cardinality.known for revision in stored):
+            # PRECEDENCE, and it is the whole point of the state: ONE proven revision settles the
+            # measurement question for this bridge, so the remaining work is to attach what exists.
+            # A4c mints an immutable revision per candidate, so several revisions per bridge is the
+            # NORMAL case — and testing `any(NOT known)` instead would let one early provisional
+            # permanently outrank every later proof, filing "go measure it" against work already
+            # done. That is precisely the mis-addressed ticket this state was added to eliminate.
+            states[key] = REALIZATION_EXISTS_UNATTACHED
         else:
-            states[key] = REALIZATION_EXISTS_UNATTACHED if stored else REALIZATION_NONE
+            states[key] = REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY
     return states
 
 

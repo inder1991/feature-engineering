@@ -6,7 +6,7 @@ bounded out, safety-rejected. That is the point. A telemetry programme that reco
 answers "how good are the features we shipped?" and never "what could this platform not do, and
 what would it take?" — and the second question is the one that funds bridge work.
 
-Three writes and two reads:
+Three writes and three reads:
 
 * ``record_planning_observations`` — the per-request row, keyed
   ``(generation_run_id, observation_mode, governed_variant_id)`` so a LIVE observation and its
@@ -75,7 +75,11 @@ CARDINALITY_EVIDENCE_REQUIRED = "cardinality_evidence_required"
 
 #: Verdict -> queue. CLOSED: a rejection whose reason is not one of these is not a demand at all
 #: (a concept mismatch is a modelling problem, not a missing bridge), and the store drops it rather
-#: than filing it somewhere plausible. 1120 + 1132 carry the same mapping as a CHECK, so the
+#: than filing it somewhere plausible. **This is where the modelling-problem rule is stated and
+#: enforced FIRST** — 1132's header cites it as "1120's own rule", which is where the CHECK lives
+#: but not where the rule is written; the migration is applied and checksum-ledgered, so it is
+#: immutable as a file and the correction is recorded here instead of edited there.
+#: 1120 + 1132 carry the same mapping as a CHECK, so the
 #: routing is structural: the queue a demand lands in is a function of its verdict, not of its
 #: caller. The two realization verdicts share ONE queue on purpose — "build a realization" and
 #: "measure the cardinality of the one that exists" are two states of the same person's work, and
@@ -335,6 +339,12 @@ def demand_identity_hash(rejection: dict, *, anchor_catalog_source: str) -> str:
     cannot masquerade as the same demand; ``to_endpoint_hint`` is advisory and deliberately absent.
     ``anchor_catalog_source`` is material for CAPACITY verdicts only — those have no hop, and the
     anchor is the one thing that makes one capacity demand different from another's.
+
+    **Pass :func:`resolve_demand_anchor`'s answer, never the rejection's raw field.** A capacity
+    rejection routinely carries a BLANK anchor and the real one lives on the parent observation, so
+    a caller that hands the raw field straight in mints a different hash for the same demand — the
+    identity fork this function exists to prevent, reintroduced one layer up. The two halves are
+    exported together for exactly that reason.
     """
     verdict = str(rejection.get("verdict") or "")
     revision_hash = str(rejection.get("recipe_revision_hash") or "")
@@ -347,6 +357,33 @@ def demand_identity_hash(rejection: dict, *, anchor_catalog_source: str) -> str:
                     hop["position_table_ref"], str(hop["hop_index"]), verdict,
                     GRAPH_VERSION, PLANNER_VERSION)
     return hashlib.sha256("|".join(material).encode()).hexdigest()
+
+
+def resolve_demand_anchor(conn: DbConn, *, observation_id: str, rejection: dict,
+                          cache: dict[str, str] | None = None) -> str:
+    """The anchor catalog :func:`demand_identity_hash` must be given — the SECOND half of the owned
+    recipe, and the half a second writer is most likely to get wrong.
+
+    A capacity rejection is minted from a bounded-out search and routinely carries NO anchor of its
+    own; the run's anchor lives on the parent observation. So the anchor is a RESOLUTION (a read),
+    not a field — and a writer that passes ``rejection["anchor_catalog_source"]`` straight into the
+    hash silently mints a second identity for a demand that already exists. Non-capacity verdicts
+    never consult the observation at all: their anchor is not material, and reading one would spend
+    a query to influence nothing.
+
+    ``cache`` memoizes the per-observation read, so one call costs at most one query however many
+    capacity rejections it carries.
+    """
+    anchor = str(rejection.get("anchor_catalog_source") or "")
+    if anchor or str(rejection.get("verdict") or "") not in CAPACITY_VERDICTS:
+        return anchor
+    memo = cache if cache is not None else {}
+    if observation_id not in memo:
+        found = conn.execute(
+            "SELECT anchor_catalog_source FROM governed_planning_observation "
+            " WHERE observation_id = %s", (observation_id,)).fetchone()
+        memo[observation_id] = found[0] if found is not None else ""
+    return memo[observation_id]
 
 
 def record_bridge_demand(conn: DbConn, *, observation_id: str,
@@ -376,22 +413,16 @@ def record_bridge_demand(conn: DbConn, *, observation_id: str,
     the same ``demand_identity_hash``, which is what ``observation_queues`` counts.
     """
     minted: list[str] = []
-    seen: dict[str, str] = {}
-    anchor_fallback: str | None = None
+    seen: set[str] = set()
+    anchor_cache: dict[str, str] = {}
     for rejection in rejections:
         verdict = str(rejection.get("verdict") or "")
         queue = DEMAND_VERDICT_QUEUES.get(verdict)
         if queue is None:
             continue
         revision_hash = str(rejection.get("recipe_revision_hash") or "")
-        anchor = str(rejection.get("anchor_catalog_source") or "")
-        if verdict in CAPACITY_VERDICTS and not anchor:
-            if anchor_fallback is None:
-                found = conn.execute(
-                    "SELECT anchor_catalog_source FROM governed_planning_observation "
-                    " WHERE observation_id = %s", (observation_id,)).fetchone()
-                anchor_fallback = found[0] if found is not None else ""
-            anchor = anchor_fallback
+        anchor = resolve_demand_anchor(conn, observation_id=observation_id, rejection=rejection,
+                                       cache=anchor_cache)
         hop = demand_hop_columns(rejection)
         identity_hash = demand_identity_hash(rejection, anchor_catalog_source=anchor)
         if identity_hash in seen:
@@ -416,7 +447,7 @@ def record_bridge_demand(conn: DbConn, *, observation_id: str,
                 "SELECT demand_id FROM bridge_demand_observation "
                 " WHERE observation_id = %s AND demand_identity_hash = %s",
                 (observation_id, identity_hash)).fetchone()
-        seen[identity_hash] = found[0]
+        seen.add(identity_hash)
         minted.append(found[0])
     return tuple(minted)
 
@@ -594,6 +625,11 @@ def demand_satisfaction(conn: DbConn, *, as_of: datetime | None = None,
     since no resolution stands behind it), so a version bump never silently empties the queue; it
     does leave a retired identity beside its successor until somebody closes it.
     """
+    if queue is not None and queue not in _QUEUE_NAMES:
+        # An unknown queue would otherwise return an EMPTY projection — "nothing is outstanding",
+        # which is the most dangerous wrong answer this function can give. `observation_queues`
+        # refuses a nonsense `limit` for the same reason.
+        raise ValueError(f"queue must be one of {list(_QUEUE_NAMES)!r}, got {queue!r}")
     resolved_as_of = as_of if as_of is not None else conn.execute("SELECT now()").fetchone()[0]
     statuses = sorted(RESOLVED_STATUSES)
     with conn.cursor(row_factory=dict_row) as cur:
@@ -812,4 +848,5 @@ __all__ = [
     "record_bridge_demand",
     "record_planning_observations",
     "resolution_summary",
+    "resolve_demand_anchor",
 ]

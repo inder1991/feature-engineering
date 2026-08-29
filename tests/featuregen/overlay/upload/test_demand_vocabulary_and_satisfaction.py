@@ -49,8 +49,10 @@ from featuregen.overlay.upload.governed_observation_store import (
     observation_queues,
     record_bridge_demand,
     record_planning_observations,
+    resolve_demand_anchor,
 )
 from featuregen.overlay.upload.governed_telemetry_worker import (
+    REALIZATION_EXISTS_UNATTACHED,
     REALIZATION_NONE,
     REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY,
     demands_for_rejection,
@@ -173,12 +175,19 @@ def test_the_category_is_not_an_action_blocker(conn) -> None:
 
     Were it registered as a semantic-eligibility reason it would acquire a six-action disposition
     row and start refusing acts — which is exactly what R6 forbids: unknown cardinality is
-    previewable under guards (the owner's matrix), so it may never BLOCK."""
+    previewable under guards (the owner's matrix), so it may never BLOCK.
+
+    The comparison is CASE-FOLDED on both sides and that is load-bearing, not tidiness: this
+    ledger stores the lowercase, ReasonCode-shaped spelling while the action vocabulary is
+    UPPERCASE throughout, so a raw `in` against either collection could never fail — the guard
+    would have read green through exactly the mistake it exists to catch.
+    """
     from featuregen.overlay.upload import semantic_eligibility_reasons as reasons
 
-    assert not hasattr(reasons, "CARDINALITY_EVIDENCE_REQUIRED")
-    assert CARDINALITY_EVIDENCE_REQUIRED not in reasons.REASON_FAMILIES
-    assert CARDINALITY_EVIDENCE_REQUIRED not in reasons.SERVING_CAPABILITY_MATRIX_CODES
+    registered = {name.upper() for name in reasons.REASON_FAMILIES}
+    registered |= {name.upper() for name in reasons.SERVING_CAPABILITY_MATRIX_CODES}
+    registered |= {name.upper() for name in vars(reasons) if not name.startswith("_")}
+    assert CARDINALITY_EVIDENCE_REQUIRED.upper() not in registered
 
 
 def test_the_closed_set_still_refuses_a_category_nobody_declared(conn) -> None:
@@ -263,13 +272,29 @@ def test_exactly_one_module_writes_the_demand_table() -> None:
     """The law made STRUCTURAL. A second writer with its own INSERT could compute a different
     `demand_identity_hash` for the same crossing — two rows, one demand, a queue that
     double-counts and a rank nobody can trust. CI is where that is caught, because the unique key
-    cannot see it: two different hashes are, to Postgres, two different demands."""
+    cannot see it: two different hashes are, to Postgres, two different demands.
+
+    **The check is on MENTIONS, not on a spelling of the INSERT, and the reason is empirical.** The
+    first version of this pin grepped the fixed literal ``INSERT INTO bridge_demand_observation``
+    and a review probe walked straight through it: a writer whose SQL is a multi-line
+    concatenation (``"INSERT INTO " "bridge_demand_observation ..."``) matches no such literal —
+    and that is not a contrived shape, it is the shape of THIS module's own INSERT. Any
+    case-insensitive regex over one statement form has the same weakness for the next spelling
+    nobody predicted, so the pin is stated over the table NAME instead: only the store that writes
+    it and the report that reads it may name it at all. A new module that mentions the table fails
+    here and gets a deliberate decision, which is the outcome wanted either way.
+    """
     root = Path(__file__).resolve().parents[4] / "src"
     assert root.is_dir(), root
     hits = subprocess.run(
-        ["grep", "-rln", "--include=*.py", "INSERT INTO bridge_demand_observation", str(root)],
+        ["grep", "-rlniE", "--include=*.py", "bridge_demand_observation", str(root)],
         capture_output=True, text=True, check=False).stdout.split()
-    assert [Path(hit).name for hit in hits] == ["governed_observation_store.py"]
+    assert sorted(Path(hit).name for hit in hits) == [
+        "governed_lens.py",                  # prose only: names the table to say what it does NOT
+                                             # serialize (`governed_lens.py:787`)
+        "governed_observation_store.py",     # the ONE writer
+        "governed_planning_report.py",       # a reader: per-queue rollups for the wave-1 report
+    ]
 
 
 def test_the_identity_material_has_exactly_one_owner(conn) -> None:
@@ -285,6 +310,43 @@ def test_the_identity_material_has_exactly_one_owner(conn) -> None:
         (demand_id,)).fetchone()[0]
     assert stored == demand_identity_hash(rejection, anchor_catalog_source="core_banking")
     assert len(stored) == 64
+
+
+def test_the_capacity_anchor_is_part_of_the_owned_recipe(conn) -> None:
+    """The half that genuinely HAS a second owner, and the one the hop path cannot exercise.
+
+    For a capacity verdict the anchor IS identity material, and a capacity rejection routinely
+    carries a blank one — the run's anchor lives on the parent observation. So the anchor is a
+    RESOLUTION, not a field, and a second writer passing the rejection's raw empty string mints a
+    DIFFERENT hash for the same demand: the identity fork the one-writer law exists to prevent,
+    reintroduced one layer above the hash. `resolve_demand_anchor` is exported beside
+    `demand_identity_hash` so both halves are callable, and the divergence is demonstrated here
+    rather than asserted."""
+    observation_id = _file(conn, "capacity_anchor")
+    rejection = _rejection(verdict="bounded_out_max_bridges", anchor_catalog_source="")
+    (demand_id,) = record_bridge_demand(conn, observation_id=observation_id,
+                                        rejections=[rejection])
+    stored = conn.execute(
+        "SELECT demand_identity_hash, demand_queue FROM bridge_demand_observation "
+        " WHERE demand_id = %s", (demand_id,)).fetchone()
+    assert stored[1] == "planner_capacity"
+
+    resolved = resolve_demand_anchor(conn, observation_id=observation_id, rejection=rejection)
+    assert resolved == "core_banking", "the anchor comes from the parent observation"
+    assert stored[0] == demand_identity_hash(rejection, anchor_catalog_source=resolved)
+    # ...and the trap the owned resolution closes: the raw field is NOT the anchor.
+    assert stored[0] != demand_identity_hash(rejection, anchor_catalog_source="")
+
+
+def test_the_anchor_resolution_leaves_a_hop_demand_alone(conn) -> None:
+    """A non-capacity anchor is not identity material, so resolving one would spend a query to
+    influence nothing — and would silently make two hop demands that differ only in their run's
+    anchor look like two demands."""
+    observation_id = _file(conn, "hop_anchor")
+    rejection = _rejection(anchor_catalog_source="")
+    assert resolve_demand_anchor(conn, observation_id=observation_id, rejection=rejection) == ""
+    assert demand_identity_hash(rejection, anchor_catalog_source="") == \
+        demand_identity_hash(rejection, anchor_catalog_source="somewhere_else")
 
 
 def test_one_occurrence_files_one_countable_record_however_often_it_is_offered(conn) -> None:
@@ -378,6 +440,10 @@ def test_the_projection_reads_as_of_and_can_be_filtered_to_one_queue(conn) -> No
     assert past["unresolved"] == [] and past["satisfied"] == []
     assert demand_satisfaction(conn, queue="planner_capacity")["satisfied"] == []
     assert len(demand_satisfaction(conn, queue="realization_gap")["satisfied"]) == 1
+    # An unknown queue must REFUSE, never return an empty projection: "nothing is outstanding" is
+    # the most dangerous wrong answer a governance queue can give.
+    with pytest.raises(ValueError, match="queue must be one of"):
+        demand_satisfaction(conn, queue="realisation_gap")
 
 
 # ── 5) provisional is not absent ───────────────────────────────────────────────────────────────
@@ -439,6 +505,43 @@ def test_an_unknown_cardinality_realization_does_not_read_as_no_realization(conn
     assert demands[0]["realizers"][0]["realization_state"] == \
         REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY
     assert demands[0]["verdict"] == CARDINALITY_EVIDENCE_REQUIRED
+
+
+def _state_and_verdict(conn, key: str) -> tuple[str, str]:
+    demands = demands_for_rejection(
+        conn, {"reason_codes": ["physical_cardinality_unavailable"],
+               "anchor_catalog_source": "ops", "evidence": [_segment(key)]},
+        recipe_revision_hash="rev-hash")
+    assert len(demands) == 1
+    return demands[0]["realizers"][0]["realization_state"], demands[0]["verdict"]
+
+
+def test_a_proven_revision_with_no_pointer_is_an_attachment_not_a_measurement(conn) -> None:
+    """The branch that came free with the second read, now pinned rather than assumed.
+
+    A revision the CAS-publish half never published is invisible to `executable_bridge_realizations`
+    whatever its cardinality — so before A7 a PROVEN, unattached realization also read as "nothing
+    exists". It is not a measurement job: the measurement is done, and what remains is attaching."""
+    key = _append_provisional(conn, cardinality=Cardinality.MANY_TO_ONE)
+    assert realization_revisions_for_bridge(conn, bridge_fact_key=key)[0].cardinality.known
+    assert _state_and_verdict(conn, key) == (REALIZATION_EXISTS_UNATTACHED, "missing_realization")
+
+
+def test_one_proven_revision_outranks_an_earlier_provisional_one(conn) -> None:
+    """PRECEDENCE, and it is the normal case rather than a corner: A4c mints an IMMUTABLE revision
+    per candidate, so a bridge routinely carries several.
+
+    Testing "any revision is unproven" would let the first provisional permanently outrank every
+    later proof — filing "go measure it" against work already done, which is the exact
+    mis-addressed ticket this state was added to eliminate. One proof settles the question for the
+    bridge; only when EVERY stored revision is unproven is the work a measurement."""
+    key = _append_provisional(conn, cardinality=None)
+    assert _state_and_verdict(conn, key) == (
+        REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY, CARDINALITY_EVIDENCE_REQUIRED)
+
+    assert _append_provisional(conn, cardinality=Cardinality.MANY_TO_ONE) == key
+    assert len(realization_revisions_for_bridge(conn, bridge_fact_key=key)) == 2
+    assert _state_and_verdict(conn, key) == (REALIZATION_EXISTS_UNATTACHED, "missing_realization")
 
 
 def test_an_absent_realization_still_reads_as_no_revision_exists(conn) -> None:
