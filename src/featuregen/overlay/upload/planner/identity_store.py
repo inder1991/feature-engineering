@@ -45,8 +45,10 @@ own BEFORE TRUNCATE raiser fires, so the append-only guard stops proving itself.
 creates is append-only, so nothing carries an FK; in its place this store LOADS AND VERIFIES the
 referenced row before writing (A4's "pins revisions that exist, never ones it would have to
 invent"), and append-only rows never disappear, so a verified reference cannot decay.
-``join_validation_policy_revision_id`` is stored with NO existence check: its store is 1136's
-(B2/B2b) and does not exist yet — an honest unchecked pin, never a fabricated FK.
+``join_validation_policy_revision_id`` WAS an honest unchecked pin ("its store is 1136's (B2/B2b)
+and does not exist yet"); B2 shipped that store, so the pin is now VERIFIED like every other — one
+more verifying load in :func:`ensure_physical_execution_plan`, and still no fabricated FK (1136's
+policy table is append-only and guarded, exactly like these).
 
 **Concurrency (the family's known caveat, unfixed by design).** The ensure/read-back idiom can
 raise :class:`IdentityStoreConflict` under REPEATABLE READ when two writers race on a first-ever
@@ -85,6 +87,7 @@ from featuregen.overlay.upload.planner.identity_chain import (
     render_digest,
     sealed_artifact_identity,
 )
+from featuregen.overlay.upload.planner.join_policy_store import require_join_validation_policy
 from featuregen.overlay.upload.planner.logical_plan_v2 import (
     LOGICAL_PLAN_CONTRACT,
     LogicalFeaturePlanV2,
@@ -636,9 +639,10 @@ def ensure_physical_execution_plan(conn: DbConn, *, plan: PhysicalExecutionPlanV
     """Persist one physical execution plan (R2's HOW) and return its ``revision_id``.
 
     Store validation stands in for the foreign keys this substrate cannot carry: the pinned logical
-    plan and the pinned execution-context revision must both already exist — a physical plan
-    realizing a meaning nobody persisted, or adopted in a context nobody minted, is a dangling
-    identity. Writing it touches NO logical row (R2/R9)."""
+    plan, the pinned execution-context revision AND the pinned join-validation policy must all
+    already exist — a physical plan realizing a meaning nobody persisted, adopted in a context
+    nobody minted, or guarded by a policy nobody declared, is a dangling identity. Writing it
+    touches NO logical row (R2/R9)."""
     _instance(plan, PhysicalExecutionPlanV1, what="plan")
     if load_logical_feature_plan(
             conn, f"{LOGICAL_PLAN_ID_PREFIX}{plan.logical_digest_ref}") is None:
@@ -651,6 +655,8 @@ def ensure_physical_execution_plan(conn: DbConn, *, plan: PhysicalExecutionPlanV
             f"the execution context {plan.execution_context_revision_id!r} was never persisted "
             "(migration 1130 / task A3 owns it) — a physical plan pins the exact context it was "
             "adopted in")
+    # B2's store (1136) made this pin checkable; the refusal it raises is B2's own typed defect.
+    require_join_validation_policy(conn, plan.join_validation_policy_revision_id)
     content = plan.content_payload()
     digest = physical_digest(plan)
     revision_id = f"{PHYSICAL_PLAN_ID_PREFIX}{digest}"

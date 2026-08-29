@@ -71,6 +71,7 @@ from featuregen.overlay.upload.planner.identity_store import (
     record_identity_digest,
     resolve_identity_digest,
 )
+from featuregen.overlay.upload.planner.join_policy_store import ensure_join_validation_policy
 from featuregen.overlay.upload.planner.logical_plan_v2 import (
     DrivingTimeRoleV1,
     IntervalBoundaryPolicyV1,
@@ -315,6 +316,18 @@ def _context(db, environment_id="env-uat", tier=ExecutionTier.SANDBOX) -> str:
 
 def _count(db, table: str) -> int:
     return db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+
+@pytest.fixture(autouse=True)
+def _the_guard_policy_this_suites_plans_pin(db):
+    """B2 (migration 1136) shipped the JoinValidationPolicyRevisionV1 store, so
+    ``ensure_physical_execution_plan`` now VERIFIES the guard-policy pin it used to only store.
+
+    Every physical plan this suite builds names ``_policy().revision_id``; declaring that one policy
+    per test keeps each assertion about the thing it was written to assert, rather than about a pin
+    that was unchecked when the suite was written. One fixture, because there is exactly one policy
+    in the suite — a per-test seed elsewhere would be the same fact restated many times."""
+    ensure_join_validation_policy(db, policy=_policy())
 
 
 # ── the migration applies ─────────────────────────────────────────────────────────────────────
