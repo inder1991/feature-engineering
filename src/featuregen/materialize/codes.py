@@ -62,6 +62,23 @@ class CompilationRefusalCode(StrEnum):
     #: the act then proceeds under a verdict nobody was shown.
     ACTION_DECISION_DRIFTED = "ACTION_DECISION_DRIFTED"
 
+    # The frozen principal/data scope (B0a, migration 1133) — SPELLED ONCE, here and in
+    # `identity.principal_scope.PRINCIPAL_SCOPE_REFUSAL_CODES`; the generation lane converts by
+    # VALUE, so a drift between the two raises rather than refusing under an invented code.
+    #: The act has no recorded principal scope, or its work item names none. Read scope is
+    #: SERVER-DERIVED: an act whose scope was never resolved from an authenticated principal is a
+    #: queue bypass however it got here.
+    PRINCIPAL_SCOPE_MISSING = "PRINCIPAL_SCOPE_MISSING"
+    #: The work item names a binding that is not this act's. ▲ THE ROW IS AUTHORITATIVE and the
+    #: payload is a claim — the 1108 rule, applied to authority rather than to decisions.
+    PRINCIPAL_SCOPE_BINDING_MISMATCH = "PRINCIPAL_SCOPE_BINDING_MISMATCH"
+    #: The authentication authority no longer vouches for the principal (revoked, or unverifiable).
+    #: Frozen claims prove what WAS authorized; they cannot prove the account still exists.
+    PRINCIPAL_NOT_CURRENT = "PRINCIPAL_NOT_CURRENT"
+    #: The principal still exists and has LOST claims the frozen scope carries. Refused rather than
+    #: re-interpreted: "whatever is left of that scope" is an authority nobody granted.
+    PRINCIPAL_SCOPE_NARROWED = "PRINCIPAL_SCOPE_NARROWED"
+
     # Read scope and safety classification.
     READ_SCOPE_INSUFFICIENT = "READ_SCOPE_INSUFFICIENT"
     PROHIBITED_INPUT = "PROHIBITED_INPUT"

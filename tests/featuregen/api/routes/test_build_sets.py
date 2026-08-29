@@ -415,3 +415,54 @@ def test_A_QUEUED_BUILD_CARRIES_ITS_RECORDED_DECISION(client, conn, enabled,
         "JOIN action_decision_revision d ON d.authorization_id = a.authorization_id "
         "WHERE d.decision_id = %s", (decision_id,)).fetchone()[0]
     assert actor == "user:sam"
+
+
+# ══ B0a — THE READ SCOPE IS THE SERVER'S ANSWER, NEVER THE CALLER'S CLAIM ══════════════════════
+def test_a_CLIENT_ROLE_CLAIM_IS_REFUSED_BY_NAME(client, conn, enabled, engineer_headers) -> None:
+    """▲ THE HOLE. `roles` was a field on this body, taken verbatim into the queue payload and on
+    to `decide_read_scope` — so a caller holding `feature:generate` could claim read roles it was
+    never granted, and a cross-catalog build makes that reach across catalogs.
+
+    Refused rather than ignored: an API that silently drops an authority claim leaves the caller
+    believing it was honoured.
+    """
+    build_set, approval = _seed(conn)
+
+    response = client.post(
+        GENERATIONS,
+        json={**_body(build_set, approval), "roles": ["pii_reader", "restricted_reader"]},
+        headers=engineer_headers)
+
+    assert response.status_code == 422, response.text
+    assert "roles" in str(response.json()["detail"])
+    assert conn.execute("SELECT count(*) FROM generation_request").fetchone()[0] == 0
+
+
+def test_the_QUEUED_SCOPE_IS_THE_AUTHENTICATED_PRINCIPALS(client, conn, enabled,
+                                                          engineer_headers) -> None:
+    """What reaches generation is what `get_identity` resolved — frozen, and named by the payload
+    only as a binding id. There is nowhere in the work item for a claim to live."""
+    from featuregen.identity.principal_scope import (
+        load_principal_scope_binding,
+        load_principal_scope_revision,
+    )
+
+    build_set, approval = _seed(conn)
+
+    body = client.post(GENERATIONS, json=_body(build_set, approval),
+                       headers=engineer_headers).json()
+
+    payload = conn.execute("SELECT payload FROM queue WHERE message_id = %s",
+                           (f"generation:{body['request_id']}",)).fetchone()[0]
+    assert "roles" not in payload
+    binding = load_principal_scope_binding(
+        conn, subject_kind="generation_request", subject_id=body["request_id"])
+    assert binding is not None
+    assert payload["principal_scope_binding_id"] == binding.binding_id
+    # The DECISION this scope was frozen against, on the binding itself — so "who authorized this,
+    # under which verdict" is one row rather than a join somebody has to guess at.
+    assert binding.action_decision_revision_id is not None
+    revision = load_principal_scope_revision(conn, binding.revision_id)
+    assert revision is not None
+    assert revision.subject == "user:sam"
+    assert revision.role_claims == ("feature_engineer",)

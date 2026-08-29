@@ -22,6 +22,12 @@ def test_compilation_codes_are_exactly_the_spec_set():
         # bypass (nothing was ever answered); DRIFTED is evidence that moved between the answer and
         # the act — a refusal a person re-requests, never a re-decision.
         "ACTION_DECISION_MISSING", "ACTION_DECISION_DRIFTED",
+        # B0a (migration 1133): the frozen principal/data scope. MISSING is the same queue-bypass
+        # judgement applied to authority; MISMATCH is a payload naming a binding that is not this
+        # act's; NOT_CURRENT and NARROWED are the recheck's second prong — frozen claims prove what
+        # WAS authorized and cannot prove the account still exists or still holds them.
+        "PRINCIPAL_SCOPE_MISSING", "PRINCIPAL_SCOPE_BINDING_MISMATCH",
+        "PRINCIPAL_NOT_CURRENT", "PRINCIPAL_SCOPE_NARROWED",
         "READ_SCOPE_INSUFFICIENT", "PROHIBITED_INPUT", "COLUMN_NOT_GOVERNED",
         # Step 6. Deliberately NOT folded into READ_SCOPE_INSUFFICIENT: read scope is a fact about
         # the CALLER and someone else may be permitted, leakage is a fact about the FEATURE and is

@@ -78,6 +78,42 @@ def _job(request_id: str = "req-1", **overrides) -> GenerationJobV2:
     return GenerationJobV2(**fields)
 
 
+def _scope(db, request_id: str, *, subject: str = "user:ops",
+           roles: tuple[str, ...] = ("feature_engineer",),
+           current_roles: tuple[str, ...] | None = None, decision: str | None = None) -> str:
+    """The frozen read scope a request runs under, seeded the way the ROUTES record it (B0a).
+
+    Both halves are real: a local account the worker's current-principal prong can resolve, and an
+    immutable principal-scope revision bound to this request. Roles are never in the payload any
+    more, so a lane test that reaches the chain has to have an authority to reach it under.
+    """
+    from featuregen.contracts import IdentityEnvelope
+    from featuregen.identity.local_session import (
+        add_user_to_group,
+        create_group,
+        create_user,
+    )
+    from featuregen.identity.principal_scope import (
+        bind_principal_scope,
+        ensure_principal_scope_revision,
+    )
+
+    username = subject.removeprefix("user:")
+    if db.execute("SELECT user_id FROM app_user WHERE username = %s",
+                  (username,)).fetchone() is None:
+        user_id = create_user(db, username, "long-test-password")
+        # The account may hold MORE than the frozen scope — that is the interesting case, and the
+        # default is that the two agree.
+        add_user_to_group(db, user_id, create_group(
+            db, f"{username}-group", current_roles if current_roles is not None else roles))
+    revision_id = ensure_principal_scope_revision(db, principal=IdentityEnvelope(
+        subject=subject, actor_kind="human", authenticated=True, auth_method="password",
+        role_claims=tuple(roles)))
+    return bind_principal_scope(
+        db, revision_id=revision_id, subject_kind="generation_request", subject_id=request_id,
+        action_decision_revision_id=decision)
+
+
 def _inventory() -> ClusterInventoryV1:
     from tests.featuregen.materialize import fixtures
 
@@ -112,8 +148,10 @@ def enqueued(db):
         requested_by="user:ops", requested_at="2026-08-21T00:00:00Z",
         generation_authorization_revision_id=approval)
     assert created
+    decision_id = _decided(db, build_set, approval)
     enqueue_generation(
-        db, job=_job(request_id, action_decision_revision_id=_decided(db, build_set, approval)),
+        db, job=_job(request_id, action_decision_revision_id=decision_id,
+                     principal_scope_binding_id=_scope(db, request_id, decision=decision_id)),
         environment_id=ENV, logical_group_name=GROUP)
     return request_id
 
@@ -183,7 +221,8 @@ def test_ENQUEUEING_ONE_REQUEST_TWICE_IS_ONE_JOB(enqueued, db) -> None:
                        (GENERATION_HANDLER,)).fetchone()[0]
     enqueue_generation(
         db, job=_job(enqueued,
-                     action_decision_revision_id=stored["action_decision_revision_id"]),
+                     action_decision_revision_id=stored["action_decision_revision_id"],
+                     principal_scope_binding_id=stored["principal_scope_binding_id"]),
         environment_id=ENV, logical_group_name=GROUP)
 
     assert db.execute("SELECT count(*) FROM queue WHERE handler = %s",
@@ -410,9 +449,142 @@ def test_THE_REQUEST_ROW_CARRIES_THE_DECISION_and_the_worker_prefers_it(db):
     # A payload with NO decision id — as if frozen before 1108 — and the row carries it: the gate
     # passes on the ROW's copy and the lane proceeds to its ordinary restore refusal, proving the
     # decision gate was satisfied from the record rather than the work item.
-    enqueue_generation(db, job=_job(request_id), environment_id=ENV, logical_group_name=GROUP)
+    enqueue_generation(
+        db, job=_job(request_id, principal_scope_binding_id=_scope(
+            db, request_id, decision=decision_id)),
+        environment_id=ENV, logical_group_name=GROUP)
     outcome = process_generation_once(db, owner="w1", inventory=_inventory())
 
     assert outcome.status == "refused"
     assert "ACTION_DECISION" not in outcome.detail, outcome.detail
+    assert "NOT_RESOLVED" in outcome.detail
+
+
+# ══ B0a — THE READ SCOPE IS SERVER-DERIVED, AND THE PAYLOAD CANNOT BRING ITS OWN ════════════════
+def _requested(db, tag: str, *, member: str = "sel-a") -> tuple[str, str]:
+    """A DECIDED request, ready to be enqueued under whatever authority a test wants to try.
+
+    ▲ The MEMBER varies per tag where two requests must coexist: `record_build_set` is idempotent
+    on content, so two sets over the same member and target are ONE set — and its request would be
+    one request, which is not the two-acts situation these tests are about."""
+    build_set, _ = _set(db, revision_id=f"bs-{tag}", members=(member,), target="trr-lane")
+    approval = _approval(db, build_set, ENV)
+    decision_id = _decided(db, build_set, approval)
+    request_id, created = request_generation(
+        db, request_id=f"req-{tag}", build_set_revision_id=build_set, environment_id=ENV,
+        requested_by="user:ops", requested_at="t",
+        generation_authorization_revision_id=approval,
+        action_decision_revision_id=decision_id)
+    assert created
+    return request_id, decision_id
+
+
+def test_a_FORGED_PAYLOAD_CARRYING_ROLES_is_refused_by_name() -> None:
+    """▲ THE HOLE B0a CLOSES, at the codec. `roles` used to be a payload field taken from the
+    request body and handed to `decide_read_scope`; a work item that still carries one is claiming
+    a read scope the server never resolved. Refused BY NAME rather than ignored — a payload the
+    lane silently half-read would build under an authority nobody can point at."""
+    forged = {**encode_job(_job("req-forged")), "roles": ["pii_reader", "restricted_reader"]}
+
+    with pytest.raises(ValueError, match="roles"):
+        decode_job(forged)
+
+
+def test_the_PAYLOAD_HAS_NOWHERE_TO_PUT_A_CLAIM_only_a_binding_id() -> None:
+    """What the queue carries is an ID, and the claims live in a durable row behind it."""
+    payload = encode_job(_job("req-shape", principal_scope_binding_id="psb_x"))
+
+    assert "roles" not in payload
+    assert payload["principal_scope_binding_id"] == "psb_x"
+
+
+def test_a_payload_naming_ANOTHER_ACTS_BINDING_refuses(db) -> None:
+    """A forged work item cannot borrow somebody else's authority: the binding is looked up by the
+    REQUEST's own id and the payload's copy is only a claim checked against it."""
+    request_id, decision_id = _requested(db, "mismatch")
+    _scope(db, request_id, decision=decision_id)
+    other_request, other_decision = _requested(db, "elsewhere", member="sel-b")
+    stolen = _scope(db, other_request, decision=other_decision)
+
+    enqueue_generation(
+        db, job=_job(request_id, action_decision_revision_id=decision_id,
+                     principal_scope_binding_id=stolen),
+        environment_id=ENV, logical_group_name=GROUP)
+    outcome = process_generation_once(db, owner="w1", inventory=_inventory())
+
+    assert outcome.status == "refused", outcome
+    assert "PRINCIPAL_SCOPE_BINDING_MISMATCH" in outcome.detail
+    assert read_request(db, request_id).refusals[0]["code"] == (
+        "PRINCIPAL_SCOPE_BINDING_MISMATCH")
+
+
+def test_an_act_with_NO_RESOLVED_SCOPE_refuses_rather_than_building_under_an_empty_one(db) -> None:
+    """"No roles" is an authority nobody granted either — the queue-bypass judgement, applied to
+    scope rather than to decisions."""
+    request_id, decision_id = _requested(db, "noscope")
+
+    enqueue_generation(
+        db, job=_job(request_id, action_decision_revision_id=decision_id),
+        environment_id=ENV, logical_group_name=GROUP)
+    outcome = process_generation_once(db, owner="w1", inventory=_inventory())
+
+    assert outcome.status == "refused", outcome
+    assert "PRINCIPAL_SCOPE_MISSING" in outcome.detail
+
+
+def test_a_REVOKED_PRINCIPAL_does_not_execute_on_frozen_claims(db) -> None:
+    """PRONG TWO at the lane. The frozen scope is intact and the decision still holds; the account
+    behind it is gone, and the build stops there."""
+    from featuregen.identity.local_session import set_user_disabled
+
+    request_id, decision_id = _requested(db, "revoked")
+    binding_id = _scope(db, request_id, decision=decision_id)
+    enqueue_generation(
+        db, job=_job(request_id, action_decision_revision_id=decision_id,
+                     principal_scope_binding_id=binding_id),
+        environment_id=ENV, logical_group_name=GROUP)
+    user_id = db.execute("SELECT user_id FROM app_user WHERE username = 'ops'").fetchone()[0]
+    assert set_user_disabled(db, user_id, True)
+
+    outcome = process_generation_once(db, owner="w1", inventory=_inventory())
+
+    assert outcome.status == "refused", outcome
+    assert "PRINCIPAL_NOT_CURRENT" in outcome.detail
+
+
+def test_a_NARROWED_SCOPE_refuses_rather_than_being_silently_reinterpreted(db) -> None:
+    """PRONG TWO's second half. The principal is current and has LOST a claim the frozen scope
+    carries — "whatever is left of that scope" is an authority nobody granted."""
+    request_id, decision_id = _requested(db, "narrowed")
+    binding_id = _scope(db, request_id, roles=("feature_engineer", "pii_reader"),
+                        decision=decision_id)
+    enqueue_generation(
+        db, job=_job(request_id, action_decision_revision_id=decision_id,
+                     principal_scope_binding_id=binding_id),
+        environment_id=ENV, logical_group_name=GROUP)
+    db.execute("DELETE FROM app_group_role WHERE role = 'pii_reader'")
+
+    outcome = process_generation_once(db, owner="w1", inventory=_inventory())
+
+    assert outcome.status == "refused", outcome
+    assert "PRINCIPAL_SCOPE_NARROWED" in outcome.detail
+
+
+def test_a_scope_that_GREW_since_the_request_still_runs_on_the_frozen_set(db) -> None:
+    """PRONG ONE, stated at the lane: claims gained since the request are irrelevant — the frozen
+    set is what authorizes, and the act proceeds past the scope gate to its ordinary refusal."""
+    request_id, decision_id = _requested(db, "grew")
+    binding_id = _scope(db, request_id, decision=decision_id)
+    enqueue_generation(
+        db, job=_job(request_id, action_decision_revision_id=decision_id,
+                     principal_scope_binding_id=binding_id),
+        environment_id=ENV, logical_group_name=GROUP)
+    group_id = db.execute("SELECT group_id FROM app_group WHERE name = 'ops-group'").fetchone()[0]
+    db.execute("INSERT INTO app_group_role (group_id, role) VALUES (%s, 'pii_reader')",
+               (group_id,))
+
+    outcome = process_generation_once(db, owner="w1", inventory=_inventory())
+
+    assert outcome.status == "refused", outcome
+    assert "PRINCIPAL" not in outcome.detail, outcome.detail
     assert "NOT_RESOLVED" in outcome.detail

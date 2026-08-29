@@ -34,6 +34,7 @@ from featuregen.api.deps import (
 )
 from featuregen.api.routes.build_sets import require_generation_enabled
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.identity.principal_scope import principal_scope_revision_of
 from featuregen.overlay.upload.code_generation_job_store import (
     JobStatusV1,
     advance_job,
@@ -171,6 +172,36 @@ class SpendApprovalIn(BaseModel):
     expires_at: ExpiryWindow
 
 
+class ExecutionParametersIn(BaseModel):
+    """The build parameters a caller DOES decide — typed, and closed.
+
+    ▲ THIS USED TO BE AN UNTYPED `dict[str, Any]`, and `roles` travelled inside it. `extra="forbid"`
+    does not reach inside a dict, so nothing on the way down looked at the key: the coordinator read
+    `params.get("roles")` into `GenerationJobV2.roles`, and Gate 2 took it as the read scope. A
+    caller holding `feature:generate` could therefore claim read roles it was never granted — and a
+    cross-catalog build makes that reach across catalogs. Read scope is now resolved from the
+    authenticated principal (B0a); a request still naming `roles` is REFUSED here by name rather
+    than silently dropped, because an ignored authority claim leaves the caller believing it was
+    honoured.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    engine_id: str = Field(min_length=1)
+    physical_type_policy: str = Field(min_length=1)
+    #: Per feature, and possibly `null` — "had no rows" and "summed to zero" are different published
+    #: answers, so there is no default.
+    empty_values: dict[str, str | None]
+    target_mode: str | None = None
+    target_ref: str | None = None
+
+    def as_parameters(self) -> dict[str, Any]:
+        """The service's mapping — omitting the optionals nobody set, so a request that named no
+        target mode hashes as it always did rather than as an explicit `null`."""
+        return {key: value for key, value in self.model_dump().items()
+                if value is not None or key == "empty_values"}
+
+
 class JobRequestIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -182,8 +213,8 @@ class JobRequestIn(BaseModel):
     logical_group_name: str = Field(min_length=1)
     #: The five declarations a generation cannot derive (`build_set_declaration` shape).
     declaration: dict[str, Any]
-    #: engine_id · physical_type_policy · empty_values · roles · target_mode · target_ref
-    execution_parameters: dict[str, Any]
+    #: engine_id · physical_type_policy · empty_values · target_mode · target_ref — and NEVER roles.
+    execution_parameters: ExecutionParametersIn
     #: Required exactly when the plan says LLM members exist; refused as a 409 otherwise.
     spend_approval: SpendApprovalIn | None = None
 
@@ -204,7 +235,7 @@ def _service_request(body: JobRequestIn):
         environment_id=body.environment_id,
         logical_group_name=body.logical_group_name,
         declaration=body.declaration,
-        execution_parameters=body.execution_parameters,
+        execution_parameters=body.execution_parameters.as_parameters(),
         spend_approval=None if body.spend_approval is None else body.spend_approval.model_dump())
 
 
@@ -259,7 +290,11 @@ def plan_code_generation(body: JobRequestIn, conn: _Conn, identity: _Identity) -
         environment_id=body.environment_id, logical_group_name=body.logical_group_name,
         selection_revision_ids=body.selection_revision_ids,
         declaration_identity=declaration_identity(declaration),
-        execution_parameters=body.execution_parameters)
+        execution_parameters=body.execution_parameters.as_parameters(),
+        # ▲ THE SAME CONTENT THE WRITE WILL HASH (B0a): the resolved scope is part of a job's
+        # identity now that the caller's `roles` no longer are, so a preview that omitted it would
+        # quote the spend ceiling of a different job. DERIVED, never recorded — `/plan` asks.
+        principal_scope_revision_id=principal_scope_revision_of(identity).revision_id)
 
     # ▲ READS a spend authorization; never creates one. The approval is what the WRITE endpoint
     # records; a plan call that minted its own ceiling would be the modal-as-money-guard defect
@@ -320,7 +355,7 @@ def request_code_generation(
     )
     try:
         job_id, created = request_code_generation_job(
-            conn, _service_request(body), actor_subject=identity.subject)
+            conn, _service_request(body), principal=identity)
     except SelectionUnavailable as exc:
         # ▲ The Task 5 review's adapter regression: these two escaped the WRITE route as 500s
         # while the plan route mapped them — same refusals, same statuses, both routes.

@@ -57,6 +57,11 @@ from featuregen.api.deps import (
     require_feature_read,
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.identity.principal_scope import (
+    PrincipalScopeRebound,
+    bind_principal_scope,
+    ensure_principal_scope_revision,
+)
 from featuregen.materialize.build_set_declaration import decode_declaration
 from featuregen.materialize.generation_authorization import (
     authorization_grantee,
@@ -163,7 +168,14 @@ class GenerationIn(BaseModel):
     #: describe exactly the members being built.
     empty_values: dict[str, str | None]
     engine_id: str = Field(min_length=1)
-    roles: list[str] = Field(default_factory=list)
+    # ▲ `roles` IS GONE FROM THIS CONTRACT (B0a). It used to be a request field taken verbatim into
+    # `GenerationJobV2.roles` and on to `decide_read_scope`, so a caller holding `feature:generate`
+    # could claim read roles it was never granted — and a cross-catalog build makes that reach
+    # across catalogs. The read scope is now RESOLVED from the authenticated principal
+    # (`get_identity` → `IdentityEnvelope.role_claims`), frozen as a principal-scope revision, and
+    # bound to this request. `extra="forbid"` above means a client still sending `roles` gets a 422
+    # naming the field rather than being silently ignored: an API that quietly drops an authority
+    # claim leaves the caller believing it was honoured.
 
 
 # ── declare ──────────────────────────────────────────────────────────────────────────────────────
@@ -340,6 +352,28 @@ def request_build(
         generation_authorization_revision_id=body.generation_authorization_revision_id,
         action_decision_revision_id=decision_id)
 
+    # ▲ THE READ SCOPE, RESOLVED SERVER-SIDE AND FROZEN (B0a, migration 1133). The claims come from
+    # the authenticated principal and nowhere else; the revision is content-addressed, so a hundred
+    # requests by one principal share one row, and the binding is what the queue names. Recorded in
+    # the SAME transaction as the request: a request whose authority is not durable is a request
+    # the worker would have to take somebody's word for.
+    #
+    # A second click by the same principal binds IDENTICALLY (the revision, the decision and the
+    # binding are all content-addressed), so the ordinary duplicate path is a no-op. A rebind under
+    # a DIFFERENT authority is refused as a typed 409 rather than escaping as a 500: the grantee
+    # check above already makes it unreachable through this route, and if it ever becomes reachable
+    # the honest answer is "this attempt already has an authority", not a stack trace.
+    try:
+        scope_binding_id = bind_principal_scope(
+            conn,
+            revision_id=ensure_principal_scope_revision(conn, principal=identity),
+            subject_kind="generation_request", subject_id=request_id,
+            action_decision_revision_id=decision_id)
+    except PrincipalScopeRebound as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "PRINCIPAL_SCOPE_ALREADY_BOUND",
+            "detail": str(exc)}) from exc
+
     if created:
         # SAME TRANSACTION as the request above. See the module docstring: a request with no queue
         # row is work nobody will ever pick up.
@@ -360,7 +394,9 @@ def request_build(
                     operand_facts=dict(declaration.operand_facts),
                     policy_realization_ids=dict(declaration.policy_realization_ids),
                     engine_id=body.engine_id,
-                    roles=tuple(body.roles),
+                    # THE BINDING, never the claims — the worker reads the frozen scope through it
+                    # and checks this copy against the durable row.
+                    principal_scope_binding_id=scope_binding_id,
                     compiled_at=now,
                     sealed_at=now,
                     action_decision_revision_id=decision_id),

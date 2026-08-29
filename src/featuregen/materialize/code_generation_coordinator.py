@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from featuregen.aggregates.ids import mint_id
+from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.code_generation_job_store import (
     CodeGenJobV1,
     JobStatusV1,
@@ -49,7 +50,27 @@ from featuregen.overlay.upload.formula_draft_service import (
 )
 from featuregen.runtime.observability import counters, log
 
-__all__ = ["process_code_generation_once"]
+__all__ = ["process_code_generation_once", "server_owned_parameters"]
+
+#: Keys a CALLER may never decide, whatever surface they arrive through (B0a). `roles` was Gate 2's
+#: read scope, taken verbatim from an untyped request map: a caller could claim read roles it was
+#: never granted, and a cross-catalog build makes that reach across catalogs. Read scope is now
+#: resolved from the authenticated principal and frozen as a principal-scope revision.
+SERVER_OWNED_PARAMETER_KEYS: frozenset[str] = frozenset({"roles"})
+
+
+def server_owned_parameters(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """`execution_parameters` with every server-owned key REMOVED.
+
+    Dropped rather than refused, because this is the SERVICE boundary and not the wire: the public
+    route refuses the key loudly (its typed body forbids it, so a client hears 422 rather than
+    believing a silently-ignored claim was honoured), while the run route replays a stored map from
+    a job recorded before the contract closed. A legacy row's stale key is not a live claim — but
+    it must not reach the build either, and dropping it here means no caller of this service can
+    reintroduce one.
+    """
+    return {key: value for key, value in parameters.items()
+            if key not in SERVER_OWNED_PARAMETER_KEYS}
 
 
 def _now(conn) -> str:
@@ -239,6 +260,10 @@ def _settle_after_authoring(conn, job: CodeGenJobV1, *, from_status: JobStatusV1
 
 # ── stage: bind, declare, decide, enqueue — the build itself stays the lane's ───────────────────
 def _build(conn, job: CodeGenJobV1) -> None:
+    from featuregen.identity.principal_scope import (
+        bind_principal_scope,
+        load_principal_scope_binding,
+    )
     from featuregen.materialize.build_set_declaration import decode_declaration
     from featuregen.materialize.generation_authorization import (
         GenerationAuthorizationV1,
@@ -341,6 +366,27 @@ def _build(conn, job: CodeGenJobV1) -> None:
         environment_id=job.environment_id, requested_by=job.requested_by, requested_at=now,
         generation_authorization_revision_id=authorization_revision_id,
         action_decision_revision_id=decision_id)
+
+    # ▲ THE READ SCOPE, FROM THE JOB'S OWN FROZEN AUTHORITY — never `params.get("roles")`, which is
+    # the hole B0a closes: that read the caller's own claim out of an untyped map and handed it to
+    # `decide_read_scope`. The scope was resolved from the authenticated principal when the person
+    # asked, and the generation this stage requests inherits exactly it, under a binding of its own
+    # so the worker can check the queue payload against a durable row.
+    job_scope = load_principal_scope_binding(
+        conn, subject_kind="code_generation_job", subject_id=job.job_id)
+    if job_scope is None:
+        # Recorded in the same transaction as the job, so absence means the row was reached another
+        # way. A build that invented a scope here would be the defect wearing a server's face.
+        advance_job(conn, job.job_id, JobStatusV1.READY_TO_BUILD, JobStatusV1.BLOCKED,
+                    terminal_detail={"blockers": ["PRINCIPAL_SCOPE_MISSING"],
+                                     "detail": "this job carries no resolved principal scope, so "
+                                               "there is no authority to build under"})
+        counters.incr("featuregen.code_generation_job.blocked")
+        return
+    generation_scope_binding_id = bind_principal_scope(
+        conn, revision_id=job_scope.revision_id, subject_kind="generation_request",
+        subject_id=request_id, action_decision_revision_id=decision_id)
+
     if created:
         enqueue_generation(
             conn,
@@ -354,7 +400,7 @@ def _build(conn, job: CodeGenJobV1) -> None:
                 operand_facts=dict(declaration.operand_facts),
                 policy_realization_ids=dict(declaration.policy_realization_ids),
                 engine_id=params["engine_id"],
-                roles=tuple(params.get("roles", ())),
+                principal_scope_binding_id=generation_scope_binding_id,
                 compiled_at=now, sealed_at=now,
                 action_decision_revision_id=decision_id),
             environment_id=job.environment_id, logical_group_name=job.logical_group_name)
@@ -541,15 +587,26 @@ def member_authoring_plans(conn, request: CodeGenJobRequestV1) -> list[dict[str,
 
 
 def request_code_generation_job(
-    conn, request: CodeGenJobRequestV1, *, actor_subject: str,
+    conn, request: CodeGenJobRequestV1, *, principal: IdentityEnvelope,
 ) -> tuple[str, bool]:
     """THE explicit write/spend act, callable from any owner of a connection — everything durable
     in one transaction; the worker's coordinator drives the rest. Returns ``(job_id, created)``.
 
     Raises `CodeGenRequestInvalid` / `SelectionUnavailable` / `CodeGenMembersRefused` /
     `SpendApprovalRequired` — all typed, none knowing what HTTP is.
+
+    ▲ THE RESOLVED PRINCIPAL, not a subject string (B0a). This act freezes the caller's read scope,
+    and a bare subject cannot carry one — every entry point (the two routes and the run-spine
+    trigger) therefore hands over the identity the server resolved, and none of them may hand over
+    roles. `execution_parameters` is a caller-supplied map: any `roles` key inside it is DROPPED
+    here rather than believed, so a legacy job row replayed by the run route cannot smuggle the old
+    claim back in.
     """
     from featuregen.aggregates.ids import mint_id
+    from featuregen.identity.principal_scope import (
+        bind_principal_scope,
+        ensure_principal_scope_revision,
+    )
     from featuregen.materialize.build_set_declaration import (
         declaration_identity,
         decode_declaration,
@@ -566,8 +623,9 @@ def request_code_generation_job(
         declaration = decode_declaration(dict(request.declaration))
     except (ValueError, TypeError) as exc:
         raise CodeGenRequestInvalid(str(exc)) from exc
+    parameters = server_owned_parameters(request.execution_parameters)
     for required in ("engine_id", "physical_type_policy", "empty_values"):
-        if required not in request.execution_parameters:
+        if required not in parameters:
             raise CodeGenRequestInvalid(
                 f"execution_parameters is missing {required!r} — each decides how the build "
                 f"runs, and a defaulted one would decide it on the caller's behalf")
@@ -586,6 +644,10 @@ def request_code_generation_job(
     identity_payload = declaration_identity(declaration)
     from featuregen.overlay.upload.code_generation_job_store import job_content_identity
 
+    # THE RESOLVED SCOPE, frozen before the job it authorizes exists — the job's content identity
+    # names it, so two principals with different read scope asking for the same build stay two
+    # jobs rather than collapsing onto the first one's authority.
+    scope_revision_id = ensure_principal_scope_revision(conn, principal=principal)
     job_identity = job_content_identity(
         considered_revision_id=request.considered_revision_id,
         target_reading_revision_id=request.target_reading_revision_id,
@@ -593,14 +655,15 @@ def request_code_generation_job(
         logical_group_name=request.logical_group_name,
         selection_revision_ids=list(request.selection_revision_ids),
         declaration_identity=identity_payload,
-        execution_parameters=dict(request.execution_parameters))
+        execution_parameters=parameters,
+        principal_scope_revision_id=scope_revision_id)
 
     if llm_members and request.spend_approval is not None:
         from featuregen.overlay.upload.llm_spend import canonical_approval_expiry
 
         approval = request.spend_approval
         authorize_spend(
-            conn, action="AUTHOR_FORMULA", actor_subject=actor_subject,
+            conn, action="AUTHOR_FORMULA", actor_subject=principal.subject,
             job_identity=job_identity,
             member_identities=[p["selection_revision_id"] for p in llm_members],
             provider_contract_hash=current_author_contract_hash(),
@@ -612,14 +675,14 @@ def request_code_generation_job(
             # latest-first reader would silently adopt (Task 4 follow-up finding).
             expires_at=canonical_approval_expiry(conn, approval["expires_at"]))
 
-    return create_job(
+    job_id, created = create_job(
         conn, job_id=mint_id("cgj"),
         considered_revision_id=request.considered_revision_id,
         target_reading_revision_id=request.target_reading_revision_id,
         environment_id=request.environment_id,
         logical_group_name=request.logical_group_name,
         declaration=dict(request.declaration), declaration_identity=identity_payload,
-        execution_parameters=dict(request.execution_parameters),
+        execution_parameters=parameters,
         members=tuple(
             JobMemberSpecV1(
                 position=p["position"],
@@ -627,4 +690,12 @@ def request_code_generation_job(
                 considered_revision_id=p["considered_revision_id"],
                 option_id=p["option_id"], formula_strategy=p["formula_strategy"],
                 strategy_warnings=tuple(p["warnings"])) for p in plans),
-        requested_by=actor_subject, requested_at=_now(conn))
+        requested_by=principal.subject, requested_at=_now(conn),
+        principal_scope_revision_id=scope_revision_id)
+    # SAME TRANSACTION as the job. The binding is idempotent on content, so landing on a live
+    # duplicate re-binds to the identical row — which it must, because the scope revision is part
+    # of the job's content identity and a duplicate is by definition the same principal's scope.
+    bind_principal_scope(
+        conn, revision_id=scope_revision_id, subject_kind="code_generation_job",
+        subject_id=job_id)
+    return job_id, created

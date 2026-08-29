@@ -156,7 +156,9 @@ def test_missing_execution_parameters_are_refused_BY_NAME(client, conn, enabled,
     del body["execution_parameters"]["engine_id"]
     response = client.post(JOBS, json=body, headers=engineer_headers)
     assert response.status_code == 422
-    assert "engine_id" in response.json()["detail"]
+    # The TYPED body names the missing field in its `loc` (B0a closed `execution_parameters` over a
+    # model so a client `roles` claim could be refused by name; the same typing names this one).
+    assert "engine_id" in str(response.json()["detail"])
 
 
 # ══ watching and cancelling ═════════════════════════════════════════════════════════════════════
@@ -317,3 +319,90 @@ def test_A_REPLAYED_CONFIRM_cannot_reset_the_budget(client, conn, enabled, engin
     assert len(rows) == 1, "two same-day expiries, ONE approval — the replay bought nothing"
     assert rows[0][0] == APPROVAL_EXPIRY_FLOOR, \
         "floored to the requested instant's UTC midnight — never extended"
+
+
+# ══ B0a — `execution_parameters` IS CLOSED, AND ROLES ARE NOT IN IT ════════════════════════════
+def test_a_CLIENT_ROLE_CLAIM_INSIDE_EXECUTION_PARAMETERS_IS_REFUSED(client, conn, enabled,
+                                                                    engineer_headers):
+    """▲ THE HOLE, and why it hid: `execution_parameters` was an untyped `dict[str, Any]`, so the
+    body's own `extra="forbid"` never reached inside it. `roles` travelled to the coordinator,
+    into `GenerationJobV2.roles`, and on to `decide_read_scope` as Gate 2's read scope — a caller
+    could claim read roles it was never granted. The map is now a typed, closed model."""
+    body = {**_seed(conn, tag="rolesclaim"), "spend_approval": _APPROVAL}
+    body["execution_parameters"]["roles"] = ["pii_reader", "restricted_reader"]
+
+    response = client.post(JOBS, json=body, headers=engineer_headers)
+
+    assert response.status_code == 422, response.text
+    assert "roles" in str(response.json()["detail"])
+    assert conn.execute("SELECT count(*) FROM code_generation_job").fetchone()[0] == 0
+
+
+def test_THE_PLAN_ROUTE_REFUSES_THE_SAME_CLAIM(client, conn, enabled, engineer_headers):
+    """One contract, both surfaces — a preview that accepted the claim would quote a build the
+    write endpoint refuses."""
+    body = _seed(conn, tag="rolesplan")
+    body["execution_parameters"]["roles"] = ["pii_reader"]
+
+    assert client.post(PLAN, json=body, headers=engineer_headers).status_code == 422
+
+
+def test_THE_JOB_CARRIES_THE_SERVER_RESOLVED_SCOPE(client, conn, enabled, engineer_headers):
+    """The frozen authority is recorded in the same transaction as the job, from the authenticated
+    principal — and the JOB's content identity names it."""
+    from featuregen.identity.principal_scope import (
+        load_principal_scope_binding,
+        load_principal_scope_revision,
+    )
+
+    body = {**_seed(conn, tag="scoped"), "spend_approval": _APPROVAL}
+    job_id = client.post(JOBS, json=body, headers=engineer_headers).json()["job_id"]
+
+    binding = load_principal_scope_binding(
+        conn, subject_kind="code_generation_job", subject_id=job_id)
+    assert binding is not None
+    revision = load_principal_scope_revision(conn, binding.revision_id)
+    assert revision is not None
+    assert revision.subject == "user:sam"
+    assert revision.role_claims == ("feature_engineer",)
+    # And the stored parameters no longer have a place to keep a claim at all.
+    stored = conn.execute(
+        "SELECT execution_parameters_json FROM code_generation_job WHERE job_id = %s",
+        (job_id,)).fetchone()[0]
+    stored = stored if isinstance(stored, dict) else json.loads(stored)
+    assert "roles" not in stored
+
+
+def test_TWO_PRINCIPALS_WITH_DIFFERENT_SCOPE_DO_NOT_SHARE_ONE_JOB(client, conn, enabled,
+                                                                  engineer_headers):
+    """▲ THE DECLARED IDENTITY CONSEQUENCE, pinned. The caller's `roles` used to sit inside
+    `execution_parameters` and therefore inside `job_content_identity`, so two people with
+    different read scope asking for the same build were two jobs. With roles gone, the
+    SERVER-RESOLVED scope takes that place — otherwise the second request would land on the first
+    one's live job and be reported as already in flight under an authority it never held."""
+    body = {**_seed(conn, tag="twoscopes"), "spend_approval": _APPROVAL}
+
+    mine = client.post(JOBS, json=body, headers=engineer_headers).json()
+    theirs = client.post(
+        JOBS, json=body,
+        headers={"X-User": "sam", "X-Roles": "feature_engineer,pii_reader"}).json()
+
+    assert mine["created"] is True
+    assert theirs["created"] is True
+    assert theirs["job_id"] != mine["job_id"]
+    identities = {row[0] for row in conn.execute(
+        "SELECT content_identity_hash FROM code_generation_job").fetchall()}
+    assert len(identities) == 2, "one identity for two authorities is the collapse this prevents"
+
+
+def test_THE_SAME_PRINCIPAL_CLICKING_TWICE_IS_STILL_ONE_JOB(client, conn, enabled,
+                                                            engineer_headers):
+    """The scope is content-addressed, so adding it to the identity did not make every request
+    unique — a double-click by one person is still one job."""
+    body = {**_seed(conn, tag="dedupe"), "spend_approval": _APPROVAL}
+
+    first = client.post(JOBS, json=body, headers=engineer_headers).json()
+    second = client.post(JOBS, json=body, headers=engineer_headers).json()
+
+    assert second["job_id"] == first["job_id"]
+    assert second["created"] is False

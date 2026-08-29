@@ -259,7 +259,7 @@ def prepare_run_code(run_id: str, body: PrepareCodeIn, conn: _Conn,
 
     try:
         job_id, created = request_code_generation_job(
-            conn, request, actor_subject=identity.subject)
+            conn, request, principal=identity)
     except SelectionUnavailable as exc:
         # `unknown_selection` is unreachable from here — this route resolved the ids out of the
         # run's own store — but the mapping is the code-generation route's, verbatim, because a

@@ -49,6 +49,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import psycopg
@@ -97,7 +98,13 @@ _NAMESPACE = "generation"
 #: materially different work, which is the guarantee a content-hashed work-item table would give.
 GENERATION_MESSAGE_PREFIX = f"{_NAMESPACE}:"
 
-PAYLOAD_VERSION = 1
+#: ▲ BUMPED TO 2 BY B0A, and deliberately — unlike `queue_lane`'s optional-key precedent, this is
+#: a field REMOVED and a required one added. `roles` used to travel in the payload as the caller's
+#: own claim about its read scope; a payload that still carries them names an authority the server
+#: never resolved, and reading it "whole" would mean honouring exactly the claim this task closed.
+#: In-flight jobs frozen under version 1 dead-letter with their reason, which is the secure answer:
+#: they carry client-supplied read scope.
+PAYLOAD_VERSION = 2
 
 #: Bounded work, so one number rather than a derivation. See the module docstring.
 LEASE_SECONDS = 300.0
@@ -165,7 +172,16 @@ class GenerationJobV2:
     #: The governed unit and currency of each operand ref, for output authority.
     operand_facts: Mapping[str, OperandFactsV2]
     engine_id: str
-    roles: tuple[str, ...] = ()
+    #: THE ACT'S AUTHORITY, by id — never its claims (B0a, migration 1133). `roles` used to sit
+    #: here, taken verbatim from the request body on both generation routes, and reached
+    #: `decide_read_scope` as Gate 2's read scope: a caller could claim read roles it was never
+    #: granted, and a cross-catalog build makes that reach across catalogs. What the worker
+    #: compiles under is now the scope FROZEN in `principal_scope_binding` for this request; this
+    #: field is the claim it checks against the durable row, and a forged payload naming another
+    #: act's binding is refused rather than believed. `None` decodes a payload frozen before the
+    #: field existed — and the worker REFUSES it (`PRINCIPAL_SCOPE_MISSING`) rather than defaulting
+    #: to an empty scope, because "no roles" is an authority nobody granted either.
+    principal_scope_binding_id: str | None = None
     target_aliases: tuple[str, ...] = ()
     policy_realization_ids: Mapping[str, str] = ()
     #: The instant recorded on what this generation produces. A per-request DECLARATION rather than
@@ -194,7 +210,7 @@ def encode_job(job: GenerationJobV2) -> dict[str, Any]:
         "empty_values": dict(job.empty_values),
         "operand_facts": {ref: _plain(facts) for ref, facts in job.operand_facts.items()},
         "engine_id": job.engine_id,
-        "roles": list(job.roles),
+        "principal_scope_binding_id": job.principal_scope_binding_id,
         "target_aliases": list(job.target_aliases),
         "policy_realization_ids": dict(job.policy_realization_ids or {}),
         "compiled_at": job.compiled_at,
@@ -222,6 +238,16 @@ def decode_job(payload: Mapping[str, Any]) -> GenerationJobV2:
     )
 
     material = _mapping(payload, where="generation job payload")
+    # ▲ REFUSED BY NAME, before anything else is read. A payload carrying `roles` is either frozen
+    # under the closed contract or forged to reintroduce it; either way it names a read scope the
+    # server never resolved, and the whole point of B0a is that such a claim is not believed. The
+    # version check below would already catch the honest case — this catches the dishonest one,
+    # which declares the current version.
+    if "roles" in material:
+        raise ValueError(
+            "generation job payload carries 'roles': read scope is SERVER-DERIVED from the "
+            "authenticated principal and travels as principal_scope_binding_id, so a payload that "
+            "claims its own roles is refused rather than honoured")
     version = material.get("version")
     if version != PAYLOAD_VERSION:
         raise ValueError(
@@ -249,7 +275,9 @@ def decode_job(payload: Mapping[str, Any]) -> GenerationJobV2:
                        _rebuild(OperandFactsV2, node, where=f"operand facts for {ref}")
                        for ref, node in facts.items()},
         engine_id=_text(material.get("engine_id"), where="job engine_id"),
-        roles=tuple(_texts(material.get("roles") or [], where="job roles")),
+        # `.get`, not `_text`: absence is a legal DECODE and an illegal ACT — the worker refuses it
+        # by name (`PRINCIPAL_SCOPE_MISSING`) rather than this codec inventing an authority.
+        principal_scope_binding_id=material.get("principal_scope_binding_id") or None,
         target_aliases=tuple(_texts(material.get("target_aliases") or [],
                                     where="job target_aliases")),
         policy_realization_ids={_text(ref, where="job policy_realization_ids key"):
@@ -567,6 +595,32 @@ def _drive(
         return _refuse(conn, claim, job, MaterializationRefused(
             CompilationRefusalCode.ACTION_DECISION_DRIFTED, str(exc)))
 
+    # ── 0b. THE FROZEN READ SCOPE, and whether it may still be spent (B0a) ──────────────────────
+    # TWO PRONGS, and neither alone is sufficient. The FROZEN claims are what authorize — they are
+    # what a person was resolved to hold when they asked, and re-resolving them here would make a
+    # build mean something different on its second delivery. But frozen claims cannot prove the
+    # account still exists, so the CURRENT authority gates: a revoked principal does not go on
+    # executing on a snapshot, and a principal whose claims have narrowed does not have its frozen
+    # authorization silently re-read as "whatever is left".
+    #
+    # The binding is looked up by the REQUEST's own id and the payload's copy is only a claim
+    # checked against it — the 1108 rule applied to authority. A forged work item therefore cannot
+    # bring its own scope: there is nowhere in the payload for one to live.
+    from featuregen.identity.principal_scope import (
+        ScopeAuthorizationRefused,
+        authorize_frozen_scope,
+    )
+
+    try:
+        scope = authorize_frozen_scope(
+            conn, subject_kind="generation_request", subject_id=job.request_id,
+            claimed_binding_id=job.principal_scope_binding_id,
+            observed_at=datetime.now(UTC))
+    except ScopeAuthorizationRefused as refusal:
+        return _refuse(conn, claim, job, MaterializationRefused(
+            CompilationRefusalCode(refusal.code), refusal.detail))
+    roles = scope.role_claims
+
     # ── 1. THE MEMBERS, rehydrated from the write-once authoring trace ──────────────────────────
     try:
         # ▲ THE PINS, not the selections. Passing selections made the lane resolve "the newest
@@ -585,7 +639,7 @@ def _drive(
         return _refuse(conn, claim, job, refusal)
 
     # ── 3. THE POPULATION ───────────────────────────────────────────────────────────────────────
-    spine = validate_spine_declaration(conn, job.spine_declaration, roles=job.roles)
+    spine = validate_spine_declaration(conn, job.spine_declaration, roles=roles)
     if isinstance(spine, MaterializationRefused):
         return _refuse(conn, claim, job, spine)
 
@@ -601,7 +655,7 @@ def _drive(
         empty_values=job.empty_values,
         operand_facts=job.operand_facts,
         logical_group_name=authorization.logical_group_name,
-        roles=job.roles,
+        roles=roles,
         target_aliases=job.target_aliases,
         policy_realization_ids=job.policy_realization_ids)
     if isinstance(compiled, MaterializationRefused):

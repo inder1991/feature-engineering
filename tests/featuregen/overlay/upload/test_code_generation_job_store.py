@@ -52,6 +52,17 @@ def _seed(conn, tag: str) -> tuple[str, list[JobMemberSpecV1]]:
     return considered, members
 
 
+def _scope(conn, *, subject: str = "user:sam",
+           roles: tuple[str, ...] = ("feature_engineer",)) -> str:
+    """The frozen principal/data-scope revision a job is recorded under."""
+    from featuregen.contracts import IdentityEnvelope
+    from featuregen.identity.principal_scope import ensure_principal_scope_revision
+
+    return ensure_principal_scope_revision(conn, principal=IdentityEnvelope(
+        subject=subject, actor_kind="human", authenticated=True, auth_method="password",
+        role_claims=roles))
+
+
 def _create(conn, tag: str, **overrides) -> str:
     considered, members = _seed(conn, tag)
     job_id, created = create_job(
@@ -60,7 +71,10 @@ def _create(conn, tag: str, **overrides) -> str:
         logical_group_name=f"grp-{tag}", declaration={"decl": tag},
         declaration_identity=_DECL_IDENTITY, execution_parameters=_PARAMS,
         members=overrides.get("members", members), requested_by="user:sam",
-        requested_at="2026-08-23T00:00:00Z")
+        requested_at="2026-08-23T00:00:00Z",
+        # THE SERVER-RESOLVED SCOPE (B0a): part of a job's content identity now that the caller's
+        # `roles` are not — two principals with different read scope must stay two jobs.
+        principal_scope_revision_id=overrides.get("principal_scope_revision_id", _scope(conn)))
     assert created is overrides.get("expect_created", True)
     return job_id
 
@@ -87,13 +101,13 @@ def test_THE_SAME_CLICK_IS_THE_SAME_JOB(db):
         target_reading_revision_id="trr-dup", environment_id="hdfc-local",
         logical_group_name="grp-dup", declaration={}, declaration_identity=_DECL_IDENTITY,
         execution_parameters=_PARAMS, members=members, requested_by="user:sam",
-        requested_at="2026-08-23T00:00:00Z")
+        requested_at="2026-08-23T00:00:00Z", principal_scope_revision_id=_scope(db))
     second, created_second = create_job(
         db, job_id="cgj-dup-2", considered_revision_id=considered,
         target_reading_revision_id="trr-dup", environment_id="hdfc-local",
         logical_group_name="grp-dup", declaration={}, declaration_identity=_DECL_IDENTITY,
         execution_parameters=_PARAMS, members=members, requested_by="user:sam",
-        requested_at="2026-08-23T00:01:00Z")
+        requested_at="2026-08-23T00:01:00Z", principal_scope_revision_id=_scope(db))
 
     assert (created_first, created_second) == (True, False)
     assert second == first, "the double-click answer is the LIVE job, not a parallel build"
@@ -108,7 +122,7 @@ def test_A_FAILED_JOB_RELEASES_THE_IDENTITY_SLOT(db):
         target_reading_revision_id="trr-slot", environment_id="hdfc-local",
         logical_group_name="grp-slot", declaration={}, declaration_identity=_DECL_IDENTITY,
         execution_parameters=_PARAMS, members=members, requested_by="user:sam",
-        requested_at="2026-08-23T00:00:00Z")
+        requested_at="2026-08-23T00:00:00Z", principal_scope_revision_id=_scope(db))
     advance_job(db, first, JobStatusV1.REQUESTED, JobStatusV1.FAILED,
                 terminal_detail={"failure": "crash"})
 
@@ -117,7 +131,7 @@ def test_A_FAILED_JOB_RELEASES_THE_IDENTITY_SLOT(db):
         target_reading_revision_id="trr-slot", environment_id="hdfc-local",
         logical_group_name="grp-slot", declaration={}, declaration_identity=_DECL_IDENTITY,
         execution_parameters=_PARAMS, members=members, requested_by="user:sam",
-        requested_at="2026-08-23T00:01:00Z")
+        requested_at="2026-08-23T00:01:00Z", principal_scope_revision_id=_scope(db))
     assert created is True and retry == "cgj-slot-2"
 
 
@@ -127,7 +141,8 @@ def test_no_members_and_duplicate_selections_are_refused_BY_NAME(db):
         create_job(db, job_id="cgj-r0", considered_revision_id=considered,
                    target_reading_revision_id="trr-refuse", environment_id="e",
                    logical_group_name="g", declaration={}, declaration_identity={},
-                   execution_parameters={}, members=(), requested_by="u", requested_at="2026-08-23T00:00:00Z")
+                   execution_parameters={}, members=(), requested_by="u",
+                   requested_at="2026-08-23T00:00:00Z", principal_scope_revision_id=_scope(db))
     twice = (members[0], JobMemberSpecV1(
         position=1, selection_revision_id=members[0].selection_revision_id,
         considered_revision_id=considered, option_id="opt-a", formula_strategy="llm_authored"))
@@ -135,7 +150,8 @@ def test_no_members_and_duplicate_selections_are_refused_BY_NAME(db):
         create_job(db, job_id="cgj-r1", considered_revision_id=considered,
                    target_reading_revision_id="trr-refuse", environment_id="e",
                    logical_group_name="g", declaration={}, declaration_identity={},
-                   execution_parameters={}, members=twice, requested_by="u", requested_at="2026-08-23T00:00:00Z")
+                   execution_parameters={}, members=twice, requested_by="u",
+                   requested_at="2026-08-23T00:00:00Z", principal_scope_revision_id=_scope(db))
 
 
 # ══ the lease ═══════════════════════════════════════════════════════════════════════════════════

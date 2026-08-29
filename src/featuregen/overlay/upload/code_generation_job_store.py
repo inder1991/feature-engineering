@@ -148,11 +148,20 @@ def job_content_identity(
     *, considered_revision_id: str, target_reading_revision_id: str, environment_id: str,
     logical_group_name: str, selection_revision_ids: Sequence[str],
     declaration_identity: Mapping[str, Any], execution_parameters: Mapping[str, Any],
+    principal_scope_revision_id: str,
 ) -> str:
     """The EXACT request content, hashed — what "the same click" means.
 
     ``declaration_identity`` is the declaration's IDENTITY payload, not its stored provenance —
     the 55f7235a lesson: folding a clock read forks the identity per request.
+
+    ▲ ``principal_scope_revision_id`` IS PART OF THE CONTENT (B0a, declared identity change). The
+    caller's `roles` used to ride inside ``execution_parameters`` and were therefore inside this
+    hash, so two people with different read scope asking for the same build were two jobs. Read
+    scope is now server-derived and no longer travels in the parameters — and without the resolved
+    scope here, those two requests would collapse onto ONE live job, whose recorded authority is
+    whichever principal got there first. The server-resolved identity replaces the client's claim
+    in the same place it used to sit.
     """
     return jcs_sha256({
         "considered_revision_id": considered_revision_id,
@@ -162,6 +171,7 @@ def job_content_identity(
         "selection_revision_ids": list(selection_revision_ids),   # ORDERED — order is identity
         "declaration_identity": dict(declaration_identity),
         "execution_parameters": dict(execution_parameters),
+        "principal_scope_revision_id": principal_scope_revision_id,
     })
 
 
@@ -170,6 +180,7 @@ def create_job(
     environment_id: str, logical_group_name: str, declaration: Mapping[str, Any],
     declaration_identity: Mapping[str, Any], execution_parameters: Mapping[str, Any],
     members: Sequence[JobMemberSpecV1], requested_by: str, requested_at: str,
+    principal_scope_revision_id: str,
 ) -> tuple[str, bool]:
     """Record the job, its members and its PENDING action rows — or return the LIVE duplicate.
 
@@ -187,7 +198,8 @@ def create_job(
         considered_revision_id=considered_revision_id,
         target_reading_revision_id=target_reading_revision_id, environment_id=environment_id,
         logical_group_name=logical_group_name, selection_revision_ids=selections,
-        declaration_identity=declaration_identity, execution_parameters=execution_parameters)
+        declaration_identity=declaration_identity, execution_parameters=execution_parameters,
+        principal_scope_revision_id=principal_scope_revision_id)
 
     inserted = conn.execute(
         "INSERT INTO code_generation_job (job_id, content_identity_hash, considered_revision_id, "

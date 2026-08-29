@@ -231,7 +231,9 @@ def _bypass_draft(conn, *, draft_id="fd-pc", window: int = 30) -> str:
     return draft_id
 
 
-def _requested(conn, *, request_id="req-pc", draft_id=None, set_id="bs-pc") -> str:
+def _requested(conn, *, request_id="req-pc", draft_id=None, set_id="bs-pc",
+               frozen_roles: tuple[str, ...] = tuple(_ROLES),
+               current_roles: tuple[str, ...] | None = None) -> str:
     """A selection, a build set, an approval and a REQUESTED generation — what a person's click
     leaves behind."""
     conn.execute(
@@ -272,7 +274,7 @@ def _requested(conn, *, request_id="req-pc", draft_id=None, set_id="bs-pc") -> s
             environment_id=ENV, logical_group_name=GROUP, build_set_revision_id=build_set,
             target_mode=TargetModeV1.EXPLORATION, target_ref=None),
         authorized_by="user:ops", authorized_at="t")
-    from tests.featuregen.materialize.test_generation_lane import _decided
+    from tests.featuregen.materialize.test_generation_lane import _decided, _scope
 
     decision_id = _decided(conn, build_set, approval)
     request_id, created = request_generation(
@@ -287,7 +289,14 @@ def _requested(conn, *, request_id="req-pc", draft_id=None, set_id="bs-pc") -> s
             availability_promise=AvailabilityPromiseV1(calendar_days=1),
             physical_type_policy=POLICY, empty_values={FEATURE: "0"},
             operand_facts=OPERAND_FACTS, engine_id="kedro-pyspark",
-            roles=tuple(_ROLES), compiled_at="t", sealed_at="2026-08-21T00:00:00Z",
+            # ▲ THE FROZEN SCOPE, not roles (B0a). `_ROLES` used to travel in this payload as the
+            # caller's own claim; it is now resolved server-side, frozen against a real local
+            # account, and named here only by its binding id — the read scope the chain compiles
+            # under is read back through it.
+            principal_scope_binding_id=_scope(
+                conn, request_id, roles=frozen_roles, current_roles=current_roles,
+                decision=decision_id),
+            compiled_at="t", sealed_at="2026-08-21T00:00:00Z",
             action_decision_revision_id=decision_id))
     return request_id
 
@@ -835,3 +844,38 @@ def test_A_DIFFERENT_FORMULA_SEALS_A_DIFFERENT_ARTIFACT(catalog, spine, monkeypa
     assert changed.compilation_identity_hash != original.compilation_identity_hash
     assert changed.project_digest != original.project_digest
     assert second_id
+
+
+# ══ B0a — WHAT COMPILES IS THE FROZEN SCOPE, NOT THE PRINCIPAL'S CURRENT CLAIMS ════════════════
+def test_THE_FROZEN_SCOPE_IS_WHAT_REACHES_COMPILATION(catalog, spine, monkeypatch):
+    """PRONG ONE, observed where it lands. The account behind this request has GAINED a claim since
+    it asked — the current-claims gate passes, because a scope is only checked for what it LOST —
+    and what reaches `compile_generation_v2` (and through it `decide_read_scope`) is still exactly
+    the frozen set.
+
+    A worker that re-resolved roles at claim time would hand `pii_reader` to a build nobody
+    authorized to read PII, and every build would silently mean whatever its requester's
+    permissions happened to be at delivery time. The build also has to SUCCEED: proving the frozen
+    scope is used means nothing if the act is refused for some other reason first.
+    """
+    import featuregen.materialize.generation_lane as lane
+
+    seen: list[tuple[str, ...]] = []
+    real = lane.compile_generation_v2
+
+    def spy(conn, admitted, **kwargs):
+        seen.append(tuple(kwargs["roles"]))
+        return real(conn, admitted, **kwargs)
+
+    monkeypatch.setattr(lane, "compile_generation_v2", spy)
+
+    _bypass_draft(catalog)
+    _requested(catalog, request_id="req-frozen", set_id="bs-frozen",
+               frozen_roles=tuple(_ROLES), current_roles=tuple(_ROLES) + ("pii_reader",))
+    _advertise_this_build(catalog)
+
+    outcome = process_generation_once(catalog, owner="w1", inventory=INVENTORY)
+
+    assert outcome.status == "generated", outcome
+    assert seen == [tuple(_ROLES)], (
+        "the build compiled under the FROZEN claims, not the ones the account holds now")

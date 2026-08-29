@@ -14,6 +14,10 @@ import pytest
 from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
 from tests.featuregen.runs._chain import seed_run_chain
 
+from featuregen.identity.principal_scope import (
+    bind_principal_scope,
+    ensure_principal_scope_revision,
+)
 from featuregen.materialize.build_set_declaration import (
     declaration_identity,
     encode_declaration,
@@ -58,15 +62,43 @@ def _job(conn, tag: str, *, n_members: int = 2) -> str:
             considered_revision_id=considered, option_id=f"opt-{position}",
             formula_strategy="llm_authored"))
     declaration = build_set_declaration()
+    # THE JOB'S FROZEN AUTHORITY (B0a) — recorded the way `request_code_generation_job` records it:
+    # a scope revision resolved from the principal, part of the job's content identity, bound to
+    # the job. The build stage reads its read scope through this and never out of the parameters.
+    scope_revision_id = _principal_scope(conn)
     job_id, created = create_job(
         conn, job_id=f"cgj-{tag}", considered_revision_id=considered,
         target_reading_revision_id=f"trr-{tag}", environment_id="hdfc-local",
         logical_group_name=f"grp-{tag}", declaration=encode_declaration(declaration),
         declaration_identity=declaration_identity(declaration),
         execution_parameters=_PARAMS, members=members, requested_by="user:sam",
-        requested_at="2026-08-23T00:00:00Z")
+        requested_at="2026-08-23T00:00:00Z",
+        principal_scope_revision_id=scope_revision_id)
     assert created
+    bind_principal_scope(conn, revision_id=scope_revision_id,
+                         subject_kind="code_generation_job", subject_id=job_id)
     return job_id
+
+
+def _principal_scope(conn, *, subject: str = "user:sam",
+                     roles: tuple[str, ...] = ("feature_engineer",)) -> str:
+    """The server-resolved scope, plus the local account the worker's current-principal prong
+    resolves it against."""
+    from featuregen.contracts import IdentityEnvelope
+    from featuregen.identity.local_session import (
+        add_user_to_group,
+        create_group,
+        create_user,
+    )
+
+    username = subject.removeprefix("user:")
+    if conn.execute("SELECT user_id FROM app_user WHERE username = %s",
+                    (username,)).fetchone() is None:
+        user_id = create_user(conn, username, "long-test-password")
+        add_user_to_group(conn, user_id, create_group(conn, f"{username}-group", roles))
+    return ensure_principal_scope_revision(conn, principal=IdentityEnvelope(
+        subject=subject, actor_kind="human", authenticated=True, auth_method="password",
+        role_claims=tuple(roles)))
 
 
 def _seed_draft(conn, job_id: str, position: int, *, state: str = "REQUESTED") -> str:
@@ -366,7 +398,8 @@ def test_THE_JOBS_CEILING_RIDES_EVERY_MEMBERS_PLAN_ROW(db):
         members=(JobMemberSpecV1(position=0, selection_revision_id=selection,
                                  considered_revision_id=revision, option_id="opt-a",
                                  formula_strategy="LLM_AUTHORED"),),
-        requested_by="user:sam", requested_at="2026-08-23T00:00:00Z")
+        requested_by="user:sam", requested_at="2026-08-23T00:00:00Z",
+        principal_scope_revision_id=_principal_scope(db))
     identity = db.execute(
         "SELECT content_identity_hash FROM code_generation_job WHERE job_id = %s",
         (job_id,)).fetchone()[0]
@@ -448,7 +481,8 @@ def test_an_ABSENT_JOB_CEILING_refuses_the_member_never_substitutes_a_dev_envelo
         members=(JobMemberSpecV1(position=0, selection_revision_id=selection,
                                  considered_revision_id=revision, option_id="opt-a",
                                  formula_strategy="LLM_AUTHORED"),),
-        requested_by="user:sam", requested_at="2026-08-23T00:00:00Z")
+        requested_by="user:sam", requested_at="2026-08-23T00:00:00Z",
+        principal_scope_revision_id=_principal_scope(db))
 
     # NO spend authorization exists for the job identity — the drive runs the REAL service.
     process_code_generation_once(db, worker_id="w1")
