@@ -64,6 +64,7 @@ from featuregen.overlay.upload.feature_planning_contracts import (
 )
 from featuregen.overlay.upload.field_resolution import canonical_hash
 from featuregen.overlay.upload.governed_observation_store import (
+    CARDINALITY_EVIDENCE_REQUIRED,
     STALE_REGISTRY,
     claim_telemetry_work,
     complete_telemetry_work,
@@ -633,6 +634,14 @@ def demands_for_rejection(conn: DbConn, rejection: dict, *, recipe_revision_hash
 REALIZATION_ATTACHED = "attached"
 REALIZATION_EXISTS_UNATTACHED = "revision_exists_unattached"
 REALIZATION_NONE = "no_revision_exists"
+#: A7/R11 — the THIRD state, and the reason A7 touches this read at all. A4c mints an immutable
+#: PROVISIONAL sandbox revision and never CAS-publishes a current pointer, so every reader that
+#: goes through ``bridge_join_realization_current`` is blind to it: before this state, A4c's output
+#: and an empty store produced the SAME demand row. "Go build a realization" would then be filed
+#: against a realization that already exists and only needs its cardinality measured — a build
+#: ticket for work already done, addressed to the wrong person. The demand it files says so by
+#: name: ``CARDINALITY_EVIDENCE_REQUIRED``, not ``missing_realization``.
+REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY = "provisional_unknown_cardinality"
 #: Not a state of the bridge — a state of the QUESTION. A revalidation fault must never read as
 #: "nothing exists" (that would file a build ticket for work that may already be done).
 REALIZATION_UNKNOWN = "realization_lookup_failed"
@@ -648,11 +657,21 @@ def _realization_states(conn: DbConn, rejection: dict, *,
                         cache: dict[str, str] | None = None) -> dict[str, str]:
     """``bridge_fact_key -> realization state`` for every governed-bridge segment in the evidence.
 
-    One store read per DISTINCT bridge fact key per item (memoized through ``cache``), inside its
-    own savepoint: ``executable_bridge_realizations`` revalidates, and a revalidation fault would
+    Two store reads per DISTINCT bridge fact key per item (memoized through ``cache``), inside one
+    savepoint: ``executable_bridge_realizations`` revalidates, and a revalidation fault would
     otherwise abort the item's whole transaction — the ``context_graph`` idiom, for the same
-    reason."""
-    from featuregen.overlay.upload.bridge_store import executable_bridge_realizations
+    reason. The second read is the A7 one, and it only runs when the first found nothing:
+
+    * something CURRENT and executable → ``revision_exists_unattached`` (wire up what exists);
+    * otherwise, a stored revision no pointer publishes — A4c's shape. UNKNOWN cardinality is the
+      distinct work item (``provisional_unknown_cardinality``: measure it); a known-cardinality
+      revision with no pointer is still "one exists, unattached", which is what it always was;
+    * nothing stored at all → ``no_revision_exists`` (build one).
+    """
+    from featuregen.overlay.upload.bridge_store import (
+        executable_bridge_realizations,
+        realization_revisions_for_bridge,
+    )
 
     states = cache if cache is not None else {}
     for segment in rejection.get("evidence") or ():
@@ -669,12 +688,19 @@ def _realization_states(conn: DbConn, rejection: dict, *,
                 found = executable_bridge_realizations(
                     conn, purpose=_REALIZATION_PURPOSE, environment=_REALIZATION_ENVIRONMENT,
                     bridge_fact_key=key)
+                stored = () if found else realization_revisions_for_bridge(
+                    conn, bridge_fact_key=key)
         except Exception:       # noqa: BLE001 — a fault must not read as "nothing exists"
             logger.warning("governed telemetry: realization lookup failed for bridge %s", key,
                            exc_info=True)
             states[key] = REALIZATION_UNKNOWN
             continue
-        states[key] = REALIZATION_EXISTS_UNATTACHED if found else REALIZATION_NONE
+        if found:
+            states[key] = REALIZATION_EXISTS_UNATTACHED
+        elif any(not revision.cardinality.known for revision in stored):
+            states[key] = REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY
+        else:
+            states[key] = REALIZATION_EXISTS_UNATTACHED if stored else REALIZATION_NONE
     return states
 
 
@@ -698,10 +724,12 @@ def contract_level_demands(rejection: dict, *, recipe_revision_hash: str,
 
       ``realization_states`` (from :func:`_realization_states`) decides WHICH segments file and
       what the row says the work is: a segment whose realization is already ``attached`` files
-      nothing (nothing is missing), while ``no_revision_exists`` and ``revision_exists_unattached``
-      both file — the state rides in the row so the queue can tell "build one" from "wire up the
-      one you have". An absent key means nobody asked the store; it is recorded as such rather
-      than assumed.
+      nothing (nothing is missing), while every other state files — the state rides in the row so
+      the queue can tell "build one" (``no_revision_exists``) from "wire up the one you have"
+      (``revision_exists_unattached``) from "measure the one you have"
+      (``provisional_unknown_cardinality``, A7). The last of those files under its OWN verdict,
+      ``CARDINALITY_EVIDENCE_REQUIRED``, in the same ``realization_gap`` queue. An absent key means
+      nobody asked the store; it is recorded as such rather than assumed.
 
     * ``bounded_out_max_frontier_states`` — hop-less by construction (its reject is minted from the
       START state, which realized nothing), so it can NEVER arrive through ``unmet_hops``. Filed
@@ -740,12 +768,19 @@ def _realization_gap(segment: dict, *, recipe_revision_hash: str, anchor: str,
     The POSITION is the near side — the catalog and table an engineer would build the realization
     in — matching S1B-2's convention for an unmet hop so the two sources land in one queue with one
     meaning. ``hop_index`` is ``-1``: this demand comes from a path that resolved, so there is no
-    frontier position to name, and inventing one would forge a distinct demand identity per run."""
+    frontier position to name, and inventing one would forge a distinct demand identity per run.
+
+    **The VERDICT follows the state (A7).** A provisional realization whose cardinality is unproven
+    is not a missing realization, and the ledger says which it is by name — one queue
+    (``realization_gap``: the same person owns both), two verdicts, two work items. The verdict is
+    identity material, so the two never collapse into one countable demand either."""
     near_ref = str(segment.get("bridge_from_object_ref") or "")
     far_ref = str(segment.get("bridge_to_object_ref") or "")
     far_catalog = str(segment.get("bridge_to_catalog_source") or "")
     return {
-        "verdict": ReasonCode.missing_realization.value,
+        "verdict": (CARDINALITY_EVIDENCE_REQUIRED
+                    if realization_state == REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY
+                    else ReasonCode.missing_realization.value),
         "recipe_revision_hash": recipe_revision_hash,
         "anchor_catalog_source": anchor,
         "relationship_id": str(segment.get("relationship_id") or ""),
@@ -868,6 +903,7 @@ __all__: list[str] = [
     "REALIZATION_ATTACHED",
     "REALIZATION_EXISTS_UNATTACHED",
     "REALIZATION_NONE",
+    "REALIZATION_PROVISIONAL_UNKNOWN_CARDINALITY",
     "REALIZATION_UNKNOWN",
     "STALE_REGISTRY",
     "UNRESOLVED_PLAN_CONTENT_HASH",

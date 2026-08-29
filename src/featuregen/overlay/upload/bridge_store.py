@@ -712,6 +712,60 @@ def load_current_bridge_realizations(
     return tuple(out)
 
 
+def realization_revisions_for_bridge(
+    conn,
+    *,
+    bridge_fact_key: str,
+    execution_tier: ExecutionTier | None = None,
+    purpose: str | None = None,
+    environment: str | None = None,
+) -> tuple[BridgeJoinRealizationRevisionV1, ...]:
+    """Every STORED revision for one bridge — pointer or no pointer — optionally scope-filtered.
+
+    Deliberately not a second production reader, and it can never become one: it returns REVISIONS
+    (immutable content) and never a :class:`CurrentBridgeRealizationV1`, so nothing downstream can
+    mistake its output for something executable. It revalidates nothing, and nothing it returns is
+    admissible for execution.
+
+    It exists because every other reader in this module goes through
+    ``bridge_join_realization_current``, and R11/A4c writes the revision half WITHOUT the
+    CAS-publish half: a provisional sandbox realization has no current pointer, so
+    :func:`load_current_bridge_realizations` — and therefore
+    :func:`executable_bridge_realizations` — cannot see it at all. To a caller asking "does
+    anything exist for this crossing?", A4c's output and an empty store were the same answer, which
+    is how "go build a realization" gets filed against a realization that already exists and only
+    needs its cardinality measured (A7's demand distinction).
+
+    Identity is verified the way :func:`load_current_bridge_realizations` verifies it: a stored
+    payload that cannot reproduce the primary keys beside it is store corruption, and skipping it
+    would turn corruption into an unexplained absence.
+    """
+    rows = conn.execute(
+        "SELECT realization_revision_id, realization_id, realization_json "
+        "FROM bridge_join_realization_revision WHERE bridge_fact_key = %s "
+        "ORDER BY realization_revision_id",
+        (bridge_fact_key,),
+    ).fetchall()
+    out: list[BridgeJoinRealizationRevisionV1] = []
+    for stored_revision_id, stored_realization_id, payload in rows:
+        revision = realization_from_json(payload)
+        if (
+            revision.realization_id != stored_realization_id
+            or revision.realization_revision_id != stored_revision_id
+        ):
+            raise BridgeStoreCorruption(
+                f"realization identity mismatch for {stored_revision_id}")
+        scope = revision.applicability_scope
+        if execution_tier is not None and scope.execution_tier is not execution_tier:
+            continue
+        if purpose is not None and purpose not in scope.purposes:
+            continue
+        if environment is not None and environment != scope.environment:
+            continue
+        out.append(revision)
+    return tuple(out)
+
+
 def _binding_revision_is_stored(conn, endpoint: IdentifierEndpointV1) -> bool:
     binding = endpoint.physical_binding
     revision_id = endpoint.binding_revision_id

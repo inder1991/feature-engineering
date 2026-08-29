@@ -344,9 +344,15 @@ def test_capacity_verdict_uses_the_reduced_material_and_routes_to_planner_capaci
 
 
 def test_queue_routing_covers_every_demand_verdict(conn) -> None:
+    """The closed set, and A7's one addition to it. `cardinality_evidence_required` shares the
+    `realization_gap` queue with `missing_realization` because they are two states of one person's
+    work — build a realization, or measure the cardinality of the provisional one that exists.
+    (`test_demand_vocabulary_and_satisfaction.py` pins the same map against SQL, in both
+    directions, so neither side can move alone.)"""
     assert DEMAND_VERDICT_QUEUES == {
         "unsanctioned_bridge": "bridge_demand",
         "missing_realization": "realization_gap",
+        "cardinality_evidence_required": "realization_gap",
         "bounded_out_max_bridges": "planner_capacity",
         "bounded_out_max_frontier_states": "planner_capacity",
     }

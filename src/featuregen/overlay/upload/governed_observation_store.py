@@ -1,5 +1,5 @@
 """Stage 1B — the governed planning observation, bridge-demand and review stores (migrations
-1120 + 1121).
+1120 + 1121, extended by 1132).
 
 Every governed planning request leaves ONE row here, whatever it did: resolved, unresolved,
 bounded out, safety-rejected. That is the point. A telemetry programme that records only successes
@@ -20,6 +20,10 @@ Three writes and two reads:
 * ``observation_queues`` — the three demand queues, AGGREGATED OVER THE FULL FILTERED POPULATION
   and only then paginated. Latest-N-then-group would let a busy week hide a standing gap.
 * ``resolution_summary`` — the wave-1 report's numerator source.
+* ``demand_satisfaction`` (A7) — the CURRENT-UNRESOLVED view. "Satisfied" is a PROJECTION over this
+  append-only history and never a delete, a flag or an in-place update: a met demand keeps every
+  filing it ever had, because how long a gap stood and how many teams hit it IS the funding
+  argument. Only which side of the read it lands on changes.
 
 ``distinct_intents`` and ``distinct_runs`` are reported SEPARATELY on purpose: five retries of one
 intent is one team asking once, and a queue that counts it as five demands ranks noise. The headline
@@ -59,13 +63,27 @@ OBSERVATION_MODES = frozenset({"live", "telemetry"})
 #: whole planning import graph into the API route chain for one constant.
 STALE_REGISTRY = "stale_registry"
 
+#: A7/R6 — a demand-QUEUE CATEGORY, and deliberately NOT a member of the action vocabulary in
+#: ``semantic_eligibility_reasons``. The crossing is sanctioned and a realization EXISTS (A4c's
+#: provisional sandbox revision); what is missing is the cardinality EVIDENCE that makes it
+#: costable. Registering it as an eligibility reason would give it a six-action disposition row and
+#: start BLOCKING acts — which the owner's matrix forbids, since unknown cardinality is previewable
+#: under guards. Its spelling follows this column's convention (the lowercase, ReasonCode-shaped
+#: strings already stored beside it), not the plan's prose casing; the constant carries the plan's
+#: name so a reader can find it from either side.
+CARDINALITY_EVIDENCE_REQUIRED = "cardinality_evidence_required"
+
 #: Verdict -> queue. CLOSED: a rejection whose reason is not one of these is not a demand at all
 #: (a concept mismatch is a modelling problem, not a missing bridge), and the store drops it rather
-#: than filing it somewhere plausible. 1120 carries the same mapping as a CHECK, so the routing is
-#: structural: the queue a demand lands in is a function of its verdict, not of its caller.
+#: than filing it somewhere plausible. 1120 + 1132 carry the same mapping as a CHECK, so the
+#: routing is structural: the queue a demand lands in is a function of its verdict, not of its
+#: caller. The two realization verdicts share ONE queue on purpose — "build a realization" and
+#: "measure the cardinality of the one that exists" are two states of the same person's work, and
+#: a fourth queue would split the ranking rather than the work.
 DEMAND_VERDICT_QUEUES: MappingProxyType[str, str] = MappingProxyType({
     ReasonCode.unsanctioned_bridge.value: "bridge_demand",
     ReasonCode.missing_realization.value: "realization_gap",
+    CARDINALITY_EVIDENCE_REQUIRED: "realization_gap",
     ReasonCode.bounded_out_max_bridges.value: "planner_capacity",
     ReasonCode.bounded_out_max_frontier_states.value: "planner_capacity",
 })
@@ -287,16 +305,78 @@ def _observation_values(row: dict) -> dict[str, Any]:
     return values
 
 
+def demand_hop_columns(rejection: dict) -> dict[str, Any]:
+    """The seven hop columns one rejection contributes, at 1120's defaults where it has none.
+
+    CAPACITY rows DROP whatever hop reached them (see :data:`CAPACITY_VERDICTS`), so they come back
+    at the schema's defaults rather than carrying the hop the frontier happened to be sitting on.
+    """
+    if str(rejection.get("verdict") or "") in CAPACITY_VERDICTS:
+        return {**dict.fromkeys(_HOP_TEXT_FIELDS, ""), "hop_index": -1}
+    hop: dict[str, Any] = {field: str(rejection.get(field) or "") for field in _HOP_TEXT_FIELDS}
+    # An EXPLICIT None means the same thing as an absent key — "no hop index" — and the
+    # planner-side adapter is the likely source of one. `int(None)` would raise instead.
+    raw_hop_index = rejection.get("hop_index")
+    hop["hop_index"] = -1 if raw_hop_index is None else int(raw_hop_index)
+    return hop
+
+
+def demand_identity_hash(rejection: dict, *, anchor_catalog_source: str) -> str:
+    """THE demand identity — the FULL sha256 hex of the unmet hop's material, never a prefix.
+
+    **Public because it is the one-writer law's load-bearing half (R5).** The unique key
+    ``(observation_id, demand_identity_hash)`` makes a repeated demand ONE row only for writers
+    that agree on the hash; a second writer that re-derived the material slightly differently would
+    mint a second, equally valid-looking row for the same crossing, and Postgres would see two
+    demands where a person sees one. So the recipe lives here, exactly once, and a writer that will
+    not call it is a defect CI can see (``test_exactly_one_module_writes_the_demand_table``).
+
+    The material is pinned by ``GRAPH_VERSION`` and ``PLANNER_VERSION`` so a graph or planner change
+    cannot masquerade as the same demand; ``to_endpoint_hint`` is advisory and deliberately absent.
+    ``anchor_catalog_source`` is material for CAPACITY verdicts only — those have no hop, and the
+    anchor is the one thing that makes one capacity demand different from another's.
+    """
+    verdict = str(rejection.get("verdict") or "")
+    revision_hash = str(rejection.get("recipe_revision_hash") or "")
+    if verdict in CAPACITY_VERDICTS:
+        material = (revision_hash, verdict, anchor_catalog_source, GRAPH_VERSION, PLANNER_VERSION)
+    else:
+        hop = demand_hop_columns(rejection)
+        material = (revision_hash, hop["relationship_id"], hop["relationship_version"],
+                    hop["from_entity"], hop["to_entity"], hop["position_catalog"],
+                    hop["position_table_ref"], str(hop["hop_index"]), verdict,
+                    GRAPH_VERSION, PLANNER_VERSION)
+    return hashlib.sha256("|".join(material).encode()).hexdigest()
+
+
 def record_bridge_demand(conn: DbConn, *, observation_id: str,
                          rejections: Sequence[dict]) -> tuple[str, ...]:
-    """Append one demand per DEMAND-SHAPED rejection; returns the ids of the rows that exist after.
+    """Append one demand per DEMAND-SHAPED rejection; returns the ids of the rows that exist after,
+    **each id exactly once**.
 
     A rejection whose verdict is not in ``DEMAND_VERDICT_QUEUES`` yields no row and no error: the
-    planner rejects for many reasons, and only four of them are somebody's unbuilt bridge. The
-    closed set is checked HERE, so only known verdicts ever reach SQL — 1120's CHECK is the second
-    line, for a caller that bypasses this store.
+    planner rejects for many reasons, and only some of them are somebody's unbuilt bridge. The
+    closed set is checked HERE, so only known verdicts ever reach SQL — 1120+1132's CHECK is the
+    second line, for a caller that bypasses this store.
+
+    **The one-writer law (R5), in this function.** Demand records ONCE per planning OCCURRENCE and
+    repeated occurrences stay countable, and the two halves need different mechanisms:
+
+    * ACROSS calls and across writers, the unique key ``(observation_id, demand_identity_hash)``
+      is the guard — an occurrence is exactly one observation (1120 keys observations by
+      ``(run, mode, governed_variant_id)``), so a second file against the same occurrence resolves
+      to the standing row.
+    * WITHIN one call, the identity set below is the guard, and it is not cosmetic: both production
+      writers report ``len(record_bridge_demand(...))`` as "demands filed", and two rejections that
+      differ only in an advisory field are ONE demand. Returning its id twice inflated the reported
+      count while the ledger stayed correct — a telemetry number nobody could reconcile against the
+      table it claimed to describe.
+
+    Recurrence is untouched by both: a second RUN is a second observation, hence a second row under
+    the same ``demand_identity_hash``, which is what ``observation_queues`` counts.
     """
     minted: list[str] = []
+    seen: dict[str, str] = {}
     anchor_fallback: str | None = None
     for rejection in rejections:
         verdict = str(rejection.get("verdict") or "")
@@ -304,29 +384,18 @@ def record_bridge_demand(conn: DbConn, *, observation_id: str,
         if queue is None:
             continue
         revision_hash = str(rejection.get("recipe_revision_hash") or "")
-        if verdict in CAPACITY_VERDICTS:
-            anchor = str(rejection.get("anchor_catalog_source") or "")
-            if not anchor:
-                if anchor_fallback is None:
-                    found = conn.execute(
-                        "SELECT anchor_catalog_source FROM governed_planning_observation "
-                        " WHERE observation_id = %s", (observation_id,)).fetchone()
-                    anchor_fallback = found[0] if found is not None else ""
-                anchor = anchor_fallback
-            hop: dict[str, Any] = dict.fromkeys(_HOP_TEXT_FIELDS, "")
-            hop["hop_index"] = -1
-            material = (revision_hash, verdict, anchor, GRAPH_VERSION, PLANNER_VERSION)
-        else:
-            hop = {field: str(rejection.get(field) or "") for field in _HOP_TEXT_FIELDS}
-            # An EXPLICIT None means the same thing as an absent key — "no hop index" — and the
-            # planner-side adapter is the likely source of one. `int(None)` would raise instead.
-            raw_hop_index = rejection.get("hop_index")
-            hop["hop_index"] = -1 if raw_hop_index is None else int(raw_hop_index)
-            material = (revision_hash, hop["relationship_id"], hop["relationship_version"],
-                        hop["from_entity"], hop["to_entity"], hop["position_catalog"],
-                        hop["position_table_ref"], str(hop["hop_index"]), verdict,
-                        GRAPH_VERSION, PLANNER_VERSION)
-        identity_hash = hashlib.sha256("|".join(material).encode()).hexdigest()
+        anchor = str(rejection.get("anchor_catalog_source") or "")
+        if verdict in CAPACITY_VERDICTS and not anchor:
+            if anchor_fallback is None:
+                found = conn.execute(
+                    "SELECT anchor_catalog_source FROM governed_planning_observation "
+                    " WHERE observation_id = %s", (observation_id,)).fetchone()
+                anchor_fallback = found[0] if found is not None else ""
+            anchor = anchor_fallback
+        hop = demand_hop_columns(rejection)
+        identity_hash = demand_identity_hash(rejection, anchor_catalog_source=anchor)
+        if identity_hash in seen:
+            continue        # one occurrence, one demand — see the one-writer law above
         found = conn.execute(
             "INSERT INTO bridge_demand_observation "
             "(demand_id, observation_id, demand_queue, demand_identity_hash, recipe_revision_hash, "
@@ -347,6 +416,7 @@ def record_bridge_demand(conn: DbConn, *, observation_id: str,
                 "SELECT demand_id FROM bridge_demand_observation "
                 " WHERE observation_id = %s AND demand_identity_hash = %s",
                 (observation_id, identity_hash)).fetchone()
+        seen[identity_hash] = found[0]
         minted.append(found[0])
     return tuple(minted)
 
@@ -475,6 +545,116 @@ def observation_queues(conn: DbConn, *, limit: int = 100, cursor: str | None = N
     if has_more:
         result["next_cursor"] = _encode_cursor(last_key)
     return result
+
+
+#: The projection's per-identity payload, in the order it is SELECTed. Named once so the SQL, the
+#: row builder and the caller cannot drift.
+_SATISFACTION_KEYS = ("demand_identity_hash", "demand_queue", "verdict", "relationship_id",
+                      "relationship_version", "from_entity", "to_entity", "position_catalog",
+                      "position_table_ref", "occurrences", "distinct_runs", "distinct_intents",
+                      "first_seen", "last_seen", "satisfied_at")
+
+
+def demand_satisfaction(conn: DbConn, *, as_of: datetime | None = None,
+                        queue: str | None = None) -> dict:
+    """The CURRENT-UNRESOLVED view over an append-only ledger: which demands are still outstanding.
+
+    **Satisfaction is a projection, never a write.** ``bridge_demand_observation`` is append-only by
+    trigger, and it stays that way: nothing here marks, deletes or supersedes a row. A demand that
+    was met keeps every filing it ever had — that history is the only record of how long the gap
+    stood and how many teams hit it, which is precisely what a funding argument is made of. What
+    changes is which side of this read it lands on.
+
+    **The evidence.** A filing is SETTLED when the SAME governed variant, in the SAME lane, later
+    planned successfully: an observation with a status in :data:`RESOLVED_STATUSES`, recorded after
+    the filing and at or before ``as_of``. That is positive evidence rather than an absence — a
+    resolved observation files no demand children (both writers skip them), so "it planned, and
+    nothing was missing" is exactly what a resolved row asserts.
+
+    Three deliberate conservatisms, each of which prefers reporting a met demand as outstanding
+    over the reverse — a governance queue that quietly drops real work is worse than one that
+    carries a stale row a person can close:
+
+    * **per (variant, lane).** A demand is satisfied only when EVERY (governed_variant_id,
+      observation_mode) pair that ever filed it has since resolved. One variant still blocked keeps
+      the demand open even if another got past it.
+    * **the lanes never cross.** A telemetry replan that succeeded says nothing about what the
+      request path could do, so ``observation_mode`` is part of the key.
+    * **re-filing re-opens.** A crossing that broke again is outstanding again — the last filing
+      simply has no later resolution behind it — and both filings stay countable.
+
+    Returns ``{"as_of", "resolved_statuses", "unresolved": [...], "satisfied": [...], "totals"}``,
+    each entry carrying the crossing, its ``occurrences`` / ``distinct_runs`` /
+    ``distinct_intents``, its ``first_seen`` / ``last_seen``, and ``satisfied_at`` (the moment the
+    LAST outstanding filing was settled; ``None`` while any filing still stands).
+
+    **Known limit, stated rather than papered over:** ``GRAPH_VERSION`` / ``PLANNER_VERSION`` are
+    inside ``demand_identity_hash``, so an engine bump re-keys demand — the pre-bump identity stops
+    recurring and the post-bump one starts. Both remain visible here (the old one as UNRESOLVED,
+    since no resolution stands behind it), so a version bump never silently empties the queue; it
+    does leave a retired identity beside its successor until somebody closes it.
+    """
+    resolved_as_of = as_of if as_of is not None else conn.execute("SELECT now()").fetchone()[0]
+    statuses = sorted(RESOLVED_STATUSES)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "WITH filed AS ("
+            # `occurred_at` is the OBSERVATION's instant, not the demand child's: R5 records demand
+            # per planning OCCURRENCE, and the child is written inside that occurrence's own
+            # transaction. The window filter stays on the child, matching `observation_queues`.
+            "  SELECT d.demand_identity_hash, d.demand_queue, d.verdict, d.relationship_id,"
+            "         d.relationship_version, d.from_entity, d.to_entity, d.position_catalog,"
+            "         d.position_table_ref, o.recorded_at AS occurred_at, o.generation_run_id,"
+            "         o.intent_id, o.governed_variant_id, o.observation_mode"
+            "    FROM bridge_demand_observation d"
+            "    JOIN governed_planning_observation o ON o.observation_id = d.observation_id"
+            "   WHERE d.recorded_at <= %s AND (%s::text IS NULL OR d.demand_queue = %s::text)"
+            "), settled AS ("
+            # One correlated lookup per FILING (not per identity): the earliest later success of
+            # that filing's own variant AND lane. A filing with none is what keeps a demand open.
+            "  SELECT f.*, (SELECT min(o2.recorded_at)"
+            "                 FROM governed_planning_observation o2"
+            "                WHERE o2.governed_variant_id = f.governed_variant_id"
+            "                  AND o2.observation_mode = f.observation_mode"
+            "                  AND o2.resolution_status = ANY(%s)"
+            "                  AND o2.recorded_at > f.occurred_at"
+            "                  AND o2.recorded_at <= %s) AS settled_at"
+            "    FROM filed f"
+            ") "
+            "SELECT demand_identity_hash, demand_queue, verdict, relationship_id,"
+            "       relationship_version, from_entity, to_entity, position_catalog,"
+            "       position_table_ref, count(*) AS occurrences,"
+            "       count(DISTINCT generation_run_id) AS distinct_runs,"
+            "       count(DISTINCT intent_id) AS distinct_intents,"
+            "       min(occurred_at) AS first_seen, max(occurred_at) AS last_seen,"
+            # bool_and over "this filing is settled": one unsettled filing keeps the demand open,
+            # and max(settled_at) is then the moment the LAST of them was settled.
+            "       CASE WHEN bool_and(settled_at IS NOT NULL) THEN max(settled_at) END"
+            "            AS satisfied_at "
+            "  FROM settled GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9 "
+            " ORDER BY demand_queue, relationship_id, from_entity, to_entity,"
+            "          demand_identity_hash",
+            (resolved_as_of, queue, queue, statuses, resolved_as_of))
+        rows = cur.fetchall()
+
+    unresolved = [{key: row[key] for key in _SATISFACTION_KEYS}
+                  for row in rows if row["satisfied_at"] is None]
+    satisfied = [{key: row[key] for key in _SATISFACTION_KEYS}
+                 for row in rows if row["satisfied_at"] is not None]
+    return {
+        "as_of": resolved_as_of,
+        "resolved_statuses": statuses,
+        "queue": queue,
+        "unresolved": unresolved,
+        "satisfied": satisfied,
+        "totals": {
+            "demand_identities": len(rows),
+            "unresolved": len(unresolved),
+            "satisfied": len(satisfied),
+            "unresolved_demand_rows": sum(entry["occurrences"] for entry in unresolved),
+            "satisfied_demand_rows": sum(entry["occurrences"] for entry in satisfied),
+        },
+    }
 
 
 def resolution_summary(conn: DbConn, *, as_of: datetime | None = None) -> dict:
@@ -615,6 +795,7 @@ def _dedupe(items) -> list[str]:
 
 __all__ = [
     "CAPACITY_VERDICTS",
+    "CARDINALITY_EVIDENCE_REQUIRED",
     "DEMAND_VERDICT_QUEUES",
     "OBSERVATION_MODES",
     "RECENT_WINDOW_DAYS",
@@ -623,6 +804,9 @@ __all__ = [
     "SUGGESTED_ENDPOINT_SAMPLE",
     "claim_telemetry_work",
     "complete_telemetry_work",
+    "demand_hop_columns",
+    "demand_identity_hash",
+    "demand_satisfaction",
     "enqueue_governed_telemetry",
     "observation_queues",
     "record_bridge_demand",
