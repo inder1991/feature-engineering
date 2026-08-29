@@ -2964,8 +2964,10 @@ describe('Intake target confirmation', () => {
     contractIntake.mockResolvedValue(INTAKE)
     contractIntakeTarget.mockResolvedValue(READING)
     await generateConfirmOn()
-    // the mandatory read ran alongside recognition, on the SAME hypothesis
-    expect(contractIntake).toHaveBeenCalledWith(HYPOTHESIS, { catalogSource: undefined })
+    // the mandatory read ran alongside recognition, on the SAME hypothesis — AND the prediction
+    // goal, which is where the horizon is written and which never used to reach this read.
+    expect(contractIntake).toHaveBeenCalledWith(
+      HYPOTHESIS, { catalogSource: undefined, objective: 'predict churn' })
     // the draft reading renders with the summary one-liner and the window
     expect(await screen.findByText(/I understood your target as/)).toBeInTheDocument()
     expect(screen.getByText('Whether the customer churned in the window.')).toBeInTheDocument()
@@ -2989,6 +2991,36 @@ describe('Intake target confirmation', () => {
     await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
       expect.objectContaining({ targetRef: 'public.labels.churned' }))
+  })
+
+  it('says when a reading came from cache rather than fresh analysis', async () => {
+    // "Same hypothesis, answer in seconds" is the cache working — but the screen said nothing, so
+    // it was indistinguishable from a backend doing nothing.
+    contractIntake.mockResolvedValue({ ...INTAKE, reason: 'replayed' })
+    await generateConfirmOn()
+    expect(await screen.findByText(/Cached answer from an identical question/))
+      .toBeInTheDocument()
+  })
+
+  it('says plainly when the MODEL never ran, instead of passing pattern-matching off as a reading',
+     async () => {
+    // The load-bearing one. `unavailable` means the model could not be reached, so the ticket is
+    // the plain-code name match plus honest abstains. On screen that was indistinguishable from a
+    // model that HAD read the hypothesis and declined to commit — two completely different facts,
+    // and presenting the second as the first is the confidence-it-does-not-have failure this
+    // platform exists to refuse.
+    contractIntake.mockResolvedValue({ ...INTAKE, reason: 'unavailable' })
+    await generateConfirmOn()
+    expect(await screen.findByText(/could not be reached/)).toBeInTheDocument()
+    expect(screen.getByText(/pattern matching/)).toBeInTheDocument()
+  })
+
+  it('says nothing extra when the reading is a fresh model call', async () => {
+    contractIntake.mockResolvedValue(INTAKE)   // reason: 'extracted'
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    expect(screen.queryByText(/Cached answer/)).toBeNull()
+    expect(screen.queryByText(/could not be reached/)).toBeNull()
   })
 
   it('the signed block keeps showing the label window it was signed with', async () => {

@@ -276,6 +276,11 @@ class IntakeIn(BaseModel):
     """The mandatory read (intake build, router-quality plan 2026-08-10): one hypothesis in, one
     ticket out — a DRAFT reading for the confirm screen, never a decision."""
     hypothesis: str = Field(min_length=1)
+    #: The screen's "Prediction goal", and the field people actually write the horizon into ("in
+    #: the next 90 days"). It never reached this read, so the window came back `unstated` and the
+    #: near-label critic — which needs a signed window — abstained on every candidate. Optional, so
+    #: every existing caller is unchanged and an omitted goal is exactly today's behaviour.
+    objective: str = ""
     catalog_source: str | None = None
 
 
@@ -1418,8 +1423,8 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
     persist_intent(conn, intent)
 
     ticket, reason = extract_intake_ticket(
-        conn, client, hypothesis=body.hypothesis, catalog_source=body.catalog_source,
-        roles=identity.role_claims, actor=identity)
+        conn, client, hypothesis=body.hypothesis, objective=body.objective,
+        catalog_source=body.catalog_source, roles=identity.role_claims, actor=identity)
     counters.incr(f"overlay.intake.{reason}")
 
     # ▲ THE PROSE DOOR IS CLOSED, FOR EVERY CLASS. Typing a column name used to write it durably

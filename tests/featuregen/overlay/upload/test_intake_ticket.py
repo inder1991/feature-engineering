@@ -205,6 +205,40 @@ def test_no_client_degrades_and_a_pinned_name_still_works(db):
     assert ticket.confidence == "abstain"
 
 
+def test_the_HORIZON_IS_READ_FROM_THE_PREDICTION_GOAL_not_only_the_hypothesis(db):
+    """The goal is where people put the horizon, and it was not reaching this read at all.
+
+    `/contract/intake` accepted only `hypothesis` + `catalog_source`, so "in the next 90 days"
+    typed into the screen's own "Prediction goal" field never arrived — the window came back
+    `unstated` and the near-label critic, which needs a signed window to say anything, went silent
+    on every candidate. Verified on the live cluster: a signed target with a stated 90-day horizon
+    recorded `target_window_days = NULL`.
+    """
+    _catalog(db)
+    ticket, _ = extract_intake_ticket(
+        db, _ticket_client(window=90), catalog_source=SOURCE, roles=("data_owner",),
+        hypothesis="Customers whose activity tails off are drifting out of the relationship.",
+        objective="Predict which customers go dormant in the next 90 days.")
+    assert ticket.target_window_days == 90
+    assert ticket.window_source == "stated", \
+        "the goal states the horizon, so the model's number is CONFIRMED by it, not merely allowed"
+
+
+def test_the_goal_is_part_of_the_cache_key_so_two_goals_cannot_collide(db):
+    """A new INPUT that is not in the key is a wrong answer served from cache. Same hypothesis,
+    different goals, different horizons — the second must re-ask rather than replay the first."""
+    _catalog(db)
+    hypothesis = "Customers whose activity tails off are drifting out of the relationship."
+    first, r1 = extract_intake_ticket(
+        db, _ticket_client(window=90), catalog_source=SOURCE, roles=("data_owner",),
+        hypothesis=hypothesis, objective="Predict dormancy in the next 90 days.")
+    second, r2 = extract_intake_ticket(
+        db, _ticket_client(window=30), catalog_source=SOURCE, roles=("data_owner",),
+        hypothesis=hypothesis, objective="Predict dormancy in the next 30 days.")
+    assert (r1, r2) == ("extracted", "extracted"), "a different goal is a different question"
+    assert (first.target_window_days, second.target_window_days) == (90, 30)
+
+
 def test_a_window_of_zero_means_not_stated(db):
     _catalog(db)
     ticket, _ = extract_intake_ticket(

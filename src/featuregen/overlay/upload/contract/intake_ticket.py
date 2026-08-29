@@ -60,9 +60,10 @@ INTAKE_TICKET_RESULT_VERSION = 1
 
 INTAKE_TICKET_TASK = "overlay.contract.intake_ticket"
 INTAKE_TICKET_PROMPT_ID = "intake_ticket"
-INTAKE_TICKET_PROMPT_VERSION = 4   # v2: + runner_up_refs (the Change-it menu)
+INTAKE_TICKET_PROMPT_VERSION = 5   # v2: + runner_up_refs (the Change-it menu)
 #                                    v3: candidates carry semantic_terms + declared_type
 #                                    v4: a typed column name rides in as a HINT, not an override
+#                                    v5: the PREDICTION GOAL reaches the read (horizon lives there)
 INTAKE_TICKET_SCHEMA_ID = "intake_ticket"
 INTAKE_TICKET_RUN_ID = "intake-ticket"
 
@@ -508,15 +509,18 @@ def _exact_pin(hypothesis: str, shortlist: Sequence[dict]) -> str | None:
     return ref
 
 
-def _input_hash(*, hypothesis: str, shortlist: Sequence[dict],
+def _input_hash(*, hypothesis: str, objective: str, shortlist: Sequence[dict],
                 vocabulary: Sequence[str]) -> str:
-    """ALL FOUR inputs, per the second-review correction — a vocabulary rename or a column
-    re-enrichment must re-ask, not serve a stale ticket."""
+    """ALL FIVE inputs — a vocabulary rename, a column re-enrichment or a DIFFERENT GOAL must
+    re-ask, not serve a stale ticket. The goal joined the inputs and had to join the key in the
+    same change: an input outside the key is a wrong answer served from cache, which is the exact
+    defect the second review caught when the key hashed one input of four."""
     return canonical_hash({
         "version": "intake-ticket-input-v1",
         "prompt_id": INTAKE_TICKET_PROMPT_ID,
         "prompt_version": INTAKE_TICKET_PROMPT_VERSION,
         "hypothesis": hypothesis,
+        "objective": objective,
         "shortlist": list(shortlist),
         "vocabulary": list(vocabulary),
     })
@@ -720,7 +724,8 @@ def is_readable_column(conn, ref: str, *, roles: Iterable[str],
          "allowed": allowed_sensitivities(roles)}).fetchone() is not None
 
 
-def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str | None = None,
+def extract_intake_ticket(conn, client, *, hypothesis: str, objective: str = "",
+                          catalog_source: str | None = None,
                           roles: Iterable[str] = (), actor=None,
                           call_ledger=None) -> tuple[IntakeTicketV1, str]:
     """The mandatory read. Returns ``(ticket, reason)`` with closed reasons: ``replayed`` (cached),
@@ -730,30 +735,42 @@ def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str 
     re-validates a replayed ticket too — and since T7's outcome/proxy labelling and window
     cross-check are both part of that validation, a ticket recorded BEFORE this rule existed is
     re-judged under it on its next read, with no re-dispatch and no stored-output rewrite."""
+    # THE HORIZON LIVES IN THE GOAL. The screen collects a "Prediction goal" beside the hypothesis
+    # and that is where people write "in the next 90 days" — but only the hypothesis reached this
+    # read, so the horizon was invisible, the window came back `unstated`, and the near-label
+    # critic (which needs a signed window) abstained on every candidate. Both texts are scanned for
+    # the horizon: `stated_horizon` returns None on TWO DIFFERENT numbers, so a hypothesis and a
+    # goal that disagree stay an honest absence rather than a coin toss.
+    goal_text = "\n\n".join(t for t in (hypothesis, objective) if t.strip())
     shortlist = _shortlist(conn, catalog_source, roles)
     # The concept each candidate ACTUALLY carries, by ref — the outcome/proxy answer's whole
     # input, and already on the shelf photo the model was shown.
     concepts_by_ref = {e["ref"]: e.get("concept") or "" for e in shortlist}
     vocabulary = _use_case_vocabulary()
     pin = _exact_pin(hypothesis, shortlist)
-    key = _input_hash(hypothesis=hypothesis, shortlist=shortlist, vocabulary=vocabulary)
+    key = _input_hash(hypothesis=hypothesis, objective=objective, shortlist=shortlist,
+                      vocabulary=vocabulary)
 
     stored = find_structured_result(
         conn, result_type=INTAKE_TICKET_RESULT_TYPE,
         result_version=INTAKE_TICKET_RESULT_VERSION, input_content_hash=key)
     if stored is not None:
-        return _ticket_from_output(dict(stored.output), pin=pin, goal=hypothesis,
+        return _ticket_from_output(dict(stored.output), pin=pin, goal=goal_text,
                                    concepts_by_ref=concepts_by_ref,
                                    vocabulary=set(vocabulary)), "replayed"
     if client is None:
-        return _degraded(pin, concepts_by_ref, goal=hypothesis), "unavailable"
+        return _degraded(pin, concepts_by_ref, goal=goal_text), "unavailable"
     if call_ledger is not None and not call_ledger.charge():
-        return _degraded(pin, concepts_by_ref, goal=hypothesis), "call_ceiling"
+        return _degraded(pin, concepts_by_ref, goal=goal_text), "call_ceiling"
 
     from featuregen.overlay.upload.contract.intake import redact_free_text
     from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
 
+    # Both free-text fields are redacted with the SAME discipline before either can egress; the
+    # goal rides the existing `objective` key rather than a new one, so no egress class changes.
     redacted = redact_free_text(hypothesis, label="hypothesis")
+    if objective.strip():
+        redacted = f"{redacted}\n\nPREDICTION GOAL: {redact_free_text(objective, label='objective')}"
     try:
         call = drive_audited_structured_call(
             conn, client, task=INTAKE_TICKET_TASK,
@@ -770,10 +787,10 @@ def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str 
     except Exception:  # noqa: BLE001 — mandatory to ATTEMPT, never load-bearing
         logger.warning("intake-ticket extraction failed; degrading to the pinned/abstain ticket",
                        exc_info=True)
-        return _degraded(pin, concepts_by_ref, goal=hypothesis), "unavailable"
+        return _degraded(pin, concepts_by_ref, goal=goal_text), "unavailable"
     if call.output is None:
-        return _degraded(pin, concepts_by_ref, goal=hypothesis), "unavailable"
-    ticket = _ticket_from_output(dict(call.output), pin=pin, goal=hypothesis,
+        return _degraded(pin, concepts_by_ref, goal=goal_text), "unavailable"
+    ticket = _ticket_from_output(dict(call.output), pin=pin, goal=goal_text,
                                  concepts_by_ref=concepts_by_ref, vocabulary=set(vocabulary))
     record_structured_result(
         conn, result_type=INTAKE_TICKET_RESULT_TYPE,

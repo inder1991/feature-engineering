@@ -240,6 +240,21 @@ const LEAKAGE_UNREGISTERED_LINE =
   'This column carries no registered concept, so nothing certifies it as an outcome label — and '
   + 'absence is not an assertion the other way either.'
 
+// WHERE THE READING CAME FROM. The server has always returned `reason` and the client has always
+// typed it; nothing rendered it, so four very different situations looked identical on screen — and
+// two of them mean the model never ran at all. A fast answer then reads as "the backend did
+// nothing", and a DEGRADED answer reads as "the model considered this and was not confident",
+// which is a claim nobody made. `extracted` is the ordinary case and says nothing: a line on every
+// normal reading is noise, and noise is how the two that matter get missed.
+const INTAKE_REASON_LINE: Record<string, string> = {
+  replayed: 'Cached answer from an identical question — no new analysis was run. Change the '
+    + 'hypothesis or the goal to ask again.',
+  unavailable: 'The model could not be reached, so this reading is from pattern matching only. '
+    + 'It is not a judgement about your hypothesis.',
+  call_ceiling: 'The analysis budget for this run is spent, so this reading is from pattern '
+    + 'matching only. It is not a judgement about your hypothesis.',
+}
+
 // T7 (b) — where the label window came from, or why there is none. Four outcomes, four sentences,
 // and NO INVENTED NUMBER anywhere: a `stated` source with `target_window_days: null` is the
 // degraded month-horizon case (a month is 28, 29, 30 or 31 days, so the goal states a horizon this
@@ -636,8 +651,14 @@ function TargetTicketFacts({ intake }: { intake: IntakeResp }) {
   // class off `proxy_candidates` by position would break silently if either list were reordered,
   // so it is looked up by ref — and an absent entry renders as absent, never as 'standard'.
   const classByRef = new Map(t.proxy_candidates.map(c => [c.ref, c.leakage_class]))
+  const reasonLine = INTAKE_REASON_LINE[intake.reason]
   return (
     <div style={{ display: 'grid', gap: 6 }} data-role="target-facts">
+      {reasonLine !== undefined && (
+        <p className="hint" role="status" style={{ margin: 0 }} data-role="intake-reason">
+          {reasonLine}
+        </p>
+      )}
       {/* T7 (b): a contradiction is the SERVER's typed refusal and names both numbers. Rendered
           verbatim — a screen that re-derived "90 vs 0" would be quoting itself. */}
       {t.window_refusal !== null ? (
@@ -2166,7 +2187,8 @@ export function WorkbenchScreen() {
     setIntakeAck(null)
     setIntakeAcknowledged('')
     const intakeSeq = seq
-    contractIntake(hypothesis.trim(), { catalogSource: source.trim() || undefined })
+    contractIntake(hypothesis.trim(),
+                   { catalogSource: source.trim() || undefined, objective })
       .then(resp => {
         if (intakeSeq !== generateSeq.current) return
         setIntake(resp)
