@@ -374,7 +374,11 @@ def test_the_g2_ruling_did_not_unship_the_only_reviewed_v2_expectation():
 # ── S1A-4c: projection-time role declaration ──────────────────────────────────────────────────
 # `planning_probe` now DECLARES each projected need's `join_role`/`temporal_role` from the
 # request's own declared facts (operand_class + the concept registry's entity_link/pit_role),
-# because 0 of the 1195 V2 operands declare either and `metadata_resolution_mode="request_contract"`
+# because virtually no V2 operand declares either — 0 of 1195 when this was written, 7 of 1196
+# today, and every one of those seven is a G2 RULING taken in the transaction-foundation pack
+# (A6's on `transaction`/`original_txn`, A6b's on the count recipe's transaction identity), never
+# a compensation for a projection that could not derive a role — and
+# `metadata_resolution_mode="request_contract"`
 # deliberately never consults the legacy resolved-need registry. Without a declared role no
 # ingredient binding carries `source_entity_key`, and `plan._assemble_rollups` starts a roll-up
 # ONLY from such a binding — so every recipe-origin cross-catalog request died before its first
@@ -605,14 +609,21 @@ def test_no_v2_recipe_projects_a_target_entity_key_today():
 
 def test_the_class_keyed_projection_diverges_from_the_concept_ladder_only_where_g2_lives():
     """The projection keys on ``operand_class``; ``_derive_one``'s ladder keys on the CONCEPT
-    (entity_link, then pit_role, then MEASURE). They agree on 1113 of the 1195 V2 operands and
-    disagree on 82 — every one of them an operand whose authored class and whose concept's
-    governed facts say different things. Pinned by SHAPE so the set cannot quietly widen:
+    (entity_link, then pit_role, then MEASURE). They agree on 1120 of the 1196 V2 operands and
+    disagree on 76 — every one of them an operand whose authored class and whose concept's
+    governed facts say different things. (First measured at ``1c656743`` as 1113/1195 agreeing and
+    82 diverging; the G2 rulings taken since — A6's on ``transaction``/``original_txn``, A6b's on
+    the count recipe's transaction identity — cleared 6 of them, and A6b's added operand arrived
+    with its ruling already made. The current census is PINNED, in both directions, by
+    ``test_the_gate_is_the_worklists_own_criterion_recomputed``; the figures here are prose and
+    this docstring is not their authority.) Pinned by SHAPE so the set cannot quietly widen:
 
-    * a ``dimension``/``status``/``policy_input`` operand on an ENTITY-LINKED concept (63): the
-      ladder calls it a hop key, the class calls it a value. This is G2's territory exactly — the
-      recipe author declared it a dimension, and the projection may not overrule that with a role
-      the author did not choose;
+    * a ``dimension``/``status``/``policy_input`` operand on an ENTITY-LINKED concept (57, was 63
+      before the rulings): the ladder calls it a hop key, the class calls it a value. This is G2's
+      territory exactly — the recipe author declared it a dimension, and the projection may not
+      overrule that with a role the author did not choose. It is also still the LARGEST remaining
+      kind by more than three to one, which is what makes the identifier ruling the one worth
+      repeating;
     * a ``dimension``/``policy_input`` operand on a PIT-bearing concept (17): same shape, time
       instead of an entity;
     * ``device_sharing_velocity`` (2): its ``entity_key`` operand names a concept the registry

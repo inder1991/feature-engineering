@@ -98,8 +98,11 @@ def test_the_selection_carries_the_governed_direction_convention_that_resolves_i
     assert "one direction" in _COUNT.eligibility.included
     assert "the opposite direction" in _COUNT.eligibility.excluded
 
-    from featuregen.overlay.upload.recipe_contract_v2 import EligibilitySpecV2
-    with pytest.raises(Exception, match="direction_sign"):
+    from featuregen.overlay.upload.recipe_contract_v2 import (
+        EligibilitySpecV2,
+        RecipeContractError,
+    )
+    with pytest.raises(RecipeContractError, match="direction_sign"):
         dataclasses.replace(_COUNT, eligibility=EligibilitySpecV2(
             policy_refs=("eligible_status:foundation-posted-events",)))
 
