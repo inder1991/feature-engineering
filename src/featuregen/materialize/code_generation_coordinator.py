@@ -261,6 +261,7 @@ def _settle_after_authoring(conn, job: CodeGenJobV1, *, from_status: JobStatusV1
 # ── stage: bind, declare, decide, enqueue — the build itself stays the lane's ───────────────────
 def _build(conn, job: CodeGenJobV1) -> None:
     from featuregen.identity.principal_scope import (
+        PrincipalScopeRebound,
         bind_principal_scope,
         load_principal_scope_binding,
     )
@@ -383,9 +384,27 @@ def _build(conn, job: CodeGenJobV1) -> None:
                                                "there is no authority to build under"})
         counters.incr("featuregen.code_generation_job.blocked")
         return
-    generation_scope_binding_id = bind_principal_scope(
-        conn, revision_id=job_scope.revision_id, subject_kind="generation_request",
-        subject_id=request_id, action_decision_revision_id=decision_id)
+    # ▲ REACHABLE, and therefore a GOVERNED BLOCK rather than a traceback. Two jobs can legitimately
+    # land on ONE generation request: `job_content_identity` now separates them by frozen scope
+    # while `record_build_set` excludes provenance and `request_generation` is idempotent on
+    # (build set, environment) — so the same build declared by two principals with different read
+    # scope reaches this line twice, the second time asking to re-aim an existing authority. The
+    # answer is the same one twelve lines up, by name: this job cannot build, and the reason says
+    # which authority already owns the attempt.
+    try:
+        generation_scope_binding_id = bind_principal_scope(
+            conn, revision_id=job_scope.revision_id, subject_kind="generation_request",
+            subject_id=request_id, action_decision_revision_id=decision_id)
+    except PrincipalScopeRebound as exc:
+        advance_job(conn, job.job_id, JobStatusV1.READY_TO_BUILD, JobStatusV1.BLOCKED,
+                    terminal_detail={"blockers": ["PRINCIPAL_SCOPE_ALREADY_BOUND"],
+                                     "generation_request_id": request_id,
+                                     "detail": str(exc)})
+        record_event(conn, job.job_id, "PRINCIPAL_SCOPE_REFUSED",
+                     {"code": "PRINCIPAL_SCOPE_ALREADY_BOUND",
+                      "generation_request_id": request_id, "detail": str(exc)})
+        counters.incr("featuregen.code_generation_job.blocked")
+        return
 
     if created:
         enqueue_generation(
@@ -610,6 +629,8 @@ def request_code_generation_job(
     from featuregen.materialize.build_set_declaration import (
         declaration_identity,
         decode_declaration,
+        encode_declaration,
+        with_server_resolved_declarer,
     )
     from featuregen.overlay.upload.code_generation_job_store import (
         JobMemberSpecV1,
@@ -623,6 +644,14 @@ def request_code_generation_job(
         declaration = decode_declaration(dict(request.declaration))
     except (ValueError, TypeError) as exc:
         raise CodeGenRequestInvalid(str(exc)) from exc
+    # ▲ THE DECLARER IS THE SERVER'S ANSWER, like the read scope below it. The spine's
+    # `declared_by` is a REQUIRED `IdentityEnvelope` that arrives inside the caller's declaration
+    # and is rebuilt from client JSON with no validation of its own; overwritten here so what is
+    # STORED — and therefore what `_build` decodes into the queue payload — carries the principal
+    # the server resolved. Changes no identity: `declaration_identity` reads the spine's
+    # `identity_payload`, which excludes every provenance field.
+    declaration = with_server_resolved_declarer(declaration, principal)
+    stored_declaration = encode_declaration(declaration)
     parameters = server_owned_parameters(request.execution_parameters)
     for required in ("engine_id", "physical_type_policy", "empty_values"):
         if required not in parameters:
@@ -681,7 +710,7 @@ def request_code_generation_job(
         target_reading_revision_id=request.target_reading_revision_id,
         environment_id=request.environment_id,
         logical_group_name=request.logical_group_name,
-        declaration=dict(request.declaration), declaration_identity=identity_payload,
+        declaration=stored_declaration, declaration_identity=identity_payload,
         execution_parameters=parameters,
         members=tuple(
             JobMemberSpecV1(

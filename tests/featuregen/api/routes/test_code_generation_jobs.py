@@ -406,3 +406,38 @@ def test_THE_SAME_PRINCIPAL_CLICKING_TWICE_IS_STILL_ONE_JOB(client, conn, enable
 
     assert second["job_id"] == first["job_id"]
     assert second["created"] is False
+
+
+def test_a_FORGED_DECLARER_IS_OVERWRITTEN_on_this_route_too(client, conn, enabled,
+                                                            engineer_headers):
+    """▲ THE OTHER INGRESS. This route stores the declaration and `_build` decodes THAT into the
+    queue payload, so a `declared_by` claiming `authenticated=True` and `break_glass=True` for a
+    subject the caller is not would ride the whole way. Closed at the SERVICE, so all three entry
+    points — this route, the run route's replay of a stored map, and the run-spine trigger — get it
+    from one place.
+    """
+    import dataclasses
+
+    from tests.featuregen.materialize.crosswalk_fixtures import SPINE_DECLARATION
+
+    from featuregen.contracts.envelopes import IdentityEnvelope
+
+    body = {**_seed(conn, tag="forgedecl"), "spend_approval": _APPROVAL}
+    body["declaration"] = encode_declaration(build_set_declaration(
+        spine_declaration=dataclasses.replace(
+            SPINE_DECLARATION,
+            declared_by=IdentityEnvelope(
+                subject="user:mallory", actor_kind="human", authenticated=True,
+                auth_method="password", role_claims=("pii_reader", "platform_admin"),
+                break_glass=True))))
+
+    job_id = client.post(JOBS, json=body, headers=engineer_headers).json()["job_id"]
+
+    stored = conn.execute(
+        "SELECT declaration_json FROM code_generation_job WHERE job_id = %s",
+        (job_id,)).fetchone()[0]
+    stored = stored if isinstance(stored, dict) else json.loads(stored)
+    declarer = stored["spine_declaration"]["declared_by"]
+    assert declarer["subject"] == "user:sam"
+    assert declarer["role_claims"] == ["feature_engineer"]
+    assert declarer["break_glass"] is False

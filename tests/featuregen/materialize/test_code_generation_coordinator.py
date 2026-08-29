@@ -29,6 +29,7 @@ from featuregen.overlay.upload.code_generation_job_store import (
     MemberStateV1,
     advance_job,
     create_job,
+    read_events,
     read_job,
     read_job_actions,
     read_members,
@@ -494,3 +495,68 @@ def test_an_ABSENT_JOB_CEILING_refuses_the_member_never_substitutes_a_dev_envelo
         "SELECT COUNT(*) FROM llm_spend_authorization_revision "
         "WHERE pricing_version = 'development'").fetchone()
     assert envelopes == (0,), "nothing was minted on the job path"
+
+
+# ══ B0a fix round — TWO AUTHORITIES ON ONE ATTEMPT IS A GOVERNED BLOCK, NOT A CRASH ════════════
+def test_A_SECOND_AUTHORITY_ON_ONE_GENERATION_REQUEST_BLOCKS_rather_than_crashing(db):
+    """▲ REACHABLE, and it took a fix-round review to find. Two jobs can legitimately land on ONE
+    generation request: `job_content_identity` separates them by frozen scope (two jobs) while
+    `record_build_set` excludes provenance and `request_generation` is idempotent on
+    (build set, environment) — so the same build declared by two principals with different read
+    scope reaches `bind_principal_scope` twice, the second asking to re-aim an existing authority.
+
+    Fail-closed either way; the difference is whether an operator reads a named blocker or a
+    traceback filed as `{"failure": "coordinator crash"}`. The answer is the one `_build` already
+    gives a missing scope twelve lines earlier.
+    """
+    first = _ready_to_build(db, "rebind")
+    assert process_code_generation_once(db, worker_id="w1") is True
+    first_request = read_job(db, first).generation_request_id
+    drafts = [m.formula_draft_id for m in read_members(db, first)]
+
+    # A SECOND job over the SAME members and the SAME drafts — so its build set is byte-identical
+    # and its generation request is the one above — frozen under a WIDER read scope.
+    considered = "crev-rebind"
+    wider = _principal_scope(db, subject="user:riya",
+                             roles=("feature_engineer", "pii_reader"))
+    declaration = build_set_declaration()
+    second, created = create_job(
+        db, job_id="cgj-rebind-2", considered_revision_id=considered,
+        target_reading_revision_id="trr-rebind", environment_id="hdfc-local",
+        logical_group_name="grp-rebind", declaration=encode_declaration(declaration),
+        declaration_identity=declaration_identity(declaration),
+        execution_parameters=_PARAMS,
+        members=tuple(JobMemberSpecV1(
+            position=position, selection_revision_id=f"sel-rebind-{position}",
+            considered_revision_id=considered, option_id=f"opt-{position}",
+            formula_strategy="llm_authored") for position in range(2)),
+        # EARLIER than the first job so `claim_due_job`'s `ORDER BY requested_at` reaches it on the
+        # next tick — the first job is still claimable at GENERATING_PREVIEW, where its own stage is
+        # a no-op watch.
+        requested_by="user:riya", requested_at="2026-08-22T00:00:00Z",
+        principal_scope_revision_id=wider)
+    assert created, "a different frozen read scope is a different job — that is B0a's identity rule"
+    bind_principal_scope(db, revision_id=wider, subject_kind="code_generation_job",
+                         subject_id=second)
+    for position, draft_id in enumerate(drafts):
+        update_member(db, second, position, state=MemberStateV1.FORMULA_READY,
+                      formula_draft_id=draft_id)
+    advance_job(db, second, JobStatusV1.REQUESTED, JobStatusV1.PLANNING_FORMULAS)
+    advance_job(db, second, JobStatusV1.PLANNING_FORMULAS, JobStatusV1.AUTHORING)
+    advance_job(db, second, JobStatusV1.AUTHORING, JobStatusV1.READY_TO_BUILD)
+
+    assert process_code_generation_once(db, worker_id="w2") is True
+
+    job = read_job(db, second)
+    assert job.status is JobStatusV1.BLOCKED
+    assert job.terminal_detail["blockers"] == ["PRINCIPAL_SCOPE_ALREADY_BOUND"]
+    assert "traceback" not in job.terminal_detail
+    assert job.terminal_detail["generation_request_id"] == first_request
+    assert any(event["stage"] == "PRINCIPAL_SCOPE_REFUSED" for event in read_events(db, second))
+    # AND THE FIRST ATTEMPT'S AUTHORITY IS UNTOUCHED — the refusal is what protects it.
+    from featuregen.identity.principal_scope import load_principal_scope_binding
+
+    binding = load_principal_scope_binding(
+        db, subject_kind="generation_request", subject_id=first_request)
+    assert binding is not None
+    assert binding.revision_id == _principal_scope(db)

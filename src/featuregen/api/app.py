@@ -152,6 +152,36 @@ def _startup_crosswalk_flag_refusal(app: FastAPI) -> None:
             CROSSWALK_EXECUTION_FLAG)
 
 
+def _startup_worker_identity_resolver_check(app: FastAPI) -> None:
+    """WHICH AUTHORITY answers "is this principal still current" — named at boot, not discovered
+    per request (B0a).
+
+    The worker prongs that re-check a frozen principal are fail-closed, and the built-in
+    `LocalWorkerIdentityResolver` can only answer for `user:<username>` subjects in this platform's
+    own IAM tables. A deployment whose principals are service accounts, tenanted, or held by an
+    external IdP must set `FEATUREGEN_WORKER_IDENTITY_RESOLVER`; without it every generation, draft
+    and recipe authoring act refuses with `PRINCIPAL_NOT_CURRENT` — correct, but a symptom an
+    operator would meet one request at a time with nothing naming the cause.
+
+    RAISES when the variable is SET and unusable, for `_startup_crosswalk_flag_refusal`'s reason:
+    a deployment that named an authority the process cannot load is not running a valid
+    configuration, it is running one where every authorization check will fail. Unset is a valid
+    configuration (local humans), so it records and does not warn.
+    """
+    from featuregen.identity.current_principal import (
+        WORKER_IDENTITY_RESOLVER_ENV,
+        configured_worker_identity_resolver,
+    )
+
+    resolver = configured_worker_identity_resolver()
+    app.state.worker_identity_resolver = type(resolver).__name__
+    logger.info(
+        "worker identity authority: %s (%s=%r). This is what decides whether a frozen principal "
+        "may still execute; subjects it cannot answer for are refused, never assumed current.",
+        type(resolver).__name__, WORKER_IDENTITY_RESOLVER_ENV,
+        os.environ.get(WORKER_IDENTITY_RESOLVER_ENV, ""))
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The same process bootstrap the worker and the test suite use: event schemas (idempotent)
@@ -167,6 +197,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # refusal where the line above is a warning. It runs BEFORE the diagnostic checks below so a
     # refused configuration never reaches anything that touches a cluster or an artifact.
     _startup_crosswalk_flag_refusal(app)
+    # RAISES on a NAMED-but-unloadable identity authority, for the same reason as the line above:
+    # with it unloadable, every frozen-principal recheck refuses.
+    _startup_worker_identity_resolver_check(app)
     # H3c — the lightweight 3C.2 signed-gate posture signal at boot (log-only, never blocks startup): a
     # loud warning when the live cross-catalog flag is ON but the signed artifact is absent/stale/invalid,
     # so a mis-provisioned gate is visible early. The per-request admission check still enforces fail-closed.

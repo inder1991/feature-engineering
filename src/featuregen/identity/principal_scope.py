@@ -410,6 +410,12 @@ def authorize_frozen_scope(
     Raises :class:`ScopeAuthorizationRefused` carrying one of
     :data:`PRINCIPAL_SCOPE_REFUSAL_CODES`. Returns the frozen claims to compile under; the caller
     never reads a role from the payload.
+
+    ``resolver`` is the explicit override; absent it, prong 2 runs against the DEPLOYMENT'S
+    configured authority (``FEATUREGEN_WORKER_IDENTITY_RESOLVER``, resolved by
+    :func:`~featuregen.identity.current_principal.configured_worker_identity_resolver` and named in
+    the API's boot log). Lane callers pass nothing precisely so that the authority is a deployment
+    setting rather than a per-call-site decision.
     """
     from featuregen.identity.current_principal import (
         PrincipalResolutionStatus,

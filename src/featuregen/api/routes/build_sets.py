@@ -62,7 +62,10 @@ from featuregen.identity.principal_scope import (
     bind_principal_scope,
     ensure_principal_scope_revision,
 )
-from featuregen.materialize.build_set_declaration import decode_declaration
+from featuregen.materialize.build_set_declaration import (
+    decode_declaration,
+    with_server_resolved_declarer,
+)
 from featuregen.materialize.generation_authorization import (
     authorization_grantee,
     load_generation_authorization,
@@ -201,6 +204,14 @@ def declare_build_set(
             # 422 rather than 500: the body is the thing that is wrong, and naming which part of it
             # is the difference between a caller fixing their request and guessing at it.
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        # ▲ THE DECLARER IS THE SERVER'S ANSWER TOO. The spine's `declared_by` is a REQUIRED
+        # `IdentityEnvelope` inside the caller's own declaration, rebuilt from client JSON with no
+        # validation of its own — so a request could assert `authenticated=True` and
+        # `break_glass=True` for a subject it is not, and that envelope was stored and carried into
+        # the queue payload. Overwritten here from the SAME identity the row's own `declared_by`
+        # already uses, two lines down. Changes no identity: provenance is outside the hash.
+        declaration = with_server_resolved_declarer(declaration, identity)
 
         revision_id, created = record_build_set(
             conn,

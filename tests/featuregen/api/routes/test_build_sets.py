@@ -466,3 +466,146 @@ def test_the_QUEUED_SCOPE_IS_THE_AUTHENTICATED_PRINCIPALS(client, conn, enabled,
     assert revision is not None
     assert revision.subject == "user:sam"
     assert revision.role_claims == ("feature_engineer",)
+
+
+# ══ B0a fix round — THE DECLARER IS SERVER-OWNED TOO, and the payload carries no client claim ═══
+def _forged_declaration() -> dict:
+    """A declaration whose spine names an identity the caller is not: authenticated, break-glass,
+    and holding two roles it was never granted.
+
+    Every field of `declared_by` is client JSON — `queue_lane._decode_spine` rebuilds the envelope
+    with `cls(**node)` behind a field-name check, and `IdentityEnvelope` is a plain frozen dataclass
+    with no validation of its own. `declared_by` is REQUIRED, so every POST already carries a
+    client-authored identity; this one simply makes it a hostile one.
+    """
+    import dataclasses
+
+    from tests.featuregen.materialize.crosswalk_fixtures import SPINE_DECLARATION
+
+    from featuregen.contracts.envelopes import IdentityEnvelope
+
+    return encode_declaration(build_set_declaration(
+        spine_declaration=dataclasses.replace(
+            SPINE_DECLARATION,
+            declared_by=IdentityEnvelope(
+                subject="user:mallory", actor_kind="human", authenticated=True,
+                auth_method="password", role_claims=("pii_reader", "platform_admin"),
+                break_glass=True))))
+
+
+def _declared_through_the_route(client, conn, headers) -> str:
+    """A build set declared the way production declares one — through the route, with a hostile
+    `declared_by` inside its declaration. ONE member, so its content differs from `_seed`'s set:
+    provenance is outside the identity, so a two-member forged declaration would land on the
+    existing row (correctly) and prove nothing about what this call stored."""
+    from tests.featuregen.materialize.crosswalk_fixtures import bind_ready_formulas
+
+    _seed(conn)
+    response = client.post(SETS, json={
+        "target_reading_revision_id": "trr-bs",
+        "selection_formula_binding_ids": list(bind_ready_formulas(conn, ["sel-1"])),
+        "declaration": _forged_declaration()}, headers=headers)
+    assert response.status_code == 201, response.text
+    assert response.json()["created"] is True
+    return response.json()["build_set_revision_id"]
+
+
+def _stored_declaration(conn, revision_id: str) -> dict:
+    import json as _json
+
+    stored = conn.execute(
+        "SELECT declaration_json FROM build_set_revision WHERE revision_id = %s",
+        (revision_id,)).fetchone()[0]
+    return stored if isinstance(stored, dict) else _json.loads(stored)
+
+
+def _walk(node, path=""):
+    """Every (path, key, value) in a payload — so a claim cannot hide one level down."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield f"{path}.{key}", key, value
+            yield from _walk(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _walk(value, f"{path}[{index}]")
+
+
+def test_a_FORGED_DECLARER_IS_OVERWRITTEN_by_the_authenticated_principal(client, conn, enabled,
+                                                                        engineer_headers) -> None:
+    """▲ THE SAME SHAPE AS `roles`, ONE KEY LOWER — and closed the same way. A caller declaring
+    `authenticated=True`, `break_glass=True` and two roles it was never granted has that envelope
+    replaced by the one `get_identity` resolved. It reaches no read decision today (provenance only,
+    excluded from `identity_payload`), which is exactly why it is closed before it does.
+    """
+    revision_id = _declared_through_the_route(client, conn, engineer_headers)
+
+    declarer = _stored_declaration(conn, revision_id)["spine_declaration"]["declared_by"]
+
+    assert declarer["subject"] == "user:sam", "the declarer is the authenticated principal"
+    assert declarer["role_claims"] == ["feature_engineer"]
+    assert declarer["break_glass"] is False
+    assert declarer["authenticated"] is False, (
+        "the dev stub ASSERTS an identity rather than proving one, and the record says so rather "
+        "than taking the caller's word that it was authenticated")
+
+
+def test_OVERWRITING_THE_DECLARER_CHANGES_NO_IDENTITY(client, conn, enabled,
+                                                      engineer_headers) -> None:
+    """Provenance is outside the hash, so this closure re-ids nothing: the same declaration sent by
+    two different principals is still ONE build set, which is the property `identity_payload`
+    exists to protect."""
+    first = _declared_through_the_route(client, conn, engineer_headers)
+
+    from tests.featuregen.materialize.crosswalk_fixtures import bind_ready_formulas
+
+    again = client.post(SETS, json={
+        "target_reading_revision_id": "trr-bs",
+        "selection_formula_binding_ids": list(bind_ready_formulas(conn, ["sel-1"])),
+        "declaration": _forged_declaration()},
+        headers={"X-User": "riya", "X-Roles": "feature_engineer"})
+
+    assert again.json()["build_set_revision_id"] == first
+    assert again.json()["created"] is False
+    # And the FIRST declarer's provenance stands — a second declaration of identical content adds
+    # nothing, so it does not get to re-attribute the first.
+    declarer = _stored_declaration(conn, first)["spine_declaration"]["declared_by"]
+    assert declarer["subject"] == "user:sam"
+
+
+def test_the_QUEUE_PAYLOAD_CARRIES_NO_CLIENT_AUTHORED_CLAIM_ANYWHERE(client, conn, enabled,
+                                                                    engineer_headers) -> None:
+    """WALKED, not spot-checked at the top level. `roles` is gone from the payload at every depth,
+    and the one nested identity it does carry — the spine's `declared_by` provenance — is the
+    server's answer rather than the caller's."""
+    from featuregen.materialize.generation_authorization import (
+        GenerationAuthorizationV1,
+        record_generation_authorization,
+    )
+    from featuregen.overlay.upload.selection_revisions import TargetModeV1
+
+    build_set = _declared_through_the_route(client, conn, engineer_headers)
+    approval = record_generation_authorization(
+        conn, GenerationAuthorizationV1(
+            environment_id="hdfc-local", logical_group_name="customer_txn_features",
+            build_set_revision_id=build_set, target_mode=TargetModeV1.EXPLORATION,
+            target_ref=None),
+        authorized_by="user:sam", authorized_at="2026-08-21T00:00:00Z")
+
+    body = client.post(GENERATIONS, json=_body(build_set, approval),
+                       headers=engineer_headers).json()
+
+    payload = conn.execute("SELECT payload FROM queue WHERE message_id = %s",
+                           (f"generation:{body['request_id']}",)).fetchone()[0]
+    assert not [path for path, key, _ in _walk(payload) if key == "roles"], (
+        "no `roles` key at ANY depth — read scope travels as a binding id")
+    claims = sorted(path for path, key, _ in _walk(payload)
+                    if key in {"role_claims", "authenticated", "break_glass"})
+    assert claims == [
+        ".spine_declaration.declared_by.authenticated",
+        ".spine_declaration.declared_by.break_glass",
+        ".spine_declaration.declared_by.role_claims",
+    ], f"an unexpected identity claim rides the payload: {claims}"
+    declarer = payload["spine_declaration"]["declared_by"]
+    assert declarer["subject"] == "user:sam"
+    assert declarer["role_claims"] == ["feature_engineer"]
+    assert declarer["break_glass"] is False

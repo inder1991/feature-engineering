@@ -157,3 +157,33 @@ def decode_declaration(payload: Mapping[str, Any]) -> BuildSetDeclarationV1:
         availability_promise=_decode_promise(material.get("availability_promise")),
         operand_facts=operand_facts,
         policy_realization_ids={str(k): str(v) for k, v in policy_node.items()})
+
+
+def with_server_resolved_declarer(
+    declaration: BuildSetDeclarationV1, principal: Any,
+) -> BuildSetDeclarationV1:
+    """The declaration with its spine's ``declared_by`` OVERWRITTEN by the resolved principal.
+
+    ▲ **THE SECOND CLIENT-AUTHORED IDENTITY, one key lower than the first.**
+    ``SpineSourceDeclarationV1.declared_by`` is a REQUIRED ``IdentityEnvelope`` that every caller
+    supplies inside `declaration`, and `queue_lane._decode_spine` rebuilds it straight from client
+    JSON (`_rebuild` = `cls(**node)` behind a field-name check, and the envelope is a plain frozen
+    dataclass with no validation of its own). So a request could declare
+    ``authenticated=True``, ``break_glass=True``, ``role_claims=('platform_admin',)`` for a subject
+    it is not, and that envelope rode all the way into the queue payload.
+
+    It reaches no read decision today — provenance only, excluded from `identity_payload` — but a
+    client-asserted `authenticated=True` is exactly what the trust boundary exists to prevent, and
+    it is one attribute access from mattering. Every ingress that accepts a declaration replaces it
+    here, the way `build_sets.py` already server-owns the build-set row's own `declared_by`.
+
+    **This changes NO identity.** `declaration_identity` (and therefore `build_set_identity` and
+    `job_content_identity`) reads the spine's `identity_payload`, which excludes every provenance
+    field — so the same declaration by two people is still one build set, and nothing re-hashes.
+    """
+    import dataclasses
+
+    return dataclasses.replace(
+        declaration,
+        spine_declaration=dataclasses.replace(
+            declaration.spine_declaration, declared_by=principal))
