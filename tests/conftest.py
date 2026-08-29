@@ -92,6 +92,23 @@ def _reset_repair_registry():
 
 
 @pytest.fixture(autouse=True)
+def _default_worker_identity_authority(monkeypatch):
+    """THE SUITE RUNS AGAINST LOCAL IAM unless a test says otherwise.
+
+    `resolve_current_principal` defaults to the DEPLOYMENT's configured resolver (B0a), so an
+    exported `FEATUREGEN_WORKER_IDENTITY_RESOLVER` on a developer's shell would silently answer for
+    every frozen-principal recheck in the suite — measured: `=garbage` turns four
+    `test_principal_scope` tests red, and a *working* external resolver would be worse, since the
+    tests would pass while proving something about that deployment rather than about the platform.
+
+    Cleared rather than `setdefault`-ed (the `FEATUREGEN_AUDIT_HMAC_KEY` idiom above) because the
+    default this suite must exercise is the variable's ABSENCE — local IAM. Tests that want another
+    authority `monkeypatch.setenv` it themselves, which still wins inside their own test.
+    """
+    monkeypatch.delenv("FEATUREGEN_WORKER_IDENTITY_RESOLVER", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_transient_backoff(request, monkeypatch):
     """THE SUITE NEVER SLEEPS. `drive_structured_call` waits before a PROVIDER_TRANSIENT re-call
     (`llm._TRANSIENT_BACKOFF_BASE_S`), so without this every test that scripts a transient fault

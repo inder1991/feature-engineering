@@ -762,3 +762,38 @@ def test_run_drift_scan_skips_when_overlay_projection_lags(db):
     finally:
         _clear_catalog_adapter()
         _clear_overlay_config()
+
+
+def test_run_forever_REFUSES_AT_BOOT_on_an_unloadable_identity_authority(
+    _throwaway_autocommit_db, monkeypatch
+) -> None:
+    """▲ THE SAME BOOT RULE AS THE COST CEILINGS, for the authority that decides whether a frozen
+    principal may still execute (B0a). THIS process spends it — the draft author, the recipe author
+    and the generation lane all recheck here — so a `FEATUREGEN_WORKER_IDENTITY_RESOLVER` naming
+    something unloadable must fail the worker at boot rather than mid-tick, where it would surface
+    as a refused build rather than as a misconfiguration.
+
+    Not a tick failure: the loop is never entered, so a monkeypatched tick that would have counted
+    itself never runs.
+    """
+    import threading
+
+    import featuregen.runtime.worker as worker
+    from featuregen.identity.current_principal import WorkerIdentityResolverUnavailable
+    from featuregen.runtime.worker import run_forever
+
+    calls = {"n": 0}
+
+    def _fake_tick(*_args, **_kw):  # pragma: no cover - reaching it IS the failure
+        calls["n"] += 1
+        raise AssertionError("the loop must not start under an unloadable identity authority")
+
+    monkeypatch.setattr(worker, "run_worker_once", _fake_tick)
+    monkeypatch.setenv("FEATUREGEN_WORKER_IDENTITY_RESOLVER", "featuregen.nope:Resolver")
+
+    with pytest.raises(WorkerIdentityResolverUnavailable) as excinfo:
+        run_forever(_throwaway_autocommit_db, interval=0.0,
+                    shutdown_event=threading.Event(), owner="w-test")
+
+    assert "FEATUREGEN_WORKER_IDENTITY_RESOLVER" in str(excinfo.value)
+    assert calls["n"] == 0

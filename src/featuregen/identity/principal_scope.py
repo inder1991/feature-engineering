@@ -172,6 +172,25 @@ class PrincipalScopeRevisionV1:
     outside the hash would let two different values share one id and the first writer's value would
     answer for the second's. ``recorded_at`` is the exception and is not stored by the store at all
     — it is the table's own default, filled on load, never hashed.
+
+    **THE THREE ENVELOPE FIELDS THIS TYPE DOES NOT CARRY, on the record.**
+
+    ``groups`` is excluded because local IAM derives ROLES from group memberships and the roles are
+    what ``decide_read_scope`` reads — groups are how the scope was reached rather than the scope
+    itself, and hashing them would fork the identity of an unchanged scope whenever somebody joined
+    an unrelated group.
+
+    ``source_of_authority`` and ``attestation`` are excluded for a DIFFERENT reason, and the
+    ``groups`` argument does not cover them: they are claims about WHO VOUCHED for the principal,
+    which is exactly the kind of fact a scope revision should carry once anything sets one. Nothing
+    does today — ``build_human_identity`` sets neither, and ``resolve_session`` is the only
+    authenticated producer — so storing them now would hash a constant ``null``.
+
+    ▲ When OIDC or service principals land and either becomes non-null, adding it is a NEW
+    migration **and a RE-IDENTIFICATION**: every existing revision's content hash changes, so
+    existing rows keep ids that no longer describe their payload and every binding pinning one
+    keeps pointing at the older content. Plan that as an expand/adopt — a new revision minted
+    beside the old — never an in-place widening of this payload.
     """
 
     subject: str

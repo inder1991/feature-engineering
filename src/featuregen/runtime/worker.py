@@ -874,6 +874,7 @@ def run_forever(
 
     `relay_routes` overrides the env-file route map (SP-0.5 r2 review #5). Cost-ceiling config is
     validated up front so a typo fails the worker at boot, not mid-finalize (review #3)."""
+    from featuregen.identity.current_principal import configured_worker_identity_resolver
     from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
     from featuregen.runtime.cost_budget import current_cost_ceilings
 
@@ -893,6 +894,13 @@ def run_forever(
         register_overlay_config(overlay_config_from_env())
         publish = _relay_publisher_from_env(relay_routes)  # production route policy (SP-0.5 r2)
         current_cost_ceilings()  # fail-fast on malformed cost-ceiling config (review #3)
+        # ▲ THE SAME RULE, for the authority that decides whether a frozen principal may still
+        # execute (B0a). THIS process is the one that spends it — the draft author, the recipe
+        # author and the generation lane all recheck here — so a `FEATUREGEN_WORKER_IDENTITY_
+        # RESOLVER` naming something unloadable must fail the worker at BOOT rather than mid-tick,
+        # where it would surface as a refused build rather than as a misconfiguration. Unset is a
+        # valid configuration (local IAM) and returns quietly.
+        configured_worker_identity_resolver()
         log("worker.start", dsn=_safe_dsn(dsn), owner=owner, interval=interval)
         while not shutdown_event.is_set():
             now = datetime.now(UTC)
