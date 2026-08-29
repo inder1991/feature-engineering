@@ -2991,6 +2991,32 @@ describe('Intake target confirmation', () => {
       expect.objectContaining({ targetRef: 'public.labels.churned' }))
   })
 
+  it('the signed block keeps showing the label window it was signed with', async () => {
+    // The window is part of what the person SIGNED, and it is the input the near-label leakage
+    // critic runs on — a critic with no window abstains on every candidate. It was rendered on the
+    // draft and then dropped from the signed block, so the one fact that says whether that check
+    // can run at all disappeared at the moment it started mattering.
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    await generateConfirmOn()
+    await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+    expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
+    expect(screen.getByText(/Label window: 90 days/)).toBeInTheDocument()
+  })
+
+  it('the signed block says plainly when no window was recorded', async () => {
+    // Absence is stated with its CONSEQUENCE, not left blank: "no window" is why a leakage check
+    // the user may be relying on will not run.
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue({
+      ...READING, target_window_days: null,
+    })
+    await generateConfirmOn()
+    await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+    expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
+    expect(screen.getByText(/No label window recorded/)).toBeInTheDocument()
+  })
+
   it('surfaces a name-vs-prose contradiction as a warning', async () => {
     contractIntake.mockResolvedValue({
       ...INTAKE,

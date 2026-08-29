@@ -3436,6 +3436,18 @@ export function WorkbenchScreen() {
                         <> <span className="badge stale">proxy for the outcome</span></>
                       )}
                     </p>
+                    {/* The window is part of what was SIGNED, and it is the input the near-label
+                        leakage critic runs on — without one, that check abstains on every
+                        candidate. It was rendered on the draft and then dropped here, so the fact
+                        that says whether the check can run at all vanished at the moment it began
+                        to matter. Absence is stated WITH its consequence, never left blank. */}
+                    <p className="hint" style={{ margin: 0 }} data-role="signed-window">
+                      {intakeReading.target_window_days !== null
+                        ? `Label window: ${intakeReading.target_window_days} days — recorded with `
+                          + 'your decision.'
+                        : 'No label window recorded. Leakage checks that compare a feature against '
+                          + 'the label over time cannot run without one.'}
+                    </p>
                     {intakeAcknowledged !== '' && (
                       <p className="hint" style={{ margin: 0 }} data-role="acknowledged">
                         You acknowledged: {intakeAcknowledged}
