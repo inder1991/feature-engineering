@@ -15,6 +15,7 @@ from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.intake_ticket import (
     INTAKE_TICKET_TASK,
+    _shortlist,
     extract_intake_ticket,
 )
 from featuregen.overlay.upload.enrich import content_hash
@@ -116,16 +117,44 @@ def test_a_typed_column_name_PINS_and_the_model_fills_the_rest(db):
     assert "retail_churn" in ticket.business_domain
 
 
-def test_the_model_cannot_override_a_pinned_name_but_the_disagreement_surfaces(db):
-    """The confirm screen's contradiction warning: 'you named X; your description reads as Y'."""
+def test_the_MODEL_decides_and_the_disagreement_with_a_typed_name_still_surfaces(db):
+    """The typed name is EVIDENCE, not an override.
+
+    Matching a word in a sentence against a column name cannot tell a deliberate reference from a
+    coincidence — "customers will close their account" reads identically to naming a column called
+    `close`. That is a weak signal, and it used to carry three strong powers: it beat the model, it
+    skipped the confidence check, and (briefly) it wrote itself durably with no click. A weak signal
+    should have weak consequences.
+
+    The model gets the same sentence, the same shortlist, and now the glossary terms and types — it
+    is far better placed to tell a verb from a column name. So it decides, and the pin rides along
+    as a hint. The disagreement is still SHOWN, because two readings differing is information.
+    """
     _catalog(db)
     ticket, _reason = extract_intake_ticket(
         db, _ticket_client(target=_SUSP),           # the model reads the prose as suspension
         catalog_source=SOURCE, roles=("data_owner",),
         hypothesis="Predict cust_status_flg based on suspension behaviour.")
-    assert ticket.target_column == _STATUS, "the pin always wins"
+    assert ticket.target_column == _SUSP, "the model's reading decides"
+    assert ticket.pinned is True, "the name match still HAPPENED and is still disclosed"
     assert ticket.contradiction is not None
     assert "cust_susp_flg" in ticket.contradiction
+
+
+def test_a_typed_name_no_longer_buys_a_CONFIDENCE_exemption(db):
+    """`cust_status_flg` carries `customer_relationship_status` — the registry declassified it, so
+    nothing certifies it as an answer. Typing its name used to exempt it from that check on the
+    reasoning that "the platform is not proposing anything". The reasoning holds only where the
+    typing was deliberate, which the match cannot establish — so the exemption goes and the class
+    check applies to every target the same way."""
+    _catalog(db)
+    ticket, _ = extract_intake_ticket(
+        db, _ticket_client(), catalog_source=SOURCE, roles=("data_owner",),
+        hypothesis="Predict cust_status_flg. Churn means no activity in 90 days.")
+    assert (ticket.target_column, ticket.pinned) == (_STATUS, True)
+    assert ticket.target_leakage_class == "standard"
+    assert ticket.confidence == "abstain", \
+        "an uncertified target abstains whether the name was typed or inferred"
 
 
 def test_a_fuzzy_target_is_selected_from_the_shortlist_and_cached(db):
@@ -196,22 +225,78 @@ def test_runners_up_are_selection_validated_ranked_and_never_the_target(db):
     assert ticket.runners_up == (_SUSP,),         "invented dropped, the target itself excluded, the real runner-up kept in rank order"
 
 
-# ══ T7 (a) — ABSTAIN-BY-DEFAULT: no outcome-family concept, no commit ════════════════════════════
+# ══ THE SHELF PHOTO — what the picker is actually shown ═════════════════════════════════════════
 
-def test_no_outcome_family_concept_in_the_catalog_ABSTAINS_and_names_the_proxies(db):
-    """The 2026-08-24 AML run's own arrangement. `cust_susp_flg` carries `restriction_status`, whose
-    registry record says `near_label=True` — a compliance CONSEQUENCE, not the AML outcome. Nothing
-    in this catalog carries a `leakage_anchor` concept, so the honest answer is the morning run's:
-    abstain, and hand back the nearest proxies with the concept each one actually carries."""
+def test_the_shortlist_carries_the_semantic_terms_and_the_declared_type(db):
+    """The picker was shown 3 of the ~45 fields the catalog holds on a column, and the two most
+    load-bearing were among the missing.
+
+    * ``semantic_terms`` carries the glossary term, the BUSINESS SUBDOMAIN PATH and the synonyms —
+      on the live catalog it is what separates "Risk and Compliance - Regulations and Compliance"
+      (`cust_susp_flg`) from "Party Lifecycle Management" (`cust_status_flg`), which is exactly the
+      AML-vs-churn question the picker is being asked. 237/237 columns carry it.
+    * ``declared_type`` is nearly a label detector by itself: labels are ``varchar(1)`` or a short
+      code, identifiers and names are long. 18 of `cib`'s 111 columns are ``varchar(1)``, and its
+      label columns are among them.
+
+    ``definition`` and ``domain`` are deliberately NOT added: measured on the live catalog,
+    `definition` returns the same templated sentence for different columns (it would blur two
+    columns the picker must separate) and `domain` is the constant "Customer" across all of `cib`.
+    More context is not the goal; more SIGNAL is.
+    """
+    _cib_catalog(db)
+    long_terms = "Customer Suspension Flag Risk and Compliance - Regulations and Compliance " + (
+        "suspension status suspended customer indicator " * 8)
+    db.execute(
+        "UPDATE graph_node SET semantic_terms = %s, declared_type = %s "
+        "WHERE kind = 'column' AND object_ref = %s", (long_terms, "varchar(1)", _CIB_SUSP))
+
+    entry = next(e for e in _shortlist(db, _CIB, ("data_owner",)) if e["ref"] == _CIB_SUSP)
+    assert entry["declared_type"] == "varchar(1)", "structural, egresses as-is"
+    assert entry["semantic_terms"].startswith("Customer Suspension Flag Risk and Compliance")
+    assert len(entry["semantic_terms"]) <= 200, \
+        "bounded — 237 columns x unbounded glossary prose is a payload, not a shelf photo"
+    # the fields already on the shelf are untouched (this fixture has no enrichment summary, so
+    # ai_summary is the honest empty string — the point is that the key is still there)
+    assert entry["concept"] == "restriction_status"
+    assert set(entry) == {"ref", "concept", "ai_summary", "semantic_terms", "declared_type"}
+
+
+def test_a_column_with_no_semantic_terms_or_type_still_makes_the_shelf(db):
+    """Absence is honest absence — an empty string, never a dropped candidate. A column the
+    enrichment never reached must still be selectable, or the picker cannot pick the right answer
+    on a freshly-uploaded catalog."""
+    _cib_catalog(db)
+    db.execute(
+        "UPDATE graph_node SET semantic_terms = NULL, declared_type = NULL "
+        "WHERE kind = 'column' AND object_ref = %s", (_CIB_STATUS,))
+    refs = {e["ref"]: e for e in _shortlist(db, _CIB, ("data_owner",))}
+    assert _CIB_STATUS in refs, "still on the shelf"
+    assert refs[_CIB_STATUS]["semantic_terms"] == ""
+    assert refs[_CIB_STATUS]["declared_type"] == ""
+
+
+# ══ T7 (a) — ABSTAIN-BY-DEFAULT: an UNCERTIFIED concept, no commit ══════════════════════════════
+
+def test_an_UNCOMMITTABLE_target_ABSTAINS_and_names_the_proxies(db):
+    """The abstention answer, driven from the class that still cannot commit.
+
+    `cust_status_flg` carries `customer_relationship_status`, which the registry positively
+    DEclassified — neither the label nor label-adjacent. Nothing warrants a silent commit onto it,
+    so the honest answer is: abstain, and hand back the nearest proxies with the concept each one
+    actually carries. (`near_label` used to land here too; it now commits — see
+    :func:`licenses_commit` and the sibling test — so the ranking below is exercised from the class
+    the rule genuinely still refuses.)"""
     _cib_catalog(db)
     ticket, reason = extract_intake_ticket(
-        db, _cib_client(), catalog_source=_CIB, roles=("data_owner",), hypothesis=_AML_GOAL)
+        db, _cib_client(target=_CIB_STATUS, runners=()),
+        catalog_source=_CIB, roles=("data_owner",), hypothesis=_AML_GOAL)
     assert reason == "extracted"
     assert ticket.confidence == "abstain", \
-        "the run committed at medium to a near-label proxy; only an outcome-family concept commits"
-    assert ticket.target_is_proxy is True
-    assert ticket.target_leakage_class == "near_label"
-    assert ticket.target_concept == "restriction_status"
+        "the registry declassified this concept; nothing certifies it, so nothing auto-commits"
+    assert ticket.target_is_proxy is False, "standard is a DENIAL of adjacency, never a proxy claim"
+    assert ticket.target_leakage_class == "standard"
+    assert ticket.target_concept == "customer_relationship_status"
     # the abstention answer is DATA: ranked proxies, each labelled with its REAL concept
     assert [(c.ref, c.concept, c.leakage_class) for c in ticket.proxy_candidates] == [
         (_CIB_SUSP, "restriction_status", "near_label"),
@@ -222,9 +307,9 @@ def test_no_outcome_family_concept_in_the_catalog_ABSTAINS_and_names_the_proxies
     assert ticket.outcome_candidates == (), "this catalog genuinely holds no label — say nothing"
 
 
-def test_an_outcome_family_concept_is_the_ONE_thing_that_commits(db):
-    """The other side of the same rule — `fraud_flag` declares `leakage_anchor=True`, so a target
-    landing on it is the label itself and the model's confidence stands."""
+def test_an_outcome_family_concept_commits_at_the_model_s_own_confidence(db):
+    """The strongest warrant — `fraud_flag` declares `leakage_anchor=True`, so a target landing on
+    it is the label ITSELF (not a proxy) and the model's confidence stands untouched."""
     rows = [(CanonicalRow(_CIB, "bo_cib_customer", "aml_sar_filed_flg", "text",
                           definition="Whether a SAR was filed for this customer."), "fraud_flag")]
     build_graph(db, _CIB, [r for r, _ in rows],
@@ -237,6 +322,28 @@ def test_an_outcome_family_concept_is_the_ONE_thing_that_commits(db):
     assert (ticket.confidence, ticket.target_is_proxy) == ("high", False)
     assert ticket.target_leakage_class == "outcome"
     assert ticket.proxy_candidates == (), "there is nothing to fall back to — this IS the label"
+
+
+def test_a_NEAR_LABEL_concept_COMMITS_and_is_still_labelled_a_proxy(db):
+    """The registry forbids building a FEATURE from a `near_label` column precisely BECAUSE it
+    borders the answer — and that is the same warrant that makes it usable as the TARGET. Both
+    classes state "answer-shaped"; only the strength of the claim differs, and strength belongs in
+    the WORDING, not in a veto. So the commit stands, and `target_is_proxy` keeps the screen honest
+    about which of the two it is.
+
+    Without this, the rule can never pass on the live catalog: `cib` and `ftr` hold ZERO
+    leakage_anchor columns between them, so every target on every hypothesis abstained and every
+    user met the same acknowledgment — a gate that fires always is a gate nobody reads."""
+    _cib_catalog(db)
+    ticket, _ = extract_intake_ticket(
+        db, _cib_client(), catalog_source=_CIB, roles=("data_owner",), hypothesis=_AML_GOAL)
+    assert ticket.target_column == _CIB_SUSP
+    assert ticket.confidence == "medium", \
+        "a near-label target is committable — the model's own band stands, unoverridden"
+    assert ticket.target_leakage_class == "near_label"
+    assert ticket.target_is_proxy is True, "committed, and STILL named a proxy — both are true"
+    assert ticket.proxy_candidates == (), "the target committed; there is nothing to fall back to"
+    assert ticket.outcome_candidates == (), "and this catalog holds no certified label to offer"
 
 
 def test_a_target_with_no_registered_concept_is_uncommittable_but_is_NOT_called_a_proxy(db):
@@ -398,9 +505,11 @@ def test_an_outcome_column_in_the_catalog_is_NAMED_and_is_never_listed_as_a_prox
     """
     _cib_catalog(db, with_label=True)
     ticket, _ = extract_intake_ticket(
-        db, _cib_client(runners=(_CIB_LABEL, _CIB_STATUS)), catalog_source=_CIB,
+        db, _cib_client(target=_CIB_STATUS, runners=(_CIB_LABEL, _CIB_SUSP)), catalog_source=_CIB,
         roles=("data_owner",), hypothesis=_AML_GOAL)
-    assert ticket.target_column == _CIB_SUSP and ticket.confidence == "abstain"
+    # the target is the STANDARD column, so the ticket abstains and both lists are populated —
+    # the arrangement that actually exercises the exclusion now that near_label commits.
+    assert ticket.target_column == _CIB_STATUS and ticket.confidence == "abstain"
     assert _CIB_LABEL in ticket.runners_up, "the model did rank it — this is not a no-op fixture"
     assert [(c.ref, c.concept, c.leakage_class) for c in ticket.outcome_candidates] == [
         (_CIB_LABEL, "fraud_flag", "outcome")]

@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.feature_assist import recommend_features
 from featuregen.overlay.upload.graph import build_graph
 
@@ -435,3 +436,65 @@ def test_feature_rationale_flows_from_generator_to_gate1(db):
     out = recommend_features(db, "predict churn", client, catalog_source="bank",
                              target_ref="public.accounts.churned", now=NOW, critic=False)
     assert out and out[0].rationale.startswith("90-day average balance")
+
+
+# ══ THE TARGET'S CONCEPT, not just the target's REF ══════════════════════════════════════════════
+
+def test_a_feature_carrying_the_TARGET_S_OWN_CONCEPT_is_a_leak(db):
+    """The veto matched the target's exact ref and nothing else, so a DIFFERENT column measuring the
+    SAME governed thing walked through it.
+
+    Here `susp_flg` is the target and `blacklist_flg` is offered as a feature. Two columns, one
+    concept (`restriction_status`) — the registry's own statement that they measure the same thing.
+    A model given one to predict the other is reading its answer back under a second name.
+
+    Deliberately NARROW. `near_label` is TARGET-RELATIVE, not absolute: `recovery_amount` leaks
+    against a default label and is an ordinary predictor for a recovery model, so a blanket ban on
+    the 13 near-label concepts would delete legitimate features. Concept EQUALITY with the declared
+    target is the part that holds for every target, and it needs no model to decide.
+    """
+    rows = [
+        (CanonicalRow("bank", "accounts", "id", "integer", is_grain=True), None),
+        (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive"), None),
+        (CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True), None),
+        (CanonicalRow("bank", "accounts", "susp_flg", "text"), "restriction_status"),
+        (CanonicalRow("bank", "accounts", "blacklist_flg", "text"), "restriction_status"),
+    ]
+    build_graph(db, "bank", [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows if c})
+    _fresh_watermark(db, "bank", NOW)
+    _govern_additivity(db, "bank", "accounts", "balance", "semi_additive")
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "same_concept", "derives_from": ["public.accounts.blacklist_flg"]},
+        {"name": "good", "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d"},
+    ]})})
+    out = recommend_features(db, "predict suspension", client, catalog_source="bank",
+                             target_ref="public.accounts.susp_flg", now=NOW)
+    assert {f.name for f in out} == {"good"}, \
+        "a different column carrying the target's own concept is the target under another name"
+
+
+def test_an_UNRELATED_concept_is_not_swept_up_by_the_target_s(db):
+    """The other half of the rule, or it would be a blanket ban by accident: a column whose concept
+    simply DIFFERS from the target's is an ordinary predictor and must survive — including one that
+    is itself near-label, which is exactly the `recovery_amount`-against-a-default-label case."""
+    rows = [
+        (CanonicalRow("bank", "accounts", "id", "integer", is_grain=True), None),
+        (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive"), None),
+        (CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True), None),
+        (CanonicalRow("bank", "accounts", "susp_flg", "text"), "restriction_status"),
+        (CanonicalRow("bank", "accounts", "recovery_amt", "numeric",
+                      additivity="additive", currency="USD"), "recovery_amount"),
+    ]
+    build_graph(db, "bank", [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows if c})
+    _fresh_watermark(db, "bank", NOW)
+    _govern_additivity(db, "bank", "accounts", "recovery_amt", "additive")
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "recovery", "derives_from": ["public.accounts.recovery_amt"],
+         "aggregation": "sum_90d"},
+    ]})})
+    out = recommend_features(db, "predict suspension", client, catalog_source="bank",
+                             target_ref="public.accounts.susp_flg", now=NOW)
+    assert {f.name for f in out} == {"recovery"}, \
+        "near-label is target-relative; a different concept is an ordinary predictor"

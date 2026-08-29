@@ -440,17 +440,18 @@ def _recorded(conn, intent_id: str) -> tuple:
         (intent_id,)).fetchone()
 
 
-def test_the_target_proposal_abstains_names_the_proxy_and_types_the_window_contradiction(
+def test_the_target_proposal_commits_names_the_proxy_and_types_the_window_contradiction(
         make_client, conn):
     """T7 (a) and (b), at the route, on the audited goal text.
 
     Three separate honesty moves, all visible on the one response:
 
-    * **Abstention.** The catalog holds no outcome-family concept, so nothing auto-commits — the
-      model's own ``confidence: high`` does not survive contact with the registry.
+    * **The commit stands.** ``restriction_status`` is ``near_label`` — answer-shaped — so the
+      model's reading is not overridden. Gating on ``outcome`` alone made this unsatisfiable on the
+      deployed catalogs, which hold no leakage_anchor concept at all.
     * **The proxy is NAMED, not hidden.** ``target_is_proxy`` with the class and the concept that
       earned it. The audit's complaint was never that ``cust_susp_flg`` was offered; it was that it
-      was offered as if it were the outcome.
+      was offered as if it were the outcome. Naming it is what answers that — not refusing it.
     * **The window contradiction is TYPED.** The goal states 90 days; the model's ticket says 0.
       A platform that recorded 0 there would be asserting a horizon the person never gave it, so
       the window is refused rather than reconciled, and ``target_window_days`` comes back None.
@@ -460,13 +461,12 @@ def test_the_target_proposal_abstains_names_the_proxy_and_types_the_window_contr
     body = _intake(client).json()
     ticket = body["ticket"]
 
-    assert ticket["confidence"] == "abstain", \
-        "no outcome-family concept exists here, so nothing commits itself"
+    assert ticket["confidence"] != "abstain", \
+        "an answer-shaped concept commits — the registry no longer vetoes the model's own band"
     assert ticket["target_is_proxy"] is True
     assert ticket["target_leakage_class"] == "near_label"
     assert ticket["target_concept"] == "restriction_status"
-    assert ticket["proxy_candidates"][0]["ref"] == _TARGET_REF
-    assert ticket["proxy_candidates"][0]["concept"] == "restriction_status"
+    assert ticket["proxy_candidates"] == [], "it committed; there is nothing to fall back to"
     assert ticket["outcome_candidates"] == [], \
         "and it says so plainly when the catalog holds no label at all"
 
@@ -480,44 +480,30 @@ def test_the_target_proposal_abstains_names_the_proxy_and_types_the_window_contr
         "and a draft is not a decision — nothing durable yet"
 
 
-def test_confirming_the_proxy_target_needs_the_acknowledgment_and_then_records_it(
+def test_confirming_the_proxy_target_needs_NO_acknowledgment_and_records_it_as_a_proxy(
         make_client, conn):
-    """T7 (c), at the route, both directions.
+    """T7 (c), at the route, as the deployed data forced it to be re-read.
 
-    The refusal is per TIER because the registry says different things per tier, and this one is
-    ``near_label``: the registry positively asserts label-adjacency, so the word PROXY is EARNED
-    here and the registry's own warrant is quoted rather than paraphrased. (A ``standard`` concept
-    gets a refusal that claims no correlation at all; an unregistered one gets "absence is not an
-    assertion". Those tiers have their own substring pins in ``test_contract_intake``; the one
-    byte-level fixture of this tier's sentence lives in ``WorkbenchScreen.test.tsx``, where the
-    verbatim law is proved from the client's side.)
+    The acknowledgment is spent where it buys something. On ``cib`` and ``ftr`` — 237 columns, no
+    leakage_anchor concept between them — the ``outcome``-only gate fired on EVERY confirmation,
+    and all three real ones acknowledged and proceeded. A gate that fires on every request is not
+    read. So ``near_label``, which the registry positively certifies as label-adjacent, now
+    confirms directly; the two tiers that warrant no commit (``standard``, unregistered) keep the
+    gate and their per-tier sentences, pinned in ``test_contract_intake``.
 
-    The acknowledgment asserts exactly one thing — "I know the registry does not certify this as
-    the outcome label" — and it is the ONLY door: behind the refusal, nothing is written.
+    Nothing the person is TOLD shrinks: the answer still names the class and flags the proxy.
     """
     client = make_client(_target_fake(window_days=0))
     upload_csv(client, "deposits", DEPOSITS_CSV)
     intent_id = _intake(client).json()["intent_id"]
 
-    unacknowledged = client.post("/contract/intake/target", json={
+    confirmed = client.post("/contract/intake/target", json={
         "intent_id": intent_id, "decision": "confirmed", "target_ref": _TARGET_REF,
         "catalog_source": "deposits"}, headers=AUTH)
-    assert unacknowledged.status_code == 422, unacknowledged.text
-    detail = unacknowledged.json()["detail"]
-    assert "restriction_status" in detail and "near_label" in detail
-    assert "PROXY" in detail, "the registry asserts adjacency here, so the word is warranted"
-    assert "BORDER" in detail, "and the warrant is QUOTED — a paraphrase is a second assertion"
-    assert "target_not_outcome_acknowledged" in detail, \
-        "the refusal names the field the client must send, so it is actionable"
-    assert _recorded(conn, intent_id)[1] is None, "nothing is recorded behind a refusal"
-
-    acknowledged = client.post("/contract/intake/target", json={
-        "intent_id": intent_id, "decision": "confirmed", "target_ref": _TARGET_REF,
-        "catalog_source": "deposits", **_ACK}, headers=AUTH)
-    assert acknowledged.status_code == 200, acknowledged.text
-    assert acknowledged.json()["target_is_proxy"] is True, \
-        "acknowledged is not un-labelled — the answer still says what this column is"
-    assert acknowledged.json()["target_leakage_class"] == "near_label"
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["target_is_proxy"] is True, \
+        "confirmed is not un-labelled — the answer still says what this column is"
+    assert confirmed.json()["target_leakage_class"] == "near_label"
     assert _recorded(conn, intent_id) == (_TARGET_REF, "human_confirmed")
 
 

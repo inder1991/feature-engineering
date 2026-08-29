@@ -108,23 +108,27 @@ def test_a_fuzzy_draft_is_NOT_a_recorded_decision_until_the_human_signs(make_cli
     assert intent_target_ref(conn, intent_id) == _BALANCE
 
 
-def test_a_typed_name_pins_an_OUTCOME_column_and_is_recorded_without_a_click(make_client, conn):
-    """shows-doesn't-gate, kept exactly where it is warranted: the column the person typed IS the
-    label, so recording it asserts nothing the registry does not already certify."""
+def test_a_typed_name_records_NOTHING_even_on_an_OUTCOME_column(make_client, conn):
+    """The prose door is closed for EVERY class, including the one it was last left open for.
+
+    The remaining justification was "the column the person typed IS the label, so recording it
+    asserts nothing new". True about the COLUMN, but the premise it rests on is that the person
+    typed it deliberately — and a bare word match cannot establish that. Nothing is hidden: the
+    ticket still reports the match, the column and its class, and the screen shows all of it. It is
+    simply not a DECISION until someone makes one.
+    """
     client = make_client(_outcome_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)
-    res = client.post("/contract/intake", json={
+    body = client.post("/contract/intake", json={
         "hypothesis": "Predict balance from customer activity.",
-        "catalog_source": "deposits"}, headers=AUTH)
-    body = res.json()
-    assert body["ticket"]["pinned"] is True
+        "catalog_source": "deposits"}, headers=AUTH).json()
+    assert body["ticket"]["pinned"] is True, "the match still happens and is still disclosed"
+    assert body["ticket"]["target_column"] == _BALANCE, "and the screen still shows it"
     assert body["ticket"]["target_leakage_class"] == "outcome"
-    ref, _, _, provenance, by = _reading(conn, body["intent_id"])
-    assert (ref, provenance) == (_BALANCE, "user_typed")
-    assert by == "user:tester"
+    assert _reading(conn, body["intent_id"])[3] is None, "but nothing durable is written"
 
 
-def test_a_typed_name_pinning_a_NON_OUTCOME_column_records_NOTHING_until_acknowledged(
+def test_a_typed_name_pinning_an_UNCERTIFIED_column_records_NOTHING_until_acknowledged(
         make_client, conn):
     """FIX ROUND NB-2 — the pin door, closed.
 
@@ -132,8 +136,12 @@ def test_a_typed_name_pinning_a_NON_OUTCOME_column_records_NOTHING_until_acknowl
     reads, at `user_typed`, with no disclosure — while clicking Confirm on the SAME column was a
     422. Two doors, opposite answers, one user. The ticket still LABELS the pin (the screen loses
     nothing); the acknowledged confirm is now the only way it becomes a record.
+
+    The invariant is that the PROSE door is never more permissive than the CLICK door, so this is
+    driven by a `standard` concept — the class both doors still refuse. (`near_label` now passes
+    BOTH, which keeps the same invariant from the other side; see the proxy tests below.)
     """
-    client = make_client(_proxy_fake())
+    client = make_client(_standard_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)
     body = client.post("/contract/intake", json={
         "hypothesis": "Predict balance from customer activity.",
@@ -141,7 +149,7 @@ def test_a_typed_name_pinning_a_NON_OUTCOME_column_records_NOTHING_until_acknowl
     intent_id = body["intent_id"]
     assert body["ticket"]["pinned"] is True, "the pin still HAPPENS — it is pure code"
     assert body["ticket"]["target_column"] == _BALANCE, "and the screen still shows it"
-    assert body["ticket"]["target_is_proxy"] is True, "labelled, not hidden"
+    assert body["ticket"]["target_leakage_class"] == "standard", "labelled, not hidden"
     assert _reading(conn, intent_id)[3] is None, \
         "but nothing durable is written — the confirm gate is the one door"
     assert intent_target_ref(conn, intent_id) is None
@@ -247,40 +255,38 @@ def test_the_change_it_menu_rides_the_response_with_its_material(make_client):
     assert body["runner_up_details"][0]["ref"] == "public.transactions.amount"
 
 
-def test_a_new_pin_overwrites_a_prior_pin_but_never_a_human_decision(make_client, conn):
-    """Review fix: pins are code-derived from the user's own current text, so a NEW pin may
-    replace a PRIOR pin (a rename between sessions must not leave the record on the old column
-    while the screen shows the new one). A human-signed reading stays untouchable.
+def test_re_running_intake_never_touches_a_signed_reading_and_writes_none_of_its_own(
+        make_client, conn):
+    """What survived the pin door closing, and what did not.
 
-    Enriched to `outcome_label` so the pin RECORDS at all — NB-2 closed the pin door for every
-    non-outcome column, and this test is about the pin-vs-pin and pin-vs-human precedence."""
+    GONE: pin-vs-pin precedence. It existed because a pin WROTE, so a stale write had to be
+    replaceable ("a rename between sessions must not leave the record on the old column while the
+    screen shows the new one"). Nothing is written now, so there is no stale record to replace and
+    no precedence to settle — the ticket is recomputed from the current text on every read.
+
+    KEPT, and load-bearing: re-running intake on a decided intent is a pure READ. That is what
+    stops a re-render of the screen from quietly reverting a human's signature.
+    """
     client = make_client(_outcome_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)
     first = client.post("/contract/intake", json={
         "hypothesis": "Predict balance from customer activity.",
         "catalog_source": "deposits"}, headers=AUTH).json()
-    assert _reading(conn, first["intent_id"])[0] == _BALANCE
-    # a DIFFERENT hypothesis pinning a different column is a different intent — so simulate the
-    # rename by rewriting the stored pin, then re-running the SAME intake: the fresh pin wins.
-    conn.execute("UPDATE contract_intent SET target_ref = %s WHERE intent_id = %s",
-                 ("public.accounts.stale_ref", first["intent_id"]))
-    again = client.post("/contract/intake", json={
-        "hypothesis": "Predict balance from customer activity.",
-        "catalog_source": "deposits"}, headers=AUTH).json()
-    assert again["intent_id"] == first["intent_id"]
-    ref, _, _, provenance, _ = _reading(conn, first["intent_id"])
-    assert (ref, provenance) == (_BALANCE, "user_typed"), "the new pin replaced the stale one"
-    # but once the human signs, intake becomes a pure read (covered end-to-end here too).
+    assert first["ticket"]["pinned"] is True
+    assert _reading(conn, first["intent_id"])[3] is None, "the pin wrote nothing to begin with"
+
     # `amount` lands unregistered in this fixture, so the correction owes the acknowledgment.
     client.post("/contract/intake/target", json={
         "intent_id": first["intent_id"], "decision": "corrected",
         "target_ref": "public.transactions.amount",
         "catalog_source": "deposits", **_ACK}, headers=AUTH)
-    client.post("/contract/intake", json={
+    again = client.post("/contract/intake", json={
         "hypothesis": "Predict balance from customer activity.",
-        "catalog_source": "deposits"}, headers=AUTH)
+        "catalog_source": "deposits"}, headers=AUTH).json()
+    assert again["intent_id"] == first["intent_id"]
     ref, _, _, provenance, _ = _reading(conn, first["intent_id"])
-    assert (ref, provenance) == ("public.transactions.amount", "human_confirmed")
+    assert (ref, provenance) == ("public.transactions.amount", "human_confirmed"), \
+        "the signature stands; the re-run neither replaced it nor added one of its own"
 
 
 # ══ T7 (c) — confirming a non-outcome target is an ACKNOWLEDGED act ══════════════════════════════
@@ -291,19 +297,22 @@ def test_a_new_pin_overwrites_a_prior_pin_but_never_a_human_decision(make_client
 # tier, because the registry says different things: near_label asserts label-adjacency, standard
 # positively denies it, and an unregistered concept asserts nothing at all.
 
-def test_the_proposal_LABELS_a_proxy_target_and_abstains_on_it(make_client):
+def test_the_proposal_COMMITS_on_a_proxy_target_and_still_LABELS_it_one(make_client):
+    """A `near_label` concept is answer-shaped, so the proposal stands — and the response carries
+    `target_is_proxy` and the class, which is what lets the screen say WHICH kind of answer it is
+    instead of refusing to have an opinion."""
     client = make_client(_proxy_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)
     body = client.post("/contract/intake", json={
         "hypothesis": "Customers likely to be flagged for AML review in the next 90 days.",
         "catalog_source": "deposits"}, headers=AUTH).json()
     ticket = body["ticket"]
-    assert ticket["target_is_proxy"] is True
+    assert ticket["target_is_proxy"] is True, "committed, and still honestly named a proxy"
     assert ticket["target_leakage_class"] == "near_label"
     assert ticket["target_concept"] == "restriction_status"
-    assert ticket["confidence"] == "abstain", "no outcome-family concept -> nothing auto-commits"
-    assert ticket["proxy_candidates"][0]["ref"] == _BALANCE
-    assert ticket["proxy_candidates"][0]["concept"] == "restriction_status"
+    assert ticket["confidence"] != "abstain", \
+        "an answer-shaped concept commits — the model's own band is no longer overridden"
+    assert ticket["proxy_candidates"] == [], "it committed; there is nothing to fall back to"
 
 
 def _intent_for(client, hypothesis="Customers likely to be flagged for AML review.") -> str:
@@ -312,22 +321,27 @@ def _intent_for(client, hypothesis="Customers likely to be flagged for AML revie
         headers=AUTH).json()["intent_id"]
 
 
-def test_the_NEAR_LABEL_refusal_speaks_of_a_proxy_and_quotes_the_registry_s_warrant(
+def test_a_NEAR_LABEL_target_is_CONFIRMED_with_no_acknowledgment_and_disclosed_as_a_proxy(
         make_client, conn):
+    """The gate no longer fires on `near_label`.
+
+    It fired on EVERY confirmation on the deployed catalogs — `cib` and `ftr` hold no
+    leakage_anchor concept between them — and all three real confirmations acknowledged and
+    proceeded. A gate that fires always is a gate nobody reads, so it is spent where it is owed:
+    `standard` and unregistered, tested below. What the person is told does not shrink — the
+    response still discloses the class and the proxy flag.
+    """
     client = make_client(_proxy_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)
     intent_id = _intent_for(client)
     res = client.post("/contract/intake/target", json={
         "intent_id": intent_id, "decision": "confirmed", "target_ref": _BALANCE,
         "catalog_source": "deposits"}, headers=AUTH)
-    assert res.status_code == 422
-    detail = res.json()["detail"]
-    assert "restriction_status" in detail and "near_label" in detail
-    assert "PROXY" in detail, "here the proxy word is EARNED — the registry asserts adjacency"
-    assert "BORDER" in detail, "and the registry's own warrant is quoted, not paraphrased"
-    assert "target_not_outcome_acknowledged" in detail, \
-        "the refusal names the field the client must send"
-    assert _reading(conn, intent_id)[3] is None, "nothing was recorded behind the refusal"
+    assert res.status_code == 200, "no acknowledgment field was sent, and none is owed"
+    assert res.json()["target_is_proxy"] is True, "accepted, and disclosed as a proxy"
+    ref, _, _, provenance, _ = _reading(conn, intent_id)
+    assert (ref, provenance) == (_BALANCE, "human_confirmed"), "the signed reading is recorded"
+    assert intent_target_ref(conn, intent_id) == _BALANCE, "and the leakage gate reads it"
 
 
 def test_the_STANDARD_refusal_claims_NO_correlation_it_only_withholds_certification(

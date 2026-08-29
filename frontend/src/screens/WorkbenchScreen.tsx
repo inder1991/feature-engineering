@@ -3397,11 +3397,12 @@ export function WorkbenchScreen() {
               before.
 
               ▲ T7 (c), NB-2: the shows-doesn't-gate PIN path is now OUTCOME-FAMILY ONLY. The
-              server stopped recording a literally-typed non-outcome column durably — typing a name
-              in prose used to write it onto the very row the leakage gate reads, undisclosed,
-              while CLICKING confirm on that same column was a refusal. So "you named it, already
-              recorded" may only be said where the record actually exists; every other pin falls
-              through to the confirm gate below, which asks for the acknowledgment out loud. */}
+              server writes NOTHING for a typed name, in any class — a bare word match cannot tell
+              a deliberate reference from an English word that happens to equal a column name, so
+              it is a hint to the reader and a fallback when there is no model, never a decision.
+              "You named it, already recorded" could therefore no longer be said of anything, and
+              the branch that said it is gone: every pin falls through to the confirm gate below,
+              which asks out loud. The ticket still reports the match and the class. */}
           {intake !== null && (
             <div className="scope-target" data-role="intake-target" style={{ marginTop: 16 }}>
               <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
@@ -3442,12 +3443,6 @@ export function WorkbenchScreen() {
                     )}
                   </div>
                 )
-              ) : intake.ticket.pinned && intake.ticket.target_column
-                  && intake.ticket.target_leakage_class === 'outcome' ? (
-                <p role="status" style={{ margin: 0 }}>
-                  Target: <code>{intake.ticket.target_column}</code> ✓ (you named it) — edit the
-                  target field above to change it.
-                </p>
               ) : intake.ticket.target_column !== null ? (
                 <div style={{ display: 'grid', gap: 8 }}>
                   <p style={{ margin: 0 }}>

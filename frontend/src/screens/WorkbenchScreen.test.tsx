@@ -3064,15 +3064,18 @@ describe('Intake target confirmation', () => {
     expect(await screen.findByText(/leakage checks are off/i)).toBeInTheDocument()
   })
 
-  it('a pinned name renders as the user’s own, already recorded, no click required', async () => {
+  it('a pinned name is shown as a reading and still asks for a click', async () => {
+    // The prose door is closed in every class: a bare word match cannot tell a deliberate
+    // reference from an English word that equals a column name, so nothing is recorded server-side
+    // and the confirm gate is the one door. The match is still disclosed on the ticket.
     contractIntake.mockResolvedValue({
       ...INTAKE,
       ticket: { ...TICKET, pinned: true },
     })
     await generateConfirmOn()
-    expect(await screen.findByText(/you named it/)).toBeInTheDocument()
-    // no confirm gate on the pin path — recorded server-side without a click
-    expect(screen.queryByRole('button', { name: /yes, that's my target/i })).toBeNull()
+    expect(await screen.findByText(/I understood your target as/)).toBeInTheDocument()
+    expect(screen.queryByText(/you named it/)).toBeNull()
+    expect(screen.getByRole('button', { name: /yes, that's my target/i })).toBeInTheDocument()
     expect(contractIntakeTarget).not.toHaveBeenCalled()
     // the pin threads into the manual target field for the considered-set request (which the
     // submitted-brief shell now keeps behind Revise brief)

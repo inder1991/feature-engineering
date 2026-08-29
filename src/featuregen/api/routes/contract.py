@@ -79,8 +79,8 @@ from featuregen.overlay.upload.contract.intake_ticket import (
     _use_case_vocabulary,
     asserts_label_adjacency,
     extract_intake_ticket,
-    is_outcome_family,
     is_readable_column,
+    licenses_commit,
     record_target_reading,
     target_leakage_class,
     target_reading,
@@ -1368,8 +1368,11 @@ def _target_class(conn, ref: str, catalog_source: str | None) -> tuple[str, str 
     return concept_name, target_leakage_class(concept_name)
 
 
-#: The sentence the confirm gate refuses with. ONE gate, THREE claims — because the registry makes
-#: three different statements and a refusal that flattens them is itself an untrue claim.
+#: The sentence the confirm gate refuses with. The registry makes three different statements and a
+#: refusal that flattens them is itself an untrue claim, so all three are kept here — but only the
+#: latter two are now REACHABLE from the gate: `near_label` licenses a commit (`licenses_commit`)
+#: and no longer refuses. The near_label wording stays because the function must describe any class
+#: it is handed truthfully, and because widening the gate is a decision that can be revisited.
 _ACKNOWLEDGE = ("Re-send with target_not_outcome_acknowledged: true to record that you know.")
 
 
@@ -1419,25 +1422,17 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
         roles=identity.role_claims, actor=identity)
     counters.incr(f"overlay.intake.{reason}")
 
-    row = _intent_row(conn, intent.intent_id)
-    # The pin is the USER's own typed name — record it without a click. A NEW pin may overwrite a
-    # PRIOR pin (both are code-derived from the user's own current text; refusing left the stored
-    # target on a column the catalog no longer resolves to while the screen showed the new one —
-    # review fix 2026-08-10). A HUMAN-signed reading (human_confirmed / exploring) is never
-    # clobbered: re-running intake on a decided intent stays a read.
+    # ▲ THE PROSE DOOR IS CLOSED, FOR EVERY CLASS. Typing a column name used to write it durably
+    # onto the very row the leakage gate reads, with no click — first for any column, then (T7
+    # NB-2) for outcome-family ones only. Both versions rested on "the person typed it, so they
+    # decided it", and a bare word match cannot establish that: "customers will close their
+    # account" is indistinguishable from naming a column called `close`.
     #
-    # ▲ T7 FIX ROUND (NB-2) — ONLY ONTO AN OUTCOME-FAMILY COLUMN. Typing a column name in prose
-    # used to write it durably onto the very row the leakage gate reads, undisclosed, while
-    # CLICKING Confirm on that same column was a typed 422: two doors, opposite answers, one user.
-    # The prose door is the one that closes, because it is the one nobody consented at. Nothing is
-    # hidden by it — the ticket still pins, still names the column, still labels its class, and the
-    # screen shows all of it. It simply is not a DECISION until someone acknowledges what it is.
-    if (ticket.pinned and ticket.target_column
-            and is_outcome_family(ticket.target_leakage_class)
-            and (row is None or row[1] in (None, "user_typed"))
-            and (row is None or row[2] != ticket.target_column or row[1] is None)):
-        record_target_reading(conn, intent_id=intent.intent_id, provenance="user_typed",
-                              target_ref=ticket.target_column, confirmed_by=identity.subject)
+    # So the name match keeps its two honest jobs — it is a HINT to the model, and the FALLBACK
+    # when no model is available — and it writes nothing. Nothing is hidden: the ticket still
+    # reports `pinned`, still names the column and still labels its class, and the screen shows all
+    # of it. The confirm gate is the one door, for everyone.
+    if ticket.pinned:
         counters.incr("overlay.intake.pinned")
 
     def _column_detail(ref: str | None) -> dict | None:
@@ -1528,7 +1523,7 @@ def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dic
             raise HTTPException(status_code=422,
                                 detail="target_ref is not a readable column in this catalog")
         concept_name, leakage_class = _target_class(conn, body.target_ref, body.catalog_source)
-        if not is_outcome_family(leakage_class) and not body.target_not_outcome_acknowledged:
+        if not licenses_commit(leakage_class) and not body.target_not_outcome_acknowledged:
             raise HTTPException(
                 status_code=422,
                 detail=_not_outcome_refusal(body.target_ref, concept_name, leakage_class))
@@ -1550,12 +1545,20 @@ def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dic
     # what exists is a counter and a log line carrying the class. A durable home is an owner item
     # on the ledger. What actually HOLDS is the 422 above: an unacknowledged non-outcome
     # confirmation is never recorded in the first place.
-    if body.decision in ("confirmed", "corrected") and not is_outcome_family(leakage_class):
+    if body.decision in ("confirmed", "corrected") and not licenses_commit(leakage_class):
         counters.incr("overlay.intake.target_not_outcome_acknowledged")
         logger.info(
             "non-outcome target acknowledged and confirmed: intent=%s ref=%s concept=%s class=%s "
             "by=%s", body.intent_id, body.target_ref, concept_name,
             leakage_class or "unregistered", identity.subject)
+    elif (body.decision in ("confirmed", "corrected")
+            and asserts_label_adjacency(leakage_class)):
+        # A PROXY commit passes the gate now, so it must not pass unobserved: this is the volume
+        # that used to arrive as acknowledgments, and the two are different facts about the run.
+        counters.incr("overlay.intake.target_proxy_confirmed")
+        logger.info(
+            "proxy target confirmed: intent=%s ref=%s concept=%s class=%s by=%s",
+            body.intent_id, body.target_ref, concept_name, leakage_class, identity.subject)
     return {"intent_id": body.intent_id, **(target_reading(conn, body.intent_id) or {}),
             "business_domain": sorted(body.business_domain),
             "target_concept": concept_name, "target_leakage_class": leakage_class,

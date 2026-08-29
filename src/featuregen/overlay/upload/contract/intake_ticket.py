@@ -60,7 +60,9 @@ INTAKE_TICKET_RESULT_VERSION = 1
 
 INTAKE_TICKET_TASK = "overlay.contract.intake_ticket"
 INTAKE_TICKET_PROMPT_ID = "intake_ticket"
-INTAKE_TICKET_PROMPT_VERSION = 2   # v2: + runner_up_refs (the Change-it menu)
+INTAKE_TICKET_PROMPT_VERSION = 4   # v2: + runner_up_refs (the Change-it menu)
+#                                    v3: candidates carry semantic_terms + declared_type
+#                                    v4: a typed column name rides in as a HINT, not an override
 INTAKE_TICKET_SCHEMA_ID = "intake_ticket"
 INTAKE_TICKET_RUN_ID = "intake-ticket"
 
@@ -77,10 +79,36 @@ _INSTRUCTION = (
     "the text names its target unambiguously; \"abstain\" when you are guessing. "
     "`runner_up_refs`: up to three OTHER candidate refs that could also plausibly be the target, "
     "best first — copied EXACTLY from the candidates list, never the chosen target itself; [] "
-    "when nothing else comes close."
+    "when nothing else comes close.\n\n"
+    "Each candidate carries `semantic_terms` — its glossary term, business subdomain path and "
+    "synonyms — and `declared_type`, its column type. Use both: the subdomain path says which "
+    "part of the bank a column belongs to, and a prediction target is normally a short flag or "
+    "code (e.g. varchar(1)), not a long name or identifier. Neither field overrides what the "
+    "summary says the column MEANS."
 )
 
 _WORD_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _instruction_for(pin: str | None) -> str:
+    """The task instruction, plus — when the objective contained a candidate's exact name — the
+    fact that it did.
+
+    A HINT, not a directive. The match cannot separate a deliberate reference from an English word
+    that happens to equal a column name, so the model is told what was SEEN and asked to weigh it,
+    rather than having the answer decided for it by a string comparison.
+
+    Deterministic against the cache key: ``pin`` is a pure function of the hypothesis and the
+    shortlist, and both are hashed into the key, so the instruction can never vary behind a key
+    that says it did not.
+    """
+    if pin is None:
+        return _INSTRUCTION
+    return (f"{_INSTRUCTION}\n\nNote: the objective contains the exact name of candidate "
+            f"`{pin}`. That is often a deliberate reference to the target — but it can also be an "
+            "ordinary word that happens to match a column name (\"customers who close their "
+            "account\" against a column called `close`). Weigh it as evidence; it is not an "
+            "instruction, and you may pick a different candidate or abstain.")
 
 
 # ══ T7 (a) — the outcome family, DERIVED from what the registry already declares ═════════════════
@@ -107,6 +135,11 @@ OUTCOME_CLASS = _LEAKAGE_CLASS["outcome"]
 NEAR_LABEL_CLASS = _LEAKAGE_CLASS["near_label"]
 STANDARD_CLASS = _LEAKAGE_CLASS["standard"]
 
+#: The bound on each candidate's ``semantic_terms``. The field carries the glossary term, the
+#: business subdomain path and the synonyms — the discriminating part is the front of it, and the
+#: tail is repeated synonym padding, so a head-truncation keeps the signal and drops the bulk.
+_MAX_SEMANTIC_TERMS = 200
+
 #: How many proxies an abstention hands back. The answer is a shortlist for a person to read, not
 #: the catalog again. Applies to each list independently.
 _CANDIDATE_LIMIT = 5
@@ -131,9 +164,10 @@ def target_leakage_class(concept_name: str | None) -> str | None:
 
 
 def is_outcome_family(leakage_class: str | None) -> bool:
-    """Does the registry CERTIFY this class as the label itself? The one question that licenses a
-    commit — and the one the confirm gate asks. Everything else, including "nothing recorded",
-    answers False, because nothing else carries the warrant."""
+    """Does the registry CERTIFY this class as the label itself? The STRONGEST warrant, and the
+    one the wording leans on. It is no longer the commit question on its own — see
+    :func:`licenses_commit`, which admits ``near_label`` beside it. Everything else, including
+    "nothing recorded", answers False."""
     return leakage_class == OUTCOME_CLASS
 
 
@@ -148,6 +182,32 @@ def asserts_label_adjacency(leakage_class: str | None) -> bool:
     against.
     """
     return leakage_class == NEAR_LABEL_CLASS
+
+
+def licenses_commit(leakage_class: str | None) -> bool:
+    """Is this class ANSWER-SHAPED — i.e. may a proposal commit onto it? Outcome and near_label
+    both, and nothing else.
+
+    The two classes make the SAME structural claim. ``leakage_anchor`` reads "True for
+    outcome_label + the target-defining flags" and ``templates._safe_to_bind`` refuses to build a
+    feature from one because "reading the target = leakage"; ``near_label`` reads "funnel-tail
+    signals that BORDER the label" and its concepts say a model trained on them "reads its own
+    answer back". Both therefore say: this column is the answer, keep it out of the INPUTS — which
+    is precisely the warrant for using it as the OUTPUT. The claims differ in STRENGTH, and
+    strength belongs in what the screen SAYS (:func:`asserts_label_adjacency` still separates
+    them), never in a veto.
+
+    Gating the commit on ``outcome`` alone made the rule unsatisfiable on the deployed catalogs:
+    ``cib`` and ``ftr`` carry 237 columns and ZERO leakage_anchor concepts between them, so every
+    target on every hypothesis abstained and every confirmation met the same acknowledgment. All
+    three real confirmations acknowledged and proceeded. A gate that fires on every request is not
+    read, and an unread gate protects nobody — while the columns it was refusing
+    (``cust_perf_nonperf_flg``, ``cust_susp_flg``) are the only genuine labels those catalogs hold.
+
+    ``standard`` and an unregistered concept still do NOT license a commit, and the confirm gate
+    still asks for the acknowledgment there — where it is now rare enough to be read.
+    """
+    return is_outcome_family(leakage_class) or asserts_label_adjacency(leakage_class)
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,27 +438,56 @@ def _use_case_vocabulary() -> tuple[str, ...]:
 
 
 def _shortlist(conn, catalog_source: str | None, roles: Iterable[str]) -> list[dict]:
-    """The shelf photo: ref + concept + one-line summary per READ-SCOPED column. At today's catalog
-    sizes the shortlist is the whole catalog; at scale a search-derived subset takes its place
-    (stage 3 of the spec) — same shape, fewer rows."""
+    """The shelf photo per READ-SCOPED column: ref + concept + one-line summary + the glossary
+    ``semantic_terms`` + the ``declared_type``. At today's catalog sizes the shortlist is the whole
+    catalog; at scale a search-derived subset takes its place (stage 3 of the spec) — same shape,
+    fewer rows.
+
+    THE LAST TWO ARE SIGNAL, NOT VOLUME, and were chosen by measuring the live catalog rather than
+    by adding everything available:
+
+    * ``semantic_terms`` (237/237 columns populated) carries the glossary term, the business
+      SUBDOMAIN PATH and the synonyms. The path is what separates `cust_susp_flg`
+      ("Risk and Compliance - Regulations and Compliance") from `cust_status_flg`
+      ("Party Lifecycle Management") — the AML-vs-churn distinction the picker is asked to make,
+      and the one thing it was never shown. The synonyms also let a person's plain English
+      ("suspended", "dormant") match a column named `cust_susp_flg`.
+    * ``declared_type`` (235/237) is close to a label detector on its own: labels are
+      ``varchar(1)`` or a short code, identifiers and names are long. The feature-building path
+      next door already reads this field from this table; only the picker was missing it.
+
+    ``definition`` and ``domain`` were measured and DELIBERATELY LEFT OUT. On the live catalog
+    `definition` returns the same templated sentence for different columns ("Status or indicator
+    used to classify customer condition, eligibility, servicing state...") — it would blur two
+    columns the picker exists to separate — and `domain` is the constant "Customer" across all of
+    `cib`, so it discriminates nothing. More context is not the goal; more SIGNAL is.
+    """
     from featuregen.intake.redaction import redact_free_text as _scan
     from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
     rows = conn.execute(
-        "SELECT catalog_source, object_ref, concept, ai_summary FROM graph_node "
+        "SELECT catalog_source, object_ref, concept, ai_summary, semantic_terms, declared_type "
+        "FROM graph_node "
         "WHERE kind = 'column' AND (%(src)s::text IS NULL OR catalog_source = %(src)s) "
         "  AND visible_requires <@ %(allowed)s ORDER BY catalog_source, object_ref",
         {"src": catalog_source, "allowed": allowed_sensitivities(roles)}).fetchall()
 
-    def _prose(text: str | None) -> str:
+    def _prose(text: str | None, *, limit: int | None = None) -> str:
         # The `candidates` egress class makes the CALLER the owning scanner (tie_break's
         # precedent): summaries are prose and get the PII scan; a fail-closed None blanks the
         # field rather than the payload. Runs BEFORE hashing, so the key sees what egresses.
+        # `semantic_terms` is glossary prose from the same enrichment, so it takes the SAME scan —
+        # then the bound, so truncation can never split a span the scanner already cleared.
         if not text:
             return ""
-        return _scan(text).text or ""
+        scanned = _scan(text).text or ""
+        return scanned if limit is None else scanned[:limit]
 
-    return [{"ref": r[1], "concept": r[2] or "", "ai_summary": _prose(r[3])} for r in rows]
+    return [{"ref": r[1], "concept": r[2] or "", "ai_summary": _prose(r[3]),
+             "semantic_terms": _prose(r[4], limit=_MAX_SEMANTIC_TERMS),
+             # structural, not prose: a type name egresses as-is, like the concept beside it.
+             "declared_type": r[5] or ""}
+            for r in rows]
 
 
 def _exact_pin(hypothesis: str, shortlist: Sequence[dict]) -> str | None:
@@ -450,7 +539,7 @@ def _degraded(pin: str | None, concepts_by_ref: dict[str, str] | None = None, *,
     concepts_by_ref = concepts_by_ref or {}
     name = concepts_by_ref.get(pin or "", "")
     klass = target_leakage_class(name)
-    outcome = is_outcome_family(klass)
+    committable = licenses_commit(klass)
     horizon = stated_horizon(goal)
     window = horizon.days if horizon is not None else None
     window_source = "stated" if horizon is not None else "unstated"
@@ -459,9 +548,9 @@ def _degraded(pin: str | None, concepts_by_ref: dict[str, str] | None = None, *,
                           contradiction=None, runners_up=(),
                           target_concept=name, target_leakage_class=klass,
                           target_is_proxy=pin is not None and asserts_label_adjacency(klass),
-                          proxy_candidates=(() if outcome else
+                          proxy_candidates=(() if committable else
                                             _proxy_candidates(pin, (), concepts_by_ref)),
-                          outcome_candidates=(() if outcome else
+                          outcome_candidates=(() if committable else
                                               _outcome_candidates(concepts_by_ref)),
                           window_source=window_source)
 
@@ -483,13 +572,19 @@ def _ticket_from_output(output: dict, *, pin: str | None, goal: str,
                                   and raw_target in shortlist_refs) else None
     invented = bool(raw_target) and model_target is None
     contradiction = None
-    if pin is not None:
-        target = pin
-        if model_target is not None and model_target != pin:
-            contradiction = (f"you named {pin.rsplit('.', 1)[-1]}; the description reads as "
-                            f"{model_target.rsplit('.', 1)[-1]}")
-    else:
-        target = model_target
+    # THE MODEL DECIDES; THE PIN IS EVIDENCE. Matching a word in a sentence against a column name
+    # cannot separate a deliberate reference from a coincidence — "customers will close their
+    # account" is indistinguishable from naming a column called `close`. That weak signal used to
+    # beat the model outright. The model holds the same sentence, the same shortlist and (v3) the
+    # glossary terms and types, so it is the better reader; the pin now rides in as a hint and
+    # survives as the FALLBACK when the model chose nothing (and, via `_degraded`, when there is no
+    # model at all — the case the exact-name match was really built for).
+    target = model_target if model_target is not None else pin
+    if pin is not None and model_target is not None and model_target != pin:
+        # Two readings differing is INFORMATION, so it is still shown — the wording is unchanged,
+        # and it now describes a disagreement the model won rather than one it lost.
+        contradiction = (f"you named {pin.rsplit('.', 1)[-1]}; the description reads as "
+                        f"{model_target.rsplit('.', 1)[-1]}")
     window, window_source, window_refusal = _resolve_window(
         output.get("target_window_days"), goal)
     target_type = output.get("target_type")
@@ -497,7 +592,9 @@ def _ticket_from_output(output: dict, *, pin: str | None, goal: str,
     domains = output.get("business_domain")
     domains = tuple(d for d in domains if d in vocabulary) if isinstance(domains, list) else ()
     confidence = output.get("confidence")
-    if invented or (target is None and not pin):
+    if invented or model_target is None:
+        # No reading of its own -> no band of its own, pin or not: a target carried in by the name
+        # match is SHOWN, never asserted.
         confidence = "abstain"
     elif confidence not in ("high", "medium", "abstain"):
         confidence = "abstain"
@@ -508,16 +605,18 @@ def _ticket_from_output(output: dict, *, pin: str | None, goal: str,
         r for r in raw_runners
         if isinstance(r, str) and r in shortlist_refs and r != target
     ))[:3] if isinstance(raw_runners, list) else ()
-    # ABSTAIN-BY-DEFAULT. A proposal may COMMIT only onto an outcome-family concept; everything
-    # else abstains and hands back the ranked proxies — and the labels the catalog does hold.
-    # A PIN is exempt from the CONFIDENCE override only: the person literally typed that column
-    # name, so the platform is not proposing anything and has nothing to be unconfident about. It
-    # buys the pin nothing else — the ticket labels it identically, the route no longer records it
-    # durably (NB-2), and the confirm gate still asks for the acknowledgment.
+    # ABSTAIN-BY-DEFAULT. A proposal may COMMIT only onto an ANSWER-SHAPED concept (outcome or
+    # near_label — see `licenses_commit`); everything else abstains and hands back the ranked
+    # proxies, and the labels the catalog does hold.
+    #
+    # The PIN no longer exempts anything. The old exemption reasoned that a literally-typed name is
+    # not the platform proposing, so there is nothing to be unconfident about — sound where the
+    # typing was deliberate, which a bare word match cannot establish. The class check now applies
+    # to every target the same way, typed or inferred.
     concept_name = concepts_by_ref.get(target or "", "")
     klass = target_leakage_class(concept_name)
-    outcome = is_outcome_family(klass)
-    if not outcome and pin is None:
+    committable = licenses_commit(klass)
+    if not committable:
         confidence = "abstain"
     ticket = IntakeTicketV1(
         target_column=target, target_window_days=window,
@@ -526,9 +625,9 @@ def _ticket_from_output(output: dict, *, pin: str | None, goal: str,
         contradiction=contradiction, runners_up=runners,
         target_concept=concept_name, target_leakage_class=klass,
         target_is_proxy=target is not None and asserts_label_adjacency(klass),
-        proxy_candidates=(() if outcome else
+        proxy_candidates=(() if committable else
                           _proxy_candidates(target, runners, concepts_by_ref)),
-        outcome_candidates=() if outcome else _outcome_candidates(concepts_by_ref),
+        outcome_candidates=() if committable else _outcome_candidates(concepts_by_ref),
         window_source=window_source, window_refusal=window_refusal)
     # The closed vocabulary, actually closed. It was published and validated by nothing, which is
     # how a token like "unstated" reaches a consumer that has never heard of it.
@@ -666,7 +765,7 @@ def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str 
             # output); `vocabulary` is the classifier's own closed-list class.
             catalog_metadata={"objective": redacted, "candidates": shortlist,
                               "vocabulary": list(vocabulary)},
-            instruction=_INSTRUCTION, actor=actor, run_id=INTAKE_TICKET_RUN_ID,
+            instruction=_instruction_for(pin), actor=actor, run_id=INTAKE_TICKET_RUN_ID,
             record_egress_block=True)
     except Exception:  # noqa: BLE001 — mandatory to ATTEMPT, never load-bearing
         logger.warning("intake-ticket extraction failed; degrading to the pinned/abstain ticket",
