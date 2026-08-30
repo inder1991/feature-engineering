@@ -346,12 +346,27 @@ def test_a_card_carries_its_rung_onto_the_wire_and_back(db):
     assert restored.capability_rung == card.capability_rung
     assert restored.serving_blockers == card.serving_blockers
 
-    engine_ideas = [feature for feature_set in cs.alternatives
-                    if feature_set.lens != GOVERNED_CROSS_CATALOG_LENS
-                    for feature in feature_set.features]
-    for idea in engine_ideas:
-        emitted = _idea_json(idea)
-        assert "capability_rung" not in emitted and "serving_blockers" not in emitted
+
+def test_an_option_that_computes_no_rung_emits_neither_key():
+    """BYTE IDENTITY, asserted where it cannot go vacuous. Every engine and LLM idea — and every
+    persisted pre-C2b snapshot — computes no rung, and `_idea_json` must emit neither key for one,
+    or every such option's bytes, its ``considered_content_hash`` and its ``option_id`` would all
+    move.
+
+    Asserted over a bare ``FeatureIdea`` rather than over a run's engine options: whether a given
+    seed produces any engine option is incidental, and a test whose subject can be empty proves
+    nothing on the day it is empty."""
+    from featuregen.overlay.upload.contract.gate1 import _idea_from_json, _idea_json
+    from featuregen.overlay.upload.feature_assist import FeatureIdea
+
+    plain = FeatureIdea(name="n", description="d", derives_from=[], aggregation="sum",
+                        grain_table="public.accounts")
+    assert plain.capability_rung == "" and plain.serving_blockers == ()
+    emitted = _idea_json(plain)
+    assert "capability_rung" not in emitted and "serving_blockers" not in emitted
+    # …and the reader restores the same honest absence from a payload carrying neither key
+    restored = _idea_from_json(emitted)
+    assert restored.capability_rung == "" and restored.serving_blockers == ()
 
 
 # ── 4. the card is honestly limited — asked of the ONE authority, not asserted here ────────────
