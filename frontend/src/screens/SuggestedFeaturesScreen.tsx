@@ -5,6 +5,7 @@ import {
   type FeatureSuggestionPageV2,
   type JoinNeighbourhood,
   SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+  type SemanticEngineEntry,
   type SuggestionGroupV2,
   type SuggestionOmittedCounts,
   type SuggestionSemanticBlock,
@@ -334,6 +335,14 @@ export function SuggestedFeaturesScreen({
                 {noPointInTime.length} {noPointInTime.length === 1 ? 'feature is' : 'features are'}
                 {' '}blocked
               </strong>
+              {/* A COUNT LINE COUNTS. It states the table-level fact these N rejections share —
+                  the callout is scoped to one table, and NO_POINT_IN_TIME is minted where that
+                  table's as-of lookup came back empty — and it quotes none of their sentences,
+                  because the backend writes one PER REJECTION naming that candidate's own column
+                  (feature_assist.py:2477). Quoting the first presented one column's ref as the
+                  reason for all N. Each sentence now lands in "Not offered" below, against the
+                  candidate it belongs to; the filter that used to hold them out of that list is
+                  why they had nowhere to be said in the first place. */}
               : this table has no confirmed as-of column, so every windowed feature would risk
               future leakage.
             </p>
@@ -372,18 +381,21 @@ export function SuggestedFeaturesScreen({
         </section>
       )}
 
-      {rejections.length > noPointInTime.length && (
+      {/* EVERY REJECTION SPEAKS ITS OWN SENTENCE, HERE, ONCE. The as-of ones used to be filtered
+          out — the callout above summarised them and this list withheld them, so the sentence the
+          backend wrote for each named candidate appeared nowhere on the page. The gate widened
+          with the filter: it was `> noPointInTime.length`, which hid the whole list on a page
+          whose only rejections were as-of ones. */}
+      {rejections.length > 0 && (
         <section className="panel sug-rejections">
           <h2>Not offered</h2>
           <ul className="rows">
-            {rejections
-              .filter(r => r.code !== 'NO_POINT_IN_TIME')
-              .map(r => (
-                <li className="row" key={`${r.code}:${r.candidate_name}`}>
-                  <span className="mono">{r.candidate_name}</span>{' '}
-                  <span className="hint">{r.explanation}</span>
-                </li>
-              ))}
+            {rejections.map(r => (
+              <li className="row" key={`${r.code}:${r.candidate_name}`}>
+                <span className="mono">{r.candidate_name}</span>{' '}
+                <span className="hint">{r.explanation}</span>
+              </li>
+            ))}
           </ul>
         </section>
       )}
@@ -456,21 +468,47 @@ function SemanticEngineSection({ semantic }: { semantic: SuggestionSemanticBlock
         <>
           <h3>Could be useful if…</h3>
           <ul className="rows" aria-label="recipes needing a decision">
-            {semantic.actionable.map(entry => {
-              const action = entry.verdicts.find(v => v.resolution)?.resolution
-                ?? 'no eligible binding for every required operand'
-              return (
-                <li key={entry.recipe_id}>
-                  <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
-                  <span className="badge stale">{entry.binding_state}</span>{' '}
-                  <span className="hint">{action}</span>
-                </li>
-              )
-            })}
+            {semantic.actionable.map(entry => (
+              <li key={entry.recipe_id}>
+                <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
+                <span className="badge stale">{entry.binding_state}</span>{' '}
+                <EntryAction entry={entry} />
+              </li>
+            ))}
           </ul>
         </>
       )}
     </section>
+  )
+}
+
+// T2: what an entry with no card is waiting on — THE SERVER'S ANSWER, one clause per operand that
+// did not bind, each worded from that operand's own verdict status.
+//
+// What was here before was a client-composed stand-in: "no eligible binding for every required
+// operand", used whenever no verdict carried a resolution. That sentence asserts ABSENCE over
+// every operand at once, and it is false for most of them — `ambiguous` and `blocked` both mean
+// the catalog CARRIES the concept, on columns the payload names in `tied_refs`. On the FTR fixture
+// that was 36 of 66 unbound required operands being told to onboard data they already had.
+//
+// The verdict `resolution` still leads when the server named a human action, because that is the
+// one field that says who acts next; the binder's own sentences follow it.
+function EntryAction({ entry }: { entry: SemanticEngineEntry }) {
+  const resolution = entry.verdicts.find(v => v.resolution)?.resolution ?? ''
+  const setup = entry.needs_setup
+  if (!setup) {
+    // No T2 block on the entry: say only what there is. A pre-T2 deployment and a candidate that
+    // bound everything are different facts, and neither licenses inventing a reason.
+    return resolution ? <span className="hint">{resolution}</span> : null
+  }
+  return (
+    <span className="hint">
+      {resolution && <>{resolution} · </>}
+      {setup.sentence}
+      {setup.unbound_concepts.length > 0 && (
+        <> · unbound: {setup.unbound_concepts.join(', ')}</>
+      )}
+    </span>
   )
 }
 

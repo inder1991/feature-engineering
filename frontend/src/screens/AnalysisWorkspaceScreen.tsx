@@ -229,12 +229,17 @@ function SelectionBlock({ selection }: { selection?: AnalysisSelection | null })
       )}
 
       {selection.refusals.map(r => {
-        const family = FAMILY_WORDS[r.family] ?? FAMILY_WORDS.undecided
+        // A FAMILY THIS SCREEN HAS NEVER HEARD OF ASSERTS NOTHING. The fallback used to be
+        // FAMILY_WORDS.undecided, so a newer backend's family arrived under "Nobody has decided
+        // this yet" AND "nothing is wrong with the data" — a positive claim about data health
+        // manufactured by a missing map entry. The refusal's own `detail` is still the answer;
+        // the family words simply stand down.
+        const family = FAMILY_WORDS[r.family]
         return (
           <div key={`${r.code}:${r.subjects.join(',')}`} className={`adg-open adg-${r.family}`}>
-            <p className="adg-open-heading">{family.heading}</p>
+            {family && <p className="adg-open-heading">{family.heading}</p>}
             <p className="adg-open-detail">{r.detail || words({}, r.code)}</p>
-            <p className="adg-open-who">{family.who}.</p>
+            {family && <p className="adg-open-who">{family.who}.</p>}
           </div>
         )
       })}

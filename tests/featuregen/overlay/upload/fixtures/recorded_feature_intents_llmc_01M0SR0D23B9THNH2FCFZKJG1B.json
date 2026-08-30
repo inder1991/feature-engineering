@@ -1,0 +1,280 @@
+{
+  "intents": [
+    {
+      "output": {
+        "output_id": "cust_risk_rating_snapshot",
+        "unit_kind": "rating_scale",
+        "additivity": "non_additive",
+        "output_type": "categorical",
+        "display_label": "Customer Risk Rating (As-Of Snapshot)",
+        "null_input_policy": "treat_missing_as_unknown",
+        "empty_population_policy": "return_null"
+      },
+      "operands": [
+        {
+          "role": "measured",
+          "concept": "customer_risk_rating",
+          "required": true,
+          "operand_class": "attribute"
+        },
+        {
+          "role": "as_of_anchor",
+          "concept": "as_of_date",
+          "required": true,
+          "operand_class": "temporal",
+          "temporal_role": "anchor"
+        }
+      ],
+      "temporal": {
+        "anchor_kind": "as_of_snapshot",
+        "window_basis": "as_of_date",
+        "cutoff_inclusivity": "inclusive"
+      },
+      "rationale": "Establishes the current AML risk classification of the customer as baseline context for behavioural-shift detection.",
+      "display_name": "Customer AML Risk Rating Snapshot",
+      "source_grain": "customer",
+      "operation_class": "snapshot",
+      "computation_kind": "deterministic_formula",
+      "primary_objective": "aml_cft.suspicious_transaction_monitoring",
+      "business_definition": "The customer's most recent effective AML/CFT risk rating observed as of the evaluation date.",
+      "output_grain_entity": "customer"
+    },
+    {
+      "output": {
+        "output_id": "cust_pep_flag",
+        "unit_kind": "boolean",
+        "additivity": "non_additive",
+        "output_type": "boolean",
+        "display_label": "Politically Exposed Person Indicator",
+        "null_input_policy": "treat_missing_as_false",
+        "empty_population_policy": "return_null"
+      },
+      "operands": [
+        {
+          "role": "measured",
+          "concept": "pep_flag",
+          "required": true,
+          "operand_class": "attribute"
+        }
+      ],
+      "temporal": {
+        "anchor_kind": "as_of_snapshot",
+        "window_basis": "as_of_date",
+        "cutoff_inclusivity": "inclusive"
+      },
+      "rationale": "PEP status is a standing risk amplifier that contextualises whether behavioural shifts warrant AML review.",
+      "display_name": "Customer PEP Indicator",
+      "source_grain": "customer",
+      "operation_class": "flag",
+      "computation_kind": "deterministic_formula",
+      "primary_objective": "aml_cft.suspicious_transaction_monitoring",
+      "business_definition": "Whether the customer is currently classified as a politically exposed person as of the evaluation date.",
+      "output_grain_entity": "customer"
+    },
+    {
+      "output": {
+        "output_id": "cust_new_to_bank_flag",
+        "unit_kind": "boolean",
+        "additivity": "non_additive",
+        "output_type": "boolean",
+        "display_label": "New-to-Bank Indicator",
+        "null_input_policy": "treat_missing_as_false",
+        "empty_population_policy": "return_null"
+      },
+      "operands": [
+        {
+          "role": "measured",
+          "concept": "new_to_bank_flag",
+          "required": true,
+          "operand_class": "attribute"
+        }
+      ],
+      "temporal": {
+        "anchor_kind": "as_of_snapshot",
+        "window_basis": "as_of_date",
+        "cutoff_inclusivity": "inclusive"
+      },
+      "rationale": "Recently onboarded customers have less established behavioural baselines, making shifts harder to interpret and often riskier.",
+      "display_name": "Customer New-to-Bank Indicator",
+      "source_grain": "customer",
+      "operation_class": "flag",
+      "computation_kind": "deterministic_formula",
+      "primary_objective": "payments.behaviour",
+      "business_definition": "Whether the customer is flagged as newly established with the bank as of the evaluation date.",
+      "output_grain_entity": "customer"
+    },
+    {
+      "output": {
+        "output_id": "cust_relationship_tenure_recency",
+        "unit_kind": "days",
+        "additivity": "non_additive",
+        "output_type": "numeric",
+        "display_label": "Time Since Relationship Origination",
+        "null_input_policy": "treat_missing_as_unknown",
+        "empty_population_policy": "return_null"
+      },
+      "operands": [
+        {
+          "role": "measured",
+          "concept": "origination_date",
+          "required": true,
+          "operand_class": "temporal",
+          "temporal_role": "event"
+        },
+        {
+          "role": "as_of_anchor",
+          "concept": "as_of_date",
+          "required": true,
+          "operand_class": "temporal",
+          "temporal_role": "anchor"
+        }
+      ],
+      "temporal": {
+        "anchor_kind": "as_of_snapshot",
+        "window_unit": "day",
+        "window_basis": "origination_date",
+        "cutoff_inclusivity": "inclusive"
+      },
+      "rationale": "Relationship tenure calibrates how anomalous a sudden behavioural change is for a given customer.",
+      "display_name": "Customer Relationship Tenure",
+      "source_grain": "customer",
+      "operation_class": "recency",
+      "computation_kind": "deterministic_formula",
+      "primary_objective": "payments.behaviour",
+      "business_definition": "The elapsed time between the customer's relationship origination and the evaluation date.",
+      "output_grain_entity": "customer"
+    },
+    {
+      "output": {
+        "output_id": "cust_crossborder_value_shift",
+        "unit_kind": "monetary_change",
+        "additivity": "non_additive",
+        "output_type": "numeric",
+        "display_label": "Cross-Border Payment Value Shift",
+        "null_input_policy": "treat_missing_as_unknown",
+        "empty_population_policy": "return_null"
+      },
+      "operands": [
+        {
+          "role": "context",
+          "concept": "customer_id",
+          "required": true,
+          "operand_class": "identifier"
+        }
+      ],
+      "temporal": {
+        "anchor_kind": "event_window",
+        "window_basis": "event_timestamp"
+      },
+      "rationale": "Central to the hypothesis but the closed vocabulary lacks any concept for transaction amount, currency corridor, or cross-border value; no honest deterministic operation can represent a jump in cross-border value.",
+      "display_name": "Cross-Border Payment Value Shift",
+      "source_grain": "customer",
+      "computation_kind": "conceptual_pattern",
+      "conceptual_reason": "No operand concept exists for transaction monetary value or cross-border corridor; the inventory only exposes fx_conversion_rate (a rate, not a payment value) and customer/KYC attributes. Forcing a sum/slope over available concepts would misrepresent the intended measure.",
+      "primary_objective": "aml_cft.suspicious_transaction_monitoring",
+      "business_definition": "The period-over-period change in the value of the customer's cross-border payment activity, capturing sudden jumps in cross-border flows.",
+      "output_grain_entity": "customer"
+    },
+    {
+      "output": {
+        "output_id": "cust_highrisk_country_counterparties",
+        "unit_kind": "count",
+        "additivity": "non_additive",
+        "output_type": "count",
+        "display_label": "Distinct Higher-Risk-Country Counterparties",
+        "null_input_policy": "treat_missing_as_unknown",
+        "empty_population_policy": "return_null"
+      },
+      "operands": [
+        {
+          "role": "context",
+          "concept": "customer_id",
+          "required": true,
+          "operand_class": "identifier"
+        }
+      ],
+      "temporal": {
+        "anchor_kind": "event_window",
+        "window_basis": "event_timestamp"
+      },
+      "rationale": "The hypothesis calls for counting counterparties in new or higher-risk countries, but the vocabulary has no counterparty entity nor country/geography concept.",
+      "display_name": "Distinct Higher-Risk-Country Counterparties",
+      "source_grain": "customer",
+      "computation_kind": "conceptual_pattern",
+      "conceptual_reason": "No counterparty entity or country/jurisdiction concept is present in the inventory; a distinct_count cannot be honestly grounded without a counterparty-country operand.",
+      "primary_objective": "aml_cft.suspicious_transaction_monitoring",
+      "business_definition": "The number of distinct counterparties located in new or higher-risk countries that the customer has transacted with over the recent window.",
+      "output_grain_entity": "customer"
+    },
+    {
+      "output": {
+        "output_id": "cust_payment_channel_change",
+        "unit_kind": "boolean",
+        "additivity": "non_additive",
+        "output_type": "boolean",
+        "display_label": "Sudden Payment Channel Change",
+        "null_input_policy": "treat_missing_as_unknown",
+        "empty_population_policy": "return_null"
+      },
+      "operands": [
+        {
+          "role": "context",
+          "concept": "customer_id",
+          "required": true,
+          "operand_class": "identifier"
+        }
+      ],
+      "temporal": {
+        "anchor_kind": "event_window",
+        "window_basis": "event_timestamp"
+      },
+      "rationale": "Detecting sudden channel changes requires a payment-channel concept that does not exist in the controlled vocabulary.",
+      "display_name": "Sudden Payment Channel Change Indicator",
+      "source_grain": "customer",
+      "computation_kind": "conceptual_pattern",
+      "conceptual_reason": "No concept represents payment channel or transaction medium; a flag operation would have nothing meaningful to evaluate against.",
+      "primary_objective": "payments.behaviour",
+      "business_definition": "Whether the customer exhibited an abrupt shift in the payment channels used relative to their established pattern.",
+      "output_grain_entity": "customer"
+    },
+    {
+      "output": {
+        "output_id": "cust_txn_velocity_spike",
+        "unit_kind": "count_rate",
+        "additivity": "non_additive",
+        "output_type": "numeric",
+        "display_label": "Transaction Velocity Spike",
+        "null_input_policy": "treat_missing_as_unknown",
+        "empty_population_policy": "return_null"
+      },
+      "operands": [
+        {
+          "role": "context",
+          "concept": "customer_id",
+          "required": true,
+          "operand_class": "identifier"
+        },
+        {
+          "role": "event_time",
+          "concept": "event_timestamp",
+          "required": true,
+          "operand_class": "temporal",
+          "temporal_role": "event"
+        }
+      ],
+      "temporal": {
+        "anchor_kind": "event_window",
+        "window_unit": "day",
+        "window_basis": "event_timestamp"
+      },
+      "rationale": "A velocity spike needs a transaction-event grain to count over time; the inventory exposes event timestamps but no transaction entity or transaction-count concept to aggregate.",
+      "display_name": "Transaction Velocity Spike",
+      "source_grain": "customer",
+      "computation_kind": "conceptual_pattern",
+      "conceptual_reason": "Although event_timestamp exists, there is no transaction entity or transaction event concept to count; a slope/count over the available customer-grain concepts cannot represent transaction velocity honestly.",
+      "primary_objective": "payments.behaviour",
+      "business_definition": "The degree to which the customer's rate of transactions over a recent window rises sharply above their prior baseline velocity.",
+      "output_grain_entity": "customer"
+    }
+  ]
+}

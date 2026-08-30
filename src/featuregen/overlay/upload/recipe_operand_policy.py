@@ -16,6 +16,9 @@ The semantic-compatibility half closes the "concept-compatible but banking-wrong
   that role without evidence;
 * opposing legs (one ``distinct_binding_group``) refusing to land on one physical column unless a
   governed sign authority explains how one column carries both directions;
+* T8, the half an authored group cannot express: a leg that denotes a SECOND instance of the
+  population's own entity refusing to land on the column the POPULATION's key bound — a customer
+  is never their own counterparty, whatever the concepts say;
 * a concept mismatch never binds at all — matching is the SAME two-tier matcher grounding uses
   (`templates._ranked_matches`), so authorization-status columns cannot satisfy
   settlement-status operands as a structural fact, not a policy.
@@ -41,6 +44,14 @@ AMBIGUOUS_BY_CLASS = {
 REQUIRED_OPERAND_MISSING = "REQUIRED_OPERAND_MISSING"
 ECONOMIC_ROLE_UNPROVEN = "ECONOMIC_ROLE_UNPROVEN"
 DISTINCT_BINDING_VIOLATED = "DISTINCT_BINDING_VIOLATED"
+# T8 — the same law as DISTINCT_BINDING_VIOLATED, over the pair the AUTHORED groups cannot
+# name. `distinct_binding_group` makes two SIBLING legs distinct from EACH OTHER (fan-in vs
+# fan-out); nothing made either leg distinct from the POPULATION whose feature it is, so a
+# catalog carrying one party column let the customer be their own counterparty. Kept as its own
+# code, not folded into DISTINCT_BINDING_VIOLATED: that one's remedy is a governed sign
+# representation on a shared column, and no sign convention can make a party its own
+# counterparty — one string for two remedies would be a refusal nobody can act on.
+POPULATION_DISTINCTNESS_VIOLATED = "POPULATION_DISTINCTNESS_VIOLATED"
 # SE-5 (shape half) — structural contradictions, closed. These refuse KNOWN incompatibility
 # only: a missing fact is never a shape refusal (missing evidence and contradictory evidence
 # are different conditions — plan invariant 6). Authority floors are deliberately NOT enforced
@@ -261,6 +272,111 @@ def _block_opposing_legs(final, members) -> None:
             resolution=_SIGN_BLOCK_RESOLUTION)
 
 
+# ── T8: a counterparty is not the population ──────────────────────────────────────────────────
+#
+# The audited failure: "did this customer pay a counterparty never seen before" bound its
+# counterparty operand to the population's OWN key column, because concept-compatibility was the
+# only test — the counterparty operand asks for `customer_id` and the population's key column
+# carries `customer_id`, so nothing refused. `distinct_binding_group` was the nearest existing
+# law and it could not reach this: an authored group makes SIBLING legs distinct from each other,
+# and the population is not a member of any group (the anchor is an `entity_key`, the legs are
+# `dimension`s). This rule is that law's missing half, and it derives its membership rather than
+# authoring a second list:
+#
+#   an operand that is NOT the population anchor, whose concept IDENTIFIES (registry namespace)
+#   the SAME entity the anchor identifies, denotes a DIFFERENT instance of that entity — the
+#   recipe declared two roles for one entity, which is what "counterparty" structurally IS — so
+#   it may not bind the column the anchor bound.
+#
+# Measured over the 317-recipe V2 registry this selects exactly six operand slots, and every one
+# is a counterparty leg: `in_counterparty` / `out_counterparty` (rapid_movement_passthrough),
+# `payer` / `payee` (fan_in_fan_out), `correspondent_bank` (nested_correspondent_flow) and
+# `counterparty` (screening_coverage_share). It reads no role NAME and no column name — the same
+# discipline `planner.requests._source_anchor` states for itself — so a recipe that spells a
+# counterparty leg some other way is covered anyway, and a role merely NAMED "counterparty" over
+# a different entity is not.
+_POPULATION_DISTINCTNESS_RESOLUTION = (
+    "this operand names a SECOND {entity} beside the population's own, and the only column it "
+    "could bind is {refs} — the very column the {anchor!r} operand binds as the population's "
+    "key. A party is never its own counterparty, so this operand is left UNBOUND rather than "
+    "bound to the population. Onboard (or enrich) a distinct {entity}-identifying column on the "
+    "event rows — a counterparty / payer / payee identifier — and this binds; the population's "
+    "key stays exactly where it is.")
+
+
+def population_anchor_and_distinct_roles(request) -> tuple[str | None, frozenset[str]]:
+    """``(anchor_role, roles that may not bind the anchor's column)`` for one request.
+
+    Duck-typed over BOTH binder inputs on purpose — a ``RecipeDefinitionV2`` and a
+    ``FeaturePlanningRequestV1`` carry the same four facts this reads (``operands``,
+    ``source_grain``, ``output_grain``, and each operand's declared class/concept/grains) — so
+    the live-column engine and the capability engine answer this question with ONE derivation.
+
+    The anchor comes from the planner's own ``_source_anchor``: a private symbol imported
+    deliberately, because a second "which operand is the population" derivation could drift from
+    the one the planner plans with, and then the binder and the plan would disagree about who the
+    population is. ``(None, frozenset())`` whenever the contract does not settle an anchor —
+    absence of a population declaration is not a licence to refuse."""
+    from featuregen.overlay.upload.concepts import canonical_entity, concept
+    from featuregen.overlay.upload.planner.requests import _source_anchor
+
+    _grain, anchor_role = _source_anchor(request)
+    if anchor_role is None:
+        return None, frozenset()
+    by_role = {op.role: op for op in request.operands}
+    anchor_concept = concept(by_role[anchor_role].concept)
+    if anchor_concept is None or anchor_concept.entity_link is None:
+        return anchor_role, frozenset()
+    # `canonical_entity` on BOTH sides: `counterparty_id` links the retired `counterparty`
+    # entity whose canonical form is `customer` (concepts._ENTITY_ALIAS_TARGETS), so a leg
+    # enriched with the alias and a population keyed on the successor still compare equal.
+    population_entity = canonical_entity(anchor_concept.entity_link)
+    distinct = set()
+    for operand in request.operands:
+        if operand.role == anchor_role:
+            continue
+        resolved = concept(operand.concept)
+        if resolved is None or resolved.namespace is None or resolved.entity_link is None:
+            continue                       # not an identifier, or names no entity: not a party
+        if canonical_entity(resolved.entity_link) == population_entity:
+            distinct.add(operand.role)
+    return anchor_role, frozenset(distinct)
+
+
+def _population_distinctness_refusal(operand, refused_refs, anchor_role,
+                                     *, shortlist_truncated: bool = False):
+    """The ONE refusal both engines emit — same code, same words, same unbound outcome.
+
+    ``shortlist_truncated`` rides through so the refusal never reads as an exhaustive search
+    (C6's law): this verdict says "the columns I could see and refused are these", never
+    "nothing carries this concept"."""
+    from featuregen.overlay.upload.concepts import canonical_entity, concept
+
+    resolved = concept(operand.concept)
+    entity = (canonical_entity(resolved.entity_link)
+              if resolved is not None and resolved.entity_link else operand.concept)
+    return OperandBindingVerdictV1(
+        role=operand.role, status="blocked", tied_refs=tuple(refused_refs),
+        reason_codes=(POPULATION_DISTINCTNESS_VIOLATED,),
+        resolution=_POPULATION_DISTINCTNESS_RESOLUTION.format(
+            entity=entity, refs=", ".join(refused_refs), anchor=anchor_role),
+        shortlist_truncated=shortlist_truncated)
+
+
+def _anchor_first(operands, anchor_role: str | None):
+    """The population anchor resolved BEFORE the operands that must be distinct from it.
+
+    A stable sort, so every other operand keeps its authored order; the verdict tuple is emitted
+    in authored order regardless (:func:`_in_authored_order`). Applied only when the rule has
+    something to protect, so for every other request the iteration is byte-identical to before."""
+    return sorted(operands, key=lambda op: 0 if op.role == anchor_role else 1)
+
+
+def _in_authored_order(verdicts, operands):
+    by_role = {verdict.role: verdict for verdict in verdicts}
+    return [by_role[operand.role] for operand in operands]
+
+
 def bind_v2_operands(conn, definition, *, catalog_source: str,
                      roles=()) -> tuple[OperandBindingVerdictV1, ...]:
     """Bind every operand of one V2 definition against one catalog, fail-closed. Uses the SAME
@@ -272,12 +388,28 @@ def bind_v2_operands(conn, definition, *, catalog_source: str,
     verdicts: list[OperandBindingVerdictV1] = []
     bound_by_group: dict[str, list[tuple[str, OperandBindingVerdictV1]]] = {}
 
-    for operand in definition.operands:
+    # T8: identical law to the capability engine below (one rule, two engines is a bug).
+    anchor_role, distinct_from_population = population_anchor_and_distinct_roles(definition)
+    population_refs: set[str] = set()
+
+    for operand in (_anchor_first(definition.operands, anchor_role)
+                    if distinct_from_population else definition.operands):
         probe = Need(operand.role, operand.concept, optional=not operand.required)
         ranked, _truncated = _ranked_matches(conn, cols, probe)
         # SE-5 shape half: structural contradictions filter BEFORE tie logic — a varchar
         # "amount" must neither bind a measure nor tie against the real one.
         ranked, shape_refused = _shape_filter(operand, ranked)
+        # T8, applied in the SAME place and for the same reason: the population's own key must
+        # not manufacture a tie for a counterparty leg, nor win one.
+        population_refused: tuple[str, ...] = ()
+        if operand.role in distinct_from_population and population_refs:
+            population_refused = tuple(c.object_ref for _s, c in ranked
+                                       if c.object_ref in population_refs)
+            ranked = [(s, c) for s, c in ranked if c.object_ref not in population_refs]
+        if not ranked and population_refused:
+            verdicts.append(_population_distinctness_refusal(
+                operand, population_refused, anchor_role))
+            continue
         if not ranked and shape_refused:
             # Columns with the concept EXIST but every one is structurally impossible — a
             # CONTRADICTION (blocked), not absence (unresolved): different fact, different code.
@@ -343,9 +475,14 @@ def bind_v2_operands(conn, definition, *, catalog_source: str,
             tied_refs=tuple(c.object_ref for c in tied_cols) if len(tied_cols) > 1 else (),
             tie_break_verdict_ref=verdict_ref, reason_codes=tuple(reason_codes))
         verdicts.append(binding)
+        if operand.role == anchor_role:
+            population_refs.add(col.object_ref)
         if operand.distinct_binding_group:
             bound_by_group.setdefault(operand.distinct_binding_group, []).append(
                 (operand.sign_direction_expectation, binding))
+
+    if distinct_from_population:
+        verdicts = _in_authored_order(verdicts, definition.operands)
 
     # Opposing legs: two members of one distinct group on ONE physical column is incompatible
     # unless the CATALOG carries a governed sign representation (C3 — the authored
@@ -449,7 +586,12 @@ def bind_with_capabilities(conn, request, context, capabilities):
     except (TypeError, ValueError):
         window_days = None
 
-    for operand in request.operands:
+    # T8: identical law to the live-column engine above (one rule, two engines is a bug).
+    anchor_role, distinct_from_population = population_anchor_and_distinct_roles(request)
+    population_refs: set[str] = set()
+
+    for operand in (_anchor_first(request.operands, anchor_role)
+                    if distinct_from_population else request.operands):
         # C6 — rank BEFORE truncating, with the evidence in hand: authority tier →
         # exact-concept-before-alternative → governed economic role → the user's hint →
         # stable ref order. THEN cut at the per-operand bound. The hint is a RANKING signal
@@ -468,6 +610,16 @@ def bind_with_capabilities(conn, request, context, capabilities):
 
         tiers: dict[str, list[str]] = {"eligible": [], "provisional": []}
         blocked_refs: list[tuple[str, tuple[str, ...]]] = []
+        # T8: the refs this operand may not have because the POPULATION has them. Held apart
+        # from `tiers` before the tier choice and before the exact-name narrowing, for the same
+        # reason `_shape_filter` runs before tie logic: the population's key must neither win a
+        # tier it should never have entered nor mask the honest candidate below it. Its
+        # eligibility verdict is still recorded above — the audit shows the column was looked
+        # at and found semantically fine; it is the CROSS-OPERAND law that refuses it, exactly
+        # as the opposing-legs law refuses a column both legs were eligible for.
+        population_refused: list[str] = []
+        forbidden = (population_refs
+                     if operand.role in distinct_from_population else frozenset())
         for ref in shortlist:
             capability = capabilities.get(ref)
             if capability is None:
@@ -478,7 +630,10 @@ def bind_with_capabilities(conn, request, context, capabilities):
                 window_days=window_days)
             eligibility[(operand.role, ref)] = verdict
             if verdict.status in tiers:
-                tiers[verdict.status].append(ref)
+                if ref in forbidden:
+                    population_refused.append(ref)
+                else:
+                    tiers[verdict.status].append(ref)
             elif verdict.status == "blocked":
                 blocked_refs.append((ref, verdict.reason_codes))
 
@@ -493,6 +648,14 @@ def bind_with_capabilities(conn, request, context, capabilities):
             if exact:
                 bindable = exact
         if not bindable:
+            # T8 first: a NAMED contradiction on a NAMED column outranks both "the search was
+            # bounded" and "nothing carries this concept" — and it carries the truncation fact
+            # itself, so it never reads as an exhaustive search.
+            if population_refused:
+                verdicts.append(_population_distinctness_refusal(
+                    operand, population_refused, anchor_role,
+                    shortlist_truncated=truncated))
+                continue
             # C6 rule 3: a REQUIRED operand whose shortlist was CUT and yielded no winner
             # fails closed as AMBIGUOUS-with-truncation — an incomplete search must never
             # report the confident "nothing carries this concept".
@@ -562,9 +725,14 @@ def bind_with_capabilities(conn, request, context, capabilities):
             resolution=selected_eligibility.resolution,
             shortlist_truncated=truncated)
         verdicts.append(binding)
+        if operand.role == anchor_role:
+            population_refs.add(selected_ref)
         if operand.distinct_binding_group:
             bound_by_group.setdefault(operand.distinct_binding_group, []).append(
                 (operand.sign_direction_expectation, binding))
+
+    if distinct_from_population:
+        verdicts = _in_authored_order(verdicts, request.operands)
 
     # Opposing legs: identical law to the live-column binder (one rule, two engines is a bug).
     final: list[OperandBindingVerdictV1] = list(verdicts)

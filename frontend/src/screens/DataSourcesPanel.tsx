@@ -28,13 +28,12 @@ function looksLikeReference(value: string): boolean {
   return SECRET_SCHEMES.some(scheme => value.startsWith(scheme))
 }
 
+// The server's own sentence, for every status. A 403 used to be rewritten into one fixed line
+// naming platform-admin — a second, drifting copy of the route's permission model, and wrong the
+// moment a route requires anything else. `detail` is never blank (the transport falls back to
+// statusText, then `HTTP <n>`), so there is no empty-banner case to compose around.
 function detail(err: unknown): string {
-  if (err instanceof ApiError) {
-    return err.status === 403
-      ? 'Changing data sources needs the platform-admin role. You can see them, not edit them.'
-      : err.detail
-  }
-  return String(err)
+  return err instanceof ApiError ? err.detail : String(err)
 }
 
 function CatalogRow(

@@ -1,15 +1,18 @@
 """Dedicated fenced worker for durable recipe-formula shadow work.
 
-**This worker authors BOTH expectation generations, and the work item's own declaration chooses.**
-Each generation has a complete, separate chain and they share nothing but this file:
+**This worker authors ONE expectation generation, and the work item must DECLARE it.** It once
+authored two and let the declaration choose; the v1 arm has since been retired, and this paragraph
+described the old shape long enough to mislead a live adjudication (2026-08-24) — the truth is
+``AUTHORABLE_EXPECTATION_SCHEMAS`` below, which is a one-element set, and the import block, which
+carries no v1 chain at all.
 
-* ``formula-v1`` (the UNDECLARED shape — absence IS the v1 declaration, see ``recipe_egress``) →
-  ``replay_authoring.run_authoring``, ``verify_frozen_configuration``,
-  ``recipe_expectation_validator``, ``recipe_tool_runner``, ``formula_facts``. **Byte-frozen**:
-  live work items were sealed against exactly these bytes.
 * ``formula-v2`` → ``replay_authoring_v2.run_authoring_v2_replay``,
   ``verify_frozen_configuration_v2``, ``recipe_expectation_validator_v2``,
-  ``recipe_tool_runner_v2``, ``formula_facts_v2``.
+  ``recipe_tool_runner_v2``, ``formula_facts_v2``. The ONLY authorable generation.
+* ``formula-v1`` (the UNDECLARED shape — absence WAS the v1 declaration, see ``recipe_egress``) is
+  no longer authorable here. An undeclared payload is not silently treated as v1: it terminalizes,
+  and ``EXPECTATION_SCHEMA_UNDECLARED`` is kept distinct from ``EXPECTATION_SCHEMA_UNKNOWN`` so the
+  operator learns which of the two things went wrong.
 
 **A4 increment 2's ``V2_AUTHORING_UNAVAILABLE`` terminal is GONE, and its cause with it.** It
 existed because A3 could only sibling the *non-production* ``formula/authoring.run_authoring``, so

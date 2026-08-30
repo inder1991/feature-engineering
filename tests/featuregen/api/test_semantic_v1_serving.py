@@ -80,10 +80,19 @@ def test_semantic_v1_serves_the_recipe_lens_from_the_semantic_engine(
     served = [r.message for r in caplog.records if r.message.startswith("engine served:")]
     assert len(served) == 1
     # The V2 engine decided every recipe outcome: whatever bound was served, whatever did not
-    # is a NAMED rejection — nothing silently dropped. On this catalog the V2 registry's
-    # objective scoping decides how many candidates exist; the invariant is the SOURCE.
+    # is NAMED — nothing silently dropped. On this catalog the V2 registry's objective scoping
+    # decides how many candidates exist; the invariant is the SOURCE.
     lens_names = {s["lens"] for s in body["alternatives"]}
-    assert "llm" in lens_names or len(body["alternatives"]) >= 1   # LLM lens unchanged
+    assert lens_names <= {"engine", "actionable"}      # engine lenses only, never legacy
+    # T2: this fixture IS the audit's shape — one table, six columns, and 82 of the eligible
+    # candidates want an `account_id` it does not carry. Nothing binds all of its required
+    # operands, so the engine's honest answer is the needs-setup lane and NOT a list of cards.
+    # The count is deliberately left open (the registry grows); the shape is the claim.
+    ideas, actionable, setup = (
+        int(served[0].split(f"{key}=")[1].split()[0])
+        for key in ("ideas", "actionable", "needs_setup"))
+    assert (ideas, actionable) == (0, 0)
+    assert setup > 0, "held-out candidates are counted, never silently dropped"
     rows = conn.execute(
         "SELECT source_origin, binding_state FROM semantic_candidate_observation").fetchall()
     assert rows, "the serving path persists its observations in the request transaction"

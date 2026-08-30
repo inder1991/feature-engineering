@@ -201,10 +201,28 @@ def _variant_axes(recipe):
 
 
 def _enumerate_variant_requests(ordered, redacted_hypothesis: str):
-    """B5 (GEN-03 closed): every authored parameterization is its OWN planning request —
-    bounded by the registry's authoring (≈940 total). The PRIMARY variant per recipe is the
-    deterministic hypothesis match (a "90 day" hypothesis leads with the 90-day variant) or
-    the authored-first values when nothing matches. Binding cost is folds, not queries (B6)."""
+    """T6 — ONE planning request per recipe: the PRIMARY variant, chosen exactly as B5 chose it
+    (the deterministic hypothesis match — a "90 day" hypothesis leads with the 90-day variant —
+    or the authored-first values when nothing matches).
+
+    B5 (GEN-03) made every authored parameterization its own candidate, ≈940 across the registry,
+    and the 2026-08-24 audit measured what that costs a human: 43 eligible recipes became 135
+    cards, ``transaction_amount_percentile`` alone contributing 9, and the SME kept 0 of them.
+    Three cards differing only in a window are not three offers — they are one offer with a dial,
+    and the dial was ALREADY being computed and rendered: ``_param_alternatives_text`` writes the
+    whole axis with the chosen value bracketed, and rides the surviving card as
+    ``param_alternatives``. So this stops MINTING the siblings; it does not stop showing them.
+
+    The combination is still enumerated, because the hypothesis match is a search over it, and the
+    ordering of that search decides which variant is primary. What changed is that only the winner
+    leaves. ``variant_primary`` is therefore True for every candidate the lens now emits — kept on
+    the carrier because it is what a reader checks to know a card is not a sibling, and it must
+    stay TRUE rather than quietly disappear.
+
+    ▲ The primary's own identity does not move. Same recipe, same chosen combo, same
+    ``planning_request_hash`` and ``variant_key`` as before; what changes is which candidates
+    EXIST. See the T6 OPERATOR CONSEQUENCES section of
+    ``docs/superpowers/plans/2026-08-24-serving-quality-remediation.md``."""
     from itertools import product
 
     tokens = _hypothesis_window_tokens(redacted_hypothesis)
@@ -221,9 +239,8 @@ def _enumerate_variant_requests(ordered, redacted_hypothesis: str):
             if any(isinstance(v, int) and v in tokens for v in combo.values()):
                 primary = combo
                 break
-        for combo in combos:
-            out.append((recipe, planning_request_from_recipe(recipe, parameter_values=combo),
-                        combo, combo == primary))
+        out.append((recipe, planning_request_from_recipe(recipe, parameter_values=primary),
+                    primary, True))
     return out
 
 
@@ -391,11 +408,19 @@ class V2RecipeCandidateV1:
     # temporal blocked, or nothing bound) — the activation fold keeps create_contract blocked.
     binding_plan: dict | None = None
     plan_refusals: tuple = ()
-    # B5: the variant identity — recipe_id + this candidate's exact parameter choice. Every
-    # authored parameterization is its OWN candidate; the variant key is what capture, facts,
-    # and option identity key on (recipe_id stays the DISPOSITION/review key).
+    # The variant identity — recipe_id + this candidate's exact parameter choice. The variant key
+    # is what capture, facts, and option identity key on (recipe_id stays the DISPOSITION/review
+    # key). Under B5 every authored parameterization was its OWN candidate; since T6 (2026-08-24)
+    # the lens emits ONE per recipe, at the PRIMARY variant, so `variant_primary` is True on every
+    # candidate it produces. It is kept, and kept true, because it is what a reader checks to know
+    # a card is not a sibling — a field that quietly disappeared would answer that question by
+    # silence.
     variant_key: str = ""
     variant_primary: bool = True
+    #: The whole authored axis with the chosen value bracketed ("window: 30/[90]/180") — the
+    #: siblings, as a control ON the card rather than as sibling cards. ▲ It is a LABEL today:
+    #: choosing another value means naming it in the hypothesis and re-running, because the
+    #: primary is the deterministic token match. Making it actionable is unchartered.
     param_alternatives: str = ""
     # B4: the candidate's own business definition for the card — recipes carry the authored
     # business_definition, intents carry the model's. DISPLAY ONLY: deliberately not on the
@@ -524,11 +549,17 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
     """SE-6 wire-up — LLM intents through the SAME engine as recipes: one audited structured
     call proposes ABSTRACT intents (concepts, operand classes, temporal contracts — never
     physical refs), each adapts to the neutral planning request, and the SHARED capability
-    binder decides WHICH columns serve. Returns (candidates, rejections): candidates in the
-    same V2RecipeCandidateV1 carrier the recipe lens emits, so assembly merges recipe/LLM
-    twins by semantic signature and the projection serves both origin-blind. Deterministic
-    intents project as conceptual_pattern ("formula pending") — the structural readiness
-    ceiling; no temporal PIT text is claimed (nothing was compiled from an authored recipe)."""
+    binder decides WHICH columns serve. Returns (candidates, rejections, normalizations):
+    candidates in the same V2RecipeCandidateV1 carrier the recipe lens emits, so assembly merges
+    recipe/LLM twins by semantic signature and the projection serves both origin-blind.
+    Deterministic intents project as conceptual_pattern ("formula pending") — the structural
+    readiness ceiling; no temporal PIT text is claimed (nothing was compiled from an authored
+    recipe).
+
+    ``normalizations`` rides beside ``rejections`` for the reason rejections do: the seam repaired
+    a served intent's vocabulary and the caller must be ABLE to say so. What a caller does with
+    it is the caller's (today: nothing renders it — that is T9's call, not a licence for the
+    generator to edit an answer invisibly)."""
     from featuregen.overlay.upload.feature_intent_generation import generate_feature_intents
     from featuregen.overlay.upload.feature_planning_contracts import (
         planning_request_from_feature_intent,
@@ -577,7 +608,7 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
             plan_refusals=iplan[1],
             display_definition=intent.business_definition,
             variant_key=request.source_definition_id))
-    return tuple(candidates), rejections
+    return tuple(candidates), rejections, [dict(n) for n in result.normalizations]
 
 
 __all__ = [

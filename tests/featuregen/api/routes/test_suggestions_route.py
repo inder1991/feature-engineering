@@ -373,11 +373,40 @@ def test_the_page_and_the_workbench_agree_on_binding_validity(
         assert direct[entry["recipe_id"]] == entry["binding_state"], entry["recipe_id"]
 
 
+def _adjudicate(conn, object_ref: str, concept: str) -> None:
+    """Settle ONE tie the way the `needs_setup` lane tells an operator to settle it: a
+    human-CONFIRMED concept on one of the tied columns. The binder prefers the eligible tier
+    over the provisional one, so the tie dissolves without a tie-break verdict.
+
+    This is why the fixture is not edited instead. Nothing binds on FTR because the catalog is
+    tie-pathological — `as_of_date` is carried by three columns and `account_id` by two — so
+    "give the fixture a bindable candidate" is not a matter of ADDING data; it is a matter of
+    somebody deciding, which is exactly the remedy the lane prescribes."""
+    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+    from featuregen.overlay.upload.column_authority import logical_ref_of
+
+    logical = logical_ref_of(conn, SOURCE, object_ref)
+    record_field_evidence(
+        conn, logical_ref=logical, field_name="concept", proposed_value=concept,
+        producer="human", strength="confirmed", producer_ref="user:sme",
+        source_snapshot_id="snap-test",
+        input_hash=field_input_hash(logical_ref=logical, field_name="concept",
+                                    material=concept))
+
+
 def test_the_cards_are_the_same_carrier(client, conn, ftr_catalog):  # noqa: F811
     """D4 hardens the SE-13 parity: not just "binding states agree" — the CARDS are the SAME
     carrier. Every bound entry's `card` is the projected FeatureIdea serialized by gate1's
     OWN serializer (proven by re-projecting and comparing equal), so the page and the
-    Workbench cannot render two different stories about one candidate."""
+    Workbench cannot render two different stories about one candidate.
+
+    T2 extends the parity to the OTHER outcome: a candidate the projection holds out carries a
+    `needs_setup` entry instead, from the same projection, so "no card here" is one answer both
+    surfaces give for the same reason rather than an absence each explains its own way.
+
+    The two adjudications below exist to keep the CARD half non-vacuous: without them this
+    fixture binds nothing and the card loop iterates zero times, which is a parity claim proven
+    over the empty set."""
     from featuregen.overlay.upload.candidate_assembly import assemble_candidates
     from featuregen.overlay.upload.contract.gate1 import _idea_json
     from featuregen.overlay.upload.generation_semantic_context import (
@@ -386,6 +415,12 @@ def test_the_cards_are_the_same_carrier(client, conn, ftr_catalog):  # noqa: F81
     from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
     from featuregen.overlay.upload.semantic_projection import project_assembled_set
     from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
+
+    # `custody_holding_dynamics` is two ambiguous operands away from binding; settling both
+    # ties is what turns it into a card. (Measured: 36 of this fixture's 66 unbound required
+    # operands are `ambiguous`, i.e. the concept is PRESENT and undecided.)
+    _adjudicate(conn, f"public.{TABLE}.acct_id", "account_id")
+    _adjudicate(conn, f"public.{TABLE}.as_of_dt", "as_of_date")
 
     semantic = client.get(f"{PATH}?contract_version=4", headers=_h()).json()["semantic"]
     entries = semantic["ranked"] + semantic["actionable"]
@@ -404,14 +439,31 @@ def test_the_cards_are_the_same_carrier(client, conn, ftr_catalog):  # noqa: F81
     expected = {idea.source_definition_id: _idea_json(idea)
                 for idea in (*projection.ideas, *projection.actionable_ideas)
                 if idea.source_definition_id}
-    carded = [entry for entry in entries if entry.get("card")]
-    assert carded, "the projection served at least one card for this table"
+    expected_setup = {entry.source_definition_id: entry.to_json()
+                      for entry in projection.needs_setup}
+    carded = [e for e in entries if e.get("card")]
+    assert carded, "the adjudications gave the card half something to compare"
     for entry in carded:
         card = entry["card"]
         key = card.get("source_definition_id")
         assert key in expected, key
         assert card == expected[key], \
             "one candidate, one carrier — the page serves gate1's own serialization"
+    # T2's half of the same parity: a held-out candidate carries the projection's own entry.
+    held = [e for e in entries if e.get("needs_setup")]
+    assert held, "this fixture still holds candidates out, and says so"
+    for entry in held:
+        assert not entry["card"], "a candidate is served OR held out, never both"
+        assert entry["needs_setup"] == expected_setup[
+            entry["needs_setup"]["source_definition_id"]]
+    # LEDGERED GAP, deliberately not asserted: an entry may carry NEITHER carrier. A candidate
+    # the typed gauntlet REFUSED is in `assembled.ranked` (it bound) but the projection returns
+    # it as a rejection, and this block surfaces no rejections at all — the product gap
+    # `contract.py`'s own three-section comment names. Closing it here would mean giving the
+    # V1 rejection wire shape a definition id to key on, and `cs.rejections` is hashed into the
+    # considered revision, so that is an identity move on a wire shape and belongs with T9/T10
+    # rather than riding in on a card-honesty fix. The universal that used to stand here
+    # ("every entry carries a card or a reason") over-claimed exactly that gap.
 
 
 def test_an_unknown_table_stays_a_200_payload_state(client, ftr_catalog):  # noqa: F811

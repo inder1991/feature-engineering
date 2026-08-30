@@ -432,8 +432,32 @@ describe('lineage view', () => {
     await screen.findAllByText('accounts')
     await userEvent.click(screen.getByRole('button', { name: /avg_eod_balance_30d/ }))
     const drawer = screen.getByRole('complementary', { name: 'Details' })
-    expect(within(drawer).getByText('DESIGN-CHECKED')).toBeInTheDocument()
+    const chip = within(drawer).getByText('DESIGN-CHECKED')
+    expect(chip).toBeInTheDocument()
+    expect(chip).toHaveClass('ln-flag--ok')
     expect(within(drawer).getByText(/Why: sharp balance drops precede churn/)).toBeInTheDocument()
+  })
+
+  // T9 item 5. Since T2/T3 the server derives `verification` from the recipe's readiness as well
+  // as the gauntlet, so a feature legitimately stamped UNVERIFIED is now the common case (3 of 317
+  // registry recipes can earn DESIGN-CHECKED). A soft-ok chip over that word is the same
+  // confidence-without-warrant the stamp exists to remove — the tone must follow the stamp.
+  it('an UNVERIFIED stamp is not dressed as an ok chip', async () => {
+    const stamped: api.LineageGraph = {
+      nodes: BASE.nodes.map(n =>
+        n.id === 'feature:feat_01HZX' ? { ...n, verification: 'UNVERIFIED' } : n,
+      ),
+      edges: BASE.edges,
+      truncated: false,
+    }
+    lineageGraph.mockResolvedValue(stamped)
+    render(<LineageView anchor={ANCHOR} />)
+    await screen.findAllByText('accounts')
+    await userEvent.click(screen.getByRole('button', { name: /avg_eod_balance_30d/ }))
+    const drawer = screen.getByRole('complementary', { name: 'Details' })
+    const chip = within(drawer).getByText('UNVERIFIED')
+    expect(chip).not.toHaveClass('ln-flag--ok')
+    expect(chip).toHaveClass('ln-flag--stale')
   })
 
   it('surfaces table provenance: a queue chip on the card and last-vouched + queue in the drawer', async () => {
