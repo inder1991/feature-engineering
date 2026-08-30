@@ -35,14 +35,21 @@ def _post(client, body=None):
                        json=body or _catalog_scoped_body(), headers=AUTH)
 
 
-def _without_ids(value):
-    """The response with every per-run identity removed, so two runs of the SAME request can be
-    compared for the only thing at issue here: whether the wire-up changed what is served.
+#: Everything that is minted per RUN rather than decided by the request. Two POSTs of the same body
+#: are two runs — a fresh intent, a fresh generation run, a fresh confirmed scope, fresh option ids
+#: (minted over the run's own generation identity) and a fresh server clock on every disposition
+#: stage. None of it says anything about WHAT was served, which is the only thing at issue here, so
+#: it is normalized away and everything else is compared verbatim.
+_PER_RUN_KEYS = frozenset({
+    "option_id", "intent_id", "generation_run_id", "scope_id",
+    "considered_revision_id", "considered_content_hash", "evaluated_at",
+})
 
-    Option ids are minted over the run's own generation identity, so they differ between any two
-    runs by construction and say nothing about content."""
+
+def _without_ids(value):
     if isinstance(value, dict):
-        return {key: _without_ids(inner) for key, inner in value.items() if key != "option_id"}
+        return {key: _without_ids(inner) for key, inner in value.items()
+                if key not in _PER_RUN_KEYS}
     if isinstance(value, list):
         return [_without_ids(item) for item in value]
     return value
@@ -118,6 +125,16 @@ def test_a_catalog_scoped_request_reaches_the_governed_lens_and_stays_additive(
     active_rejections = _without_ids(active.json()["rejections"])
     assert all(rejection in active_rejections for rejection in inactive_rejections)
     assert len(active_rejections) > len(inactive_rejections)
+
+    # 3. …and the STRONGEST form of the same statement: take the active response, remove exactly
+    #    what C2a added — the governed feature set and the governed refusals — and the WHOLE
+    #    payload is the inactive one, key for key. Nothing else in the response moved.
+    stripped = _without_ids(active.json())
+    stripped["alternatives"] = [feature_set for feature_set in stripped["alternatives"]
+                                if feature_set["lens"] != GOVERNED_CROSS_CATALOG_LENS]
+    stripped["rejections"] = [rejection for rejection in stripped["rejections"]
+                              if rejection.get("lens") != "governed"]
+    assert stripped == _without_ids(inactive.json())
 
 
 # ── the entity-only door is still shut, and for the reason it always was ──────────────────────
