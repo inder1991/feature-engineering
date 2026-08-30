@@ -24,6 +24,7 @@ from featuregen.overlay.upload.contract._serial import (
     requirements_from_json,
     requirements_to_json,
 )
+from featuregen.overlay.upload.contract.capability import CARD_AVAILABLE
 from featuregen.overlay.upload.contract.governed_identity import (
     DEFINITION_ORIGIN_RECIPE_V2,
     GovernedVariantIdentityV1,
@@ -722,8 +723,16 @@ def _governed_serving_rejection(recipe_id: str, reason: str) -> dict:
     return {"lens": "governed", "reason": reason, "recipe_id": recipe_id}
 
 
-def _governed_logical_plan_revision(conn, option) -> str | None:
+def _governed_logical_plan_revision(conn, option) -> tuple[str, tuple[str, ...]] | None:
     """Mint and persist the LOGICAL identity of one governed option, or ``None`` if it cannot be.
+
+    Returns ``(logical_plan_revision_id, absence_codes)``. The absences are A5's named ones —
+    ``TEMPORAL_JOIN_POLICY_MISSING`` for a crossing nobody declared temporal semantics for,
+    ``OPERAND_ROLE_UNRESOLVED`` for A6's G2 gate, ``INTRA_CATALOG_REALIZATION_NOT_PROJECTED`` for a
+    hop the logical path could not carry. They are returned rather than dropped because the SERVED
+    option is where a person reads them: an absence discovered here and discarded would have to be
+    re-derived by every consumer that wanted to say "why can't I generate this yet", and A5's whole
+    point is that the resolution already answered it.
 
     This is what arms migration 1135's planned lane. The marker on the option's decision row and
     the ``considered_option_plan_binding`` beneath it are two halves of one fact: 1135's deferred
@@ -753,7 +762,9 @@ def _governed_logical_plan_revision(conn, option) -> str | None:
             resolution = resolve_logical_plan(
                 request=option.request, plan=option.plan,
                 semantic_revisions=semantic_revisions_for_plan(conn, option.plan))
-            return ensure_logical_feature_plan(conn, plan=resolution.plan).revision_id
+            revision_id = ensure_logical_feature_plan(conn, plan=resolution.plan).revision_id
+            return revision_id, tuple(dict.fromkeys(
+                absence.code for absence in resolution.absences))
     except LogicalResolutionRefused as refusal:
         logger.info("governed option %s has no logical identity (%s) — not served",
                     option.identity.canonical_definition_id, refusal)
@@ -775,18 +786,35 @@ def _scoped_governed_cross_catalog_lens(
     be built by CROSSING out of it". It runs ALONGSIDE the engine, never instead of it, and it
     adds a feature set — it changes nothing about the one the engine produced.
 
-    THREE gates stand between a resolved governed plan and a served card, and each one is a
-    refusal rather than a filter, so an operator can see what was dropped and why:
+    THREE gates stand between a governed plan and a served card, and each one is a refusal rather
+    than a filter, so an operator can see what was dropped and why:
 
-    1. the planner's own — only a SELECTED RESOLVED contract plan becomes an option at all
-       (``governed_options_from_requests``); everything else is already a rejection;
+    1. the planner's own — a SELECTED RESOLVED contract plan becomes an option, and (C2b) so does
+       a plan refused for a PHYSICAL reason whose MEANING still resolves
+       (``governed_lens._execution_blocked_card``); everything else is already a rejection;
     2. **the ANCHOR RULE** — the served plan must READ from ``catalog_source``. Being authorized
        for catalogs Y and Z does not make a Y↔Z feature an answer to a question about X, and a
        lens that served one would be showing a person work they never asked for under a heading
-       that says they did;
+       that says they did. It applies to a card exactly as it does to a resolved option: this loop
+       does not know which kind it is holding, and must not;
     3. **the logical identity gate** — the option's meaning must be resolvable and persistable
        now (:func:`_governed_logical_plan_revision`), because migration 1135's marker is
        INSERT-only and an option served without it can never be plan-bound afterwards.
+
+    **C2b — A SOUND PLAN WITHOUT EXECUTION PROOF IS A CARD, NOT A REFUSAL.** Gate 1 used to require
+    a resolved CONTRACT, which is a physical verdict; the capability ladder says a card needs only a
+    logical plan, and A5 built exactly that resolution — it reads no cardinality, no realization
+    revision, no contract status. So a refusal that says only "the platform cannot prove how to
+    EXECUTE this crossing" now yields a card at the ``CARD_AVAILABLE`` rung carrying the registered
+    code for what is missing, while a refusal about MEANING (the roll-up cannot be expressed, an
+    operand is unbound, the concept is ungoverned) still refuses the card. The two are told apart by
+    ``governed_lens.EXECUTION_PROOF_REFUSALS``, an allow-list, so an unclassified code refuses.
+
+    The card is honestly limited and NOT quietly promoted: its ``serving_blockers`` are registered
+    ``semantic_eligibility_reasons`` codes whose disposition rows already refuse every act that
+    would compute over the crossing (``DIRECTIONAL_REALIZATION_MISSING`` warns at AUTHOR_FORMULA and
+    blocks from GENERATE_PREVIEW onward). This lane states FACTS; the six-action decision service
+    remains the only authority on what may be done with them.
 
     ``requests`` overrides the run's request set (the V2 registry's eligible primaries). It is the
     same seam ``templates`` is for the entity-scoped lane: a test states the exact request it is
@@ -807,6 +835,11 @@ def _scoped_governed_cross_catalog_lens(
         return ScopedGovernedLensV1((), (), (), ())
     options, planner_rejections = governed_options_from_requests(
         conn, requests=lens_requests, target_entity=target_entity, roles=tuple(roles), now=now,
+        # C2b: the serving lane is the one lane with a person to show a card to, so it is the one
+        # lane that asks for them. The telemetry lane deliberately does not — it measures the
+        # governed planner's RESOLUTION RATE, and counting cards there would report a frontier
+        # closing that had not moved.
+        include_execution_blocked_cards=True,
         budget=CompileBudget(
             remaining=SERVING_GOVERNED_MAX_COMPILES,
             deadline_monotonic=(time.monotonic()
@@ -824,17 +857,25 @@ def _scoped_governed_cross_catalog_lens(
             rejections.append(_governed_serving_rejection(
                 recipe_id, GOVERNED_OPTION_MISSES_REQUESTED_CATALOG))
             continue
-        revision_id = _governed_logical_plan_revision(conn, option)
-        if revision_id is None:
+        minted = _governed_logical_plan_revision(conn, option)
+        if minted is None:
             rejections.append(_governed_serving_rejection(
                 recipe_id, GOVERNED_OPTION_LOGICAL_IDENTITY_UNAVAILABLE))
             continue
-        ideas.append(option.idea)
+        revision_id, absence_codes = minted
+        # C2b: ONE blocker list per served option — the lens's PHYSICAL facts (what the contract
+        # could not prove) followed by A5's own absences (what the meaning left undeclared). Order
+        # is headline-first and deduplicated; severity is not encoded, because the disposition
+        # table decides severity and a producer that ranked them would be deciding it twice.
+        ideas.append(replace(option.idea, serving_blockers=tuple(dict.fromkeys(
+            (*option.idea.serving_blockers, *absence_codes)))))
         facts.append(decision_facts_for_governed_option(
             conn, option, context_hash=context_hash, uoa_entity=uoa_entity, spine_ref=spine_ref))
         plan_revisions.append(revision_id)
-    logger.info("governed cross-catalog lens (scoped to %s at %s grain): %d served, %d refused",
-                catalog_source, target_entity, len(ideas), len(rejections))
+    logger.info("governed cross-catalog lens (scoped to %s at %s grain): %d served (%d at the "
+                "card rung), %d refused", catalog_source, target_entity, len(ideas),
+                sum(1 for idea in ideas if idea.capability_rung == CARD_AVAILABLE),
+                len(rejections))
     return ScopedGovernedLensV1(tuple(ideas), tuple(facts), tuple(plan_revisions),
                                 tuple(rejections))
 
@@ -1818,6 +1859,15 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
     # byte-identical (the byte-identity pin holds) and engine cards carry the browsing axis.
     if getattr(f, "operation_class", ""):
         d["operation_class"] = f.operation_class
+    # C2b: the serving rung and the facts keeping this option off the higher ones. Only-when-set,
+    # the same byte-identity strategy as every additive key above — no engine or LLM idea computes
+    # a rung, so every option served before C2b keeps its exact bytes and therefore its option id.
+    # They ROUND-TRIP because they are part of the reviewed artifact: a Gate-1 reload must show the
+    # human the same "why can't I generate this yet" the served card showed.
+    if getattr(f, "capability_rung", ""):
+        d["capability_rung"] = f.capability_rung
+    if getattr(f, "serving_blockers", ()):
+        d["serving_blockers"] = list(f.serving_blockers)
     return d
 
 
@@ -2133,7 +2183,11 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         planner_declaration_id=d.get("planner_declaration_id"),
         near_label_verdict=d.get("near_label_verdict"),
         near_label_rationale=d.get("near_label_rationale", ""),
-        param_alternatives=d.get("param_alternatives", ""))
+        param_alternatives=d.get("param_alternatives", ""),
+        # C2b: absent keys (every engine/LLM option, every pre-C2b snapshot) restore the defaults —
+        # "" and (), which say "this lane computed no rung", never "nothing blocks this".
+        capability_rung=d.get("capability_rung", ""),
+        serving_blockers=tuple(str(code) for code in d.get("serving_blockers", ())))
 
 
 def _chosen_feature_from_snapshot(

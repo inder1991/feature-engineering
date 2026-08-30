@@ -38,6 +38,8 @@ from featuregen.overlay.upload import semantic_eligibility_reasons as R
 
 __all__ = [
     "ActionCapabilityV1",
+    "CARD_AVAILABLE",
+    "CONTRACT_RESOLVED",
     "CapabilityAssessmentV1",
     "CapabilityProjectionDefect",
     "CapabilityRenderMode",
@@ -46,8 +48,30 @@ __all__ = [
     "LADDER_RUNG_VIEW",
     "PRE_RESOURCE_COPY",
     "PRODUCTION_NOT_RELEASED_COPY",
+    "SERVING_RUNGS",
     "project_capabilities",
 ]
+
+
+# ── C2b: the SERVING RUNG — how far the platform's own evidence takes an option ────────────────
+#
+# Two rungs, and the distinction between them is the whole reason a cross-catalog card can exist
+# at all. A5 (`planner/logical_resolution`) resolves a feature's MEANING without reading a single
+# physical fact: an AI-proposed link nobody has realized has a complete, hashable logical identity.
+# The CONTRACT compiler asks a different question — can this be executed? — and its honest answer
+# for such a link is today's G3 refusal.
+#
+# ▲ A RUNG IS NOT A PERMISSION. It says which evidence the platform holds, never what a caller may
+# do: the six-action decision service is the only authority on that, and it decides from the
+# option's blocker CODES (which is why every code a card carries is a REGISTERED one with a
+# disposition row, never a label invented for display). A consumer renders the rung; it asks the
+# service before it enables a button.
+#: The feature's MEANING is resolved and persisted — a logical plan exists, so the option is a real
+#: card a person may read, compare and reason about. Nothing executable is proven.
+CARD_AVAILABLE = "CARD_AVAILABLE"
+#: …and the governed CONTRACT compiled too: the crossing has an executable directional realization.
+CONTRACT_RESOLVED = "CONTRACT_RESOLVED"
+SERVING_RUNGS: frozenset[str] = frozenset({CARD_AVAILABLE, CONTRACT_RESOLVED})
 
 
 class CapabilityRenderMode(StrEnum):

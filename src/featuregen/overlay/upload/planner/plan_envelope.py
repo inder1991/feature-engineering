@@ -107,6 +107,19 @@ def plan_envelope_from_result(result: BindingPlanningResultV1) -> PlanEnvelopeV1
     plan = next((p for p in result.candidate_plans if p.physical_plan_id == pid), None)
     if plan is None:
         return None
+    return plan_envelope_for(result, plan)
+
+
+def plan_envelope_for(result: BindingPlanningResultV1, plan: BindingPlanV1) -> PlanEnvelopeV1:
+    """The same projection, for a candidate the CALLER selected.
+
+    Split out for C2b, whose serving lane carries an option whose contract did NOT resolve: the
+    plan it is about is the one A5's ``select_logical_plan_candidate`` picked on the PATH verdict,
+    which need not be the contract-selected one. Everything below reads the plan it is handed and
+    the run-level identity beside it, so the two entries can never describe different plans while
+    claiming the same envelope shape. ``contract_resolution_status`` and ``contract_reason_codes``
+    are the plan's OWN — an envelope for an unresolved plan says so, verbatim, rather than being
+    withheld."""
     stamps = plan.audit_envelope.catalog_state_stamps if plan.audit_envelope is not None else ()
     return PlanEnvelopeV1(
         recipe_id=result.recipe_id, physical_plan_id=plan.physical_plan_id,

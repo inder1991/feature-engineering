@@ -31,6 +31,12 @@ that only ran the shipped requests could assert that the lens REFUSED and nothin
 go on passing if the wire-up were deleted. ``_plannable_request`` — the operand trimming
 ``test_governed_lens_requests`` already owns — is what lets these tests state what happens when a
 plan DOES resolve. Everything identity-, governance- and display-bearing about it is the registry's.
+
+▲ UPDATED BY C2b. "No V2 recipe reaches a resolved CONTRACT" is still true and still the reason for
+the injected request — but a recipe refused for a PHYSICAL reason is no longer refused as an option:
+it is served as a card at the ``CARD_AVAILABLE`` rung. §5 below states both shipped-registry
+outcomes measured against the real registry, and the C2b suite
+(``test_governed_card_without_execution_proof``) owns the split itself.
 """
 from __future__ import annotations
 
@@ -49,7 +55,9 @@ import featuregen.overlay.upload.contract.gate1 as gate1
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_evidence import record_field_evidence
+from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.contract.capability import CARD_AVAILABLE
 from featuregen.overlay.upload.contract.gate1 import (
     GOVERNED_CROSS_CATALOG_LENS,
     GOVERNED_OPTION_LOGICAL_IDENTITY_UNAVAILABLE,
@@ -109,13 +117,29 @@ def _seed_unrelated_catalog(db) -> None:
     _freshness(db, "hr")
 
 
-def _govern_the_concepts(db) -> None:
-    for catalog_source, object_ref, concept_name in _GOVERNED_CONCEPTS:
+#: The two the TRIMMED request does not bind and the SHIPPED one does. Kept separate so the suite
+#: can state both deployment conditions — every bound operand's meaning governed, and not.
+_SHIPPED_ONLY_CONCEPTS = (
+    ("ops", "public.transactions.amount", "monetary_flow"),
+    ("ops", "public.transactions.status", "booking_status"),
+)
+
+
+def _record_concepts(db, rows) -> None:
+    for catalog_source, object_ref, concept_name in rows:
         record_field_evidence(
             db, logical_ref=qualify_object_ref(catalog_source, object_ref),
             field_name="concept", proposed_value=concept_name,
             producer=EvidenceProducer.SOURCE, strength=AssertionStrength.ATTESTED,
             producer_ref="c2a-suite", source_snapshot_id="snap_c2a", input_hash="ih_c2a")
+
+
+def _govern_the_concepts(db) -> None:
+    _record_concepts(db, _GOVERNED_CONCEPTS)
+
+
+def _govern_the_shipped_requests_remaining_concepts(db) -> None:
+    _record_concepts(db, _SHIPPED_ONLY_CONCEPTS)
 
 
 def _client() -> FakeLLM:
@@ -312,27 +336,55 @@ def test_an_engine_lane_option_is_written_pre_plan(db):
 
 
 # ── 5. the shipped registry, stated honestly ──────────────────────────────────────────────────
-def test_the_shipped_registry_reaches_the_lens_and_is_refused_at_the_open_frontier(db):
-    """The wire-up is REAL for the registry as shipped, and what it produces today is refusals.
-
-    No V2 recipe reaches a resolved governed contract yet (G3 for a cross-catalog hop, G2 for an
-    intra-catalog one — both open, both charted in ``governed_lens``'s header), so a catalog-scoped
-    request served from the real registry gets governed REJECTIONS and no governed options. That is
-    the honest current state, and pinning it here means the day a recipe does resolve, this test is
-    where the change announces itself rather than a surprise in production."""
-    _seed_two_catalogs(db)
-    _govern_the_concepts(db)
-    cs = _build(db, catalog_source="ops", governed_requests=None,
-                hypothesis="the shipped registry, unmodified")
-    # explicitly NOT the injected request: plan the registry's own primary for the pinned recipe
-    cs = build_considered_set(
-        db, submit_intent(hypothesis="shipped registry run", actor="ds1"), _client(),
+def _shipped_registry_run(db, hypothesis: str):
+    """The registry's OWN primary for the pinned recipe — no injected request, no trimming."""
+    return build_considered_set(
+        db, submit_intent(hypothesis=hypothesis, actor="ds1"), _client(),
         catalog_source="ops", roles=(), is_live=True, target_entity="account", now=_NOW,
         v2_eligible_ids=frozenset({RECIPE_ID}))
+
+
+def test_the_shipped_registry_reaches_the_lens_and_is_served_as_a_card(db):
+    """The wire-up is REAL for the registry as shipped — and since C2b what it produces is a CARD.
+
+    No V2 recipe reaches a resolved governed CONTRACT yet: the cross-catalog frontier (G3) is open,
+    so the governed bridge hop carries no executable directional realization and the contract
+    refuses ``physical_cardinality_unavailable``. That refusal is about EXECUTION PROOF, not about
+    meaning — the roll-up is expressible, the operands are bound, the path resolves — so the option
+    is now served at the ``CARD_AVAILABLE`` rung carrying ``DIRECTIONAL_REALIZATION_MISSING``, and
+    the day G3 closes this test is where the promotion to ``CONTRACT_RESOLVED`` announces itself.
+
+    The full concept set is governed here rather than the three the rest of this suite needs: the
+    shipped request binds every operand the recipe declares, and A5 refuses a logical identity over
+    a column no governed semantic revision covers. That is a real deployment condition, and the
+    test below it pins the other side of it."""
+    _seed_two_catalogs(db)
+    _govern_the_concepts(db)
+    _govern_the_shipped_requests_remaining_concepts(db)
+    cs = _shipped_registry_run(db, "the shipped registry, unmodified")
+
+    (governed_set,) = _governed(cs)
+    (card,) = governed_set.features
+    assert card.source_definition_id == RECIPE_ID
+    assert card.capability_rung == CARD_AVAILABLE
+    assert R.DIRECTIONAL_REALIZATION_MISSING in card.serving_blockers
+    # the refusal the card replaced is gone: one outcome per request, never both
+    assert "physical_cardinality_unavailable" not in _reasons(cs)
+
+
+def test_the_shipped_registry_is_refused_when_an_operands_meaning_is_ungoverned(db):
+    """The other side of the condition above, and the one an operator is most likely to meet: the
+    SAME shipped request over the SAME catalogs, with concept evidence on only some of the columns
+    it binds. A card IS its logical identity, so the honest answer is a refusal that names exactly
+    that — never a card built over an operand whose meaning nobody governs."""
+    _seed_two_catalogs(db)
+    _govern_the_concepts(db)        # deliberately NOT the amount/status concepts
+    cs = _shipped_registry_run(db, "shipped registry, partly governed")
+
     assert not _governed(cs)
     governed_rejections = [r for r in cs.rejections if r.get("lens") == "governed"]
     assert [r["recipe_id"] for r in governed_rejections] == [RECIPE_ID]
-    assert governed_rejections[0]["reason"] == "physical_cardinality_unavailable"
+    assert governed_rejections[0]["reason"] == GOVERNED_OPTION_LOGICAL_IDENTITY_UNAVAILABLE
 
 
 @pytest.mark.parametrize("catalog_source", [None])

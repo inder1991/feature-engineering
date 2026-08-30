@@ -66,9 +66,16 @@ G2's ruling has to decide stays self-maintaining rather than rotting silently.
 The consequence for consumers: a request whose operands reach the planner with binding roles — the
 projection now derives them for ANY request, and an LLM intent may also declare its own — assembles
 a cross-catalog plan today. Whether it RESOLVES depends on what it stages over the bridge hop: a
-key/time-only contract resolves; a contract staging a MEASURE across the governed bridge becomes an
-evidence-bearing REJECTION naming ``physical_cardinality_unavailable``, which is the honest answer
-until G3 closes.
+key/time-only contract resolves; a contract staging a MEASURE across the governed bridge refuses
+with ``physical_cardinality_unavailable``, which is the honest answer until G3 closes.
+
+**C2b — AND THAT REFUSAL IS NOT THE END OF THE OPTION.** G3 is a PHYSICAL boundary: the meaning of
+the feature is fully stated (A5 resolves it without reading one physical fact), and what is missing
+is the proof that the crossing can be executed. So a caller that asks for it
+(``include_execution_blocked_cards``) is served such a request as a CARD at the ``CARD_AVAILABLE``
+rung carrying ``DIRECTIONAL_REALIZATION_MISSING``, instead of nothing at all. G2 is NOT such a
+boundary — the roll-up cannot be EXPRESSED — and stays a refusal. :data:`EXECUTION_PROOF_REFUSALS`
+is where that line is drawn, as an allow-list.
 """
 from __future__ import annotations
 
@@ -79,7 +86,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.catalog_realizations import key_entities_for, table_of
+from featuregen.overlay.upload.contract.capability import CARD_AVAILABLE, CONTRACT_RESOLVED
 from featuregen.overlay.upload.contract.governed_identity import (
     DEFINITION_ORIGIN_RECIPE_V2,
     GovernedVariantIdentityV1,
@@ -108,8 +117,10 @@ from featuregen.overlay.upload.planner.contracts import (
 )
 from featuregen.overlay.upload.planner.declarations import CompileBudget, build_compiler_context
 from featuregen.overlay.upload.planner.fingerprint import contract_input_hash
+from featuregen.overlay.upload.planner.logical_resolution import select_logical_plan_candidate
 from featuregen.overlay.upload.planner.plan_envelope import (
     PlanEnvelopeV1,
+    plan_envelope_for,
     plan_envelope_from_result,
 )
 from featuregen.overlay.upload.planner.requests import plan_planning_request, planning_probe
@@ -153,6 +164,44 @@ logger = logging.getLogger(__name__)
 _MAX_RATIONALE = 200
 _REPEATABLE_READ = "repeatable read"
 _LENS = "governed"
+
+
+# ── C2b: which refusals are about EXECUTION PROOF rather than about MEANING ───────────────────
+#
+# A5 (`planner/logical_resolution`) established that a feature's logical identity — what it MEANS —
+# needs no physical evidence at all: the operation, the typed operand bindings with their governed
+# semantic revisions, the ordered output grain, the selected parameters, the ordered logical
+# relationship path. A link nobody has realized has a complete, hashable meaning. So a refusal that
+# says only "the platform cannot PROVE how to execute this crossing" leaves a real feature standing,
+# and hiding it serves nobody: the operator's question is "what could I build here, and what is
+# missing", and the answer to the second half is a named, buildable piece of work.
+#
+# ▲ AN ALLOW-LIST, AND IT MUST STAY ONE. Every code NOT named here refuses the card. That direction
+# is the safe one and the permissive direction is not: a logical refusal means the feature cannot be
+# COMPUTED AT ALL (the roll-up cannot be expressed, an operand is unbound, the meaning is ungoverned)
+# and serving a card for one would offer a person work the platform can never do. Safety refusals
+# (`leakage_anchor_read`, `protected_attribute_read`, `binding_safety_rejected`), resource refusals
+# (`bounded_out_*`, `compile_budget_exhausted` — the planner stopped looking, so nothing is known
+# about the meaning), governance refusals (`unsanctioned_bridge`) and freshness refusals all fall on
+# the refusing side by being absent, and a code invented tomorrow does too.
+#
+# The VALUE is the registered `semantic_eligibility_reasons` code the served card carries — never
+# the planner's own spelling. The planner's vocabulary is an internal one with no disposition row;
+# the serving vocabulary is what `action_dispositions` folds, and a card must carry a code the
+# decision service can actually answer with (WARN at AUTHOR_FORMULA, BLOCK from GENERATE_PREVIEW
+# onward — the owner's capability matrix, which reads Allow in its Formula column under every link
+# condition).
+EXECUTION_PROOF_REFUSALS: dict[str, str] = {
+    # G3, the live boundary. The path RESOLVED source→target; the contract compiler then found the
+    # governed bridge hop carries no directional realization, so a measure staged there has no
+    # cardinality (`declarations.py`, `allow_provisional_bridge_cardinality=False`). The crossing is
+    # real, its meaning is stated, and what is missing is a realization — exactly D1's code.
+    ReasonCode.physical_cardinality_unavailable.value: R.DIRECTIONAL_REALIZATION_MISSING,
+    # The assembler found no realization for a hop at all. Named for completeness and for the day a
+    # path resolves around one: with no resolved path there is no logical plan either, so such a
+    # request keeps its original refusal — the card gate below is what decides, not this table.
+    ReasonCode.missing_realization.value: R.DIRECTIONAL_REALIZATION_MISSING,
+}
 
 
 # ── the carriers ──────────────────────────────────────────────────────────────────────────────
@@ -206,6 +255,15 @@ class GovernedOptionV1:
     # ``ordered_path`` is a display string, so a consumer handed only those would have to re-run
     # the planner to recover what this builder already held. Defaulted so no constructor moves.
     plan: BindingPlanV1 | None = None
+    # C2b: the SERVING RUNG this option is offered at, and the registered blocker code(s) behind
+    # it. `CONTRACT_RESOLVED` with no blockers is what every option this builder produced before
+    # C2b is, and it stays the default so no constructor moves; `CARD_AVAILABLE` with
+    # `DIRECTIONAL_REALIZATION_MISSING` is a card whose MEANING resolved and whose crossing has no
+    # executable realization. These are the PHYSICAL facts only — a served card's full blocker list
+    # also carries its logical resolution's absences, composed by the lane that resolves them
+    # (`gate1._scoped_governed_cross_catalog_lens`), because that is the lane that holds them.
+    capability_rung: str = CONTRACT_RESOLVED
+    serving_blockers: tuple[str, ...] = ()
 
 
 _NEUTRAL_GOVERNANCE = DefinitionGovernanceStateV1(
@@ -572,11 +630,54 @@ def governed_requests_for_scope(conn, *, eligible_recipe_ids: frozenset[str],
 
 @dataclass(frozen=True, slots=True)
 class _PlannedRequestV1:
-    """Pass 1's output for ONE request that reached a selected, resolved contract plan."""
+    """Pass 1's output for ONE request that reached a plan worth projecting.
+
+    Two ways in, and ``serving_blockers`` is the only thing that tells them apart downstream: a
+    SELECTED RESOLVED contract plan (empty — the option is `CONTRACT_RESOLVED`), or C2b's
+    execution-blocked CARD, whose path resolved and whose contract did not (the registered code
+    for the refusal). Pass 2 is deliberately identical for both: a card is a real governed option
+    projected from a real compiled plan, not a stub, and every fact on it — its identity, its
+    governance, its readiness, its role bindings — is derived the one way."""
 
     request: FeaturePlanningRequestV1
     plan: BindingPlanV1
     envelope: PlanEnvelopeV1
+    serving_blockers: tuple[str, ...] = ()
+
+
+def _execution_blocked_card(request: FeaturePlanningRequestV1,
+                            result: BindingPlanningResultV1) -> _PlannedRequestV1 | None:
+    """C2b — the option a PHYSICAL refusal still leaves standing, or ``None``.
+
+    FOUR gates, all of which must hold, and each closes a way a card could be dishonest:
+
+    1. **the refusal is about execution proof**, by the :data:`EXECUTION_PROOF_REFUSALS` allow-list
+       and its headline reason — the same ``_rejection_reason`` precedence the rejection would have
+       carried, so the card and the refusal it replaces can never disagree about why;
+    2. **a path RESOLVED source→target** — A5's ``select_logical_plan_candidate``, which selects on
+       the PATH verdict and never on the contract's. With no resolved path there is no relationship
+       to give a meaning to, so there is nothing to serve;
+    3. **the plan reports a governed OUTPUT GRAIN.** ``resolve_logical_plan`` refuses without one
+       and R9 never guesses a grain from a table name; checking here means the request keeps its
+       original, informative refusal instead of acquiring a second one about logical identity;
+    4. **every REQUIRED operand is BOUND.** A plan may resolve its path while a required operand
+       found no column, and the logical plan would then be built over the operands that DID bind —
+       a different feature wearing this one's canonical id. No shipped refusal reaches here in that
+       state (``missing_required_need`` is a logical refusal and is not on the allow-list), so this
+       is defence in depth against a future code being added to the list carelessly.
+    """
+    blocker = EXECUTION_PROOF_REFUSALS.get(_rejection_reason(result))
+    if blocker is None:
+        return None
+    plan = select_logical_plan_candidate(result)
+    if plan is None or plan.output_grain_ref is None:
+        return None
+    bound = {binding.need_role for binding in plan.ingredient_bindings}
+    if any(operand.required and operand.role not in bound for operand in request.operands):
+        return None
+    return _PlannedRequestV1(request=request, plan=plan,
+                             envelope=plan_envelope_for(result, plan),
+                             serving_blockers=(blocker,))
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,6 +692,7 @@ class _FrozenEvidenceV1:
 def governed_options_from_requests(conn, *, requests: Sequence[FeaturePlanningRequestV1],
                                    target_entity: str, roles: Sequence[str] = (),
                                    now: datetime, budget: CompileBudget | None = None,
+                                   include_execution_blocked_cards: bool = False,
                                    ) -> tuple[list[GovernedOptionV1], list[dict]]:
     """Plan every request against ONE frozen scope and split the outcomes: a SELECTED RESOLVED
     contract plan becomes a :class:`GovernedOptionV1`; anything else becomes an evidence-bearing
@@ -599,7 +701,17 @@ def governed_options_from_requests(conn, *, requests: Sequence[FeaturePlanningRe
 
     The shared setup mirrors ``gate1._governed_cross_catalog_options`` exactly: ONE catalog scope,
     ONE column snapshot (only under the REPEATABLE READ feature-generation isolation, where it is
-    meaningful), ONE compiler context, ONE run budget."""
+    meaningful), ONE compiler context, ONE run budget.
+
+    ``include_execution_blocked_cards`` (C2b) admits the SECOND kind of option: one whose refusal
+    was about EXECUTION PROOF rather than about meaning (:func:`_execution_blocked_card`). Such an
+    option is served at the ``CARD_AVAILABLE`` rung carrying the registered code for what is
+    missing, and it does NOT also appear as a rejection — an outcome is one thing or the other.
+
+    Default OFF, and that is a contract rather than caution: the telemetry lane
+    (``governed_telemetry_worker``) measures the RESOLUTION RATE of the governed planner, and a
+    lane that counted cards as resolutions would report a frontier closing that had not moved. Only
+    the SERVING lane asks for cards, because only serving has a person to show one to."""
     roles = tuple(roles)
     requests = tuple(requests)
     scope = resolve_catalog_scope(conn, roles=roles, target_entity=target_entity, now=now)
@@ -632,11 +744,17 @@ def governed_options_from_requests(conn, *, requests: Sequence[FeaturePlanningRe
             continue
         plan = _selected_resolved_plan(result)
         envelope = plan_envelope_from_result(result) if plan is not None else None
-        if plan is None or envelope is None:
-            # A resolved contract ALWAYS projects an envelope; if it cannot, fail closed.
+        if plan is not None and envelope is not None:
+            planned.append(_PlannedRequestV1(request=request, plan=plan, envelope=envelope))
+            continue
+        # A resolved contract ALWAYS projects an envelope; if it cannot, fail closed to the card
+        # gate, which asks its own four questions and answers None for anything it cannot stand
+        # behind — so an unprojectable "resolved" contract still becomes a rejection.
+        card = _execution_blocked_card(request, result) if include_execution_blocked_cards else None
+        if card is None:
             rejections.append(_rejection(request, result))
             continue
-        planned.append(_PlannedRequestV1(request=request, plan=plan, envelope=envelope))
+        planned.append(card)
 
     if not planned:
         return [], rejections
@@ -1075,6 +1193,9 @@ def _option_from(entry: _PlannedRequestV1, *, evidence: _FrozenEvidenceV1, compi
                  target_entity: str) -> GovernedOptionV1:
     """Project ONE option from the frozen batch. Pure over ``evidence`` — no read happens here."""
     request, plan, envelope = entry.request, entry.plan, entry.envelope
+    # C2b: DERIVED, never passed in. The rung is a restatement of one fact — did the contract
+    # compile? — and letting a caller state it separately would let the two disagree.
+    rung = CARD_AVAILABLE if entry.serving_blockers else CONTRACT_RESOLVED
     governance, definition = _governance_for(request, events_by_recipe=evidence.events_by_recipe)
     display_name, business_definition = _display_for(request, definition)
     identity = _variant_identity_for(request, plan, compile_ctx=compile_ctx)
@@ -1125,15 +1246,21 @@ def _option_from(entry: _PlannedRequestV1, *, evidence: _FrozenEvidenceV1, compi
         source_definition_id=identity.canonical_definition_id,
         input_role_bindings=_role_bindings(plan, evidence.pins),
         planner_applicability="applicable_cross_catalog",
-        physical_plan_id=envelope.physical_plan_id)
+        physical_plan_id=envelope.physical_plan_id,
+        # C2b: the rung rides the IDEA as well as the option, because the idea is what reaches a
+        # consumer — `_idea_json` is the wire shape, and a card that could not say it was a card
+        # would be indistinguishable from an executable option on every surface that renders one.
+        capability_rung=rung, serving_blockers=entry.serving_blockers)
     return GovernedOptionV1(
         idea=idea, request=request, identity=identity, governance=governance,
         readiness=readiness, display_name=display_name,
         business_definition=business_definition, unmapped_requirement_codes=unmapped,
-        plan_facts=_plan_facts(plan), plan=plan)
+        plan_facts=_plan_facts(plan), plan=plan,
+        capability_rung=rung, serving_blockers=entry.serving_blockers)
 
 
 __all__ = [
+    "EXECUTION_PROOF_REFUSALS",
     "REQUIREMENT_BUILDER_CODES",
     "DefinitionGovernanceStateV1",
     "GovernedOptionV1",

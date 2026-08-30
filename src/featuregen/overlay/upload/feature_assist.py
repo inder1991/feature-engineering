@@ -1775,6 +1775,22 @@ class FeatureIdea:
     #    what it reasoned from. Only the columns are checked — they must exist in the offered
     #    candidate set — and nothing checks the claim itself, which is why nothing may rest on it.
     grounding: tuple[GroundingNote, ...] = ()
+    # ── C2b: the SERVING RUNG this option is offered at, and the FACTS keeping it off the higher
+    #    ones. `capability_rung` is one of `contract/capability.SERVING_RUNGS` ("" for every option
+    #    served by a lane that does not compute one — every engine and LLM idea, and every
+    #    persisted pre-C2b snapshot). `serving_blockers` are REGISTERED
+    #    `semantic_eligibility_reasons` codes, verbatim and unordered-by-severity, so the six-action
+    #    decision service can fold them: a card served because its meaning resolved but its
+    #    crossing has no executable realization carries `DIRECTIONAL_REALIZATION_MISSING`, and the
+    #    disposition table (WARN at AUTHOR_FORMULA, BLOCK from GENERATE_PREVIEW onward) is what
+    #    turns that into an answer.
+    #
+    #    ▲ FACTS, NEVER A VERDICT. Nothing here says an action is allowed or refused, and no
+    #    consumer may read it as though it did — the same law `logical_resolution.serving_action_
+    #    facts` states for the absences it projects. Both are defaulted and emitted only when set,
+    #    so every existing idea's persisted bytes and option id are unchanged.
+    capability_rung: str = ""
+    serving_blockers: tuple[str, ...] = ()
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:

@@ -208,10 +208,13 @@ def decision_facts_for_governed_option(conn, option, *, context_hash: str,
         "computation_kind": request.computation_kind,
         "planning_request_hash": identity.planning_request_hash,
         "parameter_values": [[name, repr(value)] for name, value in request.parameter_values],
-        # The governed builder only ever returns an option for a SELECTED RESOLVED contract plan
-        # (anything else is an evidence-bearing rejection that never reaches this producer), and
-        # every required operand of such a plan is bound. There is no unbound governed option to
-        # describe, so the state is not re-derived from a weaker signal.
+        # Every governed option this producer sees has EVERY REQUIRED OPERAND BOUND, and that is
+        # structural on both paths into it: a SELECTED RESOLVED contract plan has bound them all by
+        # construction, and C2b's execution-blocked CARD is refused outright unless it has
+        # (`governed_lens._execution_blocked_card`'s fourth gate — a logical identity built over
+        # the operands that happened to bind would be a different feature wearing this one's
+        # canonical id). There is no unbound governed option to describe, so the state is not
+        # re-derived from a weaker signal.
         "binding_state": "bound",
         # The governed path has no per-role confirmation funnel: authority is MEASURED from the
         # resolution pins (`_role_bindings`) and re-measured at the durable write by C2's floors,
