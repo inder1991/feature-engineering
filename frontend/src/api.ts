@@ -1811,10 +1811,13 @@ export interface IntakeResp {
 // + vocabulary + prompt version), so re-asking the same question is free.
 export function contractIntake(
   hypothesis: string,
-  opts: { catalogSource?: string } = {},
+  opts: { catalogSource?: string, objective?: string } = {},
 ): Promise<IntakeResp> {
   return post('/contract/intake', {
     hypothesis,
+    // The prediction goal is where the horizon is written ("in the next 90 days"); without it the
+    // reading has no window and the leakage checks that need one cannot run.
+    objective: opts.objective ?? '',
     catalog_source: opts.catalogSource ?? null,
   })
 }

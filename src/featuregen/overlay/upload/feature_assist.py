@@ -1813,6 +1813,19 @@ def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
             for cs, ref, add, unit, cur, concept, table in rows if (cs, ref) in wanted}
 
 
+def _target_concepts(conn, target_ref: str) -> frozenset[str]:
+    """Every concept the declared TARGET ref carries. Usually one; a frozenset because a ref can
+    resolve in more than one catalog and a leak against either is still a leak.
+
+    Read as a set rather than a scalar for the same reason `_column_meta` scopes to exact pairs: a
+    guess about which catalog the target came from is not a safety answer.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT concept FROM graph_node WHERE kind = 'column' AND object_ref = %s "
+        "AND concept IS NOT NULL AND concept <> ''", (target_ref,)).fetchall()
+    return frozenset(r[0] for r in rows)
+
+
 # Aggregation words that REQUIRE a numeric measure (ratio/mean/sum/…); count/count_distinct do not.
 _NUMERIC_OP_WORDS = ("sum", "total", "avg", "average", "mean", "ratio", "rate", "net_",
                      "percent", "pct", "std", "variance", "median")
@@ -2386,6 +2399,23 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                   _gt.column_dependency_key(src, d), {"currency": meta[d]["currency"]})
     if target_ref and target_ref in derives:
         return _reject(RejectCode.LEAKAGE, "leaks target")
+    # ...and the same thing under a SECOND NAME. The ref match caught one column; two columns
+    # carrying ONE concept are the registry's own statement that they measure the same thing, so a
+    # model handed one to predict the other reads its answer back (`susp_flg` predicted from
+    # `blacklist_flg`, both `restriction_status`, on the live CIB catalog).
+    #
+    # DELIBERATELY NARROW — concept EQUALITY with the declared target, never a class ban. The 13
+    # `near_label` concepts are TARGET-RELATIVE: `recovery_amount` leaks against a default label and
+    # is an ordinary predictor for a recovery model, so refusing the class outright would delete
+    # legitimate features. What survives every target is "this column IS the target's concept".
+    # The wider "is this feature approximately the label?" question is the near-label critic's, and
+    # it needs a signed label window to answer at all.
+    if target_ref and any(meta.get(d, {}).get("concept") for d in derives):
+        target_concepts = _target_concepts(conn, target_ref)
+        for d in derives:
+            carried = meta.get(d, {}).get("concept")
+            if carried and carried in target_concepts:
+                return _reject(RejectCode.LEAKAGE, f"leaks target concept {carried}")
     if now is not None:
         for src in {p[0] for p in pairs}:
             wm = drift_watermark(conn, src)

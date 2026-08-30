@@ -135,7 +135,6 @@ function initialViewReasonText(code: string): string {
 // Phase-2B: the CLOSED modelling-context vocabulary the human may confirm/add at Gate #1. Hardcoded
 // FRONTEND-side (mirrors RANK_REASON_TEXT), tracking the backend's stable 8-member MODELLING_CONTEXTS
 // set. A SOFT dimension: these are ranking nudges only — nothing here narrows scope or rejects a recipe.
-const MODELLING_CONTEXT_OPTIONS = ['ifrs9', 'frtb', 'xva', 'lcr', 'nsfr', 'lgd', 'irrbb', 'ftp'] as const
 // Display text for the ranker's per-recipe SOFT-dimension signal warnings, mapped IN THE FRONTEND
 // (never backend text). A warning is presentation-only — a badge the human sees, never a rejection.
 // An unknown code from a newer backend still renders as words (humanizeCode), never breaks the client.
@@ -239,6 +238,21 @@ const LEAKAGE_CLASS_LINE: Record<string, string> = {
 const LEAKAGE_UNREGISTERED_LINE =
   'This column carries no registered concept, so nothing certifies it as an outcome label — and '
   + 'absence is not an assertion the other way either.'
+
+// WHERE THE READING CAME FROM. The server has always returned `reason` and the client has always
+// typed it; nothing rendered it, so four very different situations looked identical on screen — and
+// two of them mean the model never ran at all. A fast answer then reads as "the backend did
+// nothing", and a DEGRADED answer reads as "the model considered this and was not confident",
+// which is a claim nobody made. `extracted` is the ordinary case and says nothing: a line on every
+// normal reading is noise, and noise is how the two that matter get missed.
+const INTAKE_REASON_LINE: Record<string, string> = {
+  replayed: 'Cached answer from an identical question — no new analysis was run. Change the '
+    + 'hypothesis or the goal to ask again.',
+  unavailable: 'The model could not be reached, so this reading is from pattern matching only. '
+    + 'It is not a judgement about your hypothesis.',
+  call_ceiling: 'The analysis budget for this run is spent, so this reading is from pattern '
+    + 'matching only. It is not a judgement about your hypothesis.',
+}
 
 // T7 (b) — where the label window came from, or why there is none. Four outcomes, four sentences,
 // and NO INVENTED NUMBER anywhere: a `stated` source with `target_window_days: null` is the
@@ -636,8 +650,14 @@ function TargetTicketFacts({ intake }: { intake: IntakeResp }) {
   // class off `proxy_candidates` by position would break silently if either list were reordered,
   // so it is looked up by ref — and an absent entry renders as absent, never as 'standard'.
   const classByRef = new Map(t.proxy_candidates.map(c => [c.ref, c.leakage_class]))
+  const reasonLine = INTAKE_REASON_LINE[intake.reason]
   return (
     <div style={{ display: 'grid', gap: 6 }} data-role="target-facts">
+      {reasonLine !== undefined && (
+        <p className="hint" role="status" style={{ margin: 0 }} data-role="intake-reason">
+          {reasonLine}
+        </p>
+      )}
       {/* T7 (b): a contradiction is the SERVER's typed refusal and names both numbers. Rendered
           verbatim — a screen that re-derived "90 vs 0" would be quoting itself. */}
       {t.window_refusal !== null ? (
@@ -1542,7 +1562,12 @@ export function WorkbenchScreen() {
   // the recognizer's proposal, editable, and threaded into BOTH confirm and broaden as ranking nudges
   // (never a scope-narrowing filter). `signalWarnings` is the scoped response's per-recipe warning map
   // (recipe_id -> codes), present only when the ranking flag is on; presentation-only, never a rejection.
-  const [scopeContexts, setScopeContexts] = useState<string[]>([])
+  // The signed label window, EDITABLE. It was the one signed field nobody could correct, and it is
+  // the input the near-label leakage critic runs on — so a wrong or absent window switched that
+  // check off with no way to put it right. The server's own contradiction refusal ends "state the
+  // horizon on the confirm screen"; this is the control that instruction always assumed.
+  // Held as a STRING so an emptied box is "no window" rather than 0 — a 0-day window is a claim.
+  const [windowDraft, setWindowDraft] = useState('')
   const [scopeEntity, setScopeEntity] = useState<string | null>(null)
   // B10 — the unit-of-analysis confirmation: the server DERIVES a proposal from the signed
   // target's table grain; the human answers yes/no (or picks from the catalog's realistic
@@ -2166,10 +2191,12 @@ export function WorkbenchScreen() {
     setIntakeAck(null)
     setIntakeAcknowledged('')
     const intakeSeq = seq
-    contractIntake(hypothesis.trim(), { catalogSource: source.trim() || undefined })
+    contractIntake(hypothesis.trim(),
+                   { catalogSource: source.trim() || undefined, objective })
       .then(resp => {
         if (intakeSeq !== generateSeq.current) return
         setIntake(resp)
+        setWindowDraft(resp.ticket.target_window_days?.toString() ?? '')
         // A pinned name is already recorded server-side (user_typed, no click needed): thread it
         // into the manual field so the considered-set request carries what the server signed.
         if (resp.ticket.pinned && resp.ticket.target_column) setTarget(resp.ticket.target_column)
@@ -2191,7 +2218,7 @@ export function WorkbenchScreen() {
       setScopeExpansion('exact')
       // Phase-2B: seed the SOFT dimensions from the recognizer's proposal — the human confirms or
       // overrides them below before confirm/broaden. Empty/null when the recognizer proposed none.
-      setScopeContexts(rec.modelling_contexts)
+
       setScopeEntity(rec.target_entity)
     } catch (err) {
       if (seq !== generateSeq.current) return
@@ -2224,7 +2251,7 @@ export function WorkbenchScreen() {
       const t = intake.ticket
       const reading = await contractIntakeTarget(intake.intent_id, decision, {
         targetRef: decision === 'exploring' ? undefined : ref,
-        targetWindowDays: t.target_window_days ?? undefined,
+        targetWindowDays: windowDraft.trim() === '' ? undefined : Number(windowDraft),
         targetType: t.target_type !== 'abstain' ? t.target_type : undefined,
         businessDomain: t.business_domain,
         catalogSource: source.trim() || undefined,
@@ -2298,7 +2325,7 @@ export function WorkbenchScreen() {
           expansion: scopeExpansion,
           unscoped: false,
           // SOFT dimensions the human confirmed/overrode: ranking nudges only, never a scope filter.
-          modellingContexts: scopeContexts,
+          modellingContexts: [],
           targetEntity: scopeEntity,
           uoaEntity: uoaChoice?.entity ?? null,
           spineRef: uoaChoice?.spine_ref ?? null,
@@ -2347,7 +2374,7 @@ export function WorkbenchScreen() {
           expansion: 'exact',
           unscoped: true,
           // Dimensions are SOFT ranking nudges that still apply to the broadened (unscoped) set.
-          modellingContexts: scopeContexts,
+          modellingContexts: [],
           targetEntity: scopeEntity,
           // Confirmed DATA orthogonal to use-case scoping — a broaden does not forget it.
           uoaEntity: uoaChoice?.entity ?? null,
@@ -2481,7 +2508,7 @@ export function WorkbenchScreen() {
           rec.candidates.filter(c => c.relationship === 'secondary')
             .map(c => c.use_case_id))
         setScopeExpansion('exact')
-        setScopeContexts(rec.modelling_contexts)
+  
         setScopeEntity(rec.target_entity)
         return
       }
@@ -3397,11 +3424,12 @@ export function WorkbenchScreen() {
               before.
 
               ▲ T7 (c), NB-2: the shows-doesn't-gate PIN path is now OUTCOME-FAMILY ONLY. The
-              server stopped recording a literally-typed non-outcome column durably — typing a name
-              in prose used to write it onto the very row the leakage gate reads, undisclosed,
-              while CLICKING confirm on that same column was a refusal. So "you named it, already
-              recorded" may only be said where the record actually exists; every other pin falls
-              through to the confirm gate below, which asks for the acknowledgment out loud. */}
+              server writes NOTHING for a typed name, in any class — a bare word match cannot tell
+              a deliberate reference from an English word that happens to equal a column name, so
+              it is a hint to the reader and a fallback when there is no model, never a decision.
+              "You named it, already recorded" could therefore no longer be said of anything, and
+              the branch that said it is gone: every pin falls through to the confirm gate below,
+              which asks out loud. The ticket still reports the match and the class. */}
           {intake !== null && (
             <div className="scope-target" data-role="intake-target" style={{ marginTop: 16 }}>
               <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
@@ -3435,6 +3463,18 @@ export function WorkbenchScreen() {
                         <> <span className="badge stale">proxy for the outcome</span></>
                       )}
                     </p>
+                    {/* The window is part of what was SIGNED, and it is the input the near-label
+                        leakage critic runs on — without one, that check abstains on every
+                        candidate. It was rendered on the draft and then dropped here, so the fact
+                        that says whether the check can run at all vanished at the moment it began
+                        to matter. Absence is stated WITH its consequence, never left blank. */}
+                    <p className="hint" style={{ margin: 0 }} data-role="signed-window">
+                      {intakeReading.target_window_days !== null
+                        ? `Label window: ${intakeReading.target_window_days} days — recorded with `
+                          + 'your decision.'
+                        : 'No label window recorded. Leakage checks that compare a feature against '
+                          + 'the label over time cannot run without one.'}
+                    </p>
                     {intakeAcknowledged !== '' && (
                       <p className="hint" style={{ margin: 0 }} data-role="acknowledged">
                         You acknowledged: {intakeAcknowledged}
@@ -3442,12 +3482,6 @@ export function WorkbenchScreen() {
                     )}
                   </div>
                 )
-              ) : intake.ticket.pinned && intake.ticket.target_column
-                  && intake.ticket.target_leakage_class === 'outcome' ? (
-                <p role="status" style={{ margin: 0 }}>
-                  Target: <code>{intake.ticket.target_column}</code> ✓ (you named it) — edit the
-                  target field above to change it.
-                </p>
               ) : intake.ticket.target_column !== null ? (
                 <div style={{ display: 'grid', gap: 8 }}>
                   <p style={{ margin: 0 }}>
@@ -3465,6 +3499,21 @@ export function WorkbenchScreen() {
                     </p>
                   )}
                   <TargetTicketFacts intake={intake} />
+                  <div className="field" style={{ maxWidth: 220 }}>
+                    <label htmlFor="wb-label-window">Label window (days)</label>
+                    <input
+                      id="wb-label-window"
+                      type="number"
+                      min={0}
+                      value={windowDraft}
+                      onChange={e => setWindowDraft(e.target.value)}
+                      disabled={intakeBusy}
+                    />
+                    <p className="hint" style={HELP_STYLE}>
+                      How far ahead you are predicting. Leakage checks that compare a feature
+                      against the label over time need this; leave it blank if there is no horizon.
+                    </p>
+                  </div>
                   {intake.ticket.contradiction !== null && (
                     <p className="hint" role="alert" style={{ margin: 0 }}>
                       Heads up: {intake.ticket.contradiction}.
@@ -3577,45 +3626,24 @@ export function WorkbenchScreen() {
               )}
             </div>
           )}
-          {/* Phase-2B SOFT dimensions (modelling context + prediction grain). Rendered whenever a
-              recognition has landed — dimensions can be proposed WITHOUT a use-case — so it lives
-              OUTSIDE the primary/no-primary branch. These are ranking nudges ONLY: editing them
-              never narrows the scope and never rejects a recipe. */}
+          {/* Phase-2B SOFT dimension: the prediction grain. Rendered whenever a recognition has
+              landed — a dimension can be proposed WITHOUT a use-case — so it lives OUTSIDE the
+              primary/no-primary branch. A ranking nudge ONLY: editing it never narrows the scope
+              and never rejects a recipe.
+
+              THE MODELLING-CONTEXT CONTROL WAS REMOVED. Its only consumer is the ranker's
+              `modelling_context_fit`, and ranking is behind `FEATUREGEN_INTENT_RANKING`, unset in
+              this deployment — so the field was collected from people and read by nothing that
+              changes what they see. The SEEDING went with the control, deliberately: leaving the
+              recogniser's proposal to ride through an absent control would have written an LLM
+              guess into `confirmed_scope_dimension` as a human-confirmed value, which is the one
+              thing that record must never say. The recogniser's PROPOSAL is untouched and still
+              recorded on `intent_recognition_attempt`; what is gone is any claim a human reviewed
+              it. Restoring the control is the way to restore the confirmed rows — not re-seeding
+              behind a screen nobody can see. */}
           <div className="scope-dimensions" style={{ marginTop: 16 }}>
-            <h3 style={{ margin: '0 0 8px' }}>Modelling context &amp; entity (optional)</h3>
-            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-              {scopeContexts.map(ctx => (
-                <span
-                  key={ctx}
-                  className="badge"
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
-                >
-                  {ctx}
-                  <button
-                    type="button"
-                    className="btn"
-                    aria-label={`Remove context ${ctx}`}
-                    onClick={() => setScopeContexts(prev => prev.filter(c => c !== ctx))}
-                  >
-                    Remove
-                  </button>
-                </span>
-              ))}
-              <select
-                aria-label="Add modelling context"
-                value=""
-                onChange={e => {
-                  const ctx = e.target.value
-                  if (ctx) setScopeContexts(prev => (prev.includes(ctx) ? prev : [...prev, ctx]))
-                }}
-              >
-                <option value="">Add context…</option>
-                {MODELLING_CONTEXT_OPTIONS.filter(o => !scopeContexts.includes(o)).map(o => (
-                  <option key={o} value={o}>{o}</option>
-                ))}
-              </select>
-            </div>
-            <div className="field" style={{ marginTop: 12, maxWidth: 320 }}>
+            <h3 style={{ margin: '0 0 8px' }}>Target entity (optional)</h3>
+            <div className="field" style={{ maxWidth: 320 }}>
               <label htmlFor="wb-scope-entity">Target entity</label>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <input
@@ -3634,7 +3662,7 @@ export function WorkbenchScreen() {
             </div>
             {recognition.warnings.length > 0 && (
               <p className="hint" role="status" style={{ marginTop: 8 }}>
-                We couldn't map part of what you described to a known context or entity.
+                We couldn't map part of what you described to a known entity.
               </p>
             )}
           </div>
