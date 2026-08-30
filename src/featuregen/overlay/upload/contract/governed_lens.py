@@ -199,6 +199,13 @@ class GovernedOptionV1:
     # `derives_pairs` is a SORTED read set, whose first entry is the alphabetically-first catalog
     # rather than the anchor. Defaulted so no other constructor moves.
     plan_facts: dict = field(default_factory=dict)
+    # C2a: the SELECTED RESOLVED plan this option was projected from, carried rather than
+    # re-planned. The serving lane must mint the option's LOGICAL identity
+    # (:func:`~planner.logical_resolution.resolve_logical_plan`) inside the same request, and that
+    # derivation needs the plan OBJECT — ``plan_facts`` is a summary and the envelope's
+    # ``ordered_path`` is a display string, so a consumer handed only those would have to re-run
+    # the planner to recover what this builder already held. Defaulted so no constructor moves.
+    plan: BindingPlanV1 | None = None
 
 
 _NEUTRAL_GOVERNANCE = DefinitionGovernanceStateV1(
@@ -1123,7 +1130,7 @@ def _option_from(entry: _PlannedRequestV1, *, evidence: _FrozenEvidenceV1, compi
         idea=idea, request=request, identity=identity, governance=governance,
         readiness=readiness, display_name=display_name,
         business_definition=business_definition, unmapped_requirement_codes=unmapped,
-        plan_facts=_plan_facts(plan))
+        plan_facts=_plan_facts(plan), plan=plan)
 
 
 __all__ = [

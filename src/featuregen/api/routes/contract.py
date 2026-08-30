@@ -853,11 +853,20 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
 
     disposition_applicability = v2_applicability_as_result(scope)
     now = datetime.now(UTC)
-    # 3C.2a: the resolved live-activation boolean threads into the builder so the governed cross-catalog
-    # lens runs ONLY when the deployment is flag-on-and-approved (short-circuits to False when the flag is
-    # unset — no DB query). ``target_entity`` is the confirmed-scope grain the governed planner plans to,
-    # exactly the entity the log-only shadow planner already uses below.
-    is_live = is_live_cross_catalog_enabled(conn)
+    # 3C.2a / C2a: THE ONE cross-catalog activation verdict for this request, resolved HERE and
+    # threaded — the builder never reads the env flag, and nothing below asks a second time. It is
+    # the FULL H1c interlock (``cross_catalog_grounding_enabled``): the
+    # ``FEATUREGEN_INTENT_LIVE_CROSS_CATALOG`` flag, the durable per-deployment activation approval
+    # over a PASS evaluation at the current version vector, AND the signed 3C gate artifact where
+    # that enforcement is deployed. All three, or the governed lens does not run. It short-circuits
+    # to False on the unset flag with NO database query, so a flag-off deployment pays nothing and
+    # is served a byte-identical response.
+    #
+    # C2a made this verdict load-bearing on the SCOPED path: it now also gates the governed
+    # cross-catalog lens that runs alongside the engine for a request naming a catalog
+    # (``build_considered_set``'s fourth arm). ``target_entity`` is the confirmed-scope grain that
+    # lens plans to, exactly the entity the log-only shadow planner already uses below.
+    is_live = cross_catalog_grounding_enabled(conn)
     # Delivery C0 Task 5: anchor the metadata snapshot to THIS run (the scoped path already minted it
     # in step 4). A projection-lagged catalog aborts the whole considered set — feature generation must
     # not proceed on a stale projected view — surfaced as 503 CATALOG_PROJECTION_UNAVAILABLE.

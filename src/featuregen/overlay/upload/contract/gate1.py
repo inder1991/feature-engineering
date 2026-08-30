@@ -119,6 +119,29 @@ def _ground_template_outcomes(*args, **kwargs):
 # more than one catalog (which has NO such plan) can never be a recommendation — it is surfaced as a
 # rejection carrying this reason string instead.
 GOVERNED_CROSS_CATALOG_PLAN_REQUIRED = "governed_cross_catalog_plan_required"
+
+# ── C2a: the governed cross-catalog lens on a CATALOG-SCOPED request ──────────────────────────
+#: The lens name the additive governed feature set is served under. Deliberately its OWN name
+#: rather than the engine's: the two sets are produced by different planners under different
+#: authority, and a caller must be able to tell which it is holding without inspecting a feature.
+GOVERNED_CROSS_CATALOG_LENS = "governed_cross_catalog"
+#: THE ANCHOR RULE. A request scoped to catalog X asked about X. A governed plan the caller is
+#: authorized for but that never touches X answers a question nobody asked, so it is refused
+#: rather than served — authorization is not relevance, and a feature spanning only Y and Z
+#: appearing under a request for X is exactly the surprise this rule exists to make impossible.
+GOVERNED_OPTION_MISSES_REQUESTED_CATALOG = "governed_option_misses_requested_catalog"
+#: A governed plan that RESOLVED but whose LOGICAL identity could not be minted or persisted, so
+#: migration 1135's planned-lane marker cannot be armed for it. Serving it anyway would produce a
+#: card that can never be plan-bound (``binding_chain.bind_considered_option_plan`` refuses an
+#: unmarked option) — a dead end discovered at drafting rather than here. Fail closed instead.
+GOVERNED_OPTION_LOGICAL_IDENTITY_UNAVAILABLE = "governed_option_logical_identity_unavailable"
+#: The wall-clock ceiling for the SERVING lane's planning. The telemetry worker plans the same
+#: universe off the request path under ``COMPILE_BUDGET``; this one runs INSIDE a user's request,
+#: so it gets its own, smaller budget rather than inheriting a background lane's.
+SERVING_GOVERNED_COMPILE_BUDGET = timedelta(seconds=10)
+#: The compile ceiling for the same lane. Same reasoning as the time budget: a serving path that
+#: could compile 500 plans is a serving path that can spend a user's whole request doing it.
+SERVING_GOVERNED_MAX_COMPILES = 60
 #: Bumped to v3 with the typed computation. A v2 revision's options were sealed under an identity
 #: that did not include what they compute, so v2 and v3 identities are not comparable and must not
 #: be: reusing the version would let a v2 option be read as though its empty typed block were a
@@ -178,6 +201,18 @@ class ConsideredSet:
     # A1b: per-served-definition frozen facts captured at the semantic branch, written as
     # immutable semantic_option_decision rows once option ids mint at revision-persist time.
     semantic_decision_facts_by_definition_id: dict[str, dict] = field(default_factory=dict)
+    # C2a: the governed cross-catalog lane's frozen facts, keyed by the option's POSITION
+    # (``alternative:<set>:<feature>``) rather than by its definition id — and the difference is
+    # load-bearing, not stylistic. A governed option's ``source_definition_id`` is the canonical
+    # recipe id, which an engine-served option for the SAME recipe also carries; one map keyed by
+    # definition id would hand the engine's row the governed row's facts, arming migration 1135's
+    # planned-lane marker on an option that has no logical plan and aborting the whole request at
+    # COMMIT. Position is unique per served option by construction.
+    governed_decision_facts_by_path: dict[str, dict] = field(default_factory=dict)
+    # C2a: the persisted logical feature plan each governed option IS, keyed the same way. The
+    # marker and this binding are two halves of ONE fact and are written in the same transaction:
+    # 1135's deferred trigger checks at COMMIT that every marked option has a binding.
+    governed_logical_plan_by_path: dict[str, str] = field(default_factory=dict)
     considered_revision_id: str | None = None
     considered_content_hash: str | None = None
 
@@ -656,6 +691,154 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
     return ideas, rejections, evidence
 
 
+# ── C2a: the governed cross-catalog lens, reachable from a CATALOG-SCOPED request ─────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedGovernedLensV1:
+    """One catalog-scoped run's governed cross-catalog outcome, in the three shapes it is consumed.
+
+    ``ideas`` are served (in this order); ``facts`` and ``logical_plan_revision_ids`` are the
+    SAME-LENGTH, SAME-ORDER side-tables for the option at each position — the decision row's
+    frozen facts and the logical feature plan that option IS. They are parallel rather than
+    bundled because the served list is what decides an option's PATH, and the path is not known
+    until the feature set has been appended.
+
+    ``rejections`` carry the three keys ``cs.rejections`` has always had and no more. The V2 lens
+    returns evidence-bearing refusals whose payload includes bridge fact keys and physical object
+    refs; ``cs.rejections`` is served to every caller of the considered set AND hashed into the
+    immutable revision, so those are projected down to ``{lens, reason, recipe_id}`` here rather
+    than widened there — the same rule the live entity-scoped lane states for itself.
+    """
+
+    ideas: tuple[FeatureIdea, ...]
+    facts: tuple[dict, ...]
+    logical_plan_revision_ids: tuple[str, ...]
+    rejections: tuple[dict, ...]
+
+
+def _governed_serving_rejection(recipe_id: str, reason: str) -> dict:
+    """One refusal in ``cs.rejections``' three-key shape. Never widened — see the class above."""
+    return {"lens": "governed", "reason": reason, "recipe_id": recipe_id}
+
+
+def _governed_logical_plan_revision(conn, option) -> str | None:
+    """Mint and persist the LOGICAL identity of one governed option, or ``None`` if it cannot be.
+
+    This is what arms migration 1135's planned lane. The marker on the option's decision row and
+    the ``considered_option_plan_binding`` beneath it are two halves of one fact: 1135's deferred
+    trigger checks at COMMIT that a marked option has a binding, so an option marked without one
+    would abort the entire generation request at commit — which is why the plan is minted HERE,
+    before the option is served, and an option whose plan cannot be minted is not served at all.
+
+    Refuses SOFTLY (returns ``None``, the option becomes a rejection) on the two honest absences
+    :func:`~planner.logical_resolution.resolve_logical_plan` raises: a bound column that no
+    governed semantic revision covers, and a crossing missing its ordered endpoint tuples. Both
+    say the platform cannot state what this option MEANS, and an option whose meaning nobody
+    recorded is exactly what the totality law exists to keep out of a person's choices.
+
+    Savepointed: a planner or store error for ONE option is that option's refusal, never a
+    poisoned request transaction."""
+    from featuregen.overlay.upload.planner.identity_store import ensure_logical_feature_plan
+    from featuregen.overlay.upload.planner.logical_resolution import (
+        LogicalResolutionRefused,
+        resolve_logical_plan,
+        semantic_revisions_for_plan,
+    )
+
+    if option.plan is None:
+        return None
+    try:
+        with conn.transaction():   # per-option savepoint
+            resolution = resolve_logical_plan(
+                request=option.request, plan=option.plan,
+                semantic_revisions=semantic_revisions_for_plan(conn, option.plan))
+            return ensure_logical_feature_plan(conn, plan=resolution.plan).revision_id
+    except LogicalResolutionRefused as refusal:
+        logger.info("governed option %s has no logical identity (%s) — not served",
+                    option.identity.canonical_definition_id, refusal)
+        return None
+    except Exception:
+        logger.exception("logical identity persistence failed for governed option %s — not served",
+                         option.identity.canonical_definition_id)
+        return None
+
+
+def _scoped_governed_cross_catalog_lens(
+        conn, *, catalog_source: str, target_entity: str, eligible_recipe_ids: frozenset[str],
+        roles=(), now, requests=None, uoa_entity: str | None = None,
+        spine_ref: str | None = None, context_hash: str = "") -> ScopedGovernedLensV1:
+    """C2a — the governed cross-catalog options a request scoped to ONE catalog may be served.
+
+    The engine lens above answers "what can be built inside ``catalog_source``". This answers the
+    question the platform could previously only ask on a route nobody could reach: "and what can
+    be built by CROSSING out of it". It runs ALONGSIDE the engine, never instead of it, and it
+    adds a feature set — it changes nothing about the one the engine produced.
+
+    THREE gates stand between a resolved governed plan and a served card, and each one is a
+    refusal rather than a filter, so an operator can see what was dropped and why:
+
+    1. the planner's own — only a SELECTED RESOLVED contract plan becomes an option at all
+       (``governed_options_from_requests``); everything else is already a rejection;
+    2. **the ANCHOR RULE** — the served plan must READ from ``catalog_source``. Being authorized
+       for catalogs Y and Z does not make a Y↔Z feature an answer to a question about X, and a
+       lens that served one would be showing a person work they never asked for under a heading
+       that says they did;
+    3. **the logical identity gate** — the option's meaning must be resolvable and persistable
+       now (:func:`_governed_logical_plan_revision`), because migration 1135's marker is
+       INSERT-only and an option served without it can never be plan-bound afterwards.
+
+    ``requests`` overrides the run's request set (the V2 registry's eligible primaries). It is the
+    same seam ``templates`` is for the entity-scoped lane: a test states the exact request it is
+    making a claim about instead of monkeypatching the registry out from under the code.
+    """
+    from featuregen.overlay.upload.contract.governed_lens import (
+        governed_options_from_requests,
+        governed_requests_for_scope,
+    )
+    from featuregen.overlay.upload.semantic_option_decision import (
+        decision_facts_for_governed_option,
+    )
+
+    lens_requests = (tuple(requests) if requests is not None
+                     else governed_requests_for_scope(
+                         conn, eligible_recipe_ids=eligible_recipe_ids))
+    if not lens_requests:
+        return ScopedGovernedLensV1((), (), (), ())
+    options, planner_rejections = governed_options_from_requests(
+        conn, requests=lens_requests, target_entity=target_entity, roles=tuple(roles), now=now,
+        budget=CompileBudget(
+            remaining=SERVING_GOVERNED_MAX_COMPILES,
+            deadline_monotonic=(time.monotonic()
+                                + SERVING_GOVERNED_COMPILE_BUDGET.total_seconds()),
+            clock=time.monotonic))
+    rejections = [_governed_serving_rejection(str(r.get("recipe_id") or ""),
+                                              str(r.get("reason") or ""))
+                  for r in planner_rejections]
+    ideas: list[FeatureIdea] = []
+    facts: list[dict] = []
+    plan_revisions: list[str] = []
+    for option in options:
+        recipe_id = option.identity.canonical_definition_id
+        if catalog_source not in {source for source, _ref in option.idea.derives_pairs}:
+            rejections.append(_governed_serving_rejection(
+                recipe_id, GOVERNED_OPTION_MISSES_REQUESTED_CATALOG))
+            continue
+        revision_id = _governed_logical_plan_revision(conn, option)
+        if revision_id is None:
+            rejections.append(_governed_serving_rejection(
+                recipe_id, GOVERNED_OPTION_LOGICAL_IDENTITY_UNAVAILABLE))
+            continue
+        ideas.append(option.idea)
+        facts.append(decision_facts_for_governed_option(
+            conn, option, context_hash=context_hash, uoa_entity=uoa_entity, spine_ref=spine_ref))
+        plan_revisions.append(revision_id)
+    logger.info("governed cross-catalog lens (scoped to %s at %s grain): %d served, %d refused",
+                catalog_source, target_entity, len(ideas), len(rejections))
+    return ScopedGovernedLensV1(tuple(ideas), tuple(facts), tuple(plan_revisions),
+                                tuple(rejections))
+
+
 #: What a live-lane row records when its recipe RESOLVED — the planner's OWN spelling, so it can
 #: never drift from what the telemetry worker writes or what ``RESOLVED_STATUSES`` counts: a lane
 #: whose success spelling drifts is a lane missing from every resolution rate.
@@ -1080,7 +1263,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                          scope: ConfirmedScope | None = None,
                          actor_envelope=None,
                          telemetry_enabled: bool = False,
-                         v2_eligible_ids: frozenset[str] | None = None) -> ConsideredSet:
+                         v2_eligible_ids: frozenset[str] | None = None,
+                         governed_requests: Sequence | None = None) -> ConsideredSet:
     """The semantic engine's validated alternatives; the anchor is the requester's own definition run
     through the same engine (definition mode only). Every option shown to the human has passed the
     typed gauntlet. Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot
@@ -1096,8 +1280,18 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
 
     The two branches BELOW the engine are reachable only without a confirmed scope — the legacy
     per-recipe template grounding pass, which the per-table suggestions page still shares, and the
-    governed cross-catalog lens. Neither is reachable from the scoped route, and retiring the
-    template pass is its own charter (it has a live consumer on the asset-detail page).
+    entity-scoped governed cross-catalog lens. Neither is reachable from the scoped route, and
+    retiring the template pass is its own charter (it has a live consumer on the asset-detail
+    page).
+
+    C2a — THE SERVING WIRE-UP. A FOURTH arm now runs ALONGSIDE the engine (not instead of it) on a
+    catalog-scoped, live run: :func:`_scoped_governed_cross_catalog_lens` plans the governed
+    cross-catalog lens for ``catalog_source`` at ``target_entity`` grain and appends its options
+    as their own ``governed_cross_catalog`` feature set at the END of ``alternatives``. The engine
+    arm is untouched, and appending last keeps every engine option's position — and therefore its
+    option id — exactly where it was. Every served governed option must READ from the requester's
+    own ``catalog_source`` (the anchor rule) and must have a persisted logical feature plan, which
+    is what arms migration 1135's planned-lane marker on its decision row.
 
     ``applicability`` is the ONE applicability decision (computed once in the API layer, Task 7). When
     scoped grounding is enabled it narrows the template lens to the eligible recipe subset; either way it
@@ -1105,13 +1299,17 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
     builder is computation-only — it NEVER persists the confirmed scope (the API layer owns that).
 
     ``is_live`` (3C.2a) is the ROUTE-resolved live-activation boolean — the builder NEVER reads the env
-    flag. On an entity-scoped run (``catalog_source is None``) with ``is_live`` set, the governed
-    cross-catalog planner runs at ``target_entity`` grain: its resolved plans become options (each idea
+    flag, and there is ONE verdict per request (the route resolves it from
+    ``live_activation.cross_catalog_grounding_enabled`` and threads it here). It gates BOTH
+    governed arms. On an entity-scoped run (``catalog_source is None``) with ``is_live`` set, the
+    governed cross-catalog planner runs at ``target_entity`` grain: its resolved plans become options (each idea
     carrying ``origin='governed_planner'`` / ``path_authority='governed_cross_catalog'`` and the exact
     plan envelope), its unresolved ones and every cross-catalog LLM alternative become rejections. With
     ``is_live`` false the whole governed branch is skipped — byte-identical to today. ``templates``
     (default ``ALL_TEMPLATES``) narrows the recipe registry the governed lens plans over (tests inject
-    a fixture template); it never affects the single-catalog template lens.
+    a fixture template); it never affects the single-catalog template lens. ``governed_requests``
+    (C2a) is the same seam for the catalog-scoped arm: the exact planning requests to plan, default
+    the V2 registry's eligible primaries for ``v2_eligible_ids``.
 
     ``telemetry_enabled`` / ``v2_eligible_ids`` (S1B-3) are the TELEMETRY PRODUCER's two inputs, both
     resolved by the route (the builder never reads ``FEATUREGEN_INTENT_SHADOW_TELEMETRY``, exactly
@@ -1342,6 +1540,38 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                             roles=roles, planned=governed_evidence)
                 except Exception:
                     logger.exception("live governed evidence recording failed (fail-soft)")
+    # C2a — THE SERVING WIRE-UP. The governed cross-catalog lens now runs for a CATALOG-SCOPED
+    # request too, ALONGSIDE the engine rather than instead of it (hence a fresh `if`, not another
+    # `elif`): the engine arm above is untouched and its options are byte-identical either way,
+    # and this appends its own feature set at the END, so no engine option's position — and
+    # therefore no engine option's id — moves. With `is_live` false nothing here runs at all.
+    #
+    # Until now the governed lens was reachable ONLY from the entity-only branch above, which the
+    # route refuses at the door with 422 SEMANTIC_REQUIRES_CATALOG_SOURCE — so the machinery was
+    # complete and unreachable. This is the door.
+    governed_facts_by_path: dict[str, dict] = {}
+    governed_plans_by_path: dict[str, str] = {}
+    if is_live and catalog_source is not None and target_entity is not None:
+        scoped_governed = _scoped_governed_cross_catalog_lens(
+            conn, catalog_source=catalog_source, target_entity=target_entity,
+            eligible_recipe_ids=(v2_eligible_ids if v2_eligible_ids is not None
+                                 else frozenset()),
+            roles=roles, now=now, requests=governed_requests,
+            uoa_entity=getattr(scope, "uoa_entity", None),
+            spine_ref=getattr(scope, "spine_ref", None),
+            context_hash=(semantic_context.context_hash()
+                          if semantic_context is not None else ""))
+        rejections.extend(scoped_governed.rejections)
+        if scoped_governed.ideas:
+            set_index = len(alternatives)
+            alternatives.append(FeatureSet(lens=GOVERNED_CROSS_CATALOG_LENS,
+                                           features=list(scoped_governed.ideas)))
+            for feature_index, (option_facts, plan_revision_id) in enumerate(
+                    zip(scoped_governed.facts, scoped_governed.logical_plan_revision_ids,
+                        strict=True)):
+                path = f"alternative:{set_index}:{feature_index}"
+                governed_facts_by_path[path] = option_facts
+                governed_plans_by_path[path] = plan_revision_id
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         # B1: the anchor is EXTRACTED as an abstract intent (meaning only — the model is
@@ -1398,7 +1628,9 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                        ),
                        recipe_candidate_keys_by_recipe_id=recipe_candidate_keys_by_recipe_id,
                        binding_plan_by_candidate_key=binding_plan_by_candidate_key,
-                       semantic_decision_facts_by_definition_id=semantic_decision_facts)
+                       semantic_decision_facts_by_definition_id=semantic_decision_facts,
+                       governed_decision_facts_by_path=governed_facts_by_path,
+                       governed_logical_plan_by_path=governed_plans_by_path)
     logger.info("considered-set built: intent=%s catalog=%s roles=%s → lenses=%s, %d rejected, "
                 "anchor=%s, recommended_lens=%s",
                 intent.intent_id, catalog_source, tuple(roles),
@@ -1627,7 +1859,13 @@ def _with_option_ids(cs: ConsideredSet, generation_identity: str) -> ConsideredS
         # D2: the PHYSICAL identity rides the option id on top of the executable identity —
         # the frozen decision facts (which carry the plan envelope and the manifest hashes)
         # keyed by the served definition. Drift in any consumed input mints a NEW id.
-        facts = (cs.semantic_decision_facts_by_definition_id or {}).get(
+        # C2a: a governed cross-catalog option's facts are addressed by POSITION, and that lookup
+        # comes FIRST. Its `source_definition_id` is the canonical recipe id, which an engine
+        # option for the same recipe also carries — reading the definition-keyed map would give
+        # this option the engine's frozen plan and hash, i.e. a physical identity belonging to a
+        # different option. Engine options are unaffected: the position map has no entry for them.
+        facts = (cs.governed_decision_facts_by_path or {}).get(path) or (
+            cs.semantic_decision_facts_by_definition_id or {}).get(
             (feature.source_definition_id if feature is not None else None) or "")
         physical = {
             "planning_request_hash": facts.get("planning_request_hash", ""),
@@ -1776,7 +2014,8 @@ def _persist_considered_revision(
     # A1b: the immutable option-decision rows — one per SERVED semantic option, keyed to the
     # exact (revision, option) the human will act on. Written only when this call actually
     # inserted the revision (rowcount 0 = idempotent replay; the rows already exist).
-    if cursor.rowcount == 1 and cs.semantic_decision_facts_by_definition_id:
+    if cursor.rowcount == 1 and (cs.semantic_decision_facts_by_definition_id
+                                 or cs.governed_decision_facts_by_path):
         from featuregen.overlay.upload.semantic_option_decision import (
             persist_option_decisions,
         )
@@ -1788,9 +2027,35 @@ def _persist_considered_revision(
                 feature.get("source_definition_id") or feature.get("recipe_id"))
             if facts is not None:
                 facts_by_option[option_id] = facts
+        # C2a: the governed cross-catalog options, addressed by POSITION and applied AFTER the
+        # definition-keyed pass so a governed option can never be handed an engine option's facts
+        # (their canonical definition ids coincide — see `governed_decision_facts_by_path`).
+        # These are the rows that carry migration 1135's `requires_logical_plan_binding`.
+        for path, governed_facts in cs.governed_decision_facts_by_path.items():
+            governed_option_id = cs.option_ids_by_path.get(path)
+            if governed_option_id is not None:
+                facts_by_option[governed_option_id] = governed_facts
         persist_option_decisions(
             conn, considered_revision_id=row[0], generation_run_id=generation_run_id,
             metadata_snapshot_id=metadata_snapshot_id, facts_by_option_id=facts_by_option)
+        # C2a — the OTHER half of the marker, and it must land in THIS transaction. 1135's
+        # deferred trigger checks at COMMIT that every option declaring itself planned has a
+        # `considered_option_plan_binding`; the logical plan each of these options IS was already
+        # resolved and persisted while the set was being built, so this only pins the pair.
+        # Deliberately NOT fail-soft: a marked option with no binding aborts the whole request at
+        # commit anyway, and it is better to fail where the reason is legible.
+        if cs.governed_logical_plan_by_path:
+            from featuregen.overlay.upload.planner.binding_chain import (
+                bind_considered_option_plan,
+            )
+
+            for path, plan_revision_id in sorted(cs.governed_logical_plan_by_path.items()):
+                governed_option_id = cs.option_ids_by_path.get(path)
+                if governed_option_id is None:
+                    continue
+                bind_considered_option_plan(
+                    conn, considered_revision_id=row[0], option_id=governed_option_id,
+                    logical_plan_revision_id=plan_revision_id)
     return row[0], row[1]
 
 

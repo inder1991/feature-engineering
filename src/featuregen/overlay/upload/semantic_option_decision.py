@@ -143,6 +143,13 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
         # D1 — the FULL evidence record: what the card was built from, verbatim.
         "evidence": _evidence_record(candidate, idea),
         "decision_manifest": _decision_manifest(candidate, context_hash, binding_plan_hash),
+        # C2a / migration 1135 — the PLANNED-lane marker, and it is FALSE here by construction.
+        # This producer serves the semantic engine's single-catalog candidates: they are honestly
+        # PRE-PLAN (no logical feature plan is minted for them), and 1135's totality trigger fires
+        # only for rows that declare themselves planned. Stated rather than defaulted because the
+        # value is INSERT-only — 1063 refuses UPDATE — so a producer that left the key out would
+        # be deciding by omission the one fact that can never be corrected afterwards.
+        "requires_logical_plan_binding": False,
     }
 
 
@@ -266,6 +273,16 @@ def decision_facts_for_governed_option(conn, option, *, context_hash: str,
             "binding_plan_hash": binding_plan_hash,
             "recipe_revision_hash": request.source_content_hash,
         },
+        # C2a / migration 1135 — THE ARMING MARKER, and this is the only moment it can be set.
+        # A governed cross-catalog option IS a logical plan, so its row declares itself planned:
+        # 1135's deferred totality trigger then REQUIRES a `considered_option_plan_binding` for it
+        # by COMMIT, and `binding_chain.bind_considered_option_plan` refuses to bind any option
+        # whose marker is false. The value is INSERT-only (1063 refuses UPDATE and the writer ends
+        # in ON CONFLICT DO NOTHING), so an option served without it can NEVER be armed later —
+        # which is why the serving lane fails CLOSED instead, dropping an option whose logical
+        # identity it could not persist rather than serving a card nothing could ever be drafted
+        # against. See `gate1._scoped_governed_cross_catalog_lens`.
+        "requires_logical_plan_binding": True,
     }
 
 
@@ -361,9 +378,9 @@ def persist_option_decisions(conn, *, considered_revision_id: str, generation_ru
             " has_reviewed_formula_expectation, formula_expectation_revision, "
             " plan_envelope_present, dataset_story, policy_revision_pins, "
             " metadata_snapshot_id, observation_id, context_hash, evidence, decision_manifest, "
-            " binding_plan, binding_plan_hash) "
+            " binding_plan, binding_plan_hash, requires_logical_plan_binding) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (considered_revision_id, option_id) DO NOTHING",
             (mint_id("sod"), considered_revision_id, option_id, generation_run_id,
              facts["source_definition_id"], facts["generation_source"],
@@ -383,7 +400,14 @@ def persist_option_decisions(conn, *, considered_revision_id: str, generation_ru
              # nothing. `.get` because a facts dict assembled by an older build carries neither
              # key, and such a row must still be writable — it simply reads through the story.
              (Jsonb(facts["binding_plan"]) if facts.get("binding_plan") is not None else None),
-             facts.get("binding_plan_hash")))
+             facts.get("binding_plan_hash"),
+             # C2a — migration 1135's arming marker, written in THIS insert or never. The column
+             # is INSERT-only (1063 refuses UPDATE) and this statement ends in ON CONFLICT DO
+             # NOTHING, so a second, marked write of the same option is silently dropped: an
+             # option written unmarked can never be armed afterwards. `.get` with a False default
+             # because a facts dict assembled by an older build carries no such key and must stay
+             # writable — and PRE-PLAN is the honest reading of its silence.
+             bool(facts.get("requires_logical_plan_binding", False))))
         written += 1
     return written
 
