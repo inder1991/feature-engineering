@@ -987,14 +987,111 @@ def test_the_render_package_imports_neither_pyspark_nor_kedro() -> None:
         assert not [m for m in modules if m.split(".")[0] in ("pyspark", "kedro")], path
 
 
+#: The value NODES that mean a version was SPELLED rather than read. A constant, an f-string, a
+#: name or attribute (an imported ``RENDERER_VERSION`` is the sharpest case — it looks like reuse
+#: and behaves like a literal, because it is bound at import and never moves again), and any
+#: composition of those. Deliberately an ALLOW-LIST on the other side: anything not listed here is
+#: an offender unless it is one of the two RUNTIME READS below, so a syntax nobody thought about
+#: fails closed instead of slipping through.
+_SPELLED_VERSION_NODES = (ast.Constant, ast.JoinedStr, ast.Name, ast.Attribute, ast.BinOp,
+                          ast.BoolOp, ast.IfExp, ast.Tuple, ast.List, ast.Dict, ast.Set,
+                          ast.Starred, ast.Lambda, ast.UnaryOp)
+#: The two shapes that READ a version out of something at run time: a call (``_field(payload,
+#: "renderer_version", …)`` — the deserializer) and a subscript (``payload["renderer_version"]``).
+#: Neither can freeze a version, because neither HAS one until the value it reads arrives.
+_RUNTIME_READ_NODES = (ast.Call, ast.Subscript, ast.Await)
+
+
+def _version_spellings(source: str, where: str) -> list[str]:
+    """Every place ``source`` SUPPLIES a ``renderer_version`` rather than reading one.
+
+    Three shapes are checked, and the last two are ones the previous text-grep guard could not
+    see at all: a keyword argument (whatever the spacing — ``renderer_version = "x"`` inside a
+    call reads identically to the parser and did not match ``renderer_version=``), a
+    ``**{"renderer_version": …}`` dict splatted into a call, and a module/function-level binding
+    of the name to a literal.
+    """
+    offenders: list[str] = []
+
+    def check(value: ast.expr, how: str) -> None:
+        if isinstance(value, _RUNTIME_READ_NODES):
+            return
+        offenders.append(f"{where}:{getattr(value, 'lineno', 0)}: {how} "
+                         f"{ast.dump(value)[:80]}")
+
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg == "renderer_version":
+                    check(keyword.value, "renderer_version= at a call site")
+                elif keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                    for key, item in zip(keyword.value.keys, keyword.value.values, strict=True):
+                        if isinstance(key, ast.Constant) and key.value == "renderer_version":
+                            check(item, "**{'renderer_version': …} at a call site")
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "renderer_version":
+                    check(node.value, "renderer_version bound to")
+        elif (isinstance(node, ast.AnnAssign) and node.value is not None
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "renderer_version"):
+            check(node.value, "renderer_version bound to")
+    return offenders
+
+
 def test_RENDERER_VERSION_is_owned_here_and_no_call_site_can_spell_one() -> None:
     """A.13's open item. A literal at a call site would freeze the version while the renderer moved
-    underneath it, and the one thing the execution hash exists to detect is exactly that."""
+    underneath it, and the one thing the execution hash exists to detect is exactly that.
+
+    The guard forbids SPELLING a version, which is not the same act as REBUILDING a stored one.
+    ``planner/identity_store.render_profile_from_payload`` reconstructs a persisted
+    ``RenderProfileV1`` from its own canonical payload: the value it passes is whatever was
+    written down at seal time, which is the entire point of persisting it — a reconstruction that
+    substituted today's constant would silently re-date a historical profile, the exact drift this
+    guard exists to catch, in the opposite direction. So the rule is stated over the VALUE rather
+    than over the keyword's spelling, and it is STRICTER for it: a hardcoded string, an f-string,
+    an imported constant, a ``**{"renderer_version": …}`` splat and a spaced-out
+    ``renderer_version = "…"`` inside a call all fail, and the first three of those the old text
+    grep could not see. :func:`test_the_version_guard_catches_every_way_a_call_site_can_spell_one`
+    is the negative control, run on every invocation rather than by hand.
+    """
     assert isinstance(render.RENDERER_VERSION, str) and render.RENDERER_VERSION.strip()
     source_root = pathlib.Path(render.__file__).parent.parent.parent
-    offenders = [path for path in source_root.rglob("*.py")
-                 if "renderer_version=" in path.read_text(encoding="utf-8")]
+    offenders = [spelling
+                 for path in sorted(source_root.rglob("*.py"))
+                 for spelling in _version_spellings(path.read_text(encoding="utf-8"), str(path))]
     assert offenders == [], offenders
+
+
+def test_the_version_guard_catches_every_way_a_call_site_can_spell_one() -> None:
+    """The guard's own negative control, PERMANENT rather than a manual experiment.
+
+    A guard that has never been shown to fail is a guard nobody has tested. Each line below is a
+    real way a version reaches a constructor; the reconstruction cases are the ones that must be
+    allowed, and they are the reason the guard moved off a text grep in the first place.
+    """
+    spelled = [
+        'RenderProfileV1(renderer_version="kedro-renderer@1")',
+        'RenderProfileV1(renderer_version = "kedro-renderer@1")',   # the grep missed this one
+        "RenderProfileV1(renderer_version=RENDERER_VERSION)",       # …and this one
+        "RenderProfileV1(renderer_version=render.RENDERER_VERSION)",
+        'RenderProfileV1(renderer_version=f"kedro@{1}")',
+        'RenderProfileV1(renderer_version="kedro@" + "1")',
+        'RenderProfileV1(**{"renderer_version": "kedro-renderer@1"})',
+        'renderer_version = "kedro-renderer@1"',
+        'renderer_version: str = "kedro-renderer@1"',
+    ]
+    for source in spelled:
+        assert _version_spellings(source, "<probe>"), f"the guard let this through: {source}"
+    reconstructed = [
+        'RenderProfileV1(renderer_version=_field(payload, "renderer_version", what=what))',
+        'RenderProfileV1(renderer_version=payload["renderer_version"])',
+        'RenderProfileV1(**{"renderer_version": _field(payload, "renderer_version")})',
+        'renderer_version: str',                     # a dataclass field declaration
+        '{"renderer_version": render.RENDERER_VERSION}',   # a payload the renderer itself builds
+    ]
+    for source in reconstructed:
+        assert not _version_spellings(source, "<probe>"), f"the guard refused a read: {source}"
 
 
 # ══ goldens — the weakest test here, and last for that reason ════════════════════════════════════
