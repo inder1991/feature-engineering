@@ -31,6 +31,14 @@ rather than two revisions of one confirmation.
 inside the physical plan it names, and a second writable copy could disagree with the plan it claims
 to describe. This module reads them THROUGH the pinned plan and verifies the agreement.
 
+▲ **A carry-forward from step 3, undischarged and worth stating where it bites.** ``physical_digest``
+is computed over a payload that INCLUDES the logical digest the plan realizes, so one physical
+realization can never be reused across two logical plans — the identical column pairs, predicates,
+normalization and temporal binding hash to a DIFFERENT physical plan under a different meaning. That
+is safe (nothing can be re-aimed) and it is a real cost (no shared realization identity, and the
+adoption chain is per-selection rather than per-realization). It is a step-3 contract decision, not
+something this store may change; C3's card work should know it before it looks for physical reuse.
+
 **Foreign keys** follow B1's doctrine. ``selection_revision_id`` is a real FK (1072 has no truncate
 raiser). Every other leg — the execution context (1130), the physical plan (1134), the predecessor
 (this table) — points at an append-only table whose BEFORE TRUNCATE raiser an FK would disarm, so
@@ -84,8 +92,17 @@ class AdoptionDefect(ValueError):
 
 
 class AdoptionConflict(RuntimeError):
-    """Someone else moved the chain first. The row this confirmation would have written lost its
-    partial-unique index to a concurrent confirmation; re-read the head and decide again."""
+    """The chain and this caller disagree. Raised for TWO different situations, and a caller that
+    treats them alike will not survive the second:
+
+    * from :func:`confirm_physical_plan_adoption` — someone else moved the chain first. The row this
+      confirmation would have written lost its partial-unique index to a concurrent confirmation.
+      RETRYABLE: re-read the head and decide again.
+    * from :func:`load_physical_plan_adoption` / :func:`current_physical_plan_adoption` — a stored
+      row does not reproduce its own identity. That is CORRUPTION, and it is not retryable: a retry
+      loop that re-reads the head to try again will read the same bad row and spin forever. Its
+      message says "does not reproduce its own identity"; a retry loop must stop on it and escalate.
+    """
 
 
 @dataclass(frozen=True, slots=True)

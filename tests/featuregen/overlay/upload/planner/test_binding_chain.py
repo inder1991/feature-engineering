@@ -295,19 +295,35 @@ def test_the_store_refuses_an_adoption_that_does_not_exist(db) -> None:
 
 
 # ── REFUSAL 5: a build member of a planned selection must name its combined binding ───────────
-def test_a_member_of_a_planned_selection_without_a_combined_binding_refuses_at_commit(db) -> None:
+def test_a_member_of_a_planned_selection_without_a_combined_binding_refuses_immediately(db) -> None:
+    """▲ IMMEDIATE, not at COMMIT (1140). The member's FK onto its combined binding is not
+    DEFERRABLE and 1092 forbids UPDATE, so a member can only ever be written after its binding
+    exists — the deferral 1135 took bought nothing and queued pending events that made ALTER TABLE
+    refuse. Checking now also makes the refusal name the statement that caused it."""
     c = _chain(db)
     build_set = seed_build_set(db, reading=c["reading"])
     binding_id = db.execute(
         "SELECT binding_id FROM selection_formula_binding WHERE selection_revision_id = %s",
         (c["selection"],)).fetchone()[0]
-    db.execute(
-        "INSERT INTO build_set_member (revision_id, position, selection_revision_id, "
-        "  selection_formula_binding_id) VALUES (%s, 0, %s, %s)",
-        (build_set, c["selection"], binding_id))
     with pytest.raises(psycopg.errors.RaiseException) as excinfo:
-        commit_checks(db)
+        db.execute(
+            "INSERT INTO build_set_member (revision_id, position, selection_revision_id, "
+            "  selection_formula_binding_id) VALUES (%s, 0, %s, %s)",
+            (build_set, c["selection"], binding_id))
     assert "no combined binding at" in str(excinfo.value)
+
+
+def test_altering_build_set_member_after_inserting_one_now_works(db) -> None:
+    """The cost 1135 paid for a deferral it did not need, and 1140 stopped paying. A pending
+    constraint-trigger event makes Postgres refuse ALTER TABLE with ObjectInUse; with the plain
+    trigger there is no pending event, and the law still fired on the insert above."""
+    c = _chain(db)
+    build_set = seed_build_set(db, reading=c["reading"])
+    pin_build_set_member(db, build_set_revision_id=build_set, position=0,
+                         selection_revision_id=c["selection"],
+                         combined_binding_id=c["combined"].combined_binding_id)
+    db.execute("ALTER TABLE build_set_member ADD COLUMN IF NOT EXISTS b2_probe text")
+    db.execute("ALTER TABLE build_set_member DROP COLUMN IF EXISTS b2_probe")
 
 
 def test_a_member_that_names_its_combined_binding_commits(db) -> None:
@@ -340,6 +356,96 @@ def test_a_member_may_not_name_a_binding_for_another_selection(db) -> None:
             (build_set, other_selection, binding_id, c["combined"].combined_binding_id))
 
 
+# ── the two orphans 1135 let through, closed by 1140 ─────────────────────────────────────────
+def test_a_member_written_before_its_selection_was_planned_blocks_the_planning(db) -> None:
+    """REVIEWER CONSTRUCTION (A) — the orphan built by ORDER, not by a missing check.
+
+    Write the member first, using exactly the statement `build_set_store` uses today. The selection
+    is not planned yet, so the member law is satisfied. THEN plan the selection. Under 1135 that
+    produced a permanently unrepairable orphan: a planned selection with a member carrying no
+    combined binding, and both tables append-only. 1140 refuses the PLANNING — the last moment at
+    which anything can still be done — and says what to do instead."""
+    considered, option = seed_option(db, planned=True)
+    reading = seed_target_reading(db)
+    plan_id, _ = _logical(db)
+    bind_considered_option_plan(db, considered_revision_id=considered, option_id=option,
+                                logical_plan_revision_id=plan_id)
+    draft = seed_draft(db)
+    bind_formula_draft_plan(db, formula_draft_id=draft)
+    selection = seed_selection(db, reading=reading)
+    pin = record_selection_formula_binding(
+        db, selection_revision_id=selection, formula_draft_id=draft)[0]
+
+    build_set = seed_build_set(db, reading=reading)
+    db.execute(
+        "INSERT INTO build_set_member (revision_id, position, selection_revision_id, "
+        "  selection_formula_binding_id) VALUES (%s, 0, %s, %s)",
+        (build_set, selection, pin.binding_id))          # legal: the selection is not planned yet
+
+    with pytest.raises(psycopg.errors.RaiseException) as excinfo:
+        bind_selection_formula_plan(db, selection_revision_id=selection, formula_draft_id=draft)
+    message = str(excinfo.value)
+    assert "cannot now be bound to a logical plan" in message
+    assert "Declare a NEW build set" in message
+
+
+def test_a_governed_selection_may_not_skip_its_plan_binding(db) -> None:
+    """REVIEWER CONSTRUCTION (B) — the link that was simply never made.
+
+    A planned option, bound; a draft, bound; 1101's pin recorded — and then nothing. Under 1135
+    every commit check passed, the member law's precondition was the very link that was skipped, and
+    the store went on to report this governed selection as PRE-PLAN and refuse it for cross-catalog
+    generation: a governed choice silently misclassified as legacy. 1140 makes the selection link
+    total, inheriting the requirement from the draft exactly as the draft inherits it from its
+    option."""
+    considered, option = seed_option(db, planned=True)
+    reading = seed_target_reading(db)
+    plan_id, _ = _logical(db)
+    bind_considered_option_plan(db, considered_revision_id=considered, option_id=option,
+                                logical_plan_revision_id=plan_id)
+    draft = seed_draft(db)
+    bind_formula_draft_plan(db, formula_draft_id=draft)
+    selection = seed_selection(db, reading=reading)
+    record_selection_formula_binding(db, selection_revision_id=selection, formula_draft_id=draft)
+
+    with pytest.raises(psycopg.errors.RaiseException) as excinfo:
+        commit_checks(db)
+    message = str(excinfo.value)
+    assert "has no plan binding at COMMIT" in message
+    assert "misclassified as legacy" in message
+
+
+def test_a_pre_plan_pin_still_commits_untouched(db) -> None:
+    """The other half of the same law: 1140 fires only when the DRAFT is plan-bound, so every
+    legacy (selection, formula) pin in the platform still commits with nothing required of it."""
+    seed_option(db, planned=False)
+    reading = seed_target_reading(db)
+    draft = seed_draft(db)
+    selection = seed_selection(db, reading=reading)
+    record_selection_formula_binding(db, selection_revision_id=selection, formula_draft_id=draft)
+    commit_checks(db)
+    assert load_selection_formula_plan_binding(
+        db, selection_revision_id=selection, formula_draft_id=draft) is None
+
+
+# ── the arming check: a dormant law is a defect, not a default ───────────────────────────────
+def test_binding_an_unmarked_option_refuses_so_a_dormant_law_cannot_ship(db) -> None:
+    """1135's option AND draft laws are both gated on `requires_logical_plan_binding`, and the
+    marker is one-shot: 1063 refuses UPDATE and the production writer ends in ON CONFLICT DO
+    NOTHING, so an unmarked option can never be armed later. Without this refusal the whole chain
+    could be wired, run green, and enforce nothing."""
+    seed_option(db, planned=False)
+    plan_id, _ = _logical(db)
+    with pytest.raises(BindingChainDefect) as excinfo:
+        bind_considered_option_plan(db, considered_revision_id="cr_1", option_id="opt_1",
+                                    logical_plan_revision_id=plan_id)
+    message = str(excinfo.value)
+    assert "DORMANT" in message
+    assert "can never be set afterwards" in message
+    assert load_considered_option_plan_binding(
+        db, considered_revision_id="cr_1", option_id="opt_1") is None
+
+
 # ── the build environment (R3's last property) ────────────────────────────────────────────────
 def test_a_build_set_may_not_mix_execution_contexts(db) -> None:
     """The structural half of "build members' adoptions match the build environment": one build,
@@ -354,11 +460,10 @@ def test_a_build_set_may_not_mix_execution_contexts(db) -> None:
     pin_build_set_member(db, build_set_revision_id=build_set, position=0,
                          selection_revision_id=first["selection"],
                          combined_binding_id=first["combined"].combined_binding_id)
-    pin_build_set_member(db, build_set_revision_id=build_set, position=1,
-                         selection_revision_id=second["selection"],
-                         combined_binding_id=second["combined"].combined_binding_id)
     with pytest.raises(psycopg.errors.RaiseException) as excinfo:
-        commit_checks(db)
+        pin_build_set_member(db, build_set_revision_id=build_set, position=1,
+                             selection_revision_id=second["selection"],
+                             combined_binding_id=second["combined"].combined_binding_id)
     assert "execution contexts" in str(excinfo.value)
 
 

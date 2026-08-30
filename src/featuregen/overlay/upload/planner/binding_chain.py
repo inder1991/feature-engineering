@@ -29,11 +29,21 @@ back-filling a plan nobody chose.
 
 **Which legs are foreign keys** is decided by A4's discovery, not by habit: a leg is a real FK when
 the referenced table has no BEFORE TRUNCATE raiser to disarm (``formula_draft``,
-``selection_formula_binding``, the binding tables themselves); it is a VERIFYING LOAD when the
+``selection_formula_binding``, the binding tables themselves); it is a store check when the
 referenced table is append-only and guarded (``semantic_option_decision``, all of 1134, 1136's
 adoption). B1's doctrine: "an FK proves a row exists; a verifying load proves it can still reproduce
-its identity" — so every plan leg here loads the 1134 row through its own store and refuses one that
-cannot rebuild its contract or recompute its digest.
+its identity" — and the store checks here are NOT all the same strength, so they are named
+separately rather than blurred into one flattering word:
+
+* the 1134 and 1136 legs are VERIFYING LOADS. Each goes through the owning store's loader on a
+  derivable primary key, which rebuilds the typed contract and recomputes the digest, so a row that
+  has drifted from the identity it publishes stops the binding.
+* ▲ the ``semantic_option_decision`` leg is an EXISTENCE CHECK, and cannot be more than one. That
+  table has no reproducible identity to verify against — no content hash over a canonical payload,
+  no derivable id — so there is nothing for a load to re-derive and disagree with. It is read with a
+  plain ``SELECT`` for the two facts the binding needs (the provenance hash, and the arming marker),
+  and the honest description of that is "the row is there", not "the row still proves itself".
+  Calling it a verifying load would claim a guarantee this leg does not carry.
 
 **The legacy hashes ride as PROVENANCE** (round 10: relational agreement, never hash equality).
 ``planning_request_hash`` and ``binding_plan_hash`` are copied from the option and the selection and
@@ -213,8 +223,17 @@ def bind_considered_option_plan(
     ``planning_request_hash`` is COPIED from the option's own row rather than accepted from the
     caller: a provenance pin that a caller could type is a provenance pin that can be wrong.
 
+    ▲ THIS IS ALSO THE ARMING CHECK. 1135's option and draft laws are both gated on
+    ``semantic_option_decision.requires_logical_plan_binding``, which is set ONCE when the option row
+    is written and can never be set later (1063 refuses UPDATE; the production writer ends in
+    ``ON CONFLICT DO NOTHING``, so a second, marked write is silently dropped). Binding an UNMARKED
+    option would therefore build a chain whose totality triggers are permanently dormant — green
+    everywhere, enforcing nothing. Refusing here is what makes that visible at the moment it can
+    still be fixed, rather than at the incident that discovers it.
+
     Raises:
-        BindingChainDefect: the option was never recorded, or the logical plan was not persisted.
+        BindingChainDefect: the option was never recorded, the option was not served with the
+            planned marker set, or the logical plan was not persisted.
         BindingChainConflict: the option is already bound to a DIFFERENT plan. One option, one
             meaning — the primary key already forbids two rows; this says which one is there.
     """
@@ -222,13 +241,24 @@ def bind_considered_option_plan(
     option_id = _text(option_id, what="option_id")
 
     option = conn.execute(
-        "SELECT planning_request_hash FROM semantic_option_decision "
+        "SELECT planning_request_hash, requires_logical_plan_binding "
+        "FROM semantic_option_decision "
         "WHERE considered_revision_id = %s AND option_id = %s",
         (considered_revision_id, option_id)).fetchone()
     if option is None:
         raise BindingChainDefect(
             f"option {option_id!r} of {considered_revision_id!r} was never recorded, so there is "
             "nothing to bind a plan to")
+    if not option[1]:
+        raise BindingChainDefect(
+            f"option {option_id!r} of {considered_revision_id!r} was not served as a planned "
+            "cross-catalog option: `requires_logical_plan_binding` is false, so the totality law "
+            "for this option AND for every draft beneath it is DORMANT, and binding a plan here "
+            "would produce a chain that looks governed and enforces nothing. The marker is set "
+            "ONCE, by the serving path, at the moment the option row is written — 1063 refuses "
+            "UPDATE and the production writer ends in ON CONFLICT DO NOTHING, so it can never be "
+            "set afterwards and this option can never be planned. Serve the option again with the "
+            "marker set")
     digest = _verified_logical_digest(conn, logical_plan_revision_id)
 
     conn.execute(
