@@ -37,6 +37,7 @@ from tests.featuregen.overlay.upload.planner._binding_seeds import (
     seed_option,
     seed_selection,
     seed_target_reading,
+    transaction_boundary,
 )
 
 from featuregen.overlay.upload.bridge_realization import ExecutionTier
@@ -411,8 +412,13 @@ def test_a_governed_selection_may_not_skip_its_plan_binding(db) -> None:
     with pytest.raises(psycopg.errors.RaiseException) as excinfo:
         commit_checks(db)
     message = str(excinfo.value)
-    assert "has no plan binding at COMMIT" in message
-    assert "misclassified as legacy" in message
+    # ▲ EITHER guard may speak first. Since 1141, this single-transaction ordering arms BOTH the
+    # forward-looking pin trigger (1140) and the backward-looking draft trigger (1141), and the one
+    # queued first is the one that raises. Which of them refuses is an event-ordering detail; that
+    # the transaction cannot commit, and that the reason names the missing plan binding and the
+    # PRE-PLAN misreporting it would cause, is the law — so that is what is asserted.
+    assert "no plan binding at COMMIT" in message
+    assert "PRE-PLAN" in message
 
 
 def test_a_pre_plan_pin_still_commits_untouched(db) -> None:
@@ -426,6 +432,72 @@ def test_a_pre_plan_pin_still_commits_untouched(db) -> None:
     commit_checks(db)
     assert load_selection_formula_plan_binding(
         db, selection_revision_id=selection, formula_draft_id=draft) is None
+
+
+def test_a_draft_becoming_planned_re_checks_the_pins_already_made(db) -> None:
+    """THE CROSS-TRANSACTION CONSTRUCTION (fix round 2) — construction (B)'s end state, reached the
+    long way round, and the one thing 1140 did not close.
+
+    TXN1 commits a perfectly legal PRE-PLAN world: an unmarked option, a draft, a selection, a 1101
+    pin, and a build member with no combined binding. Every check passes, correctly — and 1140's
+    forward-looking pin trigger is DISCHARGED at that commit, never to run again. TXN2 then writes
+    `considered_option_plan_binding` by raw SQL (skipping the store's arming refusal) and calls
+    `bind_formula_draft_plan`, an ordinary store call that reads no marker. Nothing re-checked the
+    pin, so the measured end state was: plan bindings 0, orphan members 1, and a GOVERNED selection
+    reported PRE-PLAN.
+
+    Across transactions the closure rested on ONE store check — the posture this whole task exists
+    to replace. 1141 is the symmetric backward-looking re-check: when a draft becomes plan-bound,
+    every pin already naming it must acquire its plan binding by COMMIT."""
+    considered, option = seed_option(db, planned=False)          # unmarked: the store would refuse
+    reading = seed_target_reading(db)
+    plan_id, digest = _logical(db)
+    draft = seed_draft(db)
+    selection = seed_selection(db, reading=reading)
+    pin = record_selection_formula_binding(
+        db, selection_revision_id=selection, formula_draft_id=draft)[0]
+    build_set = seed_build_set(db, reading=reading)
+    db.execute(
+        "INSERT INTO build_set_member (revision_id, position, selection_revision_id, "
+        "  selection_formula_binding_id) VALUES (%s, 0, %s, %s)",
+        (build_set, selection, pin.binding_id))
+    transaction_boundary(db)                                     # TXN1 commits; all checks pass
+
+    # TXN2: the raw write that bypasses `bind_considered_option_plan`'s arming refusal.
+    db.execute(
+        "INSERT INTO considered_option_plan_binding (considered_revision_id, option_id, "
+        "  logical_plan_revision_id, logical_digest, planning_request_hash) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (considered, option, plan_id, digest, "prh_1"))
+    bind_formula_draft_plan(db, formula_draft_id=draft)           # an ordinary store call
+
+    with pytest.raises(psycopg.errors.RaiseException) as excinfo:
+        commit_checks(db)
+    message = str(excinfo.value)
+    assert "became bound to a logical plan while 1 selection pin(s)" in message
+    assert "reported PRE-PLAN" in message
+
+
+def test_the_in_order_flow_still_passes_with_the_pin_made_first(db) -> None:
+    """The other half: 1141 is checked at COMMIT precisely so the legitimate ordering survives.
+
+    `selection_formula_plan_binding` foreign-keys onto `formula_draft_plan_binding`, so the draft
+    must be bound BEFORE the selection can be — which means at the instant 1141's row is inserted,
+    the row it demands cannot yet exist. An immediate check would refuse this flow; a deferred one
+    lets the transaction finish the job it started."""
+    considered, option = seed_option(db, planned=True)
+    reading = seed_target_reading(db)
+    plan_id, _ = _logical(db)
+    bind_considered_option_plan(db, considered_revision_id=considered, option_id=option,
+                                logical_plan_revision_id=plan_id)
+    draft = seed_draft(db)
+    selection = seed_selection(db, reading=reading)
+    record_selection_formula_binding(db, selection_revision_id=selection, formula_draft_id=draft)
+    bind_formula_draft_plan(db, formula_draft_id=draft)           # pin already exists — allowed
+    bind_selection_formula_plan(db, selection_revision_id=selection, formula_draft_id=draft)
+    commit_checks(db)
+    assert load_selection_formula_plan_binding(
+        db, selection_revision_id=selection, formula_draft_id=draft) is not None
 
 
 # ── the arming check: a dormant law is a defect, not a default ───────────────────────────────

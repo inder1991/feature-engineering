@@ -262,3 +262,21 @@ def commit_checks(db) -> None:
     COMMIT would otherwise never fire at all. ``SET CONSTRAINTS ALL IMMEDIATE`` checks every pending
     deferred constraint at once — the same work COMMIT would do, at a point a test can observe."""
     db.execute("SET CONSTRAINTS ALL IMMEDIATE")
+
+
+def transaction_boundary(db) -> None:
+    """Simulate one COMMIT and the start of the next transaction, on a single connection.
+
+    ``SET CONSTRAINTS ALL IMMEDIATE`` runs every pending deferred check and DISCHARGES it, exactly
+    as a COMMIT would; ``SET CONSTRAINTS ALL DEFERRED`` then restores deferral so whatever the test
+    does next queues its own events afresh. What this reproduces is the property that matters for a
+    cross-transaction construction: **a deferred trigger that has already passed never runs again.**
+
+    ▲ WHY NOT TWO REAL CONNECTIONS. A second session would have to see COMMITTED rows, and every
+    table involved here (`semantic_option_decision`, `selection_formula_binding`, the binding chain)
+    is append-only with no DELETE and no TRUNCATE — so a genuine two-transaction fixture would leak
+    permanent rows into a persistent ``FEATUREGEN_TEST_DSN`` database that nothing could ever clean
+    up. The fidelity gap is stated rather than hidden: this does not prove isolation behaviour, and
+    it is not meant to. It proves the thing the construction turns on."""
+    db.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    db.execute("SET CONSTRAINTS ALL DEFERRED")

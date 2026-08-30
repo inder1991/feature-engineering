@@ -18,6 +18,24 @@ logical_digest)`` into the selection binding's. Worker-side validation is the ki
 correct on the day it is written and bypassed by the next caller (1101's own words); a shared column
 inside two composite keys cannot be satisfied with two different values by anyone, ever.
 
+**Two corrections to 1140's header, which is frozen and cannot carry them.**
+
+* 1140 says "This file closes both". That is true WITHIN a transaction. ACROSS transactions it was
+  true only while :func:`bind_considered_option_plan` remained the sole writer of
+  ``considered_option_plan_binding``: a committed pre-plan pin, and then a later transaction that
+  writes the option binding by any other route and calls :func:`bind_formula_draft_plan`, reached
+  construction (B)'s exact end state — 1140's pin trigger having already been discharged at the
+  first commit and never running again. **Migration 1141 is what makes the claim unconditional**: a
+  draft becoming plan-bound now re-checks every pin that already names it, so the law no longer
+  depends on which caller wrote what.
+* 1140's §3 argues the member trigger needs no deferral because the composite foreign key forces the
+  binding to exist first. That reasoning covers only the NON-NULL branch: the column is nullable and
+  under MATCH SIMPLE a composite FK with a NULL is not enforced at all, so it says nothing about a
+  member written with NO binding. What actually removes the need for deferral in that branch is
+  1140's own §2 trigger — a selection cannot enter the planned lane over members already written, so
+  a NULL member can never become an orphan later. The conclusion is right; the stated reason was
+  half of it.
+
 **Totality is DDL, and it is scoped.** 1135's header states the mechanism per table — a
 parent-carried binding id with a composite FK where insert order allows it (``build_set_member``), a
 DEFERRED CONSTRAINT TRIGGER checked at COMMIT where circularity forbids it (option, draft, member).
