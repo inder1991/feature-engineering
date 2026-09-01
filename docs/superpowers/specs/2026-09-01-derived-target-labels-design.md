@@ -231,11 +231,26 @@ proposes both and the human chooses**; it must not silently pick one.
 
 ---
 
-## 7.5 How candidates are proposed
+## 7.5 The flow: search first, then propose, then confirm
 
-The owner's requirement is that the tool *"come up with the options as well as the logic"*. The
-proposer therefore emits **complete structured rules**, never prose for a human to formalise — a
-proposal a person has to translate is not a proposal.
+Four steps, in this order. **The order is the design** — a registry that is written but never read
+is a junkyard, and proposing before searching is how it becomes one.
+
+### Step 1 — search the registry (no model call)
+
+Before anything is generated, look for labels that already exist for this entity, ranked against
+the hypothesis. `tgt_churned_90d` authored six months ago must surface for the next person who asks
+about churn, or two teams end up with two quietly different churn definitions and no way to compare
+the models trained on them. For `cust_perf_nonperf_flg` that is not merely untidy: *non-performing*
+carries a supervisory meaning, and three private versions of it is an audit finding.
+
+Each hit is shown with what makes reuse decidable: its rule in plain English, its window, its
+`DESIGN-CHECKED` state, and **how many models already consume it**.
+
+### Step 2 — propose new candidates only for the gap
+
+The proposer emits **complete structured rules**, never prose for a human to formalise — a proposal
+a person has to translate is not a proposal.
 
 **Discipline: selection over a closed structure, not free generation.** This is the intake ticket's
 rule (`intake_ticket.py`) applied to a richer object, and for the same reason — a model that may
@@ -265,6 +280,37 @@ the failure mode to design against.
 
 **What the proposer may not decide.** The `state_change` values (§11), and which of two defensible
 business definitions is correct. Those are put to the human.
+
+### Step 3 — present both together, distinguished
+
+Existing labels and fresh proposals appear in one list, never merged into an undifferentiated set:
+an existing governed label is a **decision the organisation already made**, a proposal is a draft.
+Existing ones rank first.
+
+**The bias is toward reuse, and it is deliberate.** A governed label three models already train on
+beats a marginally better new one, because comparability across models is the point of a registry.
+The tool says so rather than leaving the person to infer it.
+
+**Near-duplicates must be named, not silently minted.** Content-hashing catches an exact repeat, but
+`tgt_churned_60d` proposed while `tgt_churned_90d` exists is the case that quietly fills a registry
+with twins. When a proposal differs from an existing label only in its window or its threshold, the
+tool says which one, and how they differ, before the person picks.
+
+### Step 4 — the human decides, and may author their own
+
+Four available acts, not one:
+
+- **reuse** an existing label unchanged;
+- **adapt** one — a new definition, a new name, and the ancestor recorded, so "we changed churn from
+  90 to 60 days" is a visible fact rather than an archaeology exercise;
+- **accept** a proposal, confirming anything the proposer could not know (§11);
+- **author** a rule outright. The owner's requirement is that a person may *give a suggestion on the
+  target*, so the structure is directly editable and a human-authored rule is a first-class
+  definition — validated by exactly the checks in Step 2, and never weaker ones because a person
+  typed it.
+
+Whichever act is taken, the outcome is one named, content-hashed definition signed by a person. A
+label is never adopted by default and never inherited silently from a proposal nobody accepted.
 
 ---
 
