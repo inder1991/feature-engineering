@@ -202,11 +202,28 @@ Rows in a second table, inside the window, joined to the grain.
   "event_filter": "tran_crncy <> 'AED'",
   "aggregate": "count",
   "operator": ">=",
-  "threshold": 1
+  "threshold": 1,
+  "population_filter": { "lookback_days": 180, "having": "none" }
 }
 ```
 
 `event_filter` is the one free-text field and therefore the one that needs bounding — see §12.
+
+**`population_filter` decides which question is being asked**, and without it only one of two very
+different labels is expressible. `having: "none"` restricts the population to rows with no matching
+event in the `lookback_days` before the as-of date; `having: "any"` is the whole population.
+
+On *"predict which customers will do FX"* that is the difference between:
+
+- **who will do FX at all** — customers already trading FX weekly dominate, and the model largely
+  restates last month. True, and commercially close to useless.
+- **who will START** — the acquisition question, and almost certainly what is meant.
+
+`state_change` has carried this control since its first draft (`population_filter: from_values`
+excludes rows that already have the outcome). `event_window` lacked it, which made the second
+question unaskable. Discovered by walking a real hypothesis through the design; the lookback is a
+required conversation turn (§7.5) because no default is safe — `"any"` silently produces the
+degenerate label.
 
 **Cross-catalog by construction.** This example is anchored in `cib` and counts events in `ftr`.
 Labels naturally span catalogs, because the outcome lives where the events are. It needs none of
@@ -231,88 +248,108 @@ proposes both and the human chooses**; it must not silently pick one.
 
 ---
 
-## 7.5 The flow: search first, then propose, then confirm
+## 7.5 Authoring is a conversation that lands on structure
 
-Four steps, in this order. **The order is the design** — a registry that is written but never read
-is a junkyard, and proposing before searching is how it becomes one.
+**Conversational interface, structured artifact.** The owner's steer is that the target is the
+critical component and deserves a dialogue rather than a list to pick from. The dialogue is the
+interface; the artifact it produces is still the rule in §7.1–7.3, content-hashed and signed.
 
-### Step 1 — search the registry (no model call)
+The distinction is not stylistic. The platform already has the fully-conversational version —
+`ModelFeatureSpecV1.target_definition` is a string, "the label, in reviewed words", agreed by
+humans and executable by nothing. That is precisely why no label can be computed today. **A
+conversation that ends in prose rebuilds the defect this design exists to remove.** Talk in
+English; land on structure.
 
-Before anything is generated, look for labels that already exist for this entity, ranked against
-the hypothesis. `tgt_churned_90d` authored six months ago must surface for the next person who asks
-about churn, or two teams end up with two quietly different churn definitions and no way to compare
-the models trained on them. For `cust_perf_nonperf_flg` that is not merely untidy: *non-performing*
-carries a supervisory meaning, and three private versions of it is an audit finding.
+### What the conversation is for
 
-Each hit is shown with what makes reuse decidable: its rule in plain English, its window, its
-`DESIGN-CHECKED` state, and **how many models already consume it**.
+To resolve what code cannot determine, **in context and one question at a time**. A general policy
+("what should the tool do about literals?") is mostly unanswerable; a situated question ("does
+*performing* mean the value `P` in this column?") is answerable in a word.
 
-### Step 2 — propose new candidates only for the gap
+**The closed list of things the tool must ask about:**
 
-The proposer emits **complete structured rules**, never prose for a human to formalise — a proposal
-a person has to translate is not a proposal.
+| Unknown | Why it cannot be resolved | Example |
+|---|---|---|
+| Filter literals | no column-value profiling exists | is the code `AED`, `aed`, or `784`? |
+| `state_change` values | same | does the flag hold `Performing`/`P`/`1`? |
+| Population | a business decision, not a data fact | who will do FX *at all*, or who will *start*? |
+| Competing business definitions | both defensible | foreign-currency payment, or an actual conversion? |
+| The window, when the text states none | — | how far forward? |
 
-**Discipline: selection over a closed structure, not free generation.** This is the intake ticket's
-rule (`intake_ticket.py`) applied to a richer object, and for the same reason — a model that may
-invent a ref produces a rule that guards an empty room.
+**What it must NOT ask**, because it can determine them: whether a ref resolves; whether join keys
+share an entity; the base currency where the catalog declares one (`graph_node.currency = 'AED'` on
+`ftr.tran_amt_aed` — governed metadata, not a guess); the window when the goal states one.
 
-*Input:* the redacted hypothesis and prediction goal; the read-scoped column shortlist with each
-column's ref, concept, `semantic_terms` and `declared_type`; the confirmed entity; the horizon.
+Asking about something the platform already knows trains people to click through questions, which
+is how the one question that mattered gets clicked through too.
 
-*Output:* 2–4 candidate rules, each a complete header + shape, each naming its own source columns
-and a one-line plain-English reading.
+### Registry reuse, in the dialogue
 
-**Validation, code-side, on every candidate:**
+Reuse is raised **when it becomes relevant**, not as a ranked list before the person has said what
+they mean:
 
-- every ref must appear in the shortlist — an invented ref invalidates that candidate, it is not
-  repaired;
-- join keys must share an entity (`cust_num` ↔ `cif_id`, both `entity = customer`);
-- `direction` is always `forward`; a proposal that says otherwise is rejected outright rather than
-  corrected, because a backward "label" is a feature and the confusion must surface;
-- `window_days` comes from the stated horizon when the text gives one. Since 2026-08-30 the
-  prediction goal reaches this read, so *"in the next 90 days"* written in the goal is now visible
-  where it previously was not.
+> `tgt_fx_new_60d` already exists — same rule, 90-day lookback rather than 180. Use it, or is 180
+> deliberate?
 
-**The options must differ in substance, not in wording.** For an FX hypothesis the two definitions
-in §7.4 — currency ≠ AED, versus currency ≠ counterparty currency — are a genuine business choice
-and both belong on screen. Three windows over one rule is one option presented three times, and is
-the failure mode to design against.
+That is a far stronger nudge than a list at the start, because by then the tool knows enough to say
+what actually differs. The reuse bias of the previous draft still holds: a label other models
+already train on beats a marginally better new one, because comparability is the point.
 
-**What the proposer may not decide.** The `state_change` values (§11), and which of two defensible
-business definitions is correct. Those are put to the human.
+### Termination
 
-### Step 3 — present both together, distinguished
+The conversation ends one of three ways: an **existing** label adopted; a **new** definition
+registered; or **abandoned**, registering nothing. There is no fourth path where a label is adopted
+by default — an unanswered question ends the conversation rather than being filled with a guess.
 
-Existing labels and fresh proposals appear in one list, never merged into an undifferentiated set:
-an existing governed label is a **decision the organisation already made**, a proposal is a draft.
-Existing ones rank first.
+The human may also **author or override outright** at any turn, by editing the structure directly.
+A human-authored rule is first-class and faces exactly the validation below — never weaker checks
+because a person typed it.
 
-**The bias is toward reuse, and it is deliberate.** A governed label three models already train on
-beats a marginally better new one, because comparability across models is the point of a registry.
-The tool says so rather than leaving the person to infer it.
+### The transcript is provenance
 
-**Near-duplicates must be named, not silently minted.** Content-hashing catches an exact repeat, but
-`tgt_churned_60d` proposed while `tgt_churned_90d` exists is the case that quietly fills a registry
-with twins. When a proposal differs from an existing label only in its window or its threshold, the
-tool says which one, and how they differ, before the person picks.
+The exchange is retained with the definition. A pick-from-list flow records *what* was chosen; a
+conversation records *why* — that conversion was meant rather than foreign-currency, that 180 days
+was deliberate. For a label feeding regulated models, that reasoning is worth as much as the rule,
+and it is the one thing this design gets for free that the previous draft did not.
 
-### Step 4 — the human decides, and may author their own
+### Validation is never conversational
 
-Four available acts, not one:
+The dialogue decides what the rule *says*. Code decides whether it is *well-formed*, and the
+conversation cannot soften it:
 
-- **reuse** an existing label unchanged;
-- **adapt** one — a new definition, a new name, and the ancestor recorded, so "we changed churn from
-  90 to 60 days" is a visible fact rather than an archaeology exercise;
-- **accept** a proposal, confirming anything the proposer could not know (§11);
-- **author** a rule outright. The owner's requirement is that a person may *give a suggestion on the
-  target*, so the structure is directly editable and a human-authored rule is a first-class
-  definition — validated by exactly the checks in Step 2, and never weaker ones because a person
-  typed it.
+- every ref resolves in the read-scoped catalog; an invented ref is rejected, not repaired;
+- join keys share an entity (`cust_num` ↔ `cif_id`, both `entity = customer`);
+- `direction` is always `forward` — a backward "label" is a feature, and the confusion must surface
+  rather than be corrected silently;
+- `label_type` and `operator`/`threshold` pair per §7.1;
+- no unresolved literal survives into a signed definition.
 
-Whichever act is taken, the outcome is one named, content-hashed definition signed by a person. A
-label is never adopted by default and never inherited silently from a proposal nobody accepted.
+### Worked example
 
----
+> **Analyst:** predict which customers will do FX transactions in the next 60 days
+>
+> **Tool:** What counts as FX here — a payment in a currency other than AED (your catalog declares
+> AED as base), or one where the two legs differ, meaning a conversion actually happened?
+>
+> **Analyst:** conversion
+>
+> **Tool:** Predicting who will do FX *at all*, or who will *start*? With "at all", customers
+> already trading FX weekly dominate and the model largely restates last month.
+>
+> **Analyst:** who will start
+>
+> **Tool:** How far back should "not currently doing FX" look — 90 days?
+>
+> **Analyst:** 180
+>
+> **Tool:** Registering `tgt_fx_new_60d` — one row per customer as of `business_dt`; 1 when the
+> customer makes ≥1 transaction with `tran_crncy ≠ counter_party_tran_crncy` in the next 60 days,
+> among customers with none in the prior 180. Reads `ftr.cif_id`, `ftr.pstd_date`,
+> `ftr.tran_crncy`, `ftr.counter_party_tran_crncy`, `cib.cust_num`, `cib.business_dt`.
+
+Four turns; the same structured object as a pick-from-list flow, reached by asking. Note the second
+turn: the population question is the one a list would have silently decided.
+
 
 ## 8. Leakage — the correction
 
@@ -372,14 +409,31 @@ valuable extension.
 
 ---
 
-## 11. What the tool cannot know
+## 11. Why the unknowns are asked rather than guessed
 
-`state_change` needs the column's actual values (`from_values` / `to_values`).
-`cust_perf_nonperf_flg` is a `varchar(20)` and nothing in the catalog records what it contains.
+§7.5 lists what the conversation must ask about. This section records **why guessing is not an
+option there** — the failure mode is silent in both directions, and opposite, so neither looks like
+an error.
 
-The tool therefore proposes the **shape** and asks the human to confirm the values. It must not
-guess them. If value profiling later exists, this becomes a proposal rather than a blank — but the
-human confirmation stays, because a wrong value here produces a label that is silently always 0.
+**There is no column-value profiling anywhere in the platform.** `catalog_profile_revision`
+describes a *catalog* (display name, business context, domains), not the contents of a column.
+`cust_perf_nonperf_flg` is a `varchar(20)` and nothing records whether it holds `Performing`, `P`
+or `1`. Verified 2026-09-01.
+
+| Wrong guess | Result | How it looks |
+|---|---|---|
+| `state_change` value never matches | label always **0** | a model that cannot learn — noticed |
+| `event_filter` literal never matches | label always **1** | *"every customer does FX"* — a model that trains, scores, and is worthless |
+
+The second is the dangerous one: it produces a plausible pipeline all the way to deployment.
+
+**The catalog is used where it genuinely knows.** `graph_node.currency = 'AED'` on `ftr.tran_amt_aed`
+means AED-as-base is governed metadata, and the tool must take it from there rather than ask. The
+rule is: ask only what the platform cannot determine, because a question about something already
+known teaches people to click through questions — including the one that mattered.
+
+Should value profiling arrive later, these become pre-filled proposals rather than blanks. The
+confirmation stays either way.
 
 ---
 
