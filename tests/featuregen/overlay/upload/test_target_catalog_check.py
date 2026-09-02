@@ -7,7 +7,10 @@ from tests.featuregen.overlay.upload.test_templates import SOURCE
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
-from featuregen.overlay.upload.target_catalog_check import check_target_against_catalog
+from featuregen.overlay.upload.target_catalog_check import (
+    check_target_against_catalog,
+    selectable_entities,
+)
 from featuregen.overlay.upload.target_contract import StateChangeRuleV1, TargetHeaderV1
 
 _GRAIN = "public.customers.cust_num"
@@ -29,6 +32,7 @@ def _catalog(db):
 def _header(**over) -> TargetHeaderV1:
     base = dict(name="tgt_npe_90d", entity="customer", anchor_catalog=SOURCE,
                 grain_ref=_GRAIN, as_of_ref=_ASOF, window_days=90,
+                as_of_frequency="monthly",
                 label_type="binary", operator=">=", threshold=1.0)
     return TargetHeaderV1(**{**base, **over})
 
@@ -68,7 +72,10 @@ def test_a_ref_that_exists_in_ANOTHER_catalog_does_not_resolve_here(db):
     _catalog(db)
     elsewhere = _rule(header=_header(anchor_catalog="a_catalog_that_does_not_hold_these"))
     reasons = check_target_against_catalog(db, elsewhere, roles=("data_owner",))
-    assert len(reasons) == 3, "all three refs are absent from that catalog"
+    unresolved = [r for r in reasons if "does not resolve" in r]
+    assert len(unresolved) == 3, "all three refs are absent from that catalog"
+    # And the grain check fires too — nothing keys anything in a catalog that holds no columns.
+    assert any("grain" in r for r in reasons)
 
 
 def test_the_as_of_ref_must_actually_be_an_as_of_column(db):
@@ -80,3 +87,38 @@ def test_the_as_of_ref_must_actually_be_an_as_of_column(db):
     bad_anchor = _rule(header=_header(as_of_ref=_GRAIN))
     reasons = check_target_against_catalog(db, bad_anchor, roles=("data_owner",))
     assert any("as_of" in r for r in reasons)
+
+
+# ══ option C: the person picks from what the catalog can actually serve ══════════════════════════
+
+def test_selectable_entities_are_those_with_a_KEYED_SPINE_TABLE(db):
+    """Not the 38-name vocabulary and not the recogniser's guess — only entities this catalog can
+    genuinely anchor a label on, which is what makes the choice unwrong-able rather than merely
+    validated afterwards."""
+    _catalog(db)
+    assert [(e["entity"], e["spine_ref"]) for e in
+            selectable_entities(db, SOURCE, roles=("data_owner",))] == [("customer", _GRAIN)]
+
+
+def test_a_catalog_with_no_tagged_grain_offers_NOTHING_rather_than_guessing(db):
+    """It degrades quietly otherwise: an empty dropdown reads as a bug, so the caller must be able
+    to say "this catalog cannot anchor a label" instead of offering a blank list."""
+    _catalog(db)
+    db.execute("UPDATE graph_node SET entity = NULL WHERE object_ref = %s", (_GRAIN,))
+    assert selectable_entities(db, SOURCE, roles=("data_owner",)) == []
+
+
+def test_a_grain_ref_that_is_not_the_grain_for_the_DECLARED_entity_is_refused(db):
+    """The contradiction check. Choosing `customer` while anchoring on a column that is not the
+    customer key makes every row of the label the wrong shape — and nothing else would catch it."""
+    _catalog(db)
+    wrong = _rule(header=_header(grain_ref=_FLAG))
+    reasons = check_target_against_catalog(db, wrong, roles=("data_owner",))
+    assert any("grain" in r for r in reasons)
+
+
+def test_declaring_an_entity_the_grain_column_does_not_carry_is_refused(db):
+    _catalog(db)
+    wrong = _rule(header=_header(entity="account"))
+    reasons = check_target_against_catalog(db, wrong, roles=("data_owner",))
+    assert any("account" in r for r in reasons)

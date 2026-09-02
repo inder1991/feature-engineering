@@ -12,6 +12,28 @@ from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.overlay.upload.target_contract import TargetRuleV1, refs_read
 
 
+def selectable_entities(conn, catalog_source: str, *,
+                        roles: Iterable[str] = ()) -> list[dict]:
+    """The entities this catalog can genuinely anchor a label on — those with a keyed spine table.
+
+    The person CHOOSES from this list (owner's decision, 2026-09-02). Not the 38-name vocabulary,
+    which offers entities nothing can key on, and not the recogniser's `target_entity`, which
+    returned None for a hypothesis beginning "Customers" on the live cluster and carries no
+    confidence band. A closed, catalog-derived list cannot be wrong in the way a guess can.
+
+    An empty result means this catalog cannot anchor a label at all — the caller must SAY that
+    rather than render a blank dropdown, which reads as a bug.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT entity, table_name, object_ref FROM graph_node"
+        " WHERE kind = 'column' AND catalog_source = %s AND is_grain"
+        "   AND entity IS NOT NULL AND entity <> '' AND visible_requires <@ %s"
+        " ORDER BY entity, object_ref",
+        (catalog_source, allowed_sensitivities(roles))).fetchall()
+    return [{"entity": entity.lower(), "spine_table": table, "spine_ref": ref}
+            for entity, table, ref in rows]
+
+
 def check_target_against_catalog(conn, rule: TargetRuleV1, *,
                                  roles: Iterable[str] = ()) -> tuple[str, ...]:
     """Every reason this rule cannot be registered against this catalog; empty when it resolves."""
@@ -38,6 +60,27 @@ def check_target_against_catalog(conn, rule: TargetRuleV1, *,
             catalog, ref = pair
             reasons.append(
                 f"{ref} does not resolve to a readable column in catalog {catalog}")
+
+    # THE GRAIN CHECK. The person picked an entity from `selectable_entities`; this confirms the
+    # anchor really is that entity's key. Choosing `customer` while anchoring on a column that is
+    # not the customer key makes every row of the label the wrong shape, and nothing else catches
+    # it. Compared case-insensitively: the catalog stores what ingestion wrote ("Customer"), the
+    # rule carries the governed vocabulary's form ("customer").
+    grain = conn.execute(
+        "SELECT entity FROM graph_node WHERE kind = 'column' AND catalog_source = %s"
+        "   AND object_ref = %s AND is_grain AND visible_requires <@ %s",
+        (rule.header.anchor_catalog, rule.header.grain_ref,
+         allowed_sensitivities(roles))).fetchone()
+    if grain is None:
+        reasons.append(
+            f"grain_ref {rule.header.grain_ref} is not a grain column in "
+            f"{rule.header.anchor_catalog} — a label cannot be anchored on a column that does not "
+            "key its table")
+    elif (grain[0] or "").lower() != rule.header.entity.lower():
+        reasons.append(
+            f"grain_ref {rule.header.grain_ref} keys {grain[0]!r}, but the rule declares entity "
+            f"{rule.header.entity!r} — one row per {rule.header.entity} cannot be produced from a "
+            f"{grain[0]} key")
 
     as_of = (rule.header.anchor_catalog, rule.header.as_of_ref)
     if as_of in visible and not visible[as_of]:

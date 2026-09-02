@@ -23,7 +23,7 @@ def _header(name: str, window: int, label_type: str = "binary",
     return TargetHeaderV1(
         name=name, entity="customer", anchor_catalog="cib",
         grain_ref=CIB_GRAIN, as_of_ref=CIB_ASOF, window_days=window,
-        label_type=label_type,
+        as_of_frequency="monthly", label_type=label_type,
         operator=operator if thresholded else None,
         threshold=threshold if thresholded else None)
 

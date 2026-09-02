@@ -10,6 +10,7 @@ from featuregen.overlay.upload.target_contract import (
     TargetContractError,
     TargetHeaderV1,
     canonical_target,
+    describe_target,
     refs_read,
     target_content_hash,
 )
@@ -19,7 +20,7 @@ def _header(**over) -> TargetHeaderV1:
     base = dict(name="tgt_npe_90d", entity="customer", anchor_catalog="cib",
                 grain_ref="public.bo_cib_customer.cust_num",
                 as_of_ref="public.bo_cib_customer.business_dt",
-                window_days=90, label_type="binary", operator=">=", threshold=1.0)
+                window_days=90, as_of_frequency="monthly", label_type="binary", operator=">=", threshold=1.0)
     return TargetHeaderV1(**{**base, **over})
 
 
@@ -277,3 +278,64 @@ def test_a_column_to_column_filter_puts_BOTH_sides_in_lineage():
     pairs = refs_read(rule)
     assert ("ftr", "public.comp_financial_tran_repos_dly.tran_crncy") in pairs
     assert ("ftr", "public.comp_financial_tran_repos_dly.counter_party_tran_crncy") in pairs
+
+
+# ══ what a training set actually needs ═══════════════════════════════════════════════════════════
+
+def test_the_sampling_frequency_is_MANDATORY():
+    """A rule that does not say WHICH as-of dates does not define a dataset. Two teams using "the
+    same" label at different frequencies get different training sets, which destroys the
+    comparability the registry exists to provide."""
+    with pytest.raises(TargetContractError, match="as_of_frequency"):
+        _header(as_of_frequency="")
+
+
+def test_the_sampling_frequency_is_a_closed_vocabulary():
+    with pytest.raises(TargetContractError, match="as_of_frequency"):
+        _header(as_of_frequency="whenever")
+
+
+def test_a_full_observation_window_is_REQUIRED_by_default():
+    """CENSORING. A customer as-of 15 November with a 90-day window needs data through 13 February.
+    If history ends before that, the outcome is UNOBSERVABLE — and a rule that labels it 0 says
+    "did not happen" when the truth is "cannot see". Every recent row becomes a false negative and
+    the model learns that recent customers are safe, which is exactly backwards."""
+    assert _header().require_full_window is True
+
+
+def test_incomplete_windows_can_be_admitted_DELIBERATELY():
+    """Some designs want them (a survival model handling censoring itself). Allowed, but never by
+    accident — the default refuses and the exception is on the record."""
+    assert _header(require_full_window=False).require_full_window is False
+
+
+def test_a_state_change_excludes_rows_whose_state_is_UNREADABLE_at_the_as_of_date():
+    """A NULL flag at the as-of date means the row's eligibility cannot be determined. Including it
+    silently invents an answer; the default drops it."""
+    assert _state().exclude_null_at_as_of is True
+
+
+# ══ the sentence a person actually gives concurrence to ══════════════════════════════════════════
+
+def test_a_state_change_rule_renders_as_one_plain_sentence():
+    """A person approving twelve JSON fields is rubber-stamping. This is the statement of MEANING
+    they check — deterministic, no model call, so it can never drift from the rule."""
+    said = describe_target(_state())
+    assert "one row per customer" in said
+    assert "cust_perf_nonperf_flg" in said
+    assert "Performing" in said and "Non-performing" in said
+    assert "90 days" in said
+
+
+def test_an_event_window_rule_says_what_is_counted_and_over_what():
+    said = describe_target(_event())
+    assert "60 days" in said
+    assert "comp_financial_tran_repos_dly" in said
+    assert "at least 1" in said
+
+
+def test_the_sentence_states_CENSORING_and_the_sampling_frame():
+    """The two things a data scientist checks first, and the two the form would otherwise bury."""
+    said = describe_target(_state())
+    assert "monthly" in said
+    assert "full 90 days" in said

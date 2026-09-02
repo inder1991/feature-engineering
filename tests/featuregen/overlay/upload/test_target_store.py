@@ -20,7 +20,7 @@ def _rule(name="tgt_npe_90d", window=90) -> StateChangeRuleV1:
         header=TargetHeaderV1(name=name, entity="customer", anchor_catalog="cib",
                               grain_ref="public.bo_cib_customer.cust_num",
                               as_of_ref="public.bo_cib_customer.business_dt",
-                              window_days=window, label_type="binary",
+                              window_days=window, as_of_frequency="monthly", label_type="binary",
                               operator=">=", threshold=1.0),
         column_ref="public.bo_cib_customer.cust_perf_nonperf_flg",
         from_values=("Performing",), to_values=("Non-performing",))

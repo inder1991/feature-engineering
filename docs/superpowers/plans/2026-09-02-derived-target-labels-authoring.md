@@ -26,6 +26,8 @@ shape, so the form shows only that shape's fields rather than a union of both.
 
 ## Global Constraints
 
+- **`entity` is CHOSEN by the person from `selectable_entities`, never guessed.** Spec §7.5b. The route exposes the list; the grain check in `check_target_against_catalog` refuses a rule whose `grain_ref` does not key the declared entity.
+- **The person approves a SENTENCE, not a field list.** `describe_target` renders the rule in one plain line, deterministically and with no model call, and it rides every response that carries a rule. Spec §7.6.
 - **Search the registry BEFORE proposing.** A registry written and never read is a junkyard. Spec §7.5 Step 1.
 - **GUESS WHERE THE CATALOG JUSTIFIES IT; LEAVE BLANK WHERE IT DOES NOT.** The load-bearing rule of this plan. Nothing profiles column values, so the tool cannot know that `cust_perf_nonperf_flg` holds `Performing`/`Non-performing`. A wrong state value gives a label that is silently always-**0**; a wrong filter literal gives one that is silently always-**1** — a model that trains, scores and is worthless. A confidently pre-filled wrong answer gets accepted, because people confirm defaults; that is why the intake ticket already leaves a low-confidence target blank rather than pre-filling it. Spec §11.
 - **Draft ≠ rule.** A draft may have blanks and is never registered. Only a complete rule passing the contract and `check_target_against_catalog` is.
@@ -67,8 +69,8 @@ def _rule(name: str = "tgt_npe_90d", entity: str = "customer",
         header=TargetHeaderV1(name=name, entity=entity, anchor_catalog="cib",
                               grain_ref="public.bo_cib_customer.cust_num",
                               as_of_ref="public.bo_cib_customer.business_dt",
-                              window_days=window, label_type="binary",
-                              operator=">=", threshold=1.0),
+                              window_days=window, as_of_frequency="monthly",
+                              label_type="binary", operator=">=", threshold=1.0),
         column_ref="public.bo_cib_customer.cust_perf_nonperf_flg",
         from_values=("Performing",), to_values=("Non-performing",))
 
@@ -510,6 +512,11 @@ _INSTRUCTION = (
     "window — use this when the outcome is something happening, or not happening).\n\n"
     "FILL a field only when the catalog justifies it: refs copied EXACTLY from the candidates, the "
     "window from a horizon the objective states, a currency where the catalog declares one.\n\n"
+    "`as_of_frequency` says WHICH as-of dates the label is evaluated on (daily, weekly, monthly, "
+    "quarterly, single). It has no safe default — leave it blank with reason `not_stated` unless "
+    "the objective says. `require_full_window` stays true: a row whose window runs past the end of "
+    "history has an outcome nobody can observe, and labelling it 0 says 'did not happen' when the "
+    "truth is 'cannot see'.\n\n"
     "LEAVE BLANK — put the field in `needs_input` with a reason in `notes` — whatever you cannot "
     "know: which values a flag holds (`no_value_profile`); which of two defensible business "
     "definitions is meant (`business_choice`); whether the population is everyone or only those "
@@ -705,7 +712,7 @@ git add -A && git commit -m "feat(target): migration 1143 — the proposal, the 
 - Test: `tests/featuregen/api/test_targets.py`
 
 **Interfaces:**
-- Produces: `POST /targets/propose`, `POST /targets`, `GET /targets?entity=`.
+- Produces: `GET /targets/entities?catalog_source=`, `POST /targets/propose`, `POST /targets`, `GET /targets?entity=`.
 
 **Read first:** `src/featuregen/api/routes/contract.py` for the `_Conn` / `_Identity` / `_LLM`
 dependency aliases and the permission decorator, and `tests/featuregen/api/_helpers.py` for `AUTH`.
@@ -791,7 +798,10 @@ from featuregen.api.deps import get_conn, get_identity, get_llm
 from featuregen.api.permissions import require_feature_generate
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
-from featuregen.overlay.upload.target_catalog_check import check_target_against_catalog
+from featuregen.overlay.upload.target_catalog_check import (
+    check_target_against_catalog,
+    selectable_entities,
+)
 from featuregen.overlay.upload.target_contract import (
     EventFilterV1,
     EventWindowRuleV1,
@@ -799,6 +809,7 @@ from featuregen.overlay.upload.target_contract import (
     TargetContractError,
     TargetHeaderV1,
     canonical_target,
+    describe_target,
 )
 from featuregen.overlay.upload.target_draft import propose_target_draft
 from featuregen.overlay.upload.target_search import near_duplicates, search_targets
@@ -836,7 +847,9 @@ def _rule_from_body(body: dict):
         anchor_catalog=str(body.get("anchor_catalog", "")),
         grain_ref=str(body.get("grain_ref", "")), as_of_ref=str(body.get("as_of_ref", "")),
         window_days=int(body.get("window_days", 0)),
+        as_of_frequency=str(body.get("as_of_frequency", "")),
         label_type=str(body.get("label_type", "")),
+        require_full_window=bool(body.get("require_full_window", True)),
         direction=str(body.get("direction", "forward")),
         operator=body.get("operator"), threshold=body.get("threshold"))
     if body.get("shape") == "state_change":
@@ -844,7 +857,8 @@ def _rule_from_body(body: dict):
             header=header, column_ref=str(body.get("column_ref", "")),
             from_values=tuple(body.get("from_values") or ()),
             to_values=tuple(body.get("to_values") or ()),
-            population_filter=str(body.get("population_filter", "from_values")))
+            population_filter=str(body.get("population_filter", "from_values")),
+            exclude_null_at_as_of=bool(body.get("exclude_null_at_as_of", True)))
     return EventWindowRuleV1(
         header=header, event_catalog=str(body.get("event_catalog", "")),
         event_table=str(body.get("event_table", "")),
@@ -859,6 +873,13 @@ def _rule_from_body(body: dict):
         measure_ref=body.get("measure_ref"),
         population_lookback_days=int(body.get("population_lookback_days", 0)),
         population_having=str(body.get("population_having", "any")))
+
+
+@router.get("/targets/entities", dependencies=[Depends(require_feature_generate)])
+def entities(catalog_source: str, conn: _Conn, identity: _Identity) -> list[dict]:
+    """What this catalog can anchor a label on. An EMPTY list means it cannot anchor one at all —
+    the client must say that rather than render a blank dropdown, which reads as a bug."""
+    return selectable_entities(conn, catalog_source, roles=identity.role_claims)
 
 
 @router.post("/targets/propose", dependencies=[Depends(require_feature_generate)])
@@ -898,6 +919,8 @@ def create_target(body: RegisterIn, conn: _Conn, identity: _Identity) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"definition_id": definition_id, "name": rule.header.name,
             "rule": canonical_target(rule),
+            # The statement of MEANING, not the field list — what a person actually approved.
+            "reads_as": describe_target(rule),
             # Reported, never blocking: a twin may be deliberate, and the person has submitted.
             "near_duplicates": [{"name": t["name"], "differs_in": list(t["differs_in"])}
                                 for t in twins]}

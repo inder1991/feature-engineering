@@ -23,6 +23,13 @@ OPERATORS = ("==", "!=", ">=", "<=", ">", "<")
 #: Only forward. A backward rule is a feature — see the module docstring.
 DIRECTIONS = ("forward",)
 
+#: WHICH as-of dates the label is evaluated on. Mandatory and undefaulted: a rule that does not say
+#: this does not define a dataset, and two teams using "the same" label at different frequencies
+#: get different training sets — which destroys the comparability the registry exists to provide.
+#: A different frequency is a different dataset and deserves its own named label, exactly as a
+#: different window does.
+AS_OF_FREQUENCIES = ("daily", "weekly", "monthly", "quarterly", "single")
+
 #: `tgt_` is the owner's decision; the tail matches the existing feature-name rule.
 _NAME_RE = re.compile(r"^tgt_[a-z0-9_]{1,123}$")
 
@@ -48,7 +55,14 @@ class TargetHeaderV1:
     grain_ref: str
     as_of_ref: str
     window_days: int
+    as_of_frequency: str
     label_type: str
+    #: CENSORING. A customer as-of 15 November with a 90-day window needs history through 13
+    #: February to be observable. Where it is not, a rule that emits 0 says "did not happen" when
+    #: the truth is "cannot see" — every recent row becomes a false negative and the model learns
+    #: that recent customers are safe, which is exactly backwards. Default refuses; a survival
+    #: design handling censoring itself may switch it off DELIBERATELY.
+    require_full_window: bool = True
     direction: str = "forward"
     operator: str | None = None
     threshold: float | None = None
@@ -64,6 +78,10 @@ class TargetHeaderV1:
         _require(bool(self.as_of_ref.strip()),
                  "as_of_ref is mandatory — a label without an anchor date cannot be computed")
         _require(self.window_days > 0, "window_days must be positive")
+        _require(self.as_of_frequency in AS_OF_FREQUENCIES,
+                 f"as_of_frequency {self.as_of_frequency!r} not in {AS_OF_FREQUENCIES} — a rule "
+                 "that does not say which as-of dates it is evaluated on does not define a "
+                 "dataset")
         _require(self.direction in DIRECTIONS,
                  f"direction must be forward, got {self.direction!r} — a rule reading backward "
                  "from the as-of date is a FEATURE, not a label")
@@ -104,6 +122,9 @@ class StateChangeRuleV1:
     to_values: tuple[str, ...]
     at_least_once: bool = True
     population_filter: str = "from_values"
+    #: A NULL at the as-of date means the row's eligibility cannot be determined. Including it
+    #: silently invents an answer, so the default drops the row.
+    exclude_null_at_as_of: bool = True
 
     shape: str = "state_change"
 
@@ -259,3 +280,48 @@ def target_content_hash(rule: TargetRuleV1) -> str:
     """Identity by content, matching `model_feature_revision_hash`."""
     body = json.dumps(canonical_target(rule), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _window_clause(header: TargetHeaderV1) -> str:
+    censoring = (f"only where the full {header.window_days} days can be observed"
+                 if header.require_full_window
+                 else "INCLUDING rows whose window runs past the end of history")
+    return (f"over the next {header.window_days} days, sampled {header.as_of_frequency}, "
+            f"{censoring}")
+
+
+def describe_target(rule: TargetRuleV1) -> str:
+    """The rule as one plain sentence — what a person actually gives concurrence to.
+
+    A form of a dozen fields gets rubber-stamped; a statement of MEANING gets read. Rendered
+    deterministically from the rule itself, with no model call, so it can never drift from what
+    was registered — and it states the two things a data scientist checks first, the sampling
+    frame and the censoring rule, which the field list would otherwise bury.
+    """
+    h = rule.header
+    if isinstance(rule, StateChangeRuleV1):
+        population = ("among those starting in that state"
+                      if rule.population_filter == "from_values" else "across everyone")
+        nulls = (" Rows whose state cannot be read at the as-of date are excluded."
+                 if rule.exclude_null_at_as_of else "")
+        return (
+            f"{h.name}: one row per {h.entity}, as of {h.as_of_ref}. The label is 1 when "
+            f"{rule.column_ref} moves from {list(rule.from_values)} to {list(rule.to_values)} "
+            f"{_window_clause(h)}, {population}.{nulls}")
+
+    filters = "".join(
+        f" where {f.column_ref} {f.op} "
+        f"{f.value_ref or (list(f.values) if f.values else f.value)!r}"
+        for f in rule.event_filters)
+    if h.label_type == "binary":
+        measured = (f"at least {int(h.threshold or 0)} matching rows"
+                    if h.operator in (">=", ">") else
+                    f"{h.operator} {int(h.threshold or 0)} matching rows")
+    else:
+        measured = f"the {rule.aggregate} of {rule.measure_ref or 'matching rows'}"
+    population = (
+        f" among {h.entity}s with none in the prior {rule.population_lookback_days} days"
+        if rule.population_having == "none" else "")
+    return (
+        f"{h.name}: one row per {h.entity}, as of {h.as_of_ref}. The label is {measured} in "
+        f"{rule.event_table}{filters}, {_window_clause(h)}{population}.")

@@ -149,10 +149,29 @@ without executing it**. Both the safety controls and the downstream pipeline nee
   "grain_ref": "public.bo_cib_customer.cust_num",
   "as_of_ref": "public.bo_cib_customer.business_dt",
   "window_days": 90,
+  "as_of_frequency": "monthly",
+  "require_full_window": true,
   "direction": "forward",
   "label_type": "binary"
 }
 ```
+
+**`as_of_frequency` and `require_full_window` are what make this a training set rather than a
+sentence.** Added 2026-09-02 after an architect/data-scientist review; both were missing and both
+produce silently wrong labels by their absence.
+
+*`as_of_frequency`* — WHICH as-of dates the rule is evaluated on. Mandatory and undefaulted: a rule
+that omits it does not define a dataset, and two teams using "the same" label at different
+frequencies get different training sets, which destroys the comparability this registry exists to
+provide. A different frequency is a different dataset and earns its own name, exactly as a
+different window does (§5).
+
+*`require_full_window`* — **censoring**. A customer as-of 15 November with a 90-day window needs
+history through 13 February to be observable. Where it is not, a rule that emits 0 says *"did not
+happen"* when the truth is *"cannot see"*: every recent row becomes a false negative and the model
+learns that recent customers are safe, which is exactly backwards. It is the most common labelling
+error in the field. The default refuses; a survival design that handles censoring itself may switch
+it off deliberately, and the exception is then on the record.
 
 **`anchor_catalog` is not optional decoration.** `graph_node.object_ref` is only
 `public.{table}.{column}`; the catalog is a separate column, so a bare ref does **not** identify a
@@ -193,9 +212,13 @@ append-only snapshot source (§10).
   "from_values": ["Performing"],
   "to_values":   ["Non-performing"],
   "at_least_once": true,
-  "population_filter": "from_values"
+  "population_filter": "from_values",
+  "exclude_null_at_as_of": true
 }
 ```
+
+`exclude_null_at_as_of` — a NULL at the as-of date means the row's eligibility cannot be
+determined. Including it silently invents an answer, so the default drops the row.
 
 `population_filter: from_values` excludes rows that already have the outcome at the as-of date — a
 customer already non-performing on 1 January is not a candidate. Omitting this is the most common
@@ -384,6 +407,53 @@ conversation cannot soften it:
 Four turns; the same structured object as a pick-from-list flow, reached by asking. Note the second
 turn: the population question is the one a list would have silently decided.
 
+
+## 7.5b Where `entity` comes from
+
+Owner's decision, 2026-09-02: **the person chooses, from a closed catalog-derived list.**
+
+`selectable_entities(conn, catalog_source)` returns only entities with a **keyed spine table** — an
+`is_grain` column carrying that entity. On `cib` that is `customer`; on `ftr`, `transaction` and
+`account`. One click, and it cannot be wrong in the way a guess can.
+
+Two sources were rejected:
+
+* **The recogniser's `target_entity`** — the field this whole engagement opened by calling
+  inaccurate. Run live against an AML hypothesis beginning *"Customers whose…"* it returned
+  **`None`**. It offers a bare 38-name vocabulary with no descriptions and no confidence band, and
+  many of those entities are things nothing can key on. Unfit to decide a grain.
+* **Deriving it from the target column's table** (what `/contract/uoa-proposal` does) is strictly
+  better-grounded, but it needs the target column first — and here the entity is an *input to*
+  proposing the target. Circular.
+
+The derivation returns as a **check** rather than a source: `check_target_against_catalog` confirms
+`grain_ref` really is that entity's key, and refuses otherwise — *"grain_ref keys 'account', but
+the rule declares entity 'customer'"*. Choosing `customer` while anchoring on a column that is not
+the customer key makes every row of the label the wrong shape, and nothing else would catch it.
+
+**An empty list means this catalog cannot anchor a label at all.** The caller must say so rather
+than render a blank dropdown, which reads as a bug. Live coverage is thin — 8 of `cib`'s 111
+columns and 15 of `ftr`'s 126 carry an entity — so this degrades quietly if a future catalog has no
+tagged grain.
+
+---
+
+## 7.6 The sentence a person gives concurrence to
+
+`describe_target(rule)` renders the whole rule as one plain sentence, deterministically and with no
+model call, so it can never drift from what was registered:
+
+> `tgt_npe_90d`: one row per customer, as of `public.bo_cib_customer.business_dt`. The label is 1
+> when `cust_perf_nonperf_flg` moves from `['Performing']` to `['Non-performing']` over the next 90
+> days, sampled monthly, only where the full 90 days can be observed, among those starting in that
+> state. Rows whose state cannot be read at the as-of date are excluded.
+
+**A form of a dozen fields gets rubber-stamped; a statement of meaning gets read.** The
+conversational draft of this design produced such a sentence as its final turn; moving to a form
+lost it, and this restores it. It deliberately states the sampling frame and the censoring rule —
+the two things a data scientist checks first and the two a field list buries.
+
+---
 
 ## 8. Leakage — the correction
 
