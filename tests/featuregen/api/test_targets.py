@@ -1,0 +1,144 @@
+"""The authoring route: propose a filled form, then register what the person submits.
+
+Search runs BESIDE the proposal in a separate key — an existing label is a decision the
+organisation already made, a draft is a draft — and the SENTENCE is renderable before submitting,
+because a person approving twelve JSON fields is rubber-stamping.
+"""
+from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
+
+from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.overlay.upload.target_draft import TARGET_DRAFT_TASK
+
+_GRAIN = "public.accounts.id"
+_ASOF = "public.accounts.posted_at"
+_FLAG = "public.accounts.balance"
+
+
+def _enrichment() -> dict:
+    return {
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary"}),
+        "overlay.enrich.definition": FakeResponse(output={"definition": "a column"}),
+        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"}),
+    }
+
+
+def _draft_fake() -> FakeLLM:
+    return FakeLLM(script={**_enrichment(), TARGET_DRAFT_TASK: FakeResponse(output={
+        "shape": "state_change",
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
+                   "as_of_frequency": "monthly", "label_type": "binary",
+                   "operator": ">=", "threshold": 1},
+        "needs_input": ["from_values", "to_values"],
+        "notes": {"from_values": "no_value_profile", "to_values": "no_value_profile"}})})
+
+
+def _no_draft_fake() -> FakeLLM:
+    """Enrichment scripted, the draft task NOT — the proposer's technical-failure path."""
+    return FakeLLM(script=_enrichment())
+
+
+def _entity_of(client) -> str:
+    """Whatever this uploaded catalog can actually anchor a label on."""
+    listed = client.get("/targets/entities?catalog_source=deposits", headers=AUTH).json()
+    return listed[0]["entity"] if listed else ""
+
+
+def _valid_rule(client) -> dict:
+    entities = client.get("/targets/entities?catalog_source=deposits", headers=AUTH).json()
+    spine = entities[0]
+    return {"shape": "state_change", "name": "tgt_npe_90d", "entity": spine["entity"],
+            "anchor_catalog": "deposits", "grain_ref": spine["spine_ref"],
+            "as_of_ref": _ASOF, "window_days": 90, "as_of_frequency": "monthly",
+            "label_type": "binary", "operator": ">=", "threshold": 1,
+            "column_ref": _FLAG, "from_values": ["P"], "to_values": ["N"]}
+
+
+def test_the_catalog_says_what_it_can_ANCHOR_a_label_on(make_client):
+    """The person picks from this — not from the 38-name vocabulary and not from a model's guess."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    listed = client.get("/targets/entities?catalog_source=deposits", headers=AUTH).json()
+    assert listed, "this catalog has a keyed spine table, so it must offer at least one entity"
+    assert {"entity", "spine_table", "spine_ref"} <= set(listed[0])
+
+
+def test_propose_returns_the_registry_hits_BESIDE_the_draft(make_client):
+    """Spec §7.5 Step 1 — search runs with the proposal, in a SEPARATE key. Merging them into one
+    list would hide which is a decision already made and which is a draft."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.post("/targets/propose", json={
+        "hypothesis": "which customers go non-performing",
+        "entity": _entity_of(client), "catalog_source": "deposits"}, headers=AUTH).json()
+    assert "existing" in body and "draft" in body
+    assert body["draft"]["shape"] == "state_change"
+    assert "from_values" in body["draft"]["needs_input"]
+
+
+def test_an_entity_this_catalog_cannot_ANCHOR_is_refused(make_client):
+    """The person picks from `selectable_entities`, but the route must not trust the client to have
+    picked from it — and "no keyed spine table" is a better answer than a draft anchored on
+    nothing."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/targets/propose", json={
+        "hypothesis": "h", "entity": "spacecraft", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "ENTITY_NOT_ANCHORABLE"
+
+
+def test_a_proposal_that_fails_technically_is_reported_not_faked(make_client):
+    client = make_client(_no_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.post("/targets/propose", json={
+        "hypothesis": "h", "entity": _entity_of(client), "catalog_source": "deposits"},
+        headers=AUTH).json()
+    assert body["draft"] is None
+
+
+def test_the_sentence_is_available_BEFORE_submitting(make_client):
+    """The person approves a statement of meaning, not twelve fields — so it must be renderable
+    while the form is being edited, not returned once they have committed."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    said = client.post("/targets/describe", json={"rule": _valid_rule(client)},
+                       headers=AUTH).json()["reads_as"]
+    assert "one row per" in said
+    assert "sampled monthly" in said and "observed" in said
+
+
+def test_an_incomplete_rule_describes_as_NOTHING_rather_than_erroring(make_client):
+    """A half-filled form is the normal state while someone is typing, not a failure."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.post("/targets/describe", json={"rule": {"shape": "state_change"}},
+                       headers=AUTH).json()
+    assert body["reads_as"] is None and body["incomplete"]
+
+
+def test_registering_an_INVALID_rule_is_a_typed_422(make_client):
+    """The contract's refusals reach the caller intact — a backward rule is a feature, and saying
+    so is more useful than a 500."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    bad = _valid_rule(client) | {"direction": "backward"}
+    res = client.post("/targets", json={"rule": bad}, headers=AUTH)
+    assert res.status_code == 422
+    assert "forward" in str(res.json()["detail"])
+
+
+def test_registering_stores_the_rule_its_proposal_and_the_comment(make_client):
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    rule = _valid_rule(client)
+    res = client.post("/targets", json={
+        "rule": rule, "description": "credit deterioration",
+        "proposed_draft": {"fields": {"window_days": 90}},
+        "author_comment": "180 because the desk reviews quarterly"}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert "one row per" in res.json()["reads_as"]
+
+    listed = client.get(f"/targets?entity={rule['entity']}", headers=AUTH).json()
+    assert listed[0]["name"] == "tgt_npe_90d"
+    assert "quarterly" in listed[0]["author_comment"]
+    assert listed[0]["proposed_draft"]["fields"]["window_days"] == 90

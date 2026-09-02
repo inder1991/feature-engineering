@@ -107,7 +107,7 @@ _INSTRUCTION = (
 
 def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_source: str,
                          grain_ref: str, as_of_ref: str,
-                         roles=(), actor=None) -> "TargetDraftV1 | None":
+                         roles=(), actor=None) -> TargetDraftV1 | None:
     """One governed call. Returns None on any technical outcome — never a fabricated draft.
 
     `grain_ref` and `as_of_ref` come from the entity the PERSON chose (`selectable_entities`), and

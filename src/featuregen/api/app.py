@@ -48,6 +48,7 @@ from featuregen.api.routes import (
     selection_telemetry,
     semantics,
     suggestions,
+    targets,
     uploads,
 )
 from featuregen.config import get_settings
@@ -242,6 +243,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
                                  headers={RUN_ID_HEADER: run_id} if run_id else None)
 
     app.include_router(auth.router)
+    app.include_router(targets.router)
     app.include_router(admin.router)
     app.include_router(uploads.router)
     app.include_router(ingestion_runs.router)
