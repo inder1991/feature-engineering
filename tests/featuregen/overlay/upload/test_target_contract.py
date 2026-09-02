@@ -8,6 +8,9 @@ from featuregen.overlay.upload.target_contract import (
     StateChangeRuleV1,
     TargetContractError,
     TargetHeaderV1,
+    canonical_target,
+    refs_read,
+    target_content_hash,
 )
 
 
@@ -164,3 +167,52 @@ def test_a_sum_aggregate_REQUIRES_a_measure():
 def test_a_count_aggregate_FORBIDS_a_measure():
     with pytest.raises(TargetContractError, match="measure_ref"):
         _event(measure_ref="public.comp_financial_tran_repos_dly.tran_amt_aed")
+
+
+# ══ lineage and identity ═════════════════════════════════════════════════════════════════════════
+
+def test_refs_read_names_every_column_the_rule_touches():
+    """This is the lineage answer — "tran_crncy is being retired, which labels break?" — NOT a
+    leakage blocklist. A feature reading the same columns BACKWARD is the method, not a leak."""
+    assert refs_read(_event()) == (
+        ("cib", "public.bo_cib_customer.business_dt"),
+        ("cib", "public.bo_cib_customer.cust_num"),
+        ("ftr", "public.comp_financial_tran_repos_dly.cif_id"),
+        ("ftr", "public.comp_financial_tran_repos_dly.pstd_date"),
+    )
+
+
+def test_refs_read_keeps_the_two_SIDES_of_a_join_apart():
+    """`join_left` is on the anchor and `join_right` on the event side. Collapsing them to bare
+    refs is exactly the M3 defect `_column_meta` exists to avoid."""
+    pairs = refs_read(_event())
+    assert ("cib", "public.bo_cib_customer.cust_num") in pairs
+    assert ("ftr", "public.comp_financial_tran_repos_dly.cif_id") in pairs
+
+
+def test_refs_read_includes_the_measure_when_there_is_one():
+    r = _event(header=_header(name="tgt_fx_volume_60d", label_type="amount",
+                              operator=None, threshold=None),
+               aggregate="sum",
+               measure_ref="public.comp_financial_tran_repos_dly.tran_amt_aed")
+    assert ("ftr", "public.comp_financial_tran_repos_dly.tran_amt_aed") in refs_read(r)
+
+
+def test_refs_read_for_a_state_change_includes_the_watched_column():
+    assert ("cib", "public.bo_cib_customer.cust_perf_nonperf_flg") in refs_read(_state())
+
+
+def test_the_content_hash_is_stable_for_an_identical_rule():
+    """Content-addressing is what makes an identical rule authored twice ONE row, and any edit a
+    new definition rather than a mutation of one other models are already trained against."""
+    assert target_content_hash(_state()) == target_content_hash(_state())
+
+
+def test_changing_the_window_changes_the_hash():
+    other = _state(header=_header(window_days=60))
+    assert target_content_hash(_state()) != target_content_hash(other)
+
+
+def test_the_canonical_body_carries_the_shape():
+    assert canonical_target(_state())["shape"] == "state_change"
+    assert canonical_target(_event())["shape"] == "event_window"

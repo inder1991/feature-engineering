@@ -13,8 +13,10 @@ Pure Python: no DB, no LLM. Catalog resolution lives in `target_catalog_check`.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 LABEL_TYPES = ("binary", "count", "amount")
 OPERATORS = ("==", "!=", ">=", "<=", ">", "<")
@@ -174,3 +176,43 @@ class EventWindowRuleV1:
                      "'not currently doing this' is meaningless without a period")
         _require(self.population_lookback_days >= 0,
                  "population_lookback_days cannot be negative")
+
+
+TargetRuleV1 = StateChangeRuleV1 | EventWindowRuleV1
+
+
+def refs_read(rule: TargetRuleV1) -> tuple[tuple[str, str], ...]:
+    """Every (catalog_source, object_ref) pair the rule reads, sorted and deduped.
+
+    For LINEAGE and IMPACT — "this column is being retired, which labels break?" — and NOT a
+    leakage blocklist. A feature reading the same columns BACKWARD from the as-of date is the
+    method (past FX predicting future FX); blocking on column overlap would delete the use case.
+    The leakage control is temporal and already exists. Spec §8, §9.
+
+    Pairs, never bare refs: `object_ref` is only `public.{table}.{column}` (M3).
+    """
+    anchor = rule.header.anchor_catalog
+    refs = {(anchor, rule.header.grain_ref), (anchor, rule.header.as_of_ref)}
+    if isinstance(rule, StateChangeRuleV1):
+        refs.add((anchor, rule.column_ref))
+    else:
+        # join_left is on the ANCHOR side, join_right on the EVENT side — the whole point of the
+        # pair. Collapsing them to bare refs is the M3 defect.
+        refs.add((anchor, rule.join_left))
+        refs.update({(rule.event_catalog, rule.event_date_ref),
+                     (rule.event_catalog, rule.join_right)})
+        if rule.measure_ref is not None:
+            refs.add((rule.event_catalog, rule.measure_ref))
+    return tuple(sorted(refs))
+
+
+def canonical_target(rule: TargetRuleV1) -> dict:
+    """The rule as a plain, ordered dict — the body the content hash is taken over."""
+    # `asdict` recurses into the nested header dataclass already — no second pass needed.
+    return asdict(rule)
+
+
+def target_content_hash(rule: TargetRuleV1) -> str:
+    """Identity by content, matching `model_feature_revision_hash`."""
+    body = json.dumps(canonical_target(rule), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode()).hexdigest()
