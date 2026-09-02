@@ -60,7 +60,7 @@ from dataclasses import replace
 
 from featuregen.overlay.upload.target_contract import StateChangeRuleV1, TargetHeaderV1
 from featuregen.overlay.upload.target_search import near_duplicates, search_targets
-from featuregen.overlay.upload.target_store import register_target
+from featuregen.overlay.upload.target_store import register_target, targets_for_entity
 
 
 def _rule(name: str = "tgt_npe_90d", entity: str = "customer",
@@ -108,6 +108,16 @@ def test_a_proposal_differing_only_in_its_WINDOW_is_named_as_a_near_duplicate(db
     register_target(db, _rule(), description="d", registered_by="a")
     twins = near_duplicates(db, _rule(name="tgt_npe_60d", window=60))
     assert [(t["name"], t["differs_in"]) for t in twins] == [("tgt_npe_90d", ("window_days",))]
+
+
+def test_a_twin_is_found_even_though_tuples_round_trip_as_LISTS(db):
+    """The bug this guards: `canonical_target` yields tuples, the stored jsonb yields lists, and
+    `("Performing",) != ["Performing"]`. Comparing them directly disables twin detection entirely
+    — silently, while a feature claims to prevent twins."""
+    register_target(db, _rule(), description="d", registered_by="a")
+    stored = targets_for_entity(db, "customer")[0]["rule"]
+    assert isinstance(stored["from_values"], list), "the round trip really does change the type"
+    assert near_duplicates(db, _rule(name="tgt_npe_60d", window=60)) != []
 
 
 def test_a_genuinely_different_rule_is_not_a_near_duplicate(db):
@@ -189,9 +199,16 @@ def near_duplicates(conn, rule) -> list[dict]:
     be stated before a person submits, or the registry fills with `tgt_churned_60d` beside
     `tgt_churned_90d` and nobody can say which one the bank means.
     """
+    import json
+
     from featuregen.overlay.upload.target_contract import canonical_target
 
-    proposed = canonical_target(rule)
+    # THROUGH JSON, deliberately. `canonical_target` yields TUPLES; the same rule read back from
+    # the `rule` jsonb column yields LISTS, and `("Performing",) != ["Performing"]`. Comparing the
+    # two directly makes `rest_same` False for every state_change rule, so twin detection silently
+    # returns nothing while claiming to prevent exactly that. Normalising both sides through the
+    # same round-trip the store performs is what makes the comparison mean anything.
+    proposed = json.loads(json.dumps(canonical_target(rule)))
     proposed_head = dict(proposed["header"])
     out: list[dict] = []
     for row in targets_for_entity(conn, rule.header.entity):
@@ -337,6 +354,7 @@ NEEDS_INPUT_REASONS = (
     "business_choice",         # two defensible definitions; not the tool's call
     "population_choice",       # "who will do it at all" vs "who will START"
     "not_stated",              # the objective gives no horizon
+    "not_in_catalog",          # the model named a column that is not in the candidates
 )
 
 
@@ -359,6 +377,11 @@ class TargetDraftV1:
     notes: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        # `frozen=True` protects the ATTRIBUTES, not the dicts they point at. Copying on
+        # construction makes the guarantee real rather than advertised: a caller cannot reach in
+        # and change a draft after it has been validated.
+        object.__setattr__(self, "fields", dict(self.fields))
+        object.__setattr__(self, "notes", dict(self.notes))
         _require(self.shape in DRAFT_SHAPES, f"shape {self.shape!r} not in {DRAFT_SHAPES}")
         both = set(self.fields) & set(self.needs_input)
         _require(not both,
@@ -467,6 +490,20 @@ def test_a_ref_the_model_INVENTED_is_dropped_and_becomes_a_blank(db):
         "needs_input": [], "notes": {}}))
     assert "column_ref" not in draft.fields
     assert "column_ref" in draft.needs_input
+    assert draft.notes["column_ref"] == "not_in_catalog", \
+        "the blank must say the column is absent, not that its VALUES are unprofiled"
+
+
+def test_an_unstated_horizon_comes_back_as_a_BLANK_not_a_default(db):
+    """`as_of_frequency` is the one mandatory field with no safe default, so "the model omitted it"
+    is the case most worth pinning: it must arrive as a justified blank, never quietly filled."""
+    _catalog(db)
+    draft = _propose(db, _client({
+        "shape": "state_change",
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG},
+        "needs_input": ["as_of_frequency"], "notes": {"as_of_frequency": "not_stated"}}))
+    assert "as_of_frequency" in draft.needs_input
+    assert "as_of_frequency" not in draft.fields
 
 
 def test_no_client_returns_nothing_rather_than_a_fabricated_draft(db):
@@ -497,10 +534,15 @@ TARGET_DRAFT_PROMPT_ID = "target_draft"
 TARGET_DRAFT_PROMPT_VERSION = 1
 TARGET_DRAFT_SCHEMA_ID = "target_draft"
 
-#: Fields that must name a candidate column. Anything else is dropped to a blank rather than
-#: trusted — the intake ticket's rule ("an off-shortlist target is ABSTAIN, never trusted").
-_REF_FIELDS = ("grain_ref", "as_of_ref", "column_ref", "event_date_ref",
-               "join_left", "join_right", "measure_ref")
+#: Fields the model may name, and which must therefore be candidate columns. Anything off the
+#: shortlist is dropped to a blank rather than trusted — the intake ticket's rule ("an off-shortlist
+#: target is ABSTAIN, never trusted").
+#:
+#: `grain_ref` and `as_of_ref` are NOT here: the person chose the entity, and `selectable_entities`
+#: already returns its `spine_ref`. Letting the model guess a grain the person has effectively
+#: already picked only invites a disagreement the grain check then rejects — with the person unable
+#: to see why.
+_REF_FIELDS = ("column_ref", "event_date_ref", "join_left", "join_right", "measure_ref")
 
 #: FIXED protocol text. The hypothesis and candidates ride `catalog_metadata` — the
 #: `formula/author.py` injection stance: they are DATA, not instructions.
@@ -529,8 +571,14 @@ _INSTRUCTION = (
 
 
 def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_source: str,
+                         grain_ref: str, as_of_ref: str,
                          roles=(), actor=None) -> "TargetDraftV1 | None":
-    """One governed call. Returns None on any technical outcome — never a fabricated draft."""
+    """One governed call. Returns None on any technical outcome — never a fabricated draft.
+
+    `grain_ref` and `as_of_ref` come from the entity the PERSON chose (`selectable_entities`), and
+    are stamped onto the draft rather than proposed. The model is never asked for a decision that
+    has already been made.
+    """
     from featuregen.overlay.upload.contract.intake_ticket import _shortlist
     from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
 
@@ -563,7 +611,17 @@ def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_
             del fields[name]
             if name not in needs:
                 needs.append(name)
-                notes[name] = "no_value_profile"
+                # NOT `no_value_profile` — that would tell the person "nothing records what this
+                # column contains" about a column that does not exist. The form renders a sentence
+                # per reason, so a wrong code shows a wrong explanation for the blank.
+                notes[name] = "not_in_catalog"
+    # The chosen entity's spine is stamped on, never guessed; and it overrides anything the model
+    # supplied for those keys.
+    fields["entity"] = entity
+    fields["anchor_catalog"] = catalog_source
+    fields["grain_ref"] = grain_ref
+    fields["as_of_ref"] = as_of_ref
+    needs = [n for n in needs if n not in ("entity", "anchor_catalog", "grain_ref", "as_of_ref")]
     try:
         return TargetDraftV1(shape=str(body.get("shape", "")), fields=fields,
                              needs_input=tuple(needs), notes=notes)
@@ -712,7 +770,7 @@ git add -A && git commit -m "feat(target): migration 1143 — the proposal, the 
 - Test: `tests/featuregen/api/test_targets.py`
 
 **Interfaces:**
-- Produces: `GET /targets/entities?catalog_source=`, `POST /targets/propose`, `POST /targets`, `GET /targets?entity=`.
+- Produces: `GET /targets/entities?catalog_source=`, `POST /targets/propose`, `POST /targets/describe`, `POST /targets`, `GET /targets?entity=`.
 
 **Read first:** `src/featuregen/api/routes/contract.py` for the `_Conn` / `_Identity` / `_LLM`
 dependency aliases and the permission decorator, and `tests/featuregen/api/_helpers.py` for `AUTH`.
@@ -739,6 +797,18 @@ def test_propose_returns_the_registry_hits_BESIDE_the_draft(make_client):
     assert body["draft"]["shape"] in ("state_change", "event_window")
 
 
+def test_an_entity_this_catalog_cannot_ANCHOR_is_refused(make_client):
+    """The person picks from `selectable_entities`, but the route must not trust the client to have
+    picked from it — and "no keyed spine table" is a better answer than a draft anchored on
+    nothing."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/targets/propose", json={
+        "hypothesis": "h", "entity": "spacecraft", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 422
+    assert res.json()["detail"]["code"] == "ENTITY_NOT_ANCHORABLE"
+
+
 def test_a_proposal_that_fails_technically_is_reported_not_faked(make_client):
     client = make_client(_no_draft_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)
@@ -746,6 +816,26 @@ def test_a_proposal_that_fails_technically_is_reported_not_faked(make_client):
         "hypothesis": "h", "entity": "customer", "catalog_source": "deposits"},
         headers=AUTH).json()
     assert body["draft"] is None
+
+
+def test_the_sentence_is_available_BEFORE_submitting(make_client):
+    """The person approves a statement of meaning, not twelve fields — so it must be renderable
+    while the form is being edited, not returned once they have committed."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    said = client.post("/targets/describe", json={"rule": _valid_rule_for_deposits()},
+                       headers=AUTH).json()["reads_as"]
+    assert "one row per customer" in said
+    assert "sampled" in said and "observed" in said
+
+
+def test_an_incomplete_rule_describes_as_NOTHING_rather_than_erroring(make_client):
+    """A half-filled form is the normal state while someone is typing, not a failure."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.post("/targets/describe", json={"rule": {"shape": "state_change"}},
+                       headers=AUTH).json()
+    assert body["reads_as"] is None and body["incomplete"]
 
 
 def test_registering_an_INVALID_rule_is_a_typed_422(make_client):
@@ -832,6 +922,10 @@ class ProposeIn(BaseModel):
     catalog_source: str = Field(min_length=1)
 
 
+class DescribeIn(BaseModel):
+    rule: dict
+
+
 class RegisterIn(BaseModel):
     rule: dict
     description: str = ""
@@ -886,10 +980,30 @@ def entities(catalog_source: str, conn: _Conn, identity: _Identity) -> list[dict
 def propose(body: ProposeIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Search FIRST, then propose. The two travel in separate keys: an existing label is a decision
     the organisation already made, a draft is a draft."""
+    # The person chose the entity; the SERVER looks up its spine rather than trusting the client
+    # to echo one back, and refuses an entity this catalog cannot anchor.
+    spine = next((e for e in selectable_entities(conn, body.catalog_source,
+                                                 roles=identity.role_claims)
+                  if e["entity"] == body.entity.lower()), None)
+    if spine is None:
+        raise HTTPException(status_code=422, detail={
+            "code": "ENTITY_NOT_ANCHORABLE",
+            "message": f"{body.catalog_source} has no keyed spine table for {body.entity!r}"})
+    as_of = conn.execute(
+        "SELECT object_ref FROM graph_node WHERE kind = 'column' AND catalog_source = %s"
+        "   AND table_name = %s AND is_as_of LIMIT 1",
+        (body.catalog_source, spine["spine_table"])).fetchone()
+    if as_of is None:
+        raise HTTPException(status_code=422, detail={
+            "code": "NO_AS_OF_COLUMN",
+            "message": f"{spine['spine_table']} has no as-of column, so a forward window cannot "
+                       "be measured from it"})
+
     existing = search_targets(conn, entity=body.entity, hypothesis=body.hypothesis)
     draft = propose_target_draft(
         conn, client, hypothesis=body.hypothesis, entity=body.entity,
-        catalog_source=body.catalog_source, roles=identity.role_claims, actor=identity)
+        catalog_source=body.catalog_source, grain_ref=spine["spine_ref"], as_of_ref=as_of[0],
+        roles=identity.role_claims, actor=identity)
     return {
         "existing": [{"name": e["name"], "description": e["description"],
                       "window_days": e["window_days"], "match_terms": list(e["match_terms"])}
@@ -898,6 +1012,24 @@ def propose(body: ProposeIn, conn: _Conn, identity: _Identity, client: _LLM) -> 
             "shape": draft.shape, "fields": draft.fields,
             "needs_input": list(draft.needs_input), "notes": draft.notes},
     }
+
+
+@router.post("/targets/describe", dependencies=[Depends(require_feature_generate)])
+def describe(body: DescribeIn) -> dict:
+    """The rule as one plain sentence, so the FORM can show it while the person edits.
+
+    Returning it only from registration — as an earlier draft of this plan did — gets the whole
+    argument backwards: the sentence exists so a person approves a statement of MEANING rather than
+    twelve fields, and one produced after they have committed approves nothing. Deterministic and
+    model-free, so it cannot drift from the rule it renders.
+
+    A rule too incomplete to construct has no meaning to state yet, which is an ordinary answer
+    here rather than an error — the form is still being filled in.
+    """
+    try:
+        return {"reads_as": describe_target(_rule_from_body(body.rule))}
+    except (TargetContractError, TypeError, ValueError) as exc:
+        return {"reads_as": None, "incomplete": str(exc)}
 
 
 @router.post("/targets", dependencies=[Depends(require_feature_generate)])
