@@ -25,6 +25,19 @@ NEEDS_INPUT_REASONS = (
 )
 
 
+#: What each shape needs before a form can be filled in. A draft must ACCOUNT FOR every one of
+#: them — filled, or blank with a reason. Found by the first real model call, which returned
+#: `shape: state_change` and nothing else with an empty `needs_input`: valid under the old rules,
+#: and rendering as a form of unexplained blanks, which is the failure this type exists to prevent.
+_SHARED_FIELDS = ("name", "entity", "anchor_catalog", "grain_ref", "as_of_ref",
+                  "window_days", "as_of_frequency", "label_type")
+SHAPE_FIELDS = {
+    "state_change": _SHARED_FIELDS + ("column_ref", "from_values", "to_values"),
+    "event_window": _SHARED_FIELDS + ("event_catalog", "event_table", "event_date_ref",
+                                      "join_left", "join_right", "aggregate"),
+}
+
+
 class DraftError(ValueError):
     """A malformed draft — refused at construction."""
 
@@ -59,6 +72,12 @@ class TargetDraftV1:
             _require(reason in NEEDS_INPUT_REASONS,
                      f"{name} is needed but its reason {reason!r} is not one of "
                      f"{NEEDS_INPUT_REASONS} — a blank nobody explains gets filled in carelessly")
+        accounted = set(self.fields) | set(self.needs_input)
+        missing = [f for f in SHAPE_FIELDS[self.shape] if f not in accounted]
+        _require(not missing,
+                 f"{missing!r} are neither filled nor listed in needs_input — every field a "
+                 f"{self.shape} rule needs must be accounted for, or the form renders blanks "
+                 "with no explanation for any of them")
 
 
 TARGET_DRAFT_TASK = "overlay.target.draft"
@@ -87,6 +106,14 @@ _INSTRUCTION = (
     "`shape` is `state_change` (a column's value at the as-of date versus inside the window — use "
     "this when the outcome is a flag flipping) or `event_window` (rows in another table inside the "
     "window — use this when the outcome is something happening, or not happening).\n\n"
+    "EVERY field below must be ACCOUNTED FOR — either in `fields` or in `needs_input` with a "
+    "reason. A field you simply omit is neither, and the form then shows a blank nobody can "
+    "explain.\n\n"
+    "Both shapes need: name (prefixed `tgt_`), window_days, as_of_frequency, label_type "
+    "(binary|count|amount), and for a binary label operator + threshold. `state_change` also "
+    "needs column_ref, from_values, to_values. `event_window` also needs event_catalog, "
+    "event_table, event_date_ref, join_left, join_right, aggregate (count|sum). Do NOT supply "
+    "entity, anchor_catalog, grain_ref or as_of_ref — those are already chosen.\n\n"
     "FILL a field only when the catalog justifies it: refs copied EXACTLY from the candidates, the "
     "window from a horizon the objective states, a currency where the catalog declares one.\n\n"
     "`as_of_frequency` says WHICH as-of dates the label is evaluated on (daily, weekly, monthly, "

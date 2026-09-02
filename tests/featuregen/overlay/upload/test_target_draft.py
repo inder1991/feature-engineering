@@ -10,7 +10,10 @@ def _draft(**over) -> TargetDraftV1:
     base = dict(
         shape="state_change",
         fields={"name": "tgt_npe_90d", "entity": "customer", "anchor_catalog": "cib",
-                "window_days": 90, "column_ref": "public.bo_cib_customer.cust_perf_nonperf_flg"},
+                "grain_ref": "public.bo_cib_customer.cust_num",
+                "as_of_ref": "public.bo_cib_customer.business_dt",
+                "window_days": 90, "as_of_frequency": "monthly", "label_type": "binary",
+                "column_ref": "public.bo_cib_customer.cust_perf_nonperf_flg"},
         needs_input=("from_values", "to_values"),
         notes={"from_values": "no_value_profile", "to_values": "no_value_profile"})
     return TargetDraftV1(**{**base, **over})
@@ -27,8 +30,9 @@ def test_a_draft_may_be_INCOMPLETE_where_a_rule_may_not():
 def test_a_field_cannot_be_both_FILLED_and_NEEDED():
     """That contradiction is how a guessed value gets rendered as if a person supplied it."""
     with pytest.raises(DraftError, match="both"):
-        _draft(fields={"window_days": 90}, needs_input=("window_days",),
-               notes={"window_days": "not_stated"})
+        _draft(needs_input=("window_days", "from_values", "to_values"),
+               notes={"window_days": "not_stated", "from_values": "no_value_profile",
+                      "to_values": "no_value_profile"})
 
 
 def test_every_needed_field_must_say_WHY_it_is_needed():
@@ -49,13 +53,16 @@ def test_the_shape_is_closed():
 
 
 def test_a_complete_draft_needs_nothing():
-    assert _draft(needs_input=(), notes={}).needs_input == ()
+    complete = dict(_draft().fields)
+    complete |= {"from_values": ["Performing"], "to_values": ["Non-performing"]}
+    assert TargetDraftV1(shape="state_change", fields=complete).needs_input == ()
 
 
 def test_a_frozen_draft_cannot_be_mutated_through_its_dicts():
     """`frozen=True` protects the attributes, not the dicts they point at. Copying on construction
     makes the guarantee real rather than advertised."""
-    supplied = {"name": "tgt_npe_90d"}
+    supplied = dict(_draft().fields)
+    supplied |= {"from_values": ["Performing"], "to_values": ["Non-performing"]}
     draft = TargetDraftV1(shape="state_change", fields=supplied)
     supplied["name"] = "tampered"
     assert draft.fields["name"] == "tgt_npe_90d"
@@ -104,7 +111,8 @@ def test_a_draft_comes_back_with_its_blanks_and_reasons(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90},
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
+                   "as_of_frequency": "monthly", "label_type": "binary"},
         "needs_input": ["from_values", "to_values"],
         "notes": {"from_values": "no_value_profile", "to_values": "no_value_profile"}}))
     assert draft.shape == "state_change"
@@ -119,7 +127,9 @@ def test_the_chosen_entitys_SPINE_is_stamped_on_never_guessed(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG,
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
+                   "as_of_frequency": "monthly", "label_type": "binary",
+                   "from_values": ["P"], "to_values": ["N"],
                    "grain_ref": "public.customers.something_else"},
         "needs_input": [], "notes": {}}))
     assert draft.fields["grain_ref"] == _GRAIN
@@ -133,7 +143,9 @@ def test_a_ref_the_model_INVENTED_is_dropped_and_becomes_a_blank(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": "public.customers.invented"},
+        "fields": {"name": "tgt_npe_90d", "column_ref": "public.customers.invented",
+                   "window_days": 90, "as_of_frequency": "monthly", "label_type": "binary",
+                   "from_values": ["P"], "to_values": ["N"]},
         "needs_input": [], "notes": {}}))
     assert "column_ref" not in draft.fields
     assert "column_ref" in draft.needs_input
@@ -147,7 +159,8 @@ def test_an_unstated_horizon_comes_back_as_a_BLANK_not_a_default(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG},
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
+                   "label_type": "binary", "from_values": ["P"], "to_values": ["N"]},
         "needs_input": ["as_of_frequency"], "notes": {"as_of_frequency": "not_stated"}}))
     assert "as_of_frequency" in draft.needs_input
     assert "as_of_frequency" not in draft.fields
@@ -164,3 +177,41 @@ def test_a_body_that_contradicts_itself_returns_nothing(db):
     assert _propose(db, _client({
         "shape": "state_change", "fields": {"window_days": 90},
         "needs_input": ["window_days"], "notes": {"window_days": "not_stated"}})) is None
+
+
+def test_a_draft_must_ACCOUNT_FOR_every_field_its_shape_needs():
+    """Found by the first real model call: it returned `shape: state_change` and nothing else —
+    no column, no window, no name — with an EMPTY needs_input. That passed validation, because
+    the type only checked that blanks carry reasons, never that the shape was covered. The form
+    would then render everything blank with no explanation for any of it, which is the exact
+    failure this type exists to prevent."""
+    with pytest.raises(DraftError, match="accounted for"):
+        TargetDraftV1(shape="state_change",
+                      fields={"entity": "customer", "anchor_catalog": "cib",
+                              "grain_ref": "public.t.k", "as_of_ref": "public.t.d"})
+
+
+def test_a_field_is_accounted_for_by_being_BLANK_with_a_reason():
+    """Covered does not mean filled — a justified blank is a complete answer."""
+    draft = TargetDraftV1(
+        shape="state_change",
+        fields={"entity": "customer", "anchor_catalog": "cib", "grain_ref": "public.t.k",
+                "as_of_ref": "public.t.d", "name": "tgt_npe_90d", "window_days": 90,
+                "as_of_frequency": "monthly", "label_type": "binary", "operator": ">=",
+                "threshold": 1, "column_ref": "public.t.flag"},
+        needs_input=("from_values", "to_values"),
+        notes={"from_values": "no_value_profile", "to_values": "no_value_profile"})
+    assert draft.needs_input == ("from_values", "to_values")
+
+
+def test_an_event_window_draft_is_measured_against_ITS_OWN_fields():
+    """The two shapes need different keys; a state_change field list must not satisfy an
+    event_window draft."""
+    with pytest.raises(DraftError, match="accounted for"):
+        TargetDraftV1(shape="event_window",
+                      fields={"entity": "customer", "anchor_catalog": "cib",
+                              "grain_ref": "public.t.k", "as_of_ref": "public.t.d",
+                              "name": "tgt_x_90d", "window_days": 90,
+                              "as_of_frequency": "monthly", "label_type": "binary",
+                              "operator": ">=", "threshold": 1,
+                              "column_ref": "public.t.flag"})
