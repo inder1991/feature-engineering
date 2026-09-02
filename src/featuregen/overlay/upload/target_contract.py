@@ -124,6 +124,43 @@ class StateChangeRuleV1:
                  "against itself and observe nothing")
 
 
+#: A CLOSED operator set. An open one is an open grammar: free text in a stored, model-authored
+#: definition is an injection surface, un-auditable, and — the reason that actually forced this —
+#: INVISIBLE TO LINEAGE. A filter written as `"tran_crncy <> 'AED'"` reads a column that
+#: `refs_read` cannot see, so `target_derives_from` would answer "no label depends on tran_crncy"
+#: while one silently did.
+FILTER_OPS = ("==", "!=", ">", ">=", "<", "<=", "in", "not_in")
+#: The two ops taking a list. Between them they cover the common OR case ("currency in (USD, EUR)")
+#: without admitting OR into the grammar.
+_LIST_OPS = ("in", "not_in")
+
+
+@dataclass(frozen=True, slots=True)
+class EventFilterV1:
+    """One condition on the event rows. Conditions are ANDed; there is deliberately no OR — that
+    is the stated cost of a closed structure, and `in` covers the case that otherwise needs it."""
+
+    column_ref: str
+    op: str
+    value: str | None = None            # a literal
+    values: tuple[str, ...] = ()        # a literal list, for in / not_in
+    value_ref: str | None = None        # ANOTHER COLUMN — needs no unverifiable literal at all
+
+    def __post_init__(self) -> None:
+        _require(bool(self.column_ref.strip()), "column_ref is mandatory")
+        _require(self.op in FILTER_OPS, f"op {self.op!r} not in {FILTER_OPS}")
+        supplied = sum([self.value is not None, bool(self.values),
+                        self.value_ref is not None])
+        _require(supplied == 1,
+                 "exactly one of value / values / value_ref must be supplied")
+        if self.op in _LIST_OPS:
+            _require(bool(self.values),
+                     f"{self.op} takes values (a list), not a single value")
+        else:
+            _require(not self.values,
+                     f"{self.op} takes a single value or value_ref, not values (a list)")
+
+
 AGGREGATES = ("count", "sum")
 #: `none` restricts the population to rows with NO matching event in the lookback before the as-of
 #: date ("who will START"); `any` is the whole population ("who will do it at all"). The difference
@@ -149,7 +186,7 @@ class EventWindowRuleV1:
     join_left: str
     join_right: str
     aggregate: str
-    event_filter: str | None = None
+    event_filters: tuple[EventFilterV1, ...] = ()
     measure_ref: str | None = None
     population_lookback_days: int = 0
     population_having: str = "any"
@@ -203,6 +240,12 @@ def refs_read(rule: TargetRuleV1) -> tuple[tuple[str, str], ...]:
                      (rule.event_catalog, rule.join_right)})
         if rule.measure_ref is not None:
             refs.add((rule.event_catalog, rule.measure_ref))
+        # A filter reads columns too. Missing them made `target_derives_from` answer "nothing
+        # depends on this column" about a column a label genuinely depends on.
+        for condition in rule.event_filters:
+            refs.add((rule.event_catalog, condition.column_ref))
+            if condition.value_ref is not None:
+                refs.add((rule.event_catalog, condition.value_ref))
     return tuple(sorted(refs))
 
 

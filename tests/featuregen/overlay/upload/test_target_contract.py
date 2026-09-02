@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from featuregen.overlay.upload.target_contract import (
+    EventFilterV1,
     EventWindowRuleV1,
     StateChangeRuleV1,
     TargetContractError,
@@ -124,7 +125,10 @@ def _event(**over) -> EventWindowRuleV1:
                 event_date_ref="public.comp_financial_tran_repos_dly.pstd_date",
                 join_left="public.bo_cib_customer.cust_num",
                 join_right="public.comp_financial_tran_repos_dly.cif_id",
-                event_filter="tran_crncy <> counter_party_tran_crncy",
+                event_filters=(EventFilterV1(
+                    column_ref="public.comp_financial_tran_repos_dly.tran_crncy",
+                    op="!=",
+                    value_ref="public.comp_financial_tran_repos_dly.counter_party_tran_crncy"),),
                 aggregate="count")
     return EventWindowRuleV1(**{**base, **over})
 
@@ -178,7 +182,11 @@ def test_refs_read_names_every_column_the_rule_touches():
         ("cib", "public.bo_cib_customer.business_dt"),
         ("cib", "public.bo_cib_customer.cust_num"),
         ("ftr", "public.comp_financial_tran_repos_dly.cif_id"),
+        # BOTH sides of the filter are here. Under the old free-text filter they were invisible,
+        # so lineage would have said nothing depended on these columns.
+        ("ftr", "public.comp_financial_tran_repos_dly.counter_party_tran_crncy"),
         ("ftr", "public.comp_financial_tran_repos_dly.pstd_date"),
+        ("ftr", "public.comp_financial_tran_repos_dly.tran_crncy"),
     )
 
 
@@ -216,3 +224,56 @@ def test_changing_the_window_changes_the_hash():
 def test_the_canonical_body_carries_the_shape():
     assert canonical_target(_state())["shape"] == "state_change"
     assert canonical_target(_event())["shape"] == "event_window"
+
+
+# ══ the closed filter structure ══════════════════════════════════════════════════════════════════
+
+def test_a_filter_may_compare_a_column_to_a_LITERAL():
+    f = EventFilterV1(column_ref="public.t.tran_crncy", op="!=", value="AED")
+    assert (f.op, f.value) == ("!=", "AED")
+
+
+def test_a_filter_may_compare_a_column_to_ANOTHER_COLUMN():
+    """The truer FX definition — a conversion actually happened — needs no literal at all, which
+    also means no unverifiable value to guess."""
+    f = EventFilterV1(column_ref="public.t.tran_crncy", op="!=",
+                      value_ref="public.t.counter_party_tran_crncy")
+    assert f.value_ref.endswith("counter_party_tran_crncy")
+
+
+def test_exactly_one_kind_of_right_hand_side_is_required():
+    with pytest.raises(TargetContractError, match="exactly one"):
+        EventFilterV1(column_ref="public.t.c", op="!=")
+    with pytest.raises(TargetContractError, match="exactly one"):
+        EventFilterV1(column_ref="public.t.c", op="!=", value="A", value_ref="public.t.d")
+
+
+def test_an_unrecognised_operator_is_refused():
+    """A CLOSED set. This is the whole point of the change — an open operator is an open grammar."""
+    with pytest.raises(TargetContractError, match="op"):
+        EventFilterV1(column_ref="public.t.c", op="LIKE", value="%AED%")
+
+
+def test_in_requires_a_LIST_and_scalar_ops_forbid_one():
+    assert EventFilterV1(column_ref="public.t.c", op="in", values=("USD", "EUR")).values
+    with pytest.raises(TargetContractError, match="values"):
+        EventFilterV1(column_ref="public.t.c", op="in", value="USD")
+    with pytest.raises(TargetContractError, match="values"):
+        EventFilterV1(column_ref="public.t.c", op="!=", values=("USD",))
+
+
+def test_the_filters_COLUMNS_reach_lineage():
+    """The defect the free-text filter had: `tgt_fx_active_90d` reads `tran_crncy`, and
+    `refs_read` could not see it, so `target_derives_from` would answer "no labels depend on this
+    column" while one silently did."""
+    rule = _event(event_filters=(
+        EventFilterV1(column_ref="public.comp_financial_tran_repos_dly.tran_crncy",
+                      op="!=", value="AED"),))
+    assert ("ftr", "public.comp_financial_tran_repos_dly.tran_crncy") in refs_read(rule)
+
+
+def test_a_column_to_column_filter_puts_BOTH_sides_in_lineage():
+    rule = _event()  # the default fixture compares tran_crncy to counter_party_tran_crncy
+    pairs = refs_read(rule)
+    assert ("ftr", "public.comp_financial_tran_repos_dly.tran_crncy") in pairs
+    assert ("ftr", "public.comp_financial_tran_repos_dly.counter_party_tran_crncy") in pairs

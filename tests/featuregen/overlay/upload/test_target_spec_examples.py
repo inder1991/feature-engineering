@@ -4,6 +4,7 @@ one hand-rolled fixture, which only proves the contract accepts itself."""
 from __future__ import annotations
 
 from featuregen.overlay.upload.target_contract import (
+    EventFilterV1,
     EventWindowRuleV1,
     StateChangeRuleV1,
     TargetHeaderV1,
@@ -59,7 +60,9 @@ def _tgt_fx_active_90d() -> EventWindowRuleV1:
         event_catalog="ftr", event_table=FTR_TABLE,
         event_date_ref=f"{FTR_TABLE}.pstd_date", join_left=CIB_GRAIN,
         join_right=f"{FTR_TABLE}.cif_id",
-        event_filter="tran_crncy <> 'AED'", aggregate="count")
+        event_filters=(EventFilterV1(column_ref=f"{FTR_TABLE}.tran_crncy",
+                                     op="!=", value="AED"),),
+        aggregate="count")
 
 
 def _all_four():
@@ -76,6 +79,13 @@ def test_the_churn_label_needs_a_zero_threshold_to_mean_NO_activity():
     not `>= 1`, and the one most likely to be written the wrong way round."""
     rule = _tgt_churned_90d()
     assert (rule.header.operator, rule.header.threshold) == ("==", 0.0)
+
+
+def test_the_fx_example_puts_its_FILTER_column_in_lineage():
+    """`tgt_fx_active_90d` is defined BY `tran_crncy`. Under the free-text filter that column never
+    reached `target_derives_from`, so "which labels break if tran_crncy is retired?" answered
+    "none" — about the one label that would."""
+    assert ("ftr", f"{FTR_TABLE}.tran_crncy") in refs_read(_tgt_fx_active_90d())
 
 
 def test_a_cross_catalog_example_reads_BOTH_catalogs():

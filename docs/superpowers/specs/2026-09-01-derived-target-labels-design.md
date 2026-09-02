@@ -213,7 +213,10 @@ Rows in a second table, inside the window, joined to the grain.
   "event_date_ref": "public.comp_financial_tran_repos_dly.pstd_date",
   "join": { "left":  "public.bo_cib_customer.cust_num",
             "right": "public.comp_financial_tran_repos_dly.cif_id" },
-  "event_filter": "tran_crncy <> 'AED'",
+  "event_filters": [
+    { "column_ref": "public.comp_financial_tran_repos_dly.tran_crncy",
+      "op": "!=", "value": "AED" }
+  ],
   "aggregate": "count",
   "operator": ">=",
   "threshold": 1,
@@ -221,7 +224,23 @@ Rows in a second table, inside the window, joined to the grain.
 }
 ```
 
-`event_filter` is the one free-text field and therefore the one that needs bounding — see §12.
+**`event_filters` is a CLOSED structure, resolved from §12.1.** Each condition is
+`{column_ref, op, value | values | value_ref}` with `op` drawn from a closed set; conditions are
+ANDed. There is deliberately no `OR` — that is the stated cost — and `in` / `not_in` cover the case
+that most often needs it ("currency in (USD, EUR)").
+
+Three reasons, and the third is what forced it:
+
+1. Free text in a stored, MODEL-AUTHORED definition is an injection surface.
+2. A grammar nobody bounded grows forever and cannot be audited.
+3. **It made lineage lie.** A filter written `"tran_crncy <> 'AED'"` reads a column `refs_read`
+   cannot see, so `target_derives_from` would answer *"no label depends on `tran_crncy`"* about the
+   very label defined by it. The closed structure puts both sides of every condition — including a
+   `value_ref` comparing two columns — into the lineage.
+
+`value_ref` also removes an unverifiable literal from the commonest case: *"a conversion actually
+happened"* is `tran_crncy != counter_party_tran_crncy`, which needs no guessed currency code at
+all (§11).
 
 **`population_filter` decides which question is being asked**, and without it only one of two very
 different labels is expressible. `having: "none"` restricts the population to rows with no matching
@@ -454,11 +473,12 @@ confirmation stays either way.
 
 ## 12. Open questions for review
 
-1. **`event_filter` is free text**, and free text is how a definition language becomes an
-   injection surface and an un-auditable grammar. Options: a closed predicate structure
-   (`{column, op, value}`), an allow-list of operators over catalog-resolved refs, or accepting
-   text with the pipeline owning validation. Recommend the closed structure; it costs expressiveness
-   for `OR` chains.
+1. ~~**`event_filter` is free text**~~ — **RESOLVED 2026-09-02, owner's decision: the closed
+   structure.** Implemented as `event_filters` (§7.3), ANDed, no `OR`. The deciding argument was
+   not the injection surface but the lineage defect: the free-text form made
+   `target_derives_from` answer "nothing depends on this column" about a column a label was
+   defined by. Zero labels were registered at the time, so the shape changed with no data
+   migration.
 2. **Who may change a definition** other people's models are trained against. Content-addressing
    makes an edit a new row, but the *name* must resolve somewhere — needs an active-revision
    pointer and a rule about moving it, mirroring `feature_active_revision`.
