@@ -23,11 +23,18 @@ class TargetNameTaken(ValueError):
     on a definition meets this routinely, and a typed refusal can name what is in the way."""
 
 
-def register_target(conn, rule: TargetRuleV1, *, description: str, registered_by: str) -> str:
+def register_target(conn, rule: TargetRuleV1, *, description: str, registered_by: str,
+                    proposed_draft: dict | None = None, author_comment: str = "",
+                    adapted_from: str | None = None) -> str:
     """Persist a rule and its lineage; return the definition id.
 
     Idempotent on content: re-registering an identical rule returns the existing id rather than
     minting a second row. Verification is DESIGN-CHECKED and never higher — see the migration.
+
+    `proposed_draft` is kept so the DIFF against the registered rule stays computable: "proposed 90
+    days, human changed it to 180" is the provenance, and `author_comment` is the one thing that
+    diff cannot say for itself. Both absent for a rule authored in code — honest absence, not an
+    invented record.
     """
     content_hash = target_content_hash(rule)
     existing = conn.execute(
@@ -48,11 +55,14 @@ def register_target(conn, rule: TargetRuleV1, *, description: str, registered_by
     definition_id = f"tdef_{uuid.uuid4().hex[:16]}"
     conn.execute(
         "INSERT INTO target_definition (definition_id, name, entity, shape, window_days,"
-        " label_type, rule, content_hash, description, registered_by)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        " label_type, rule, content_hash, description, registered_by, proposed_draft,"
+        " author_comment, adapted_from)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (definition_id, header.name, header.entity, rule.shape, header.window_days,
          header.label_type, json.dumps(canonical_target(rule)), content_hash,
-         description, registered_by))
+         description, registered_by,
+         json.dumps(proposed_draft) if proposed_draft is not None else None,
+         author_comment, adapted_from))
     for catalog_source, object_ref in refs_read(rule):
         conn.execute(
             "INSERT INTO target_derives_from (definition_id, catalog_source, object_ref)"
@@ -62,17 +72,21 @@ def register_target(conn, rule: TargetRuleV1, *, description: str, registered_by
 
 
 def _row(conn, definition_id: str, name: str, entity: str, shape: str, window_days: int,
-         label_type: str, rule, verification: str, description: str) -> dict:
+         label_type: str, rule, verification: str, description: str,
+         proposed_draft, author_comment: str, adapted_from: str | None) -> dict:
     derives = [(r[0], r[1]) for r in conn.execute(
         "SELECT catalog_source, object_ref FROM target_derives_from WHERE definition_id = %s"
         " ORDER BY catalog_source, object_ref", (definition_id,)).fetchall()]
     return {"definition_id": definition_id, "name": name, "entity": entity, "shape": shape,
             "window_days": window_days, "label_type": label_type, "rule": rule,
-            "verification": verification, "description": description, "derives_from": derives}
+            "verification": verification, "description": description, "derives_from": derives,
+            "proposed_draft": proposed_draft, "author_comment": author_comment,
+            "adapted_from": adapted_from}
 
 
 _SELECT = ("SELECT definition_id, name, entity, shape, window_days, label_type, rule,"
-           " verification, description FROM target_definition")
+           " verification, description, proposed_draft, author_comment, adapted_from"
+           " FROM target_definition")
 
 
 def target_by_name(conn, entity: str, name: str) -> dict | None:

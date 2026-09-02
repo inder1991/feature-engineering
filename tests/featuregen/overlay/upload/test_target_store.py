@@ -72,3 +72,32 @@ def test_a_different_window_is_a_DIFFERENT_label(db):
 def test_search_is_scoped_to_the_entity(db):
     register_target(db, _rule(), description="d", registered_by="a")
     assert targets_for_entity(db, "account") == []
+
+
+def test_the_proposal_and_the_comment_are_stored_with_the_definition(db):
+    """The DIFF between proposed and submitted is the provenance — "proposed 90 days, human changed
+    it to 180" — and the comment carries the why. For a label feeding regulated models that
+    reasoning is worth as much as the rule."""
+    register_target(db, _rule(), description="d", registered_by="a",
+                    proposed_draft={"fields": {"window_days": 90}},
+                    author_comment="180 because the FX desk reviews quarterly")
+    row = target_by_name(db, "customer", "tgt_npe_90d")
+    assert row["proposed_draft"]["fields"]["window_days"] == 90
+    assert "FX desk" in row["author_comment"]
+
+
+def test_a_label_registered_in_code_has_no_proposal_and_an_empty_comment(db):
+    """Registration is not form-only — a rule authored in code is first-class, and its honest
+    provenance is absent rather than invented."""
+    register_target(db, _rule(), description="d", registered_by="a")
+    row = target_by_name(db, "customer", "tgt_npe_90d")
+    assert (row["proposed_draft"], row["author_comment"]) == (None, "")
+
+
+def test_ADAPTING_a_label_records_its_ancestor(db):
+    """Spec §7.5 Step 4. Without this, "we moved churn from 90 days to 60" is two
+    unrelated-looking rows and nobody can see that one replaced the other."""
+    ancestor = register_target(db, _rule(), description="d", registered_by="a")
+    register_target(db, _rule(name="tgt_npe_60d", window=60), description="d",
+                    registered_by="a", adapted_from=ancestor)
+    assert target_by_name(db, "customer", "tgt_npe_60d")["adapted_from"] == ancestor
