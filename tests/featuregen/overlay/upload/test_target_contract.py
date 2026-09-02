@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 
 from featuregen.overlay.upload.target_contract import (
+    StateChangeRuleV1,
     TargetContractError,
     TargetHeaderV1,
 )
@@ -68,3 +69,43 @@ def test_a_count_label_without_a_threshold_is_accepted():
 def test_the_window_must_be_positive():
     with pytest.raises(TargetContractError, match="window_days"):
         _header(window_days=0)
+
+
+# ══ the state_change shape ═══════════════════════════════════════════════════════════════════════
+
+def _state(**over) -> StateChangeRuleV1:
+    base = dict(header=_header(),
+                column_ref="public.bo_cib_customer.cust_perf_nonperf_flg",
+                from_values=("Performing",), to_values=("Non-performing",))
+    return StateChangeRuleV1(**{**base, **over})
+
+
+def test_a_well_formed_state_change_rule_is_accepted():
+    r = _state()
+    assert r.column_ref.endswith("cust_perf_nonperf_flg")
+    assert r.population_filter == "from_values"
+
+
+def test_a_value_in_BOTH_from_and_to_is_incoherent():
+    """If Performing is both the starting state and the outcome, the rule asks whether a
+    customer changed from a state to itself. Silently always-0; caught here instead."""
+    with pytest.raises(TargetContractError, match="both"):
+        _state(from_values=("Performing",), to_values=("Performing", "Non-performing"))
+
+
+def test_from_and_to_values_are_both_mandatory():
+    """Empty values are how a label becomes silently always-0 — nothing matches."""
+    with pytest.raises(TargetContractError, match="from_values"):
+        _state(from_values=())
+
+
+def test_a_state_change_label_must_be_binary():
+    """A state either changed or it did not; counting a change is a different rule shape."""
+    with pytest.raises(TargetContractError, match="binary"):
+        _state(header=_header(label_type="count", operator=None, threshold=None))
+
+
+def test_the_watched_column_cannot_BE_the_anchor_date():
+    """Comparing a date against itself observes nothing."""
+    with pytest.raises(TargetContractError, match="same column"):
+        _state(column_ref="public.bo_cib_customer.business_dt")

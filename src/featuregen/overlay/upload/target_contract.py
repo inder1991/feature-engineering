@@ -79,3 +79,44 @@ class TargetHeaderV1:
             _require(not thresholded,
                      f"a {self.label_type} label FORBIDS operator/threshold — it measures, "
                      "it does not threshold")
+
+
+#: How the population is bounded for a state-change rule. `from_values` excludes rows that
+#: ALREADY have the outcome at the as-of date — a customer already non-performing on 1 January is
+#: not a candidate. Omitting this is the most common way to build a silently broken label.
+STATE_POPULATIONS = ("from_values", "all")
+
+
+@dataclass(frozen=True, slots=True)
+class StateChangeRuleV1:
+    """A column's value at the as-of date, compared against its value inside the window.
+
+    Requires an append-only snapshot source: if the source rewrites a row in place rather than
+    appending a new as-of, "the value in January" silently returns a later one. `header.as_of_ref`
+    records which column carries that assumption.
+    """
+
+    header: TargetHeaderV1
+    column_ref: str
+    from_values: tuple[str, ...]
+    to_values: tuple[str, ...]
+    at_least_once: bool = True
+    population_filter: str = "from_values"
+
+    shape: str = "state_change"
+
+    def __post_init__(self) -> None:
+        _require(bool(self.column_ref.strip()), "column_ref is mandatory")
+        _require(bool(self.from_values), "from_values is mandatory")
+        _require(bool(self.to_values), "to_values is mandatory")
+        overlap = set(self.from_values) & set(self.to_values)
+        _require(not overlap,
+                 f"{sorted(overlap)!r} appear in both from_values and to_values — a change from "
+                 "a state to itself is not an outcome")
+        _require(self.population_filter in STATE_POPULATIONS,
+                 f"population_filter {self.population_filter!r} not in {STATE_POPULATIONS}")
+        _require(self.header.label_type == "binary",
+                 "a state_change label must be binary — a state changed or it did not")
+        _require(self.column_ref != self.header.as_of_ref,
+                 "column_ref and as_of_ref are the same column — the rule would compare a date "
+                 "against itself and observe nothing")
