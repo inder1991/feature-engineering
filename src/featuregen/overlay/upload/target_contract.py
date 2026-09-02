@@ -120,3 +120,57 @@ class StateChangeRuleV1:
         _require(self.column_ref != self.header.as_of_ref,
                  "column_ref and as_of_ref are the same column — the rule would compare a date "
                  "against itself and observe nothing")
+
+
+AGGREGATES = ("count", "sum")
+#: `none` restricts the population to rows with NO matching event in the lookback before the as-of
+#: date ("who will START"); `any` is the whole population ("who will do it at all"). The difference
+#: is which question is being asked, and `any` silently yields the degenerate label.
+EVENT_POPULATIONS = ("any", "none")
+
+
+@dataclass(frozen=True, slots=True)
+class EventWindowRuleV1:
+    """Rows in a second table, inside the window, joined to the grain.
+
+    Cross-catalog by construction — anchored in one catalog, counting events in another. The join
+    is DECLARED in a reviewed definition rather than decided by a planner at request time, so this
+    needs none of the live cross-catalog machinery.
+    """
+
+    header: TargetHeaderV1
+    #: The catalog the EVENT side lives in — routinely different from `header.anchor_catalog`,
+    #: which is what makes this shape cross-catalog and why it must be stated.
+    event_catalog: str
+    event_table: str
+    event_date_ref: str
+    join_left: str
+    join_right: str
+    aggregate: str
+    event_filter: str | None = None
+    measure_ref: str | None = None
+    population_lookback_days: int = 0
+    population_having: str = "any"
+
+    shape: str = "event_window"
+
+    def __post_init__(self) -> None:
+        for field_name in ("event_catalog", "event_table", "event_date_ref",
+                           "join_left", "join_right"):
+            _require(bool(getattr(self, field_name).strip()), f"{field_name} is mandatory")
+        _require(self.aggregate in AGGREGATES,
+                 f"aggregate {self.aggregate!r} not in {AGGREGATES}")
+        if self.aggregate == "sum":
+            _require(self.measure_ref is not None and bool(self.measure_ref.strip()),
+                     "a sum aggregate REQUIRES measure_ref — there is nothing to add up")
+        else:
+            _require(self.measure_ref is None,
+                     "a count aggregate FORBIDS measure_ref — it counts rows, not values")
+        _require(self.population_having in EVENT_POPULATIONS,
+                 f"population_having {self.population_having!r} not in {EVENT_POPULATIONS}")
+        if self.population_having == "none":
+            _require(self.population_lookback_days > 0,
+                     "excluding prior activity REQUIRES a positive population lookback — "
+                     "'not currently doing this' is meaningless without a period")
+        _require(self.population_lookback_days >= 0,
+                 "population_lookback_days cannot be negative")
