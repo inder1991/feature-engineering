@@ -145,6 +145,7 @@ without executing it**. Both the safety controls and the downstream pipeline nee
 {
   "name": "tgt_npe_90d",
   "entity": "customer",
+  "anchor_catalog": "cib",
   "grain_ref": "public.bo_cib_customer.cust_num",
   "as_of_ref": "public.bo_cib_customer.business_dt",
   "window_days": 90,
@@ -152,6 +153,18 @@ without executing it**. Both the safety controls and the downstream pipeline nee
   "label_type": "binary"
 }
 ```
+
+**`anchor_catalog` is not optional decoration.** `graph_node.object_ref` is only
+`public.{table}.{column}`; the catalog is a separate column, so a bare ref does **not** identify a
+column. `_column_meta` already scopes every lookup to an exact `(catalog_source, object_ref)` pair
+for precisely this reason — its docstring cites finding **M3**: *"a same-named column in another
+catalog cannot contaminate the reading"*. A rule carrying bare refs would reintroduce a defect this
+codebase has already fixed once. Two catalogs each holding a `public.customers` table is all it
+takes.
+
+Per **side** rather than per **ref**: a `state_change` rule reads one catalog, and an
+`event_window` rule reads exactly two. Qualifying every field would repeat the same value five
+times and still not say, at a glance, that a rule spans `cib` → `ftr`.
 
 `direction` is the governed field: the one declaration in the platform that reading ahead of the
 as-of date is legitimate, and by exactly how much.
@@ -195,6 +208,7 @@ Rows in a second table, inside the window, joined to the grain.
 ```json
 {
   "shape": "event_window",
+  "event_catalog": "ftr",
   "event_table": "public.comp_financial_tran_repos_dly",
   "event_date_ref": "public.comp_financial_tran_repos_dly.pstd_date",
   "join": { "left":  "public.bo_cib_customer.cust_num",
@@ -225,7 +239,8 @@ question unaskable. Discovered by walking a real hypothesis through the design; 
 required conversation turn (§7.5) because no default is safe — `"any"` silently produces the
 degenerate label.
 
-**Cross-catalog by construction.** This example is anchored in `cib` and counts events in `ftr`.
+**Cross-catalog by construction**, and now legibly so: `anchor_catalog: cib`,
+`event_catalog: ftr`. This example is anchored in `cib` and counts events in `ftr`.
 Labels naturally span catalogs, because the outcome lives where the events are. It needs none of
 the live cross-catalog planner: the join is *declared in a reviewed definition*, not decided by a
 planner at request time. (As of this date the entity-only cross-catalog route is still refused

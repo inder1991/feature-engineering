@@ -17,6 +17,7 @@
 - **`direction` is always `"forward"`.** A backward rule is a feature; it is refused, never corrected. Spec §7.5.
 - **`label_type` and `operator`/`threshold` are exclusive:** `binary` requires both; `count` and `amount` forbid both. Spec §7.1.
 - **Migration number 1142.** 1130–1139 are reserved by the cross-catalog serving program (see the reservation note in `1141_draft_plan_binding_rechecks_its_pins.sql`), 1140 and 1141 are allocated. **1142 is the next free number and this plan allocates it.** Migration files are checksummed and immutable once applied anywhere.
+- **Every ref is scoped by a catalog.** `graph_node.object_ref` is only `public.{table}.{column}` — the catalog is a separate column, so a bare ref does not identify a column. `_column_meta` scopes to an exact `(catalog_source, object_ref)` pair and cites finding **M3** for it: *"a same-named column in another catalog cannot contaminate the reading"*. Carried per **side** (`anchor_catalog` on the header, `event_catalog` on the event shape), not per ref. Spec §7.1.
 - **Content hash:** `hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()`, matching `model_feature_revision_hash`.
 - **The verification ladder stops at `DESIGN-CHECKED`.** This plan must never write `DATA-CHECKED` or above — the platform does not execute the rule and cannot know the class balance. Spec §10.
 
@@ -65,7 +66,7 @@ from featuregen.overlay.upload.target_contract import (
 
 
 def _header(**over) -> TargetHeaderV1:
-    base = dict(name="tgt_npe_90d", entity="customer",
+    base = dict(name="tgt_npe_90d", entity="customer", anchor_catalog="cib",
                 grain_ref="public.bo_cib_customer.cust_num",
                 as_of_ref="public.bo_cib_customer.business_dt",
                 window_days=90, label_type="binary", operator=">=", threshold=1.0)
@@ -162,6 +163,9 @@ class TargetHeaderV1:
 
     name: str
     entity: str
+    #: Which catalog `grain_ref` and `as_of_ref` live in. A bare ref does not identify a column
+    #: (M3) — `graph_node.object_ref` omits the catalog entirely.
+    anchor_catalog: str
     grain_ref: str
     as_of_ref: str
     window_days: int
@@ -174,6 +178,9 @@ class TargetHeaderV1:
         _require(bool(_NAME_RE.match(self.name)),
                  f"name {self.name!r} must match {_NAME_RE.pattern}")
         _require(bool(self.entity.strip()), "entity is mandatory")
+        _require(bool(self.anchor_catalog.strip()),
+                 "anchor_catalog is mandatory — a ref without a catalog does not identify a "
+                 "column (M3)")
         _require(bool(self.grain_ref.strip()), "grain_ref is mandatory")
         _require(bool(self.as_of_ref.strip()),
                  "as_of_ref is mandatory — a label without an anchor date cannot be computed")
@@ -185,8 +192,12 @@ class TargetHeaderV1:
                  f"label_type {self.label_type!r} not in {LABEL_TYPES}")
         thresholded = self.operator is not None or self.threshold is not None
         if self.label_type == "binary":
-            _require(self.operator in OPERATORS and self.threshold is not None,
+            _require(self.operator is not None and self.threshold is not None,
                      "a binary label REQUIRES operator and threshold")
+            # Reported separately: "requires an operator" misdirects when one was supplied and is
+            # simply not a recognised comparison.
+            _require(self.operator in OPERATORS,
+                     f"operator {self.operator!r} not in {OPERATORS}")
         else:
             _require(not thresholded,
                      f"a {self.label_type} label FORBIDS operator/threshold — it measures, "
@@ -303,6 +314,9 @@ class StateChangeRuleV1:
                  f"population_filter {self.population_filter!r} not in {STATE_POPULATIONS}")
         _require(self.header.label_type == "binary",
                  "a state_change label must be binary — a state changed or it did not")
+        _require(self.column_ref != self.header.as_of_ref,
+                 "column_ref and as_of_ref are the same column — the rule would compare a date "
+                 "against itself and observe nothing")
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -338,6 +352,7 @@ from featuregen.overlay.upload.target_contract import EventWindowRuleV1
 
 def _event(**over) -> EventWindowRuleV1:
     base = dict(header=_header(name="tgt_fx_new_60d", window_days=60),
+                event_catalog="ftr",
                 event_table="public.comp_financial_tran_repos_dly",
                 event_date_ref="public.comp_financial_tran_repos_dly.pstd_date",
                 join_left="public.bo_cib_customer.cust_num",
@@ -407,6 +422,9 @@ class EventWindowRuleV1:
     """
 
     header: TargetHeaderV1
+    #: The catalog the EVENT side lives in — routinely different from `header.anchor_catalog`,
+    #: which is what makes this shape cross-catalog and why it must be stated.
+    event_catalog: str
     event_table: str
     event_date_ref: str
     join_left: str
@@ -420,7 +438,8 @@ class EventWindowRuleV1:
     shape: str = "event_window"
 
     def __post_init__(self) -> None:
-        for field_name in ("event_table", "event_date_ref", "join_left", "join_right"):
+        for field_name in ("event_catalog", "event_table", "event_date_ref",
+                           "join_left", "join_right"):
             _require(bool(getattr(self, field_name).strip()), f"{field_name} is mandatory")
         _require(self.aggregate in AGGREGATES,
                  f"aggregate {self.aggregate!r} not in {AGGREGATES}")
@@ -475,11 +494,18 @@ def test_refs_read_names_every_column_the_rule_touches():
     """This is the lineage answer — "tran_crncy is being retired, which labels break?" — NOT a
     leakage blocklist. A feature reading the same columns BACKWARD is the method, not a leak."""
     assert refs_read(_event()) == (
-        "public.bo_cib_customer.business_dt",
-        "public.bo_cib_customer.cust_num",
-        "public.comp_financial_tran_repos_dly.cif_id",
-        "public.comp_financial_tran_repos_dly.pstd_date",
+        ("cib", "public.bo_cib_customer.business_dt"),
+        ("cib", "public.bo_cib_customer.cust_num"),
+        ("ftr", "public.comp_financial_tran_repos_dly.cif_id"),
+        ("ftr", "public.comp_financial_tran_repos_dly.pstd_date"),
     )
+
+
+def test_refs_read_keeps_the_two_SIDES_of_a_join_apart():
+    """`join_left` is on the anchor and `join_right` on the event side. Collapsing them to bare
+    refs is exactly the M3 defect `_column_meta` exists to avoid."""
+    assert ("cib", "public.bo_cib_customer.cust_num") in refs_read(_event())
+    assert ("ftr", "public.comp_financial_tran_repos_dly.cif_id") in refs_read(_event())
 
 
 def test_refs_read_includes_the_measure_when_there_is_one():
@@ -487,11 +513,11 @@ def test_refs_read_includes_the_measure_when_there_is_one():
                               operator=None, threshold=None),
                aggregate="sum",
                measure_ref="public.comp_financial_tran_repos_dly.tran_amt_aed")
-    assert "public.comp_financial_tran_repos_dly.tran_amt_aed" in refs_read(r)
+    assert ("ftr", "public.comp_financial_tran_repos_dly.tran_amt_aed") in refs_read(r)
 
 
 def test_refs_read_for_a_state_change_includes_the_watched_column():
-    assert "public.bo_cib_customer.cust_perf_nonperf_flg" in refs_read(_state())
+    assert ("cib", "public.bo_cib_customer.cust_perf_nonperf_flg") in refs_read(_state())
 
 
 def test_the_content_hash_is_stable_for_an_identical_rule():
@@ -531,7 +557,7 @@ Append:
 TargetRuleV1 = StateChangeRuleV1 | EventWindowRuleV1
 
 
-def refs_read(rule: TargetRuleV1) -> tuple[str, ...]:
+def refs_read(rule: TargetRuleV1) -> tuple[tuple[str, str], ...]:
     """Every catalog ref the rule reads, sorted and deduped.
 
     For LINEAGE and IMPACT — "this column is being retired, which labels break?" — and NOT a
@@ -539,21 +565,25 @@ def refs_read(rule: TargetRuleV1) -> tuple[str, ...]:
     method (past FX predicting future FX); blocking on column overlap would delete the use case.
     The leakage control is temporal and already exists. Spec §8, §9.
     """
-    refs = {rule.header.grain_ref, rule.header.as_of_ref}
+    anchor = rule.header.anchor_catalog
+    refs = {(anchor, rule.header.grain_ref), (anchor, rule.header.as_of_ref)}
     if isinstance(rule, StateChangeRuleV1):
-        refs.add(rule.column_ref)
+        refs.add((anchor, rule.column_ref))
     else:
-        refs.update({rule.event_date_ref, rule.join_left, rule.join_right})
+        # join_left is on the ANCHOR side, join_right on the EVENT side — the whole point of the
+        # pair. Collapsing them to bare refs is the M3 defect.
+        refs.add((anchor, rule.join_left))
+        refs.update({(rule.event_catalog, rule.event_date_ref),
+                     (rule.event_catalog, rule.join_right)})
         if rule.measure_ref is not None:
-            refs.add(rule.measure_ref)
+            refs.add((rule.event_catalog, rule.measure_ref))
     return tuple(sorted(refs))
 
 
 def canonical_target(rule: TargetRuleV1) -> dict:
     """The rule as a plain, ordered dict — the body the content hash is taken over."""
-    body = asdict(rule)
-    body["header"] = asdict(rule.header)
-    return body
+    # `asdict` recurses into the nested header dataclass already — no second pass needed.
+    return asdict(rule)
 
 
 def target_content_hash(rule: TargetRuleV1) -> str:
@@ -584,7 +614,7 @@ git add -A && git commit -m "feat(target): refs_read for lineage, and content-ad
 
 **Interfaces:**
 - Consumes: `TargetRuleV1`, `refs_read`, `target_content_hash`, `canonical_target`.
-- Produces: `register_target(conn, rule, *, description, registered_by) -> str` (returns `definition_id`); `target_by_name(conn, name) -> dict | None`; `targets_for_entity(conn, entity) -> list[dict]`.
+- Produces: `register_target(conn, rule, *, description, registered_by) -> str` (returns `definition_id`); `target_by_name(conn, entity, name) -> dict | None`; `targets_for_entity(conn, entity) -> list[dict]`; `TargetNameTaken`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -595,8 +625,10 @@ from __future__ import annotations
 from featuregen.overlay.upload.target_contract import (
     EventWindowRuleV1, StateChangeRuleV1, TargetHeaderV1,
 )
+import pytest
+
 from featuregen.overlay.upload.target_store import (
-    register_target, target_by_name, targets_for_entity,
+    TargetNameTaken, register_target, target_by_name, targets_for_entity,
 )
 
 
@@ -613,17 +645,17 @@ def _rule(name="tgt_npe_90d", window=90) -> StateChangeRuleV1:
 
 def test_registering_a_rule_stores_it_and_its_lineage(db):
     register_target(db, _rule(), description="credit deterioration", registered_by="user:tester")
-    row = target_by_name(db, "tgt_npe_90d")
+    row = target_by_name(db, "customer", "tgt_npe_90d")
     assert row["entity"] == "customer"
     assert row["verification"] == "DESIGN-CHECKED"
-    assert "public.bo_cib_customer.cust_perf_nonperf_flg" in row["derives_from"]
+    assert ("cib", "public.bo_cib_customer.cust_perf_nonperf_flg") in row["derives_from"]
 
 
 def test_the_ladder_never_starts_above_DESIGN_CHECKED(db):
     """The platform does not execute the rule, so it cannot know the class balance or whether the
     rule matched anything at all. DATA-CHECKED is unreachable here BY CONSTRUCTION. Spec §10."""
     register_target(db, _rule(), description="d", registered_by="user:tester")
-    assert target_by_name(db, "tgt_npe_90d")["verification"] == "DESIGN-CHECKED"
+    assert target_by_name(db, "customer", "tgt_npe_90d")["verification"] == "DESIGN-CHECKED"
 
 
 def test_registering_the_SAME_rule_twice_is_one_definition(db):
@@ -631,6 +663,17 @@ def test_registering_the_SAME_rule_twice_is_one_definition(db):
     first = register_target(db, _rule(), description="d", registered_by="a")
     second = register_target(db, _rule(), description="d", registered_by="b")
     assert first == second
+
+
+def test_reusing_a_NAME_for_a_different_rule_is_a_typed_refusal(db):
+    """Someone iterating on a definition will hit this, so it must not surface as a raw
+    IntegrityError from the (entity, name) index. The refusal names the definition in the way."""
+    register_target(db, _rule(), description="d", registered_by="a")
+    changed = _rule()
+    changed = StateChangeRuleV1(header=changed.header, column_ref=changed.column_ref,
+                                from_values=("Performing",), to_values=("Watchlist",))
+    with pytest.raises(TargetNameTaken, match="tgt_npe_90d"):
+        register_target(db, changed, description="d", registered_by="a")
 
 
 def test_a_different_window_is_a_DIFFERENT_label(db):
@@ -691,6 +734,11 @@ CREATE TABLE IF NOT EXISTS target_definition (
     CONSTRAINT target_definition_shape_chk CHECK (shape IN ('state_change', 'event_window')),
     CONSTRAINT target_definition_type_chk  CHECK (label_type IN ('binary', 'count', 'amount')),
     CONSTRAINT target_definition_window_chk CHECK (window_days > 0),
+    -- DELIBERATELY NARROWER than the feature ladder, which also has DATA-CHECKED and
+    -- USEFULNESS-CHECKED. Under specify-not-execute those rungs are unreachable, and a CHECK is a
+    -- stronger guarantee than a convention nobody re-reads. CONSEQUENCE, accepted: admitting them
+    -- later costs a migration — which is the right price for making the claim impossible to write
+    -- by accident in the meantime.
     CONSTRAINT target_definition_verification_chk
         CHECK (verification IN ('UNVERIFIED', 'DESIGN-CHECKED'))
 );
@@ -701,9 +749,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS target_definition_name_per_entity
 
 -- Lineage, for IMPACT ("this column is retired — which labels break?"), never a leakage blocklist.
 CREATE TABLE IF NOT EXISTS target_derives_from (
-    definition_id text NOT NULL REFERENCES target_definition(definition_id) ON DELETE CASCADE,
-    object_ref    text NOT NULL,
-    PRIMARY KEY (definition_id, object_ref)
+    definition_id  text NOT NULL REFERENCES target_definition(definition_id) ON DELETE CASCADE,
+    -- The catalog is part of the identity. `object_ref` is only `public.{table}.{column}`, so a
+    -- bare ref does not name a column (M3) — the same reason `_column_meta` scopes to the pair.
+    catalog_source text NOT NULL,
+    object_ref     text NOT NULL,
+    PRIMARY KEY (definition_id, catalog_source, object_ref)
 );
 
 CREATE TABLE IF NOT EXISTS target_consumer (
@@ -740,6 +791,12 @@ from featuregen.overlay.upload.target_contract import (
 )
 
 
+class TargetNameTaken(ValueError):
+    """This entity already has a label of this name, with a DIFFERENT rule. Raised rather than
+    letting the `(entity, name)` unique index surface as a raw IntegrityError — someone iterating
+    on a definition meets this routinely, and a typed refusal can name what is in the way."""
+
+
 def register_target(conn, rule: TargetRuleV1, *, description: str, registered_by: str) -> str:
     """Persist a rule and its lineage; return the definition id.
 
@@ -753,8 +810,16 @@ def register_target(conn, rule: TargetRuleV1, *, description: str, registered_by
     if existing is not None:
         return existing[0]
 
-    definition_id = f"tdef_{uuid.uuid4().hex[:16]}"
     header = rule.header
+    taken = conn.execute(
+        "SELECT definition_id FROM target_definition WHERE entity = %s AND name = %s",
+        (header.entity, header.name)).fetchone()
+    if taken is not None:
+        raise TargetNameTaken(
+            f"{header.name} already exists for entity {header.entity} as {taken[0]} with a "
+            "different rule — a changed rule is a new label, so give it its own name")
+
+    definition_id = f"tdef_{uuid.uuid4().hex[:16]}"
     conn.execute(
         "INSERT INTO target_definition (definition_id, name, entity, shape, window_days,"
         " label_type, rule, content_hash, description, registered_by)"
@@ -762,18 +827,19 @@ def register_target(conn, rule: TargetRuleV1, *, description: str, registered_by
         (definition_id, header.name, header.entity, rule.shape, header.window_days,
          header.label_type, json.dumps(canonical_target(rule)), content_hash,
          description, registered_by))
-    for object_ref in refs_read(rule):
+    for catalog_source, object_ref in refs_read(rule):
         conn.execute(
-            "INSERT INTO target_derives_from (definition_id, object_ref) VALUES (%s, %s)",
-            (definition_id, object_ref))
+            "INSERT INTO target_derives_from (definition_id, catalog_source, object_ref)"
+            " VALUES (%s, %s, %s)",
+            (definition_id, catalog_source, object_ref))
     return definition_id
 
 
 def _row(conn, definition_id: str, name: str, entity: str, shape: str, window_days: int,
          label_type: str, rule, verification: str, description: str) -> dict:
-    derives = [r[0] for r in conn.execute(
-        "SELECT object_ref FROM target_derives_from WHERE definition_id = %s ORDER BY object_ref",
-        (definition_id,)).fetchall()]
+    derives = [(r[0], r[1]) for r in conn.execute(
+        "SELECT catalog_source, object_ref FROM target_derives_from WHERE definition_id = %s"
+        " ORDER BY catalog_source, object_ref", (definition_id,)).fetchall()]
     return {"definition_id": definition_id, "name": name, "entity": entity, "shape": shape,
             "window_days": window_days, "label_type": label_type, "rule": rule,
             "verification": verification, "description": description, "derives_from": derives}
@@ -783,8 +849,10 @@ _SELECT = ("SELECT definition_id, name, entity, shape, window_days, label_type, 
            " verification, description FROM target_definition")
 
 
-def target_by_name(conn, name: str) -> dict | None:
-    row = conn.execute(f"{_SELECT} WHERE name = %s", (name,)).fetchone()
+def target_by_name(conn, entity: str, name: str) -> dict | None:
+    """Entity-scoped, because the unique index is `(entity, name)`. Looking up by name alone
+    would return an arbitrary row once two entities both have a `tgt_churned_90d`."""
+    row = conn.execute(f"{_SELECT} WHERE entity = %s AND name = %s", (entity, name)).fetchone()
     return None if row is None else _row(conn, *row)
 
 
@@ -851,9 +919,9 @@ def _catalog(db):
 
 def _rule(**over) -> StateChangeRuleV1:
     base = dict(column_ref=_FLAG, from_values=("P",), to_values=("N",))
-    header = TargetHeaderV1(name="tgt_npe_90d", entity="customer", grain_ref=_GRAIN,
-                            as_of_ref=_ASOF, window_days=90, label_type="binary",
-                            operator=">=", threshold=1.0)
+    header = TargetHeaderV1(name="tgt_npe_90d", entity="customer", anchor_catalog=SOURCE,
+                            grain_ref=_GRAIN, as_of_ref=_ASOF, window_days=90,
+                            label_type="binary", operator=">=", threshold=1.0)
     return StateChangeRuleV1(header=header, **{**base, **over})
 
 
@@ -880,16 +948,38 @@ def test_a_ref_the_caller_CANNOT_READ_is_refused(db):
     assert any("perf_flg" in r for r in reasons)
 
 
+def test_a_ref_that_exists_in_ANOTHER_catalog_does_not_resolve_here(db):
+    """M3, guarded. A rule declaring `anchor_catalog` must not be satisfied by a same-named column
+    sitting in a different catalog — that is the defect `_column_meta` is pair-scoped to avoid."""
+    _catalog(db)
+    elsewhere = StateChangeRuleV1(
+        header=TargetHeaderV1(name="tgt_npe_90d", entity="customer",
+                              anchor_catalog="a_catalog_that_does_not_hold_these",
+                              grain_ref=_GRAIN, as_of_ref=_ASOF, window_days=90,
+                              label_type="binary", operator=">=", threshold=1.0),
+        column_ref=_FLAG, from_values=("P",), to_values=("N",))
+    reasons = check_target_against_catalog(db, elsewhere, roles=("data_owner",))
+    assert len(reasons) == 3, "all three refs are absent from that catalog"
+
+
 def test_the_as_of_ref_must_actually_be_an_as_of_column(db):
     """`as_of_ref` carries the append-only assumption the whole state_change shape rests on.
     Pointing it at an ordinary column makes the rule quietly wrong rather than refused."""
     _catalog(db)
     bad = StateChangeRuleV1(
-        header=TargetHeaderV1(name="tgt_npe_90d", entity="customer", grain_ref=_GRAIN,
-                              as_of_ref=_FLAG, window_days=90, label_type="binary",
-                              operator=">=", threshold=1.0),
+        header=TargetHeaderV1(name="tgt_npe_90d", entity="customer", anchor_catalog=SOURCE,
+                              grain_ref=_GRAIN, as_of_ref=_ASOF, window_days=90,
+                              label_type="binary", operator=">=", threshold=1.0),
+        column_ref=_GRAIN, from_values=("P",), to_values=("N",))
+    # `cust_num` is not an as-of column, so pointing the ANCHOR at it must be refused. (The
+    # contract already refuses as_of_ref == column_ref, so the two checks do not overlap.)
+    bad_anchor = StateChangeRuleV1(
+        header=TargetHeaderV1(name="tgt_npe_90d", entity="customer", anchor_catalog=SOURCE,
+                              grain_ref=_GRAIN, as_of_ref=_GRAIN, window_days=90,
+                              label_type="binary", operator=">=", threshold=1.0),
         column_ref=_FLAG, from_values=("P",), to_values=("N",))
-    assert any("as_of" in r for r in check_target_against_catalog(db, bad, roles=("data_owner",)))
+    reasons = check_target_against_catalog(db, bad_anchor, roles=("data_owner",))
+    assert any("as_of" in r for r in reasons)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -919,21 +1009,25 @@ def check_target_against_catalog(conn, rule: TargetRuleV1, *,
     """Every reason this rule cannot be registered against this catalog; empty when it resolves."""
     reasons: list[str] = []
     wanted = refs_read(rule)
+    # Matched on the (catalog_source, object_ref) PAIR, never on the ref alone. `object_ref` is
+    # only `public.{table}.{column}`, so a bare match lets a same-named column in another catalog
+    # answer for this one — the M3 defect `_column_meta` is scoped to avoid.
     rows = conn.execute(
-        "SELECT object_ref, is_as_of FROM graph_node WHERE kind = 'column'"
-        " AND object_ref = ANY(%s) AND visible_requires <@ %s",
+        "SELECT catalog_source, object_ref, is_as_of FROM graph_node WHERE kind = 'column'"
+        " AND (catalog_source, object_ref) = ANY(%s) AND visible_requires <@ %s",
         (list(wanted), allowed_sensitivities(roles))).fetchall()
-    visible = {ref: is_as_of for ref, is_as_of in rows}
+    visible = {(catalog, ref): is_as_of for catalog, ref, is_as_of in rows}
 
-    for ref in wanted:
-        if ref not in visible:
+    for pair in wanted:
+        if pair not in visible:
+            catalog, ref = pair
             reasons.append(
-                f"{ref} does not resolve to a readable column in this catalog")
+                f"{ref} does not resolve to a readable column in catalog {catalog}")
 
-    as_of = rule.header.as_of_ref
+    as_of = (rule.header.anchor_catalog, rule.header.as_of_ref)
     if as_of in visible and not visible[as_of]:
         reasons.append(
-            f"as_of_ref {as_of} is not an as-of column — the label's anchor date must be one, "
+            f"as_of_ref {as_of[1]} is not an as-of column — the label's anchor date must be one, "
             "or the window is measured from something that does not move with time")
     return tuple(reasons)
 ```
@@ -956,6 +1050,137 @@ Expected: the suite green with 39 more tests than the pre-plan baseline; ruff un
 
 ```bash
 git add -A && git commit -m "feat(target): catalog resolution — refs resolve, read-scope holds, as_of is really an as-of"
+```
+
+---
+
+### Task 7: The spec's own worked examples must construct
+
+**Files:**
+- Test: `tests/featuregen/overlay/upload/test_target_spec_examples.py`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1–5. Produces nothing.
+
+**Why this task exists.** Spec §7.4 names four labels the design claims are expressible. Nothing so
+far proves any of them can actually be built — the unit tests all use one hand-rolled fixture, which
+proves the contract accepts *itself*. This is the test that catches a contract which cannot express
+what its own spec advertises, and it is the one a reviewer should insist on.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+"""Spec §7.4's four worked examples, constructed. A contract that cannot build the labels its own
+design advertises is the failure this file exists to catch."""
+from __future__ import annotations
+
+from featuregen.overlay.upload.target_contract import (
+    EventWindowRuleV1, StateChangeRuleV1, TargetHeaderV1, refs_read,
+)
+from featuregen.overlay.upload.target_store import register_target, targets_for_entity
+
+CIB_GRAIN = "public.bo_cib_customer.cust_num"
+CIB_ASOF = "public.bo_cib_customer.business_dt"
+FTR_TABLE = "public.comp_financial_tran_repos_dly"
+
+
+def _header(name: str, window: int, label_type: str = "binary") -> TargetHeaderV1:
+    thresholded = label_type == "binary"
+    return TargetHeaderV1(
+        name=name, entity="customer", anchor_catalog="cib",
+        grain_ref=CIB_GRAIN, as_of_ref=CIB_ASOF, window_days=window,
+        label_type=label_type,
+        operator=">=" if thresholded else None,
+        threshold=1.0 if thresholded else None)
+
+
+def _tgt_npe_90d() -> StateChangeRuleV1:
+    # Values are ILLUSTRATIVE: nothing profiles this varchar(20), which is why the authoring
+    # conversation asks rather than guesses (spec §11).
+    return StateChangeRuleV1(
+        header=_header("tgt_npe_90d", 90),
+        column_ref="public.bo_cib_customer.cust_perf_nonperf_flg",
+        from_values=("Performing",), to_values=("Non-performing",))
+
+
+def _tgt_restricted_90d() -> StateChangeRuleV1:
+    return StateChangeRuleV1(
+        header=_header("tgt_restricted_90d", 90),
+        column_ref="public.bo_cib_customer.cust_susp_flg",
+        from_values=("N",), to_values=("Y",))
+
+
+def _tgt_churned_90d() -> EventWindowRuleV1:
+    """Zero rows in the window — "no transaction for 90 days", the churn definition the spec opens
+    with and the one nothing in the platform could express."""
+    return EventWindowRuleV1(
+        header=_header("tgt_churned_90d", 90), event_catalog="ftr", event_table=FTR_TABLE,
+        event_date_ref=f"{FTR_TABLE}.pstd_date", join_left=CIB_GRAIN,
+        join_right=f"{FTR_TABLE}.cif_id", aggregate="count")
+
+
+def _tgt_fx_active_90d() -> EventWindowRuleV1:
+    return EventWindowRuleV1(
+        header=_header("tgt_fx_active_90d", 90), event_catalog="ftr", event_table=FTR_TABLE,
+        event_date_ref=f"{FTR_TABLE}.pstd_date", join_left=CIB_GRAIN,
+        join_right=f"{FTR_TABLE}.cif_id",
+        event_filter="tran_crncy <> 'AED'", aggregate="count")
+
+
+def test_all_four_spec_examples_construct():
+    for rule in (_tgt_npe_90d(), _tgt_restricted_90d(),
+                 _tgt_churned_90d(), _tgt_fx_active_90d()):
+        assert rule.header.direction == "forward"
+
+
+def test_the_churn_label_needs_a_zero_threshold_to_mean_NO_activity():
+    """"Churned" is the ABSENCE of events. `count == 0` — the one example where the threshold is
+    not `>= 1`, and the one most likely to be written the wrong way round."""
+    rule = EventWindowRuleV1(
+        header=TargetHeaderV1(
+            name="tgt_churned_90d", entity="customer", anchor_catalog="cib",
+            grain_ref=CIB_GRAIN, as_of_ref=CIB_ASOF, window_days=90,
+            label_type="binary", operator="==", threshold=0.0),
+        event_catalog="ftr", event_table=FTR_TABLE,
+        event_date_ref=f"{FTR_TABLE}.pstd_date", join_left=CIB_GRAIN,
+        join_right=f"{FTR_TABLE}.cif_id", aggregate="count")
+    assert (rule.header.operator, rule.header.threshold) == ("==", 0.0)
+
+
+def test_a_cross_catalog_example_reads_BOTH_catalogs():
+    """The event shape spans catalogs by construction — anchored in `cib`, counting in `ftr`."""
+    catalogs = {catalog for catalog, _ in refs_read(_tgt_churned_90d())}
+    assert catalogs == {"cib", "ftr"}
+
+
+def test_the_four_examples_register_and_are_all_findable_for_the_entity(db):
+    for rule in (_tgt_npe_90d(), _tgt_restricted_90d(),
+                 _tgt_churned_90d(), _tgt_fx_active_90d()):
+        register_target(db, rule, description="spec example", registered_by="user:tester")
+    assert {t["name"] for t in targets_for_entity(db, "customer")} == {
+        "tgt_npe_90d", "tgt_restricted_90d", "tgt_churned_90d", "tgt_fx_active_90d"}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/featuregen/overlay/upload/test_target_spec_examples.py -v`
+Expected: FAIL before Tasks 1–5 exist; after them it should PASS. **If any example cannot be
+constructed, that is a contract defect, not a test defect — fix the contract.**
+
+- [ ] **Step 3: Run the full suite and the linter**
+
+```bash
+uv run pytest -q -p no:randomly
+uv run ruff check src/ tests/
+```
+
+Expected: green; ruff unchanged from the pre-plan baseline (56 pre-existing errors — do not "fix"
+them here).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A && git commit -m "test(target): the spec's four worked examples construct and register"
 ```
 
 ---
