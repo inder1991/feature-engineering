@@ -59,3 +59,108 @@ def test_a_frozen_draft_cannot_be_mutated_through_its_dicts():
     draft = TargetDraftV1(shape="state_change", fields=supplied)
     supplied["name"] = "tampered"
     assert draft.fields["name"] == "tgt_npe_90d"
+
+
+# ══ the proposer ═════════════════════════════════════════════════════════════════════════════════
+
+from featuregen.intake.llm import FakeLLM, FakeResponse  # noqa: E402
+from featuregen.overlay.upload.canonical import CanonicalRow  # noqa: E402
+from featuregen.overlay.upload.enrich import content_hash  # noqa: E402
+from featuregen.overlay.upload.graph import build_graph  # noqa: E402
+from featuregen.overlay.upload.target_draft import (  # noqa: E402
+    TARGET_DRAFT_TASK,
+    propose_target_draft,
+)
+
+CIB = "cib"
+_GRAIN = "public.customers.cust_num"
+_ASOF = "public.customers.business_dt"
+_FLAG = "public.customers.perf_flg"
+
+
+def _catalog(db):
+    rows = [
+        (CanonicalRow(CIB, "customers", "cust_num", "integer", is_grain=True,
+                      entity="Customer"), "customer_id"),
+        (CanonicalRow(CIB, "customers", "business_dt", "timestamp", as_of=True), "as_of_date"),
+        (CanonicalRow(CIB, "customers", "perf_flg", "text"), "npe_flag"),
+    ]
+    build_graph(db, CIB, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+
+
+def _client(output: dict) -> FakeLLM:
+    return FakeLLM(script={TARGET_DRAFT_TASK: FakeResponse(output=output)})
+
+
+def _propose(db, client):
+    return propose_target_draft(
+        db, client, hypothesis="which customers go non-performing in 90 days",
+        entity="customer", catalog_source=CIB, grain_ref=_GRAIN, as_of_ref=_ASOF,
+        roles=("data_owner",))
+
+
+def test_a_draft_comes_back_with_its_blanks_and_reasons(db):
+    _catalog(db)
+    draft = _propose(db, _client({
+        "shape": "state_change",
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90},
+        "needs_input": ["from_values", "to_values"],
+        "notes": {"from_values": "no_value_profile", "to_values": "no_value_profile"}}))
+    assert draft.shape == "state_change"
+    assert "from_values" in draft.needs_input
+    assert draft.fields["column_ref"] == _FLAG
+
+
+def test_the_chosen_entitys_SPINE_is_stamped_on_never_guessed(db):
+    """The person picked the entity and `selectable_entities` already returns its spine. Letting
+    the model guess a grain already chosen only invites a disagreement the grain check rejects,
+    with the person unable to see why."""
+    _catalog(db)
+    draft = _propose(db, _client({
+        "shape": "state_change",
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG,
+                   "grain_ref": "public.customers.something_else"},
+        "needs_input": [], "notes": {}}))
+    assert draft.fields["grain_ref"] == _GRAIN
+    assert draft.fields["as_of_ref"] == _ASOF
+    assert draft.fields["entity"] == "customer"
+
+
+def test_a_ref_the_model_INVENTED_is_dropped_and_becomes_a_blank(db):
+    """Selection, never generation — the intake ticket's rule, applied here. Repairing it would
+    let the model name a column that is not there and have the platform agree."""
+    _catalog(db)
+    draft = _propose(db, _client({
+        "shape": "state_change",
+        "fields": {"name": "tgt_npe_90d", "column_ref": "public.customers.invented"},
+        "needs_input": [], "notes": {}}))
+    assert "column_ref" not in draft.fields
+    assert "column_ref" in draft.needs_input
+    assert draft.notes["column_ref"] == "not_in_catalog", \
+        "the blank must say the column is absent, not that its VALUES are unprofiled"
+
+
+def test_an_unstated_horizon_comes_back_as_a_BLANK_not_a_default(db):
+    """`as_of_frequency` is the one mandatory field with no safe default, so "the model omitted it"
+    is the case most worth pinning: it must arrive as a justified blank, never quietly filled."""
+    _catalog(db)
+    draft = _propose(db, _client({
+        "shape": "state_change",
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG},
+        "needs_input": ["as_of_frequency"], "notes": {"as_of_frequency": "not_stated"}}))
+    assert "as_of_frequency" in draft.needs_input
+    assert "as_of_frequency" not in draft.fields
+
+
+def test_no_client_returns_nothing_rather_than_a_fabricated_draft(db):
+    _catalog(db)
+    assert _propose(db, None) is None
+
+
+def test_a_body_that_contradicts_itself_returns_nothing(db):
+    """Filled AND needed is refused by the draft type; the proposer must not paper over it."""
+    _catalog(db)
+    assert _propose(db, _client({
+        "shape": "state_change", "fields": {"window_days": 90},
+        "needs_input": ["window_days"], "notes": {"window_days": "not_stated"}})) is None

@@ -1479,6 +1479,17 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # LLM-2 candidate critic (SP-12 item 5): {"issues": [{"name","issue"}]} — advisory quality/fit notes.
     ("feature_candidate_critique", 1): {"type": "object", "additionalProperties": True,
                                         "properties": {"issues": {"type": "array"}}},
+    # Target authoring (2026-09-02): the proposed FORM, not a rule. `fields` is open because the
+    # two rule shapes carry different keys; the closed semantics are `TargetDraftV1`'s and are
+    # enforced code-side, including the refusal of a field that is both filled and needed.
+    ("target_draft", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "shape": {"type": "string", "enum": ["state_change", "event_window"]},
+            "fields": {"type": "object", "additionalProperties": True},
+            "needs_input": {"type": "array", "items": {"type": "string"}},
+            "notes": {"type": "object", "additionalProperties": True}},
+        "required": ["shape", "fields"]},
     # Intent-recognition (Phase-1A): the closed-shape recognition body. Structure only — the closed-
     # taxonomy semantics (id in registry, primary is a leaf) are a post-pass in recognizer.recognize.
     # SUPERSEDED by v2 below and BYTE-FROZEN: no dispatch requests v1 any more, but it is the
