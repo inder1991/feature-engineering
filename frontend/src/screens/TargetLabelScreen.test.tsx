@@ -2,6 +2,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, it, vi } from 'vitest'
 import * as api from '../api'
+import { ApiError } from '../api'
 import { TargetLabelScreen } from './TargetLabelScreen'
 
 vi.mock('../api', async importOriginal => {
@@ -220,4 +221,14 @@ it('submits the edited filters with the rule', async () => {
   await waitFor(() => expect(registerTarget).toHaveBeenCalled())
   const filters = registerTarget.mock.calls[0][0].rule.event_filters as { value: string }[]
   expect(filters[0].value).toBe('USD')
+})
+
+it('says you lack the ROLE rather than blaming the catalog', async () => {
+  // The default dev session is data_owner, which has no feature:generate — so this is what a
+  // person actually hits on first open. Reporting "no keyed spine table" would be a wrong reason
+  // for a blank: it blames the data for a permissions problem and sends them to fix the catalog.
+  listTargetEntities.mockRejectedValue(new ApiError(403, 'missing permission: feature:generate'))
+  render(<TargetLabelScreen />)
+  expect(await screen.findByText(/feature_engineer/i)).toBeInTheDocument()
+  expect(screen.queryByText(/no keyed spine table/i)).not.toBeInTheDocument()
 })

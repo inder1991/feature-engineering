@@ -11,6 +11,7 @@
 // the label will be built.
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
+  ApiError,
   describeTarget,
   listCatalogs,
   listTargetEntities,
@@ -153,6 +154,7 @@ export function TargetLabelScreen() {
   const [catalogs, setCatalogs] = useState<VisibleCatalog[]>([])
   const [source, setSource] = useState('')
   const [entities, setEntities] = useState<SelectableEntity[] | null>(null)
+  const [forbidden, setForbidden] = useState(false)
   const [entity, setEntity] = useState('')
   const [hypothesis, setHypothesis] = useState('')
 
@@ -187,10 +189,16 @@ export function TargetLabelScreen() {
     setEntities(null)
     listTargetEntities(source)
       .then(list => {
+        setForbidden(false)
         setEntities(list)
         setEntity(list[0]?.entity ?? '')
       })
-      .catch(() => setEntities([]))
+      .catch(e => {
+        // A 403 is NOT "this catalog cannot anchor a label" — reporting it that way blames the
+        // data for a permissions problem and sends the person to fix the wrong thing.
+        setForbidden(e instanceof ApiError && e.status === 403)
+        setEntities([])
+      })
   }, [source])
 
   useEffect(() => {
@@ -304,7 +312,13 @@ export function TargetLabelScreen() {
           </select>
         </div>
 
-        {entities !== null && entities.length === 0 ? (
+        {forbidden ? (
+          <p className="empty">
+            This session cannot author prediction targets. Authoring needs the
+            <strong> feature_engineer</strong> role (or <strong>platform_admin</strong>) —
+            change it in the session bar above and this screen will load.
+          </p>
+        ) : entities !== null && entities.length === 0 ? (
           <p className="empty">
             {source} has no keyed spine table, so it cannot anchor a prediction target. A label
             needs one row per thing being predicted and a date to measure forward from.

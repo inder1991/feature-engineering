@@ -7,7 +7,11 @@ export interface Session {
   roles: string[]
 }
 
-let current: Session = { user: 'dev', roles: ['data_owner'] }
+// The dev session stands in for real auth. It carries BOTH roles because the app it ships with
+// needs both: `data_owner` uploads a catalog, `feature_engineer` carries `feature:generate`, which
+// every /targets route requires. With `data_owner` alone a fresh session 403s on the whole
+// prediction-target screen — a permissions wall that reads as a broken feature.
+let current: Session = { user: 'dev', roles: ['data_owner', 'feature_engineer'] }
 const listeners = new Set<() => void>()
 
 export function getSession(): Session {
