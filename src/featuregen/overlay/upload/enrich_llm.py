@@ -1516,6 +1516,11 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     #
     # `notes` values are the CLOSED reason set, so a bad reason is repaired inside the bounded loop
     # instead of the whole draft being discarded after it returns.
+    # v2 — SUPERSEDED by v3 and BYTE-FROZEN. Two live drafts were produced under it (the cib NPE
+    # label and the cross-catalog FX label), so it is their contract. It is frozen rather than
+    # edited because `_require_schema` now REFUSES a registry body that differs from the build —
+    # the guard added the same day, on its first outing, correctly forcing this bump instead of a
+    # silent overwrite.
     ("target_draft", 2): {
         "type": "object", "additionalProperties": False,
         "properties": {
@@ -1554,6 +1559,79 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                             "population_lookback_days"]},
                         "value": {"type": "string"}},
                     "required": ["key", "value"]}},
+            "needs_input": {"type": "array", "items": {"type": "string"}},
+            # An ARRAY of pairs for the same reason, and one the map form could not have satisfied
+            # anyway: a map has arbitrary KEYS, and Anthropic rejects a dict-valued
+            # `additionalProperties` outright (HTTP 400). Pairs keep the reason enum-constrained ON
+            # THE WIRE, so a bad one is repaired inside the bounded loop instead of failing the
+            # draft after it returns.
+            "notes": {
+                "type": "array",
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "field": {"type": "string"},
+                        "reason": {
+                            "type": "string",
+                            "enum": ["no_value_profile", "business_choice", "population_choice",
+                                     "not_stated", "not_in_catalog"]}},
+                    "required": ["field", "reason"]}}},
+        "required": ["shape", "fields", "needs_input", "notes"]},
+    ("target_draft", 3): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "shape": {"type": "string", "enum": ["state_change", "event_window"]},
+            # KEY/VALUE PAIRS, not an object of 22 optional properties — and this is a provider
+            # limit, not a preference. Anthropic compiles the schema into a generation grammar and
+            # refuses one with more than 24 optional parameters ("too many optional parameters"),
+            # then refuses this one at 22 as well ("Schema is too complex"). Probing the live API
+            # established both that the COUNT is what bites — 22 optional properties are rejected
+            # even when every one is a plain string — and where the ceiling sits: 12 optional
+            # properties are ACCEPTED, 16 are REJECTED. A rule carries 22, and every one must be
+            # optional by necessity (a blank field is ABSENT from `fields` and named in
+            # `needs_input` instead), so the object form was never viable here. This is the shape
+            # that fits, not a workaround for one that nearly did.
+            #
+            # `key` stays enum-constrained, so the model is still steered to the field names it may
+            # use; the types come back as text and are coerced server-side (`_fields_from`), where
+            # a value that will not coerce is kept verbatim and shown rather than silently dropped.
+            # A LIST field repeats its key, the way a form encodes a multi-value input.
+            #
+            # The four STAMPED keys (entity / anchor_catalog / grain_ref / as_of_ref) are
+            # deliberately absent: structured output constrains GENERATION against this schema, so
+            # the model cannot emit them, and the server overwrites them regardless.
+            "fields": {
+                "type": "array",
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "key": {"type": "string", "enum": [
+                            "name", "window_days", "as_of_frequency", "label_type", "operator",
+                            "threshold", "require_full_window",
+                            "column_ref", "from_values", "to_values", "population_filter",
+                            "exclude_null_at_as_of", "at_least_once",
+                            "event_catalog", "event_table", "event_date_ref", "join_left",
+                            "join_right", "aggregate", "measure_ref", "population_having",
+                            "population_lookback_days"]},
+                        "value": {"type": "string"}},
+                    "required": ["key", "value"]}},
+            # The event-side conditions. A live call found this missing: "who will start
+            # transacting in FOREIGN CURRENCY" needs a filter on the currency column, the schema
+            # carried none, so the model could not propose one and the label silently counted
+            # EVERY transaction — the wrong question, wearing the right name. Nested closed
+            # objects, which the pair form already proved acceptable; `fields` being pairs leaves
+            # ample optional-parameter headroom for them.
+            "event_filters": {
+                "type": "array",
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "column_ref": {"type": "string"},
+                        "op": {"type": "string",
+                               "enum": ["==", "!=", ">", ">=", "<", "<=", "in", "not_in"]},
+                        "value": {"type": "string"},
+                        "value_ref": {"type": "string"}},
+                    "required": ["column_ref", "op"]}},
             "needs_input": {"type": "array", "items": {"type": "string"}},
             # An ARRAY of pairs for the same reason, and one the map form could not have satisfied
             # anyway: a map has arbitrary KEYS, and Anthropic rejects a dict-valued

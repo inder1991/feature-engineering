@@ -255,9 +255,12 @@ def test_the_dispatched_schema_DECLARES_every_field_it_expects():
     """
     schema = _SCHEMAS[(TARGET_DRAFT_SCHEMA_ID, TARGET_DRAFT_SCHEMA_VERSION)]
     declared = set(schema["properties"]["fields"]["items"]["properties"]["key"]["enum"])
-    stamped = {"entity", "anchor_catalog", "grain_ref", "as_of_ref"}
+    # Stamped server-side, and `event_filters` rides its own top-level key because a filter is a
+    # nested object rather than a scalar pair. Neither belongs in the pair-key enum.
+    elsewhere = {"entity", "anchor_catalog", "grain_ref", "as_of_ref", "event_filters"}
+    assert "event_filters" in schema["properties"], "filters must be proposable somewhere"
     for shape, needed in SHAPE_FIELDS.items():
-        missing = [f for f in needed if f not in declared and f not in stamped]
+        missing = [f for f in needed if f not in declared and f not in elsewhere]
         assert not missing, f"{shape} needs {missing}, which the schema never mentions"
 
 
@@ -398,7 +401,7 @@ def test_the_event_side_of_a_cross_catalog_label_is_OFFERED_not_unreachable(db):
                          event_date_ref="public.txns.pstd_date",
                          join_left=_GRAIN, join_right="public.txns.cif_id",
                          aggregate="count", population_having="none"),
-        "needs_input": [], "notes": []})})
+        "event_filters": [], "needs_input": [], "notes": []})})
     draft = _propose(db, client)
     assert draft is not None, "the event-side refs must survive rather than be dropped"
     assert draft.fields["event_catalog"] == "ftr"
@@ -453,3 +456,49 @@ def test_a_registry_body_that_DRIFTS_from_the_build_is_refused(db):
                (json.dumps({"type": "object", "properties": {}}),))
     with pytest.raises(SchemaUnregisteredError, match="DIFFERS"):
         _require_schema(db, reg, "target_draft", 2)
+
+
+def test_an_event_FILTER_can_be_proposed_at_all(db):
+    """The gap a live call found. "Who will start transacting in FOREIGN CURRENCY" needs a filter
+    on the currency column; the schema carried no `event_filters` at all, so the model could not
+    propose one and the coverage set did not miss it. The label then counts EVERY transaction —
+    silently the wrong question, which is the exact failure mode this design exists to prevent.
+    """
+    _catalog(db)
+    _event_catalog(db)
+    _bridge(db)
+    draft = _propose(db, _client({
+        "shape": "event_window",
+        "fields": _pairs(name="tgt_fx_90d", window_days=90, as_of_frequency="monthly",
+                         label_type="binary", event_catalog="ftr", event_table="txns",
+                         event_date_ref="public.txns.pstd_date", join_left=_GRAIN,
+                         join_right="public.txns.cif_id", aggregate="count",
+                         population_having="any"),
+        "event_filters": [{"column_ref": "public.txns.tran_crncy", "op": "!=", "value": "AED"}],
+        "needs_input": [], "notes": []}))
+    assert draft.fields["event_filters"] == [
+        {"column_ref": "public.txns.tran_crncy", "op": "!=", "value": "AED"}]
+
+
+def test_event_filters_must_be_ACCOUNTED_FOR_like_any_other_field():
+    """"No filter" has to be a decision someone made, not a field nobody mentioned — a missing
+    filter silently WIDENS the label."""
+    assert "event_filters" in SHAPE_FIELDS["event_window"]
+
+
+def test_a_SCHEMA_QUALIFIED_event_table_is_normalised(db):
+    """The live model returned `public.comp_financial_tran_repos_dly` where the contract wants the
+    bare table name, and the SQL renderer cross-checks the two — so the rule would have refused to
+    render. The name is the same name; normalise rather than refuse."""
+    _catalog(db)
+    _event_catalog(db)
+    _bridge(db)
+    draft = _propose(db, _client({
+        "shape": "event_window",
+        "fields": _pairs(name="tgt_fx_90d", window_days=90, as_of_frequency="monthly",
+                         label_type="binary", event_catalog="ftr", event_table="public.txns",
+                         event_date_ref="public.txns.pstd_date", join_left=_GRAIN,
+                         join_right="public.txns.cif_id", aggregate="count",
+                         population_having="any"),
+        "event_filters": [], "needs_input": [], "notes": []}))
+    assert draft.fields["event_table"] == "txns"

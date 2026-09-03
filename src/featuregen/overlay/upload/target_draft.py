@@ -40,7 +40,7 @@ SHAPE_FIELDS = {
     # silently absent.
     "event_window": _SHARED_FIELDS + ("event_catalog", "event_table", "event_date_ref",
                                       "join_left", "join_right", "aggregate",
-                                      "population_having"),
+                                      "population_having", "event_filters"),
 }
 
 
@@ -94,10 +94,11 @@ TARGET_DRAFT_PROMPT_ID = "target_draft"
 #: new one.
 TARGET_DRAFT_PROMPT_VERSION = 2
 TARGET_DRAFT_SCHEMA_ID = "target_draft"
-#: v2 DECLARES every field a rule can carry. v1 left `fields` an open object with no properties,
+#: v3 adds `event_filters`, without which a label counting FX transactions counted every
+#: transaction instead. v2 DECLARES every field a rule can carry. v1 left `fields` an open object with no properties,
 #: and the schema — not the instruction — is what steers a structured-output call: two live calls
 #: returned `fields: {}` and validated cleanly. v1 stays byte-frozen as their contract.
-TARGET_DRAFT_SCHEMA_VERSION = 2
+TARGET_DRAFT_SCHEMA_VERSION = 3
 
 #: Fields the model may name, and which must therefore be candidate columns. Anything off the
 #: shortlist is dropped to a blank rather than trusted — the intake ticket's rule ("an off-shortlist
@@ -147,6 +148,11 @@ _INSTRUCTION = (
     "its refs and set `event_catalog` to that candidate's `catalog`. `verified_joins` carries "
     "join keys the organisation has already CONFIRMED between the two — use one rather than "
     "choosing your own, and leave `join_right` blank if none fits.\n\n"
+    "`event_filters` narrows WHICH EVENTS COUNT, and it is a separate top-level list of "
+    "{column_ref, op, value} — an objective naming a currency, a channel or a product needs one, "
+    "and without it the label counts every row in the table and answers a wider question than the "
+    "one asked. Send an EMPTY list only when the objective genuinely counts everything. Give "
+    "`event_table` as the bare table name.\n\n"
     "`population_having` decides WHICH QUESTION the label asks: `none` is 'who will START' and "
     "excludes anyone already doing this in the lookback; `any` is 'who will do it at all'. An "
     "objective saying start/begin/first-time means `none` with a lookback. Getting this wrong "
@@ -293,6 +299,19 @@ def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_
 
     body = dict(call.output)
     fields = _fields_from(body.get("fields"))
+    # A LIST of conditions, not a pair — it rides its own top-level key because a filter is a
+    # nested object. "No filter" must still be a decision someone made rather than a field nobody
+    # mentioned, so an empty list is a filled value and the coverage rule counts it as one.
+    if "event_filters" in body:
+        fields["event_filters"] = [
+            {k: v for k, v in dict(f).items() if v not in (None, "")}
+            for f in (body.get("event_filters") or ()) if isinstance(f, dict)]
+    # The live model answered `public.comp_financial_tran_repos_dly` where the contract wants the
+    # bare table name, and the SQL renderer cross-checks the two — so the rule would have refused
+    # to render. It is the same name; normalise rather than refuse.
+    table = fields.get("event_table")
+    if isinstance(table, str) and "." in table:
+        fields["event_table"] = table.rsplit(".", 1)[-1]
     needs = list(body.get("needs_input") or ())
     notes = _notes_from(body.get("notes"))
 
