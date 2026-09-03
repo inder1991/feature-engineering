@@ -24,6 +24,9 @@ const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', 
   // Step 5a's coordinator: plan / request / watch / cancel (api.ts planCodeGeneration &c.),
   // and the build-set surface the coordinator's journey reads through.
   '/code-generation-jobs', '/build-sets',
+  // Derived target labels: propose / describe / sql / register / attach. DISTINCT from
+  // '/features' — a label is what features are FOR, and it has its own registry.
+  '/targets',
   // Phase G's materialization trigger + status. No screen calls it yet — it is here because
   // nginx.conf and this list must agree, and because a missing prefix answers a POST with 405
   // from the SPA rather than a 404 anyone would recognise as routing.
