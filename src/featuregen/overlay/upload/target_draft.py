@@ -84,6 +84,10 @@ TARGET_DRAFT_TASK = "overlay.target.draft"
 TARGET_DRAFT_PROMPT_ID = "target_draft"
 TARGET_DRAFT_PROMPT_VERSION = 1
 TARGET_DRAFT_SCHEMA_ID = "target_draft"
+#: v2 DECLARES every field a rule can carry. v1 left `fields` an open object with no properties,
+#: and the schema — not the instruction — is what steers a structured-output call: two live calls
+#: returned `fields: {}` and validated cleanly. v1 stays byte-frozen as their contract.
+TARGET_DRAFT_SCHEMA_VERSION = 2
 
 #: Fields the model may name, and which must therefore be candidate columns. Anything off the
 #: shortlist is dropped to a blank rather than trusted — the intake ticket's rule ("an off-shortlist
@@ -153,6 +157,7 @@ def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_
             conn, client, task=TARGET_DRAFT_TASK,
             prompt_id=f"{TARGET_DRAFT_PROMPT_ID}_v{TARGET_DRAFT_PROMPT_VERSION}",
             schema_id=TARGET_DRAFT_SCHEMA_ID,
+            schema_version=TARGET_DRAFT_SCHEMA_VERSION,
             catalog_metadata={"objective": hypothesis, "candidates": shortlist,
                               "entity": entity},
             instruction=_INSTRUCTION, actor=actor)

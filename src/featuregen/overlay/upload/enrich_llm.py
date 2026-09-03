@@ -1482,6 +1482,11 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # Target authoring (2026-09-02): the proposed FORM, not a rule. `fields` is open because the
     # two rule shapes carry different keys; the closed semantics are `TargetDraftV1`'s and are
     # enforced code-side, including the refusal of a field that is both filled and needed.
+    # v1 — SUPERSEDED by v2 below and BYTE-FROZEN. `fields` was an open object with NO declared
+    # properties, and that is what actually steers a structured-output call: `{}` was both the
+    # easiest answer and a valid one, so two live calls returned exactly that while
+    # `validation_result` said "ok". Naming the fields in the INSTRUCTION did not change it and
+    # could not have. It stays because it is the contract those llm_call rows were produced under.
     ("target_draft", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {
@@ -1490,6 +1495,64 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
             "needs_input": {"type": "array", "items": {"type": "string"}},
             "notes": {"type": "object", "additionalProperties": True}},
         "required": ["shape", "fields"]},
+    # v2 — the version dispatched today. Every field a rule can carry is DECLARED, with its type
+    # and, where the contract closes the set, its enum.
+    #
+    # The four STAMPED keys are declared even though the instruction says not to send them:
+    # `project_for_anthropic` CLOSES `additionalProperties` on the wire schema, so an undeclared
+    # key the model echoes back is not a droppable ref — it is a failed call. Declaring them makes
+    # a harmless echo harmless. They are overwritten server-side regardless.
+    #
+    # `notes` values are the CLOSED reason set, so a bad reason is repaired inside the bounded loop
+    # instead of the whole draft being discarded after it returns.
+    ("target_draft", 2): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "shape": {"type": "string", "enum": ["state_change", "event_window"]},
+            "fields": {
+                "type": "object", "additionalProperties": True,
+                "properties": {
+                    # Stamped server-side from the person's own choice; declared, never trusted.
+                    "entity": {"type": "string"},
+                    "anchor_catalog": {"type": "string"},
+                    "grain_ref": {"type": "string"},
+                    "as_of_ref": {"type": "string"},
+                    # Shared by both shapes.
+                    "name": {"type": "string"},
+                    "window_days": {"type": "integer"},
+                    "as_of_frequency": {
+                        "type": "string",
+                        "enum": ["daily", "weekly", "monthly", "quarterly", "single"]},
+                    "label_type": {"type": "string", "enum": ["binary", "count", "amount"]},
+                    "operator": {"type": "string",
+                                 "enum": ["==", "!=", ">=", "<=", ">", "<"]},
+                    "threshold": {"type": "number"},
+                    "require_full_window": {"type": "boolean"},
+                    # state_change.
+                    "column_ref": {"type": "string"},
+                    "from_values": {"type": "array", "items": {"type": "string"}},
+                    "to_values": {"type": "array", "items": {"type": "string"}},
+                    "population_filter": {"type": "string", "enum": ["from_values", "all"]},
+                    "exclude_null_at_as_of": {"type": "boolean"},
+                    "at_least_once": {"type": "boolean"},
+                    # event_window.
+                    "event_catalog": {"type": "string"},
+                    "event_table": {"type": "string"},
+                    "event_date_ref": {"type": "string"},
+                    "join_left": {"type": "string"},
+                    "join_right": {"type": "string"},
+                    "aggregate": {"type": "string", "enum": ["count", "sum"]},
+                    "measure_ref": {"type": "string"},
+                    "population_having": {"type": "string", "enum": ["any", "none"]},
+                    "population_lookback_days": {"type": "integer"}}},
+            "needs_input": {"type": "array", "items": {"type": "string"}},
+            "notes": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "string",
+                    "enum": ["no_value_profile", "business_choice", "population_choice",
+                             "not_stated", "not_in_catalog"]}}},
+        "required": ["shape", "fields", "needs_input", "notes"]},
     # Intent-recognition (Phase-1A): the closed-shape recognition body. Structure only — the closed-
     # taxonomy semantics (id in registry, primary is a leaf) are a post-pass in recognizer.recognize.
     # SUPERSEDED by v2 below and BYTE-FROZEN: no dispatch requests v1 any more, but it is the

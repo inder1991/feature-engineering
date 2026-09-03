@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import pytest
 
-from featuregen.overlay.upload.target_draft import DraftError, TargetDraftV1
+from featuregen.overlay.upload.target_draft import (
+    NEEDS_INPUT_REASONS,
+    DraftError,
+    TargetDraftV1,
+)
 
 
 def _draft(**over) -> TargetDraftV1:
@@ -215,3 +219,57 @@ def test_an_event_window_draft_is_measured_against_ITS_OWN_fields():
                               "as_of_frequency": "monthly", "label_type": "binary",
                               "operator": ">=", "threshold": 1,
                               "column_ref": "public.t.flag"})
+
+
+# ══ the schema is what actually steers the model ═════════════════════════════════════════════════
+
+from featuregen.overlay.upload.enrich_llm import _SCHEMAS  # noqa: E402
+from featuregen.overlay.upload.target_draft import (  # noqa: E402
+    SHAPE_FIELDS,
+    TARGET_DRAFT_SCHEMA_ID,
+    TARGET_DRAFT_SCHEMA_VERSION,
+)
+
+
+def test_the_dispatched_schema_DECLARES_every_field_it_expects():
+    """Found by a live call, twice. The INSTRUCTION is not what constrains structured output — the
+    schema is. `fields` was declared as an open object with no properties, which makes `{}` both
+    the easiest answer and a perfectly valid one, and the model returned exactly that both times
+    while `validation_result` said "ok".
+
+    Naming the fields in the prompt did not change it and could not have.
+    """
+    schema = _SCHEMAS[(TARGET_DRAFT_SCHEMA_ID, TARGET_DRAFT_SCHEMA_VERSION)]
+    declared = set(schema["properties"]["fields"].get("properties", {}))
+    for shape, needed in SHAPE_FIELDS.items():
+        missing = [f for f in needed if f not in declared]
+        assert not missing, f"{shape} needs {missing}, which the schema never mentions"
+
+
+def test_the_schema_still_ACCEPTS_the_stamped_fields_the_model_may_echo():
+    """The instruction tells it not to supply these, but a closed schema that REFUSES them would
+    turn a harmless echo into a failed call. They are overwritten server-side anyway."""
+    schema = _SCHEMAS[(TARGET_DRAFT_SCHEMA_ID, TARGET_DRAFT_SCHEMA_VERSION)]
+    declared = set(schema["properties"]["fields"].get("properties", {}))
+    assert {"entity", "anchor_catalog", "grain_ref", "as_of_ref"} <= declared
+
+
+def test_the_schema_constrains_a_BLANKS_REASON_to_the_closed_set():
+    """An unrecognised reason renders as a blank with no explanation. Constraining it in the schema
+    lets the bounded repair loop fix it, rather than the draft being discarded whole afterwards."""
+    schema = _SCHEMAS[(TARGET_DRAFT_SCHEMA_ID, TARGET_DRAFT_SCHEMA_VERSION)]
+    notes = schema["properties"]["notes"]["additionalProperties"]
+    assert set(notes["enum"]) == set(NEEDS_INPUT_REASONS)
+
+
+def test_version_1_stays_BYTE_FROZEN():
+    """Two live llm_call rows were produced under v1. It is the contract they were produced under,
+    so it neither changes nor goes away — the same rule `use_case_recognition` v1 follows."""
+    assert _SCHEMAS[("target_draft", 1)] == {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "shape": {"type": "string", "enum": ["state_change", "event_window"]},
+            "fields": {"type": "object", "additionalProperties": True},
+            "needs_input": {"type": "array", "items": {"type": "string"}},
+            "notes": {"type": "object", "additionalProperties": True}},
+        "required": ["shape", "fields"]}
