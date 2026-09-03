@@ -232,3 +232,64 @@ it('says you lack the ROLE rather than blaming the catalog', async () => {
   expect(await screen.findByText(/feature_engineer/i)).toBeInTheDocument()
   expect(screen.queryByText(/no keyed spine table/i)).not.toBeInTheDocument()
 })
+
+// ══ progress while the model is thinking ════════════════════════════════════════════════════════
+// A real call over the whole catalog takes 20-40 seconds. With only a disabled button to look at,
+// a person testing this reasonably concludes it is broken and reloads — losing the draft they were
+// waiting for.
+
+function deferred<T>() {
+  let resolve!: (v: T) => void
+  let reject!: (e: unknown) => void
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+async function startProposing() {
+  const user = userEvent.setup()
+  const pending = deferred<api.TargetProposal>()
+  proposeTarget.mockReturnValue(pending.promise)
+  render(<TargetLabelScreen />)
+  await waitFor(() => expect(listTargetEntities).toHaveBeenCalled())
+  await user.type(screen.getByLabelText(/what are you trying to predict/i), 'which customers…')
+  await user.click(screen.getByRole('button', { name: /propose a target/i }))
+  return { user, pending }
+}
+
+it('says what it is doing while the model is thinking', async () => {
+  const { pending } = await startProposing()
+  const status = await screen.findByRole('status')
+  expect(status).toHaveTextContent(/reading/i)
+  // Naming the catalog and its size is the difference between "something is happening" and
+  // "this is the work I asked for".
+  expect(status).toHaveTextContent(/cib/)
+  expect(status).toHaveTextContent(/9 columns/)
+  pending.resolve({ existing: [], draft: DRAFT })
+})
+
+it('sets an expectation for HOW LONG, so a slow call does not read as a hung one', async () => {
+  const { pending } = await startProposing()
+  expect(await screen.findByRole('status')).toHaveTextContent(/seconds/i)
+  pending.resolve({ existing: [], draft: DRAFT })
+})
+
+it('the button says it is working rather than looking merely disabled', async () => {
+  const { pending } = await startProposing()
+  expect(await screen.findByRole('button', { name: /proposing/i })).toBeDisabled()
+  pending.resolve({ existing: [], draft: DRAFT })
+})
+
+it('clears the progress once the draft arrives', async () => {
+  const { pending } = await startProposing()
+  await screen.findByRole('status')
+  pending.resolve({ existing: [], draft: DRAFT })
+  await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+})
+
+it('clears the progress when the call FAILS, rather than appearing to run for ever', async () => {
+  const { pending } = await startProposing()
+  await screen.findByRole('status')
+  pending.reject(new ApiError(500, 'boom'))
+  await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+  expect(screen.getByText(/boom/)).toBeInTheDocument()
+})

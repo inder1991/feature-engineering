@@ -172,6 +172,10 @@ export function TargetLabelScreen() {
   const [showSql, setShowSql] = useState(false)
   const [registered, setRegistered] = useState<RegisteredTarget[]>([])
   const [busy, setBusy] = useState(false)
+  // SEPARATE from `busy`, which also covers registration. A progress line saying "reading the
+  // catalog" while a registration is in flight would describe the wrong work.
+  const [proposing, setProposing] = useState(false)
+  const [elapsed, setElapsed] = useState(0)
   const [error, setError] = useState('')
   const [done, setDone] = useState<string | null>(null)
 
@@ -244,8 +248,20 @@ export function TargetLabelScreen() {
     return () => { live = false; clearTimeout(timer) }
   }, [rule, showSql])
 
+  // A ticking count, because the useful question during a 30-second wait is "is this still
+  // going?" and a static message cannot answer it.
+  useEffect(() => {
+    if (!proposing) {
+      setElapsed(0)
+      return
+    }
+    const started = Date.now()
+    const timer = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 1000)
+    return () => clearInterval(timer)
+  }, [proposing])
+
   const propose = useCallback(async () => {
-    setBusy(true); setError(''); setProposalFailed(false); setDone(null)
+    setBusy(true); setProposing(true); setError(''); setProposalFailed(false); setDone(null)
     try {
       const result = await proposeTarget({ hypothesis, entity, catalog_source: source })
       setExisting(result.existing)
@@ -271,10 +287,13 @@ export function TargetLabelScreen() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'the proposal failed')
     } finally {
-      setBusy(false)
+      // In `finally`, so a failure clears the progress too — a message that keeps running after
+      // the call died is worse than none, because it says the opposite of what happened.
+      setBusy(false); setProposing(false)
     }
   }, [hypothesis, entity, source])
 
+  const columnCount = catalogs.find(c => c.source === source)?.columns ?? null
   const blanks = draft?.needs_input ?? []
   const unfilled = blanks.filter(key => !(values[key] ?? '').trim())
 
@@ -348,11 +367,24 @@ export function TargetLabelScreen() {
             </div>
 
             <button
-              type="button" className="btn btn--primary" disabled={busy || !hypothesis.trim() || !entity}
+              type="button" className="btn btn--primary"
+              disabled={busy || !hypothesis.trim() || !entity}
               onClick={propose}
             >
-              Propose a target
+              {proposing ? 'Proposing…' : 'Propose a target'}
             </button>
+
+            {proposing && (
+              // `role="status"` so it is announced rather than only seen. Naming the catalog and
+              // its size is the difference between "something is happening" and "this is the work
+              // I asked for" — one real call reads the whole shortlist.
+              <p className="tgt-progress" role="status">
+                Reading {columnCount === null ? 'the' : columnCount} column
+                {columnCount === 1 ? '' : 's'} in {source} and proposing a rule. This usually takes
+                20–40 seconds{elapsed > 0 ? ` — ${elapsed}s so far` : ''}.
+              </p>
+            )}
+            {error && !proposing && <p className="error" role="alert">{error}</p>}
           </>
         )}
       </section>
