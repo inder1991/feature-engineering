@@ -1,6 +1,8 @@
 """The proposed draft: what the tool fills in, what it leaves blank, and why."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from featuregen.overlay.upload.target_draft import (
@@ -348,3 +350,106 @@ def test_a_value_that_will_not_COERCE_is_kept_rather_than_dropped():
     would present an unexplained blank and lose the evidence that anything went wrong."""
     from featuregen.overlay.upload.target_draft import _fields_from
     assert _fields_from([{"key": "window_days", "value": "ninety"}]) == {"window_days": "ninety"}
+
+
+# ══ the event side lives in ANOTHER catalog ══════════════════════════════════════════════════════
+
+def _bridge(db, entity="customer") -> None:
+    """A VERIFIED cross-catalog edge: the platform's own answer to "same customer, both catalogs"."""
+    db.execute(
+        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, "
+        "left_object_ref, right_catalog_source, right_object_ref, confirmed_event_id, status) "
+        "VALUES ('fk1', %s, 'cib', 'public.customers.cust_num', 'ftr', "
+        "'public.txns.cif_id', 'evt1', 'VERIFIED') ON CONFLICT DO NOTHING", (entity,))
+
+
+def _event_catalog(db) -> None:
+    rows = [
+        (CanonicalRow("ftr", "txns", "cif_id", "text", is_grain=True, entity="Customer"),
+         "customer_id"),
+        (CanonicalRow("ftr", "txns", "pstd_date", "timestamp", as_of=True), "as_of_date"),
+        (CanonicalRow("ftr", "txns", "tran_crncy", "text"), "currency"),
+    ]
+    build_graph(db, "ftr", [r for r, _ in rows], concepts={content_hash(r): c for r, c in rows})
+
+
+def test_the_event_side_of_a_cross_catalog_label_is_OFFERED_not_unreachable(db):
+    """An `event_window` label is cross-catalog BY CONSTRUCTION — it counts events in a second
+    catalog. A shortlist scoped to the anchor made every event-side field come back
+    `not_in_catalog`, so the shape could never be fully proposed. A live call proved it.
+
+    The reachable catalogs are not guessed: they are the ones a VERIFIED `entity_bridge_edge` says
+    hold the same entity.
+    """
+    _catalog(db)
+    _event_catalog(db)
+    _bridge(db)
+    captured = {}
+
+    class _Capture(FakeLLM):
+        def call(self, request):                       # noqa: D102
+            captured["meta"] = request.inputs
+            return super().call(request)
+
+    client = _Capture(script={TARGET_DRAFT_TASK: FakeResponse(output={
+        "shape": "event_window",
+        "fields": _pairs(name="tgt_fx_90d", window_days=90, as_of_frequency="monthly",
+                         label_type="binary", event_catalog="ftr", event_table="txns",
+                         event_date_ref="public.txns.pstd_date",
+                         join_left=_GRAIN, join_right="public.txns.cif_id",
+                         aggregate="count", population_having="none"),
+        "needs_input": [], "notes": []})})
+    draft = _propose(db, client)
+    assert draft is not None, "the event-side refs must survive rather than be dropped"
+    assert draft.fields["event_catalog"] == "ftr"
+    assert draft.fields["join_right"] == "public.txns.cif_id"
+
+
+def test_the_VERIFIED_join_is_handed_to_the_model_rather_than_guessed(db):
+    """The platform already recorded which columns join the two catalogs, and it was human
+    confirmed. Making the model invent one instead would be inventing a key the organisation has
+    already decided."""
+    _catalog(db)
+    _event_catalog(db)
+    _bridge(db)
+    seen = {}
+
+    class _Capture(FakeLLM):
+        def call(self, request):                       # noqa: D102
+            seen.update(request.inputs)
+            return super().call(request)
+
+    _propose(db, _Capture(script={TARGET_DRAFT_TASK: FakeResponse(output={
+        "shape": "state_change", "fields": _pairs(name="tgt_x_90d"),
+        "needs_input": [], "notes": []})}))
+    joins = json.dumps(seen)
+    assert "cif_id" in joins, "the verified join must reach the model"
+
+
+def test_population_having_is_part_of_the_COVERAGE_set_for_an_event_label(db):
+    """"Who will START" versus "who will do it at all" are different questions, and `any` silently
+    yields the degenerate one. A live call on a hypothesis that literally said START left it unset,
+    and nothing objected — because it was not in the coverage set."""
+    assert "population_having" in SHAPE_FIELDS["event_window"]
+
+
+def test_a_registry_body_that_DRIFTS_from_the_build_is_refused(db):
+    """The defect that cost five deploys. Schemas register only when MISSING, so editing a body in
+    place is a silent no-op wherever that version already exists — the code says one thing and the
+    wire sends another, with nothing to tell you. Refusing names the pair and points at the fix,
+    which is a version bump: a registered version is the contract its responses were produced
+    under, so it is never silently overwritten.
+    """
+    from featuregen.documents.registry import DocumentSchemaRegistry
+    from featuregen.overlay.upload.enrich_llm import (
+        SchemaUnregisteredError,
+        _require_schema,
+        register_enrichment_schemas,
+    )
+    register_enrichment_schemas(db)
+    reg = DocumentSchemaRegistry(db)
+    db.execute("UPDATE document_type_registry SET json_schema = %s "
+               " WHERE type_name = 'target_draft' AND schema_version = 2",
+               (json.dumps({"type": "object", "properties": {}}),))
+    with pytest.raises(SchemaUnregisteredError, match="DIFFERS"):
+        _require_schema(db, reg, "target_draft", 2)

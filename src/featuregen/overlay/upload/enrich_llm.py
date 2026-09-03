@@ -215,6 +215,13 @@ _STRUCTURAL_META_KEYS = frozenset({
     # the owning adapter scans, this gate admits the scanned shape). Refs and the remaining keys
     # are platform-derived tokens.
     "candidates",
+    # Derived target labels: the EVENT side of a cross-catalog rule, and the confirmed join to it.
+    # `event_candidates` is `candidates` from a second catalog and carries exactly that shape —
+    # `_shortlist` runs the same `redact_free_text` pass over `ai_summary`/`semantic_terms` before
+    # the payload is built, so the owning adapter has already scanned it (the `candidates`
+    # precedent above). `verified_joins` is platform-derived only: catalog names and object refs
+    # off a human-CONFIRMED `entity_bridge_edge`, with no prose field at all.
+    "event_candidates", "verified_joins",
     # ...and its three sibling tokens: a registry template id, an authored need role, a registry
     # concept name — closed-vocabulary platform values, never uploader text.
     "template_id", "need_role", "need_concept",
@@ -2112,6 +2119,20 @@ def _require_schema(conn, reg: DocumentSchemaRegistry, schema_id: str, schema_ve
     if schema is None:
         (register or register_enrichment_schemas)(conn)
         schema = reg.schema_for(schema_id, schema_version)
+    # REGISTRY DRIFT. Registration only happens when a version is MISSING, so editing a schema body
+    # in place is a silent no-op anywhere that version already exists: the code says one thing, the
+    # wire sends another, and nothing anywhere notices. That cost five deploys to find, each one
+    # dispatching a body the build had not contained for hours.
+    #
+    # A registered version is a CONTRACT — responses were produced under it — so the fix is never
+    # to overwrite it silently. Refuse, and name the pair: the correct action is a version bump.
+    if schema is not None and (schema_id, schema_version) in _SCHEMAS \
+            and schema != _SCHEMAS[(schema_id, schema_version)]:
+        raise SchemaUnregisteredError(
+            f"output schema ({schema_id!r}, v{schema_version}) in the registry DIFFERS from the "
+            "body this build declares — a registered version is the contract its responses were "
+            "produced under, so it is never silently overwritten. Bump the version and register "
+            "the new body, or clear the stale registration if nothing was produced under it")
     if schema is None:
         raise SchemaUnregisteredError(
             f"output schema ({schema_id!r}, v{schema_version}) is not registered — refusing to "

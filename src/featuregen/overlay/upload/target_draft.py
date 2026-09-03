@@ -33,8 +33,14 @@ _SHARED_FIELDS = ("name", "entity", "anchor_catalog", "grain_ref", "as_of_ref",
                   "window_days", "as_of_frequency", "label_type")
 SHAPE_FIELDS = {
     "state_change": _SHARED_FIELDS + ("column_ref", "from_values", "to_values"),
+    # `population_having` is here because a live call proved its absence costs the label its
+    # meaning: on a hypothesis that literally said "who will START", the draft left it unset and
+    # nothing objected, so the rule would have defaulted to `any` — "who will do it at all", the
+    # degenerate label the spec warns about. Filled or explicitly a `population_choice` blank; not
+    # silently absent.
     "event_window": _SHARED_FIELDS + ("event_catalog", "event_table", "event_date_ref",
-                                      "join_left", "join_right", "aggregate"),
+                                      "join_left", "join_right", "aggregate",
+                                      "population_having"),
 }
 
 
@@ -137,6 +143,14 @@ _INSTRUCTION = (
     "definitions is meant (`business_choice`); whether the population is everyone or only those "
     "who have not yet had the outcome (`population_choice`); the horizon when the text states none "
     "(`not_stated`).\n\n"
+    "For an `event_window`, the event side lives in ANOTHER catalog: use `event_candidates` for "
+    "its refs and set `event_catalog` to that candidate's `catalog`. `verified_joins` carries "
+    "join keys the organisation has already CONFIRMED between the two — use one rather than "
+    "choosing your own, and leave `join_right` blank if none fits.\n\n"
+    "`population_having` decides WHICH QUESTION the label asks: `none` is 'who will START' and "
+    "excludes anyone already doing this in the lookback; `any` is 'who will do it at all'. An "
+    "objective saying start/begin/first-time means `none` with a lookback. Getting this wrong "
+    "produces a label that looks fine and answers the other question.\n\n"
     "A GUESS IS WORSE THAN A BLANK. A wrong flag value produces a label that is always 0; a wrong "
     "filter value produces one that is always 1. Both look like working models. Never invent a "
     "ref, and never both fill a field and list it in `needs_input`."
@@ -210,6 +224,29 @@ def _notes_from(raw) -> dict:
     return notes
 
 
+def _bridged(conn, entity: str) -> list[dict]:
+    """The catalogs a VERIFIED `entity_bridge_edge` says hold this same entity, with the join.
+
+    An `event_window` label is cross-catalog BY CONSTRUCTION — it counts events in a second
+    catalog — so a shortlist scoped to the anchor made every event-side field come back
+    `not_in_catalog` and the shape could never be fully proposed. A live call proved it.
+
+    Which catalogs are reachable is NOT guessed here, and neither is the join: both come from an
+    edge the organisation already confirmed. Making the model invent a join key would be inventing
+    something already decided, and `VERIFIED` is the only status that counts — an unconfirmed
+    candidate is exactly the kind of guess this design refuses elsewhere.
+    """
+    rows = conn.execute(
+        "SELECT left_catalog_source, left_object_ref, right_catalog_source, right_object_ref"
+        "  FROM entity_bridge_edge"
+        " WHERE lower(entity_id) = lower(%s) AND status = 'VERIFIED'", (entity,)).fetchall()
+    joins = []
+    for left_cat, left_ref, right_cat, right_ref in rows:
+        joins.append({"left_catalog": left_cat, "left_ref": left_ref,
+                      "right_catalog": right_cat, "right_ref": right_ref})
+    return joins
+
+
 def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_source: str,
                          grain_ref: str, as_of_ref: str,
                          roles=(), actor=None) -> TargetDraftV1 | None:
@@ -224,8 +261,17 @@ def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_
 
     if client is None:
         return None
-    shortlist = _shortlist(conn, catalog_source, roles)
-    known = {entry["ref"] for entry in shortlist}
+    shortlist = [dict(entry, catalog=catalog_source)
+                 for entry in _shortlist(conn, catalog_source, roles)]
+    joins = _bridged(conn, entity)
+    # Every OTHER catalog a verified bridge reaches — the event side of a cross-catalog label.
+    event_catalogs = sorted({side for join in joins
+                             for side in (join["left_catalog"], join["right_catalog"])}
+                            - {catalog_source})
+    event_candidates = [dict(entry, catalog=cat)
+                        for cat in event_catalogs
+                        for entry in _shortlist(conn, cat, roles)]
+    known = {entry["ref"] for entry in shortlist} | {e["ref"] for e in event_candidates}
     try:
         call = drive_audited_structured_call(
             conn, client, task=TARGET_DRAFT_TASK,
@@ -233,7 +279,12 @@ def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_
             schema_id=TARGET_DRAFT_SCHEMA_ID,
             schema_version=TARGET_DRAFT_SCHEMA_VERSION,
             catalog_metadata={"objective": hypothesis, "candidates": shortlist,
-                              "entity": entity},
+                              "entity": entity,
+                              # The event side of a cross-catalog label, and the CONFIRMED join
+                              # between them. Absent for a catalog no verified bridge reaches, in
+                              # which case only `state_change` is proposable — which is the truth.
+                              "event_candidates": event_candidates,
+                              "verified_joins": joins},
             instruction=_INSTRUCTION, actor=actor)
     except Exception:  # noqa: BLE001 — a proposal is never load-bearing
         return None

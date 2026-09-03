@@ -23,13 +23,17 @@ def _enrichment() -> dict:
 
 
 def _draft_fake() -> FakeLLM:
+    # The WIRE form: {key, value} pairs with text values. Anthropic refuses a schema with this
+    # many optional properties, so the fields cannot be an object — see the schema comment.
     return FakeLLM(script={**_enrichment(), TARGET_DRAFT_TASK: FakeResponse(output={
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
-                   "as_of_frequency": "monthly", "label_type": "binary",
-                   "operator": ">=", "threshold": 1},
+        "fields": [{"key": k, "value": v} for k, v in (
+            ("name", "tgt_npe_90d"), ("column_ref", _FLAG), ("window_days", "90"),
+            ("as_of_frequency", "monthly"), ("label_type", "binary"),
+            ("operator", ">="), ("threshold", "1"))],
         "needs_input": ["from_values", "to_values"],
-        "notes": {"from_values": "no_value_profile", "to_values": "no_value_profile"}})})
+        "notes": [{"field": "from_values", "reason": "no_value_profile"},
+                  {"field": "to_values", "reason": "no_value_profile"}]})})
 
 
 def _no_draft_fake() -> FakeLLM:
