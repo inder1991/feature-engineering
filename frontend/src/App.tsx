@@ -260,17 +260,6 @@ const PAGES: PageHead[] = [
       + 'contracts.',
   },
   {
-    route: 'targets',
-    label: 'Prediction targets',
-    eyebrow: 'CATALOG · TARGET',
-    title: 'Prediction targets',
-    description:
-      'A training label is normally CONSTRUCTED, not stored — "went non-performing within 90 '
-      + 'days" is a rule over history, not a column anyone ingested. State what you want to '
-      + 'predict, and the tool proposes the rule: filled where the catalog justifies it, blank '
-      + 'where only you can know.',
-  },
-  {
     route: 'analysis',
     label: 'Ask a question',
     eyebrow: 'CATALOG · ANALYSE',
@@ -446,9 +435,25 @@ type PageHead = {
 }
 
 // The detail sheets, keyed by route: reached from an action elsewhere, never from the left rail.
+// Authoring a prediction target is a STEP INSIDE feature generation, not a destination beside it:
+// the label is what the features are FOR, and a separate rail item made you state the same
+// hypothesis twice. Reached from the workbench's target decision, the same way `asset` is reached
+// from a search hit — a route, deliberately absent from the rail.
+const TARGETS_PAGE = {
+  route: 'targets' as Route,
+  label: 'Prediction target',
+  eyebrow: 'CATALOG · GENERATE · TARGET',
+  title: 'Build a prediction target',
+  description:
+    'A training label is normally CONSTRUCTED, not stored — "went non-performing within 90 days" '
+    + 'is a rule over history, not a column anyone ingested. The tool proposes the rule: filled '
+    + 'where the catalog justifies it, blank where only you can know.',
+}
+
 const DETAIL_PAGES: Partial<Record<Route, PageHead>> = {
   asset: ASSET_PAGE,
   suggested: SUGGESTED_PAGE,
+  targets: TARGETS_PAGE,
 }
 
 export default function App() {
@@ -605,8 +610,19 @@ export default function App() {
           />
         )}
         {route === 'entity-map' && entityMapEnabled() && <EntityMapScreen navigate={navigate} />}
-        {route === 'workbench' && <WorkbenchScreen />}
-        {route === 'targets' && <TargetLabelScreen />}
+        {route === 'workbench' && <WorkbenchScreen navigate={navigate} />}
+        {route === 'targets' && (
+          // The hypothesis rides the hash so it is stated ONCE, in the workbench, and carried
+          // here — retyping it was the friction that made this a separate tab in the first place.
+          <TargetLabelScreen
+            key={params.get('hypothesis') ?? ''}
+            initialHypothesis={params.get('hypothesis') ?? ''}
+            initialSource={params.get('catalog_source') ?? ''}
+            onBack={params.get('from') === 'workbench'
+              ? () => navigate('workbench')
+              : undefined}
+          />
+        )}
         {route === 'analysis' && <AnalysisWorkspaceScreen />}
       </main>
     </div>

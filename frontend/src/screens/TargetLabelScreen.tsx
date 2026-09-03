@@ -150,13 +150,22 @@ function buildRule(shape: string, values: Record<string, string>): Record<string
   return rule
 }
 
-export function TargetLabelScreen() {
+interface Props {
+  /** The objective stated in the workbench, carried across so it is typed ONCE. */
+  initialHypothesis?: string
+  initialSource?: string
+  /** Present when this was reached from a feature-generation run; the way back to it. */
+  onBack?: () => void
+}
+
+export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
+                                    onBack }: Props = {}) {
   const [catalogs, setCatalogs] = useState<VisibleCatalog[]>([])
-  const [source, setSource] = useState('')
+  const [source, setSource] = useState(initialSource)
   const [entities, setEntities] = useState<SelectableEntity[] | null>(null)
   const [forbidden, setForbidden] = useState(false)
   const [entity, setEntity] = useState('')
-  const [hypothesis, setHypothesis] = useState('')
+  const [hypothesis, setHypothesis] = useState(initialHypothesis)
 
   const [draft, setDraft] = useState<TargetDraft | null>(null)
   const [existing, setExisting] = useState<ExistingTarget[]>([])
@@ -578,7 +587,16 @@ export function TargetLabelScreen() {
             >
               Register this target
             </button>
-            {done && <p className="hint" role="status">Registered {done}.</p>}
+            {done && (
+              <div className="tgt-done">
+                <p className="hint" role="status">Registered {done}.</p>
+                {onBack && (
+                  <button type="button" className="btn btn--primary" onClick={onBack}>
+                    Back to feature generation
+                  </button>
+                )}
+              </div>
+            )}
             {error && <p className="error" role="alert">{error}</p>}
           </section>
         </>

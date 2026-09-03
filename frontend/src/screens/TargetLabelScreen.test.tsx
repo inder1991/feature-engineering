@@ -58,9 +58,9 @@ beforeEach(() => {
   })
 })
 
-async function proposed() {
+async function proposed(props: Parameters<typeof TargetLabelScreen>[0] = {}) {
   const user = userEvent.setup()
-  render(<TargetLabelScreen />)
+  render(<TargetLabelScreen {...props} />)
   await waitFor(() => expect(listTargetEntities).toHaveBeenCalled())
   await user.type(screen.getByLabelText(/what are you trying to predict/i),
     'which customers go non-performing')
@@ -292,4 +292,36 @@ it('clears the progress when the call FAILS, rather than appearing to run for ev
   pending.reject(new ApiError(500, 'boom'))
   await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
   expect(screen.getByText(/boom/)).toBeInTheDocument()
+})
+
+// ══ reached from feature generation, not from a tab ══════════════════════════════════════════════
+
+it('starts from the objective the workbench already has, rather than asking again', async () => {
+  render(<TargetLabelScreen initialHypothesis="which customers go non-performing"
+                            initialSource="cib" />)
+  await waitFor(() => expect(listTargetEntities).toHaveBeenCalledWith('cib'))
+  expect(screen.getByLabelText(/what are you trying to predict/i))
+    .toHaveValue('which customers go non-performing')
+})
+
+it('hands you back to the run that needed the label', async () => {
+  const onBack = vi.fn()
+  const user = await proposed({ onBack })
+  await user.type(screen.getByLabelText(/starting values/i), 'Performing')
+  await user.type(screen.getByLabelText(/outcome values/i), 'Non-performing')
+  await waitFor(() => expect(screen.getByRole('button', { name: /register this/i })).toBeEnabled())
+  await user.click(screen.getByRole('button', { name: /register this/i }))
+  await waitFor(() => expect(registerTarget).toHaveBeenCalled())
+  await user.click(await screen.findByRole('button', { name: /back to feature generation/i }))
+  expect(onBack).toHaveBeenCalled()
+})
+
+it('offers no way back when it was NOT reached from a run', async () => {
+  const user = await proposed()
+  await user.type(screen.getByLabelText(/starting values/i), 'Performing')
+  await user.type(screen.getByLabelText(/outcome values/i), 'Non-performing')
+  await waitFor(() => expect(screen.getByRole('button', { name: /register this/i })).toBeEnabled())
+  await user.click(screen.getByRole('button', { name: /register this/i }))
+  await waitFor(() => expect(registerTarget).toHaveBeenCalled())
+  expect(screen.queryByRole('button', { name: /back to feature generation/i })).toBeNull()
 })

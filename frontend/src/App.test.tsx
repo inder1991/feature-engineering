@@ -62,14 +62,15 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders fourteen nav items in order (Runs after Registry) and lands on Overview by default', () => {
+  it('renders thirteen nav items in order (Runs after Registry) and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
       'Overview',
       'Discover candidates',
-      // A prediction target precedes feature generation: the label is what the features are FOR.
-      'Prediction targets',
+      // NO 'Prediction targets' item. Authoring a target is a STEP INSIDE feature generation —
+      // the label is what the features are for — so it is a detail route reached from the
+      // workbench, like 'asset' from a search hit. A rail item made you state the hypothesis twice.
       'Ask a question',
       'Registry',
       'Runs',

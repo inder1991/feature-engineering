@@ -76,6 +76,7 @@ import {
   type FormulaDraftStatus,
 } from '../api'
 import { FormulaDraftAction } from './FormulaDraftAction'
+import type { Route } from '../nav'
 import { getSession } from '../session'
 
 // ---- Phase 1B feature flags -------------------------------------------------------------------
@@ -639,6 +640,32 @@ function Gate({ state, who, title, sub }: {
 // catalog DOES hold, and the nearest proxies. On the 2026-08-24 AML run every one of these facts
 // existed and none of them was rendered: the objective said "in the next 90 days", the ticket said
 // 0, and the screen showed neither number.
+function BuildTargetAction({ navigate, hypothesis, source, subtle }: {
+  navigate?: (route: Route, params?: Record<string, string>) => void
+  hypothesis: string
+  source: string
+  subtle?: boolean
+}) {
+  // The THIRD answer at the target decision, and the one the platform did not have. "Sign this
+  // target" and "pick a different one" both assume the outcome is already a column; a great many
+  // are not — "went non-performing within 90 days" is a rule over history. Without this, an
+  // objective whose label has to be CONSTRUCTED could only be answered with "just exploring",
+  // which is a different question.
+  //
+  // The hypothesis travels in the hash so it is stated once, here, and never retyped.
+  if (!navigate) return null
+  return (
+    <button
+      type="button" className={subtle ? 'btn btn--ghost' : 'btn'}
+      onClick={() => navigate('targets', {
+        hypothesis, catalog_source: source, from: 'workbench',
+      })}
+    >
+      Build the target instead
+    </button>
+  )
+}
+
 function TargetTicketFacts({ intake }: { intake: IntakeResp }) {
   const t = intake.ticket
   const classLine = t.target_leakage_class === null
@@ -1449,7 +1476,12 @@ function AuditDrawerBody({ record }: { record: OptionDecisionRecord }) {
 }
 
 
-export function WorkbenchScreen() {
+interface WorkbenchProps {
+  /** Present when the shell can route; the target step uses it to hand off and take you back. */
+  navigate?: (route: Route, params?: Record<string, string>) => void
+}
+
+export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
   const [goal, setGoal] = useState('')
   const [hypothesis, setHypothesis] = useState('')
   // The server-side intent that will later govern these candidates into a signed contract. Set
@@ -3527,6 +3559,13 @@ export function WorkbenchScreen() {
                     >
                       Yes, that's my target
                     </button>
+                    {/* Offered even when a column WAS read, because a column that merely records
+                        the outcome is often not the label you want — the label is usually a rule
+                        over a window, and this is where a person can say so. Subtle: the read
+                        column stays the primary answer. */}
+                    <BuildTargetAction
+                      navigate={navigate} hypothesis={hypothesis} source={source} subtle
+                    />
                     <button
                       type="button" className="btn" disabled={intakeBusy}
                       onClick={() => setIntakeCorrecting(v => !v)}
@@ -3579,13 +3618,16 @@ export function WorkbenchScreen() {
               ) : (
                 <div style={{ display: 'grid', gap: 8 }}>
                   <p style={{ margin: 0 }}>
-                    No target detected in your objective. Type one into the target field above, or
-                    explore without one.
+                    No target detected in your objective. Type one into the target field above,
+                    build the target from a rule, or explore without one.
                   </p>
                   {/* An abstention is an ANSWER, not a blank: the catalog's own outcome labels and
                       nearest proxies are what makes it one. Same block as the confirm branch. */}
                   <TargetTicketFacts intake={intake} />
-                  <div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    <BuildTargetAction
+                      navigate={navigate} hypothesis={hypothesis} source={source}
+                    />
                     <button
                       type="button" className="btn" disabled={intakeBusy}
                       onClick={() => answerIntake('exploring')}
