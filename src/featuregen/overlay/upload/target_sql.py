@@ -248,6 +248,12 @@ def _state_change(rule: StateChangeRuleV1, anchor: str, grain: str, as_of: str,
     else:
         # "ended non-performing" is a different label from "was ever non-performing"; rendering
         # both the same way would make the flag decorative.
+        #
+        # A PLAIN JOIN, deliberately — and this is where the two modes diverge for a row with no
+        # observations inside its window (an account that closed). "Was it ever X" counts observed
+        # transitions and honestly reports 0; "what was it at the END" has no end state to read, so
+        # the row is dropped rather than labelled 0, which would assert a state nobody recorded.
+        # A test executes both and pins the difference.
         ctes.append(
             "last_in_window AS (\n"
             "    -- 'the state at the END of the window'\n"

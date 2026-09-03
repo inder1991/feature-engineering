@@ -239,3 +239,23 @@ def test_the_lookback_carries_the_SAME_filters_as_the_outcome(fx):
             column_ref="public.comp_financial_tran_repos_dly.tran_crncy",
             op="!=", value="USD"),)))
     assert ("C3", "2024-04-30") in labels
+
+
+def test_the_two_at_least_once_modes_treat_an_UNOBSERVED_window_differently(db):
+    """A real and deliberate asymmetry, pinned so it stays deliberate.
+
+    C7 exists at the as-of date and then never appears again — an account that closed, say.
+
+    "was it EVER non-performing in the window" counts observed transitions, and none were observed,
+    so 0 is the honest answer and the row stays. "what was the state at the END of the window" has
+    no end state to read, so the row has no label and is dropped rather than guessed. Labelling it
+    0 there would assert a state nobody recorded.
+    """
+    rows = [("C2", date, "Performing") for date in _SNAPSHOTS]     # sets the history horizon
+    rows.append(("C7", "2024-01-31", "Performing"))                # and then nothing
+    _anchor(db, rows)
+
+    ever = _run(db, _state())
+    ended = _run(db, _state(at_least_once=False))
+    assert ever[("C7", "2024-01-31")] == 0
+    assert ("C7", "2024-01-31") not in ended
