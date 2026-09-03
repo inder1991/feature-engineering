@@ -109,6 +109,10 @@ const SHAPE_FIELDS: Record<string, FieldSpec[]> = {
 // rejects, with the person unable to see why.
 const STAMPED = ['entity', 'anchor_catalog', 'grain_ref', 'as_of_ref']
 
+//: Long enough that typing a value is one request rather than one per character, short enough that
+//: the sentence still reads as live feedback on what was just typed.
+const DEBOUNCE_MS = 250
+
 function asText(value: unknown): string {
   if (value === null || value === undefined) return ''
   if (Array.isArray(value)) return value.join(', ')
@@ -190,22 +194,31 @@ export function TargetLabelScreen() {
 
   // The sentence and the SQL are recomputed from the CURRENT form, not from what was proposed —
   // a person approving a statement about a rule they have since edited is approving nothing.
+  //
+  // DEBOUNCED, because `rule` changes on every keystroke: typing "Non-performing" into one field
+  // would otherwise be fourteen round trips, and the answers could land out of order. The `live`
+  // flag discards a response whose request has already been superseded, so the form never shows a
+  // sentence describing a rule the person has moved past.
   useEffect(() => {
     if (!rule) return
     let live = true
-    describeTarget(rule)
-      .then(r => { if (live) { setSentence(r.reads_as); setIncomplete(r.incomplete) } })
-      .catch(() => { if (live) setSentence(null) })
-    return () => { live = false }
+    const timer = setTimeout(() => {
+      describeTarget(rule)
+        .then(r => { if (live) { setSentence(r.reads_as); setIncomplete(r.incomplete) } })
+        .catch(() => { if (live) setSentence(null) })
+    }, DEBOUNCE_MS)
+    return () => { live = false; clearTimeout(timer) }
   }, [rule])
 
   useEffect(() => {
     if (!rule || !showSql) return
     let live = true
-    previewTargetSql(rule)
-      .then(r => { if (live) setSql(r.sql) })
-      .catch(() => { if (live) setSql(null) })
-    return () => { live = false }
+    const timer = setTimeout(() => {
+      previewTargetSql(rule)
+        .then(r => { if (live) setSql(r.sql) })
+        .catch(() => { if (live) setSql(null) })
+    }, DEBOUNCE_MS)
+    return () => { live = false; clearTimeout(timer) }
   }, [rule, showSql])
 
   const propose = useCallback(async () => {

@@ -141,6 +141,9 @@ it('registers the rule, the original proposal and the comment', async () => {
   await user.type(screen.getByLabelText(/starting values/i), 'Performing')
   await user.type(screen.getByLabelText(/outcome values/i), 'Non-performing')
   await user.type(screen.getByLabelText(/why you changed/i), '90 because the desk reviews monthly')
+  // The button is gated on the SENTENCE, which is debounced: a person reads what the label means
+  // and then approves it. Clicking before it catches up is not a flow anyone has.
+  await waitFor(() => expect(screen.getByRole('button', { name: /register/i })).toBeEnabled())
   await user.click(screen.getByRole('button', { name: /register/i }))
   await waitFor(() => expect(registerTarget).toHaveBeenCalled())
   const body = registerTarget.mock.calls[0][0]
@@ -155,9 +158,20 @@ it('records what the tool proposed even after the person edits it', async () => 
   await user.type(screen.getByLabelText(/window \(days\)/i), '180')
   await user.type(screen.getByLabelText(/starting values/i), 'Performing')
   await user.type(screen.getByLabelText(/outcome values/i), 'Non-performing')
+  await waitFor(() => expect(screen.getByRole('button', { name: /register/i })).toBeEnabled())
   await user.click(screen.getByRole('button', { name: /register/i }))
   await waitFor(() => expect(registerTarget).toHaveBeenCalled())
   const body = registerTarget.mock.calls[0][0]
   expect(body.rule.window_days).toBe(180)
   expect((body.proposed_draft as unknown as api.TargetDraft).fields.window_days).toBe(90)
+})
+
+it('collapses a burst of typing into ONE describe call, not one per keystroke', async () => {
+  const user = await proposed()
+  describeTarget.mockClear()
+  await user.type(screen.getByLabelText(/starting values/i), 'Performing')
+  await waitFor(() => expect(describeTarget).toHaveBeenCalled())
+  // Ten characters typed. Without debouncing this is ten round trips whose answers can also land
+  // out of order, leaving a sentence describing a rule the person has already moved past.
+  expect(describeTarget.mock.calls.length).toBeLessThan(4)
 })
