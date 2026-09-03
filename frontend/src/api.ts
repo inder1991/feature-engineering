@@ -4963,3 +4963,112 @@ export interface RunSpendApproval {
   pricing_version: string
   expires_at: string
 }
+
+// ── Derived target labels ────────────────────────────────────────────────────────────────────────
+// A training label is normally CONSTRUCTED ("went non-performing within 90 days"), not stored, so
+// the platform proposes a RULE and a person completes it. The tool fills what the catalog justifies
+// and leaves blank what it cannot know — nothing profiles column values, so it cannot know whether
+// a flag holds 'Performing' or 'P', and a confidently pre-filled wrong answer gets accepted because
+// people confirm defaults.
+
+/** What a catalog can anchor a label on — the person picks from THIS, not from a free text box. */
+export interface SelectableEntity {
+  entity: string
+  spine_table: string
+  spine_ref: string
+}
+
+/** A partly-filled form. `needs_input` names the blanks; `notes` says WHY each one is blank. */
+export interface TargetDraft {
+  shape: string
+  fields: Record<string, unknown>
+  needs_input: string[]
+  notes: Record<string, string>
+}
+
+/** A label the organisation has ALREADY decided on — a decision, not a draft, hence its own key. */
+export interface ExistingTarget {
+  name: string
+  description: string
+  window_days: number
+  match_terms: string[]
+}
+
+export interface TargetProposal {
+  existing: ExistingTarget[]
+  draft: TargetDraft | null
+}
+
+/** The rule as one plain sentence. `incomplete` is the ordinary state of a form being filled in. */
+export interface TargetDescription {
+  reads_as: string | null
+  incomplete: string | null
+}
+
+/** The derivation logic — the query that will build the training data. */
+export interface TargetSql {
+  sql: string | null
+  incomplete: string | null
+  reads_as?: string
+}
+
+export interface RegisteredTarget {
+  definition_id: string
+  name: string
+  entity: string
+  shape: string
+  window_days: number
+  label_type: string
+  rule: Record<string, unknown>
+  verification: string
+  description: string
+  derives_from: [string, string][]
+  proposed_draft: Record<string, unknown> | null
+  author_comment: string
+  adapted_from: string | null
+}
+
+export interface TargetRegistered {
+  definition_id: string
+  name: string
+  rule: Record<string, unknown>
+  reads_as: string
+  near_duplicates: { name: string; differs_in: string[] }[]
+}
+
+export function listTargetEntities(catalogSource: string): Promise<SelectableEntity[]> {
+  return request(`/targets/entities?${new URLSearchParams({ catalog_source: catalogSource })}`)
+}
+
+export function proposeTarget(body: {
+  hypothesis: string
+  entity: string
+  catalog_source: string
+}): Promise<TargetProposal> {
+  return post('/targets/propose', body)
+}
+
+export function describeTarget(rule: Record<string, unknown>): Promise<TargetDescription> {
+  return post('/targets/describe', { rule })
+}
+
+export function previewTargetSql(rule: Record<string, unknown>): Promise<TargetSql> {
+  return post('/targets/sql', { rule })
+}
+
+export function registerTarget(body: {
+  rule: Record<string, unknown>
+  description: string
+  proposed_draft: Record<string, unknown> | null
+  author_comment: string
+}): Promise<TargetRegistered> {
+  return post('/targets', body)
+}
+
+export function listTargets(entity: string): Promise<RegisteredTarget[]> {
+  return request(`/targets?${new URLSearchParams({ entity })}`)
+}
+
+export function registeredTargetSql(entity: string, name: string): Promise<TargetSql> {
+  return request(`/targets/${encodeURIComponent(entity)}/${encodeURIComponent(name)}/sql`)
+}

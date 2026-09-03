@@ -25,6 +25,7 @@ import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
 import { RunDetailScreen } from './screens/RunDetailScreen'
 import { RunsScreen } from './screens/RunsScreen'
 import { AnalysisWorkspaceScreen } from './screens/AnalysisWorkspaceScreen'
+import { TargetLabelScreen } from './screens/TargetLabelScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { SemanticsPendingScreen } from './screens/SemanticsPendingScreen'
 import { SuggestedFeaturesScreen } from './screens/SuggestedFeaturesScreen'
@@ -73,6 +74,14 @@ function NavIcon({ children }: { children: ReactElement | ReactElement[] }) {
 }
 
 const ICONS: Record<Route, ReactElement> = {
+  targets: (
+    <NavIcon>
+      {/* a bullseye — the thing being predicted */}
+      <circle cx="8" cy="8" r="6.25" />
+      <circle cx="8" cy="8" r="3" />
+      <circle cx="8" cy="8" r="0.75" />
+    </NavIcon>
+  ),
   'code-generation': (
     <NavIcon>
       {/* code brackets — the generation workspace */}
@@ -249,6 +258,17 @@ const PAGES: PageHead[] = [
       'State a hypothesis and goal, plan a candidate set over one catalog, then save ideas — '
       + 'browsable sketches, never a model input — or govern the ones that matter into signed '
       + 'contracts.',
+  },
+  {
+    route: 'targets',
+    label: 'Prediction targets',
+    eyebrow: 'CATALOG · TARGET',
+    title: 'Prediction targets',
+    description:
+      'A training label is normally CONSTRUCTED, not stored — "went non-performing within 90 '
+      + 'days" is a rule over history, not a column anyone ingested. State what you want to '
+      + 'predict, and the tool proposes the rule: filled where the catalog justifies it, blank '
+      + 'where only you can know.',
   },
   {
     route: 'analysis',
@@ -586,6 +606,7 @@ export default function App() {
         )}
         {route === 'entity-map' && entityMapEnabled() && <EntityMapScreen navigate={navigate} />}
         {route === 'workbench' && <WorkbenchScreen />}
+        {route === 'targets' && <TargetLabelScreen />}
         {route === 'analysis' && <AnalysisWorkspaceScreen />}
       </main>
     </div>

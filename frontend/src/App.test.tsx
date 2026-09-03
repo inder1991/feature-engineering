@@ -62,12 +62,14 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders thirteen nav items in order (Runs after Registry) and lands on Overview by default', () => {
+  it('renders fourteen nav items in order (Runs after Registry) and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
       'Overview',
       'Discover candidates',
+      // A prediction target precedes feature generation: the label is what the features are FOR.
+      'Prediction targets',
       'Ask a question',
       'Registry',
       'Runs',
