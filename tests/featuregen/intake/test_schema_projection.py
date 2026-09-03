@@ -95,7 +95,12 @@ def test_maxlength_inside_additional_properties_is_stripped_and_detected():
     assert any("maxLength" in p for p in provider_incompatibilities(schema))
     out = project_for_anthropic(schema)
     assert "maxLength" not in out["additionalProperties"]
-    assert provider_incompatibilities(out) == []
+    # The projection strips `maxLength`, but the CONSTRUCT itself is unsupported: Anthropic rejects
+    # a dict-valued `additionalProperties` with HTTP 400 (keyword=type), which a live call proved
+    # on 2026-09-03. This used to assert the projected schema was clean; it is not, and saying so
+    # is the point — the interior being well-formed was never the question.
+    assert [p for p in provider_incompatibilities(out) if "map-object" not in p] == []
+    assert any("map-object" in p for p in provider_incompatibilities(out))
 
 
 def test_bool_additional_properties_is_untouched_and_clean():
@@ -185,3 +190,15 @@ def test_every_registered_schema_projects_provider_clean():
     assert not dirty, (
         "provider-incompatible wire schemas — the 2026-08-14 outage class, reintroduced:\n"
         + "\n".join(f"  {k}: {v}" for k, v in dirty.items()))
+
+
+def test_a_MAP_OBJECT_is_provider_incompatible():
+    """A dict-valued `additionalProperties` is how JSON Schema says "arbitrary keys to this shape".
+    Anthropic rejects it with HTTP 400 (keyword=type), and this guard used to wave it through — its
+    recursion checked the sub-schema was well-formed, which it was, and never asked whether the
+    construct was supported at all. A live call is what found it.
+    """
+    from featuregen.intake.schema_projection import provider_incompatibilities
+    problems = provider_incompatibilities({
+        "type": "object", "additionalProperties": {"type": "string", "enum": ["a", "b"]}})
+    assert any("map-object" in p for p in problems)

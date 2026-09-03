@@ -261,11 +261,18 @@ def provider_incompatibilities(schema: object, _path: str = "$") -> list[str]:
         # surviving projection is a projection bug — flag them all.
         problems.append(f"type-array at {_path}")
     # Anthropic rejects an OPEN object (`additionalProperties: true`, or the open default of absence).
-    # This is the guard's blind spot that let permissive feature schemas reach the wire. A typed
-    # sub-schema (dict) form is left to the recursion below, not flagged here.
+    # This is the guard's blind spot that let permissive feature schemas reach the wire.
     if (schema.get("type") == "object" or "properties" in schema) \
             and schema.get("additionalProperties", True) is True:
         problems.append(f"open-object at {_path}")
+    # A DICT-VALUED `additionalProperties` — the JSON Schema way to say "a map of arbitrary keys to
+    # this shape". Anthropic rejects it outright (HTTP 400, keyword=type), and this guard used to
+    # wave it through with a comment saying the recursion below would handle it: the recursion
+    # checks the sub-schema is well-formed, which it was, and never asks whether the CONSTRUCT is
+    # supported at all. A live call proved otherwise. Express a map as an array of {key, value}
+    # pairs instead — closed objects all the way down, which is what the subset requires.
+    if isinstance(schema.get("additionalProperties"), dict):
+        problems.append(f"map-object at {_path}")
     for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
         if isinstance(schema.get(key), dict):
             for k, v in schema[key].items():

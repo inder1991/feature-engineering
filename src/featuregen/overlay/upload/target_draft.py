@@ -82,7 +82,11 @@ class TargetDraftV1:
 
 TARGET_DRAFT_TASK = "overlay.target.draft"
 TARGET_DRAFT_PROMPT_ID = "target_draft"
-TARGET_DRAFT_PROMPT_VERSION = 1
+#: Bumped when `_INSTRUCTION` changes materially. It went to 2 when the instruction began naming
+#: the fields per shape: the replay key is derived from the redacted INPUTS, so leaving it at 1
+#: would let a result produced under the old instruction come back for a request made under the
+#: new one.
+TARGET_DRAFT_PROMPT_VERSION = 2
 TARGET_DRAFT_SCHEMA_ID = "target_draft"
 #: v2 DECLARES every field a rule can carry. v1 left `fields` an open object with no properties,
 #: and the schema — not the instruction — is what steers a structured-output call: two live calls
@@ -136,6 +140,22 @@ _INSTRUCTION = (
 )
 
 
+def _notes_from(raw) -> dict:
+    """The wire form is a LIST of {field, reason} pairs; the draft holds a mapping.
+
+    A map cannot be expressed in Anthropic's schema subset — it requires closed objects, and a
+    dict-valued `additionalProperties` is rejected with HTTP 400. Pairs say the same thing in the
+    closed form. The dict form is still accepted here so a replayed v1 body reads correctly.
+    """
+    if isinstance(raw, dict):
+        return dict(raw)
+    notes = {}
+    for entry in raw or ():
+        if isinstance(entry, dict) and entry.get("field"):
+            notes[str(entry["field"])] = entry.get("reason")
+    return notes
+
+
 def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_source: str,
                          grain_ref: str, as_of_ref: str,
                          roles=(), actor=None) -> TargetDraftV1 | None:
@@ -169,7 +189,7 @@ def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_
     body = dict(call.output)
     fields = dict(body.get("fields") or {})
     needs = list(body.get("needs_input") or ())
-    notes = dict(body.get("notes") or {})
+    notes = _notes_from(body.get("notes"))
 
     # An off-candidate ref is DROPPED to a blank, never repaired and never trusted.
     for name in _REF_FIELDS:

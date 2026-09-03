@@ -1546,12 +1546,23 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                     "population_having": {"type": "string", "enum": ["any", "none"]},
                     "population_lookback_days": {"type": "integer"}}},
             "needs_input": {"type": "array", "items": {"type": "string"}},
+            # An ARRAY of pairs, not a map. `notes` is conceptually field -> reason, but a map has
+            # arbitrary KEYS and Anthropic's subset requires closed objects — a dict-valued
+            # `additionalProperties` is rejected outright (HTTP 400, keyword=type), which one live
+            # call proved. Pairs express the same thing in the closed form, and buy something the
+            # map could not: the reason is enum-constrained ON THE WIRE, so a bad one is repaired
+            # inside the bounded loop instead of failing the draft after it returns.
             "notes": {
-                "type": "object",
-                "additionalProperties": {
-                    "type": "string",
-                    "enum": ["no_value_profile", "business_choice", "population_choice",
-                             "not_stated", "not_in_catalog"]}}},
+                "type": "array",
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "field": {"type": "string"},
+                        "reason": {
+                            "type": "string",
+                            "enum": ["no_value_profile", "business_choice", "population_choice",
+                                     "not_stated", "not_in_catalog"]}},
+                    "required": ["field", "reason"]}}},
         "required": ["shape", "fields", "needs_input", "notes"]},
     # Intent-recognition (Phase-1A): the closed-shape recognition body. Structure only — the closed-
     # taxonomy semantics (id in registry, primary is a leaf) are a post-pass in recognizer.recognize.

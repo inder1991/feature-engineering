@@ -118,7 +118,8 @@ def test_a_draft_comes_back_with_its_blanks_and_reasons(db):
         "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
                    "as_of_frequency": "monthly", "label_type": "binary"},
         "needs_input": ["from_values", "to_values"],
-        "notes": {"from_values": "no_value_profile", "to_values": "no_value_profile"}}))
+        "notes": [{"field": "from_values", "reason": "no_value_profile"},
+                  {"field": "to_values", "reason": "no_value_profile"}]}))
     assert draft.shape == "state_change"
     assert "from_values" in draft.needs_input
     assert draft.fields["column_ref"] == _FLAG
@@ -135,7 +136,7 @@ def test_the_chosen_entitys_SPINE_is_stamped_on_never_guessed(db):
                    "as_of_frequency": "monthly", "label_type": "binary",
                    "from_values": ["P"], "to_values": ["N"],
                    "grain_ref": "public.customers.something_else"},
-        "needs_input": [], "notes": {}}))
+        "needs_input": [], "notes": []}))
     assert draft.fields["grain_ref"] == _GRAIN
     assert draft.fields["as_of_ref"] == _ASOF
     assert draft.fields["entity"] == "customer"
@@ -150,7 +151,7 @@ def test_a_ref_the_model_INVENTED_is_dropped_and_becomes_a_blank(db):
         "fields": {"name": "tgt_npe_90d", "column_ref": "public.customers.invented",
                    "window_days": 90, "as_of_frequency": "monthly", "label_type": "binary",
                    "from_values": ["P"], "to_values": ["N"]},
-        "needs_input": [], "notes": {}}))
+        "needs_input": [], "notes": []}))
     assert "column_ref" not in draft.fields
     assert "column_ref" in draft.needs_input
     assert draft.notes["column_ref"] == "not_in_catalog", \
@@ -165,7 +166,8 @@ def test_an_unstated_horizon_comes_back_as_a_BLANK_not_a_default(db):
         "shape": "state_change",
         "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
                    "label_type": "binary", "from_values": ["P"], "to_values": ["N"]},
-        "needs_input": ["as_of_frequency"], "notes": {"as_of_frequency": "not_stated"}}))
+        "needs_input": ["as_of_frequency"],
+        "notes": [{"field": "as_of_frequency", "reason": "not_stated"}]}))
     assert "as_of_frequency" in draft.needs_input
     assert "as_of_frequency" not in draft.fields
 
@@ -180,7 +182,8 @@ def test_a_body_that_contradicts_itself_returns_nothing(db):
     _catalog(db)
     assert _propose(db, _client({
         "shape": "state_change", "fields": {"window_days": 90},
-        "needs_input": ["window_days"], "notes": {"window_days": "not_stated"}})) is None
+        "needs_input": ["window_days"],
+        "notes": [{"field": "window_days", "reason": "not_stated"}]})) is None
 
 
 def test_a_draft_must_ACCOUNT_FOR_every_field_its_shape_needs():
@@ -258,8 +261,10 @@ def test_the_schema_constrains_a_BLANKS_REASON_to_the_closed_set():
     """An unrecognised reason renders as a blank with no explanation. Constraining it in the schema
     lets the bounded repair loop fix it, rather than the draft being discarded whole afterwards."""
     schema = _SCHEMAS[(TARGET_DRAFT_SCHEMA_ID, TARGET_DRAFT_SCHEMA_VERSION)]
-    notes = schema["properties"]["notes"]["additionalProperties"]
-    assert set(notes["enum"]) == set(NEEDS_INPUT_REASONS)
+    # PAIRS, not a map: Anthropic rejects a dict-valued `additionalProperties` outright, so the
+    # reason rides an item property where it can still be enum-constrained on the wire.
+    reason = schema["properties"]["notes"]["items"]["properties"]["reason"]
+    assert set(reason["enum"]) == set(NEEDS_INPUT_REASONS)
 
 
 def test_version_1_stays_BYTE_FROZEN():
@@ -273,3 +278,30 @@ def test_version_1_stays_BYTE_FROZEN():
             "needs_input": {"type": "array", "items": {"type": "string"}},
             "notes": {"type": "object", "additionalProperties": True}},
         "required": ["shape", "fields"]}
+
+
+def test_the_wire_form_of_notes_is_normalised_back_to_a_MAPPING(db):
+    """The schema sends pairs; the draft holds a mapping. The conversion is where a field could
+    silently lose its reason and become an unexplained blank."""
+    _catalog(db)
+    draft = _propose(db, _client({
+        "shape": "state_change",
+        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
+                   "as_of_frequency": "monthly", "label_type": "binary"},
+        "needs_input": ["from_values", "to_values"],
+        "notes": [{"field": "from_values", "reason": "no_value_profile"},
+                  {"field": "to_values", "reason": "business_choice"}]}))
+    assert draft.notes == {"from_values": "no_value_profile", "to_values": "business_choice"}
+
+
+def test_the_dict_form_of_notes_still_normalises():
+    """Tested at its own level, deliberately. A v1-shaped body cannot reach the proposer any more —
+    schema v2 would reject it — so driving this through `propose_target_draft` would assert a path
+    that cannot happen. The branch stays because a recorded v1 body is still readable data.
+    """
+    from featuregen.overlay.upload.target_draft import _notes_from
+    assert _notes_from({"from_values": "no_value_profile"}) == {
+        "from_values": "no_value_profile"}
+    assert _notes_from([{"field": "a", "reason": "not_stated"}]) == {"a": "not_stated"}
+    assert _notes_from(None) == {}
+    assert _notes_from([{"reason": "not_stated"}]) == {}, "a pair with no field names nothing"
