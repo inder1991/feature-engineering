@@ -33,12 +33,15 @@ from featuregen.overlay.upload.target_contract import (
     TargetHeaderV1,
     canonical_target,
     describe_target,
+    target_from_canonical,
 )
 from featuregen.overlay.upload.target_draft import propose_target_draft
 from featuregen.overlay.upload.target_search import near_duplicates, search_targets
+from featuregen.overlay.upload.target_sql import SqlRenderError, compile_target_sql
 from featuregen.overlay.upload.target_store import (
     TargetNameTaken,
     register_target,
+    target_by_name,
     targets_for_entity,
 )
 
@@ -57,6 +60,10 @@ class ProposeIn(BaseModel):
 
 class DescribeIn(BaseModel):
     rule: dict
+
+
+class AttachIn(BaseModel):
+    intent_id: str = Field(min_length=1)
 
 
 class RegisterIn(BaseModel):
@@ -194,3 +201,64 @@ def create_target(body: RegisterIn, conn: _Conn, identity: _Identity) -> dict:
 @router.get("/targets", dependencies=[Depends(require_feature_generate)])
 def list_targets(entity: str, conn: _Conn, identity: _Identity) -> list[dict]:
     return targets_for_entity(conn, entity)
+
+
+@router.post("/targets/sql", dependencies=[Depends(require_feature_generate)])
+def preview_sql(body: DescribeIn) -> dict:
+    """The DERIVATION LOGIC for a rule still being edited.
+
+    The sentence says what the label means; this says how it will be built. A person approving a
+    label should be able to see the query that will produce their training data while they can
+    still change it — the same argument as `describe`, one level deeper. Deterministic and
+    model-free, so it cannot drift from the rule it renders.
+
+    An incomplete rule has no logic to show yet, which is the ordinary state of a form being filled
+    in rather than an error.
+    """
+    try:
+        return {"sql": compile_target_sql(_rule_from_body(body.rule)), "incomplete": None}
+    except (TargetContractError, SqlRenderError, TypeError, ValueError) as exc:
+        return {"sql": None, "incomplete": str(exc)}
+
+
+@router.get("/targets/{entity}/{name}/sql", dependencies=[Depends(require_feature_generate)])
+def registered_sql(entity: str, name: str, conn: _Conn) -> dict:
+    """The logic for a label already registered — for whoever RUNS it, who was not necessarily the
+    person who approved it. The sentence travels with it for the same reason."""
+    row = target_by_name(conn, entity, name)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"no target named {name!r} is registered for {entity!r}")
+    rule = target_from_canonical(row["rule"])
+    return {"name": name, "definition_id": row["definition_id"],
+            "sql": compile_target_sql(rule), "reads_as": describe_target(rule)}
+
+
+@router.post("/targets/{entity}/{name}/attach", dependencies=[Depends(require_feature_generate)])
+def attach_to_intent(entity: str, name: str, body: AttachIn, conn: _Conn) -> dict:
+    """Make a registered label the prediction target of an intent.
+
+    This is the seam that stops the registry being an island: before it, a person could author and
+    register a derived label and nothing in the platform could be trained against it.
+
+    Recorded SERVER-side on `contract_intent`, exactly as `target_ref` is (0965), so draft and
+    confirm never trust a client-supplied target. Beside `target_ref` and never with it — two kinds
+    of target on one intent would name two different things to predict.
+    """
+    row = target_by_name(conn, entity, name)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"no target named {name!r} is registered for {entity!r}")
+    intent = conn.execute("SELECT target_ref FROM contract_intent WHERE intent_id = %s",
+                          (body.intent_id,)).fetchone()
+    if intent is None:
+        raise HTTPException(status_code=404, detail=f"no intent {body.intent_id!r}")
+    if intent[0] is not None:
+        raise HTTPException(status_code=409, detail={
+            "code": "TARGET_ALREADY_SET",
+            "message": f"intent {body.intent_id} already predicts the column {intent[0]!r}; an "
+                       "intent names one kind of target"})
+    conn.execute("UPDATE contract_intent SET target_definition_id = %s WHERE intent_id = %s",
+                 (row["definition_id"], body.intent_id))
+    return {"intent_id": body.intent_id, "definition_id": row["definition_id"], "name": name,
+            "reads_as": describe_target(target_from_canonical(row["rule"]))}

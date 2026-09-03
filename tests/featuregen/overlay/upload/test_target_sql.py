@@ -243,3 +243,47 @@ def test_the_sentence_travels_WITH_the_sql():
     """The SQL is checked by whoever runs it, who was not necessarily in the room when it was
     approved. The statement of meaning must arrive with it."""
     assert "one row per customer" in compile_target_sql(_state())
+
+
+# ══ rehydration ══════════════════════════════════════════════════════════════════════════════════
+
+from featuregen.overlay.upload.target_contract import (  # noqa: E402
+    canonical_target,
+    target_from_canonical,
+)
+
+
+def test_a_stored_rule_can_be_read_BACK_into_the_type_that_validates_it():
+    """The registry stores rules as jsonb. Without this they are a write-only record: nothing can
+    render, re-describe, or re-check a label once it has been registered."""
+    for rule in (_state(), _event()):
+        assert canonical_target(target_from_canonical(canonical_target(rule))) == \
+            canonical_target(rule)
+
+
+def test_rehydration_restores_TUPLES_not_lists():
+    """`asdict` flattens tuples to lists, and a list where the contract declares a tuple compares
+    unequal through the content hash — the same defect that made `near_duplicates` unable to fire."""
+    rule = target_from_canonical(canonical_target(_state()))
+    assert isinstance(rule.from_values, tuple)
+
+
+def test_rehydration_restores_nested_EVENT_FILTERS():
+    rule = target_from_canonical(canonical_target(_event(event_filters=(EventFilterV1(
+        column_ref="public.comp_financial_tran_repos_dly.tran_crncy",
+        op="in", values=("USD", "EUR")),))))
+    assert rule.event_filters[0].values == ("USD", "EUR")
+
+
+def test_a_stored_rule_that_is_INVALID_is_refused_on_the_way_back_in():
+    """Rehydration goes through the constructors, so a hand-edited row cannot become a rule the
+    contract would never have accepted."""
+    body = canonical_target(_state())
+    body["header"]["direction"] = "backward"
+    with pytest.raises(Exception, match="forward"):
+        target_from_canonical(body)
+
+
+def test_a_rehydrated_rule_compiles_to_the_SAME_sql():
+    assert compile_target_sql(target_from_canonical(canonical_target(_state()))) == \
+        compile_target_sql(_state())

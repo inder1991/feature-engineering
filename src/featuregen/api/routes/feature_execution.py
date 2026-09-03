@@ -161,6 +161,10 @@ class GenerationRequestIn(BaseModel):
     build_set_revision_id: str = Field(min_length=1)
     target_mode: str = Field(min_length=1)
     target_ref: str | None = None
+    #: A RULE-BASED label from the target registry (1142/1144), instead of a catalog column. A
+    #: prediction names exactly one kind of target; the dataclass and a database CHECK both refuse
+    #: two, because two would authorize one generation to predict two different things.
+    target_definition_id: str | None = None
 
 
 @router.post("/feature-execution/generations", status_code=201,
@@ -190,7 +194,8 @@ def authorize_generation(
         authorization = GenerationAuthorizationV1(
             environment_id=body.environment_id, logical_group_name=body.logical_group_name,
             build_set_revision_id=body.build_set_revision_id,
-            target_mode=TargetModeV1(body.target_mode), target_ref=body.target_ref)
+            target_mode=TargetModeV1(body.target_mode), target_ref=body.target_ref,
+            target_definition_id=body.target_definition_id)
     except ValueError as exc:
         # 422 and not 500: a body whose two target fields disagree is a caller error with a
         # message that names exactly which pair is wrong.
@@ -207,6 +212,7 @@ def authorize_generation(
         "logical_group_name": authorization.logical_group_name,
         "target_mode": authorization.target_mode.value,
         "target_ref": authorization.target_ref,
+        "target_definition_id": authorization.target_definition_id,
         "detail": "the generation authorization was recorded; it is what a verification names",
     }
 

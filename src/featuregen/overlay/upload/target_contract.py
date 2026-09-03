@@ -276,6 +276,39 @@ def canonical_target(rule: TargetRuleV1) -> dict:
     return asdict(rule)
 
 
+def target_from_canonical(body: dict) -> TargetRuleV1:
+    """The inverse of :func:`canonical_target` — rebuild the typed rule from its stored form.
+
+    Without this the registry is WRITE-ONLY: a rule lands in `target_definition.rule` as jsonb and
+    nothing can render, re-describe or re-check it afterwards. Rehydration goes back through the
+    constructors, so a hand-edited row cannot become a rule the contract would never have accepted.
+
+    Tuples are restored deliberately. `asdict` flattens them to lists, and a list where the
+    contract declares a tuple compares unequal through the content hash — the defect that once made
+    `near_duplicates` unable to fire at all.
+    """
+    header = TargetHeaderV1(**body["header"])
+    if body.get("shape") == "state_change":
+        return StateChangeRuleV1(
+            header=header, column_ref=body["column_ref"],
+            from_values=tuple(body.get("from_values") or ()),
+            to_values=tuple(body.get("to_values") or ()),
+            at_least_once=bool(body.get("at_least_once", True)),
+            population_filter=body.get("population_filter", "from_values"),
+            exclude_null_at_as_of=bool(body.get("exclude_null_at_as_of", True)))
+    return EventWindowRuleV1(
+        header=header, event_catalog=body["event_catalog"], event_table=body["event_table"],
+        event_date_ref=body["event_date_ref"], join_left=body["join_left"],
+        join_right=body["join_right"], aggregate=body["aggregate"],
+        event_filters=tuple(
+            EventFilterV1(column_ref=f["column_ref"], op=f["op"], value=f.get("value"),
+                          values=tuple(f.get("values") or ()), value_ref=f.get("value_ref"))
+            for f in (body.get("event_filters") or ())),
+        measure_ref=body.get("measure_ref"),
+        population_lookback_days=int(body.get("population_lookback_days", 0)),
+        population_having=body.get("population_having", "any"))
+
+
 def target_content_hash(rule: TargetRuleV1) -> str:
     """Identity by content, matching `model_feature_revision_hash`."""
     body = json.dumps(canonical_target(rule), sort_keys=True, separators=(",", ":"))

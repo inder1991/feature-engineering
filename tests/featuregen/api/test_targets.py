@@ -142,3 +142,130 @@ def test_registering_stores_the_rule_its_proposal_and_the_comment(make_client):
     assert listed[0]["name"] == "tgt_npe_90d"
     assert "quarterly" in listed[0]["author_comment"]
     assert listed[0]["proposed_draft"]["fields"]["window_days"] == 90
+
+
+# ══ the derivation logic ═════════════════════════════════════════════════════════════════════════
+
+def test_the_SQL_is_previewable_before_the_label_is_registered(make_client):
+    """The person approving a label should see the logic that will build their training data while
+    they can still change it — the same argument as the sentence, one level deeper."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.post("/targets/sql", json={"rule": _valid_rule(client)}, headers=AUTH).json()
+    assert "WITH as_of_dates AS" in body["sql"]
+    assert body["incomplete"] is None
+
+
+def test_an_incomplete_rule_previews_as_NOTHING_rather_than_erroring(make_client):
+    """A half-filled form is the normal state while someone is typing."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.post("/targets/sql", json={"rule": {"shape": "state_change"}},
+                       headers=AUTH).json()
+    assert body["sql"] is None and body["incomplete"]
+
+
+def test_a_REGISTERED_label_can_be_asked_for_its_sql(make_client):
+    """The consumer who runs it was not necessarily the person who approved it."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    rule = _valid_rule(client)
+    client.post("/targets", json={"rule": rule, "description": "d"}, headers=AUTH)
+    res = client.get(f"/targets/{rule['entity']}/tgt_npe_90d/sql", headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert "WITH as_of_dates AS" in res.json()["sql"]
+    assert "one row per" in res.json()["reads_as"]
+
+
+def test_asking_for_the_sql_of_a_label_that_does_not_exist_is_a_404(make_client):
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.get("/targets/customer/tgt_never_registered/sql", headers=AUTH)
+    assert res.status_code == 404
+
+
+# ══ the seam into generation ═════════════════════════════════════════════════════════════════════
+
+def test_a_registered_label_can_be_ATTACHED_to_an_intent(make_client, db):
+    """Until this existed the registry was an island: a person could author a label and nothing in
+    the platform could then be trained against it."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    rule = _valid_rule(client)
+    definition_id = client.post("/targets", json={"rule": rule, "description": "d"},
+                                headers=AUTH).json()["definition_id"]
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, "
+               "redacted_hypothesis) VALUES ('int-9','h','hypothesis','h')")
+    res = client.post(f"/targets/{rule['entity']}/tgt_npe_90d/attach",
+                      json={"intent_id": "int-9"}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    assert res.json()["definition_id"] == definition_id
+
+
+def test_attaching_a_label_to_an_intent_that_ALREADY_has_a_column_target_is_refused(
+        make_client, db):
+    """Two kinds of target on one intent would name two different things to predict."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    rule = _valid_rule(client)
+    client.post("/targets", json={"rule": rule, "description": "d"}, headers=AUTH)
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, "
+               "redacted_hypothesis, target_ref) "
+               "VALUES ('int-8','h','hypothesis','h','public.accounts.churned')")
+    res = client.post(f"/targets/{rule['entity']}/tgt_npe_90d/attach",
+                      json={"intent_id": "int-8"}, headers=AUTH)
+    assert res.status_code == 409
+
+
+# ══ end to end: a registered label becomes a governed generation target ══════════════════════════
+
+def _build_set(db) -> None:
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, "
+               "redacted_hypothesis) VALUES ('int-e2e','h','hypothesis','h') "
+               "ON CONFLICT DO NOTHING")
+    db.execute("INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
+               "VALUES ('trr-e2e','int-e2e','exploration','h') ON CONFLICT DO NOTHING")
+    db.execute("INSERT INTO build_set_revision (revision_id, target_reading_revision_id, "
+               "declaration_hash, declaration_json, content_hash, declared_by, declared_at) "
+               "VALUES ('bs-e2e','trr-e2e','dh','{}'::jsonb,'bs-e2e','user:ops','2026-09-03') "
+               "ON CONFLICT DO NOTHING")
+
+
+def test_a_generation_can_be_AUTHORIZED_for_a_registered_label(make_client, db, monkeypatch):
+    """The whole seam in one test: author a label, register it, and authorize a generation to
+    predict it. Before this the registry was complete and disconnected — nothing in the platform
+    could be trained against anything it held."""
+    monkeypatch.setenv("FEATUREGEN_MATERIALIZE_ENABLED", "1")
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    _build_set(db)
+    definition_id = client.post("/targets", json={"rule": _valid_rule(client), "description": "d"},
+                                headers=AUTH).json()["definition_id"]
+
+    res = client.post("/feature-execution/generations", json={
+        "environment_id": "sandbox", "logical_group_name": "grp",
+        "build_set_revision_id": "bs-e2e", "target_mode": "prediction",
+        "target_definition_id": definition_id}, headers=AUTH)
+    assert res.status_code == 201, res.text
+    assert res.json()["target_definition_id"] == definition_id
+    assert res.json()["target_ref"] is None
+
+    consumers = db.execute("SELECT consumer_ref FROM target_consumer WHERE definition_id = %s",
+                           (definition_id,)).fetchall()
+    assert consumers, "§9: authorizing a generation is how a label acquires a consumer"
+
+
+def test_authorizing_with_BOTH_kinds_of_target_is_a_422(make_client, db, monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_MATERIALIZE_ENABLED", "1")
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    _build_set(db)
+    definition_id = client.post("/targets", json={"rule": _valid_rule(client), "description": "d"},
+                                headers=AUTH).json()["definition_id"]
+    res = client.post("/feature-execution/generations", json={
+        "environment_id": "sandbox", "logical_group_name": "grp",
+        "build_set_revision_id": "bs-e2e", "target_mode": "prediction",
+        "target_ref": "public.accounts.churned",
+        "target_definition_id": definition_id}, headers=AUTH)
+    assert res.status_code == 422
+    assert "one kind of target" in str(res.json()["detail"])

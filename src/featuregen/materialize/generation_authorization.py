@@ -41,6 +41,10 @@ class GenerationAuthorizationV1:
     build_set_revision_id: str
     target_mode: TargetModeV1
     target_ref: str | None
+    #: A RULE-BASED label (1142) instead of a catalog column. Sits BESIDE `target_ref` because a
+    #: bare column fits neither rule shape, so replacing it would mean inventing a passthrough
+    #: shape purely to migrate old rows. Exactly one of the two may be set.
+    target_definition_id: str | None = None
 
     def __post_init__(self) -> None:
         for value, what in (
@@ -52,22 +56,38 @@ class GenerationAuthorizationV1:
                 raise ValueError(
                     f"a generation authorization with a blank {what} authorizes a generation "
                     f"nobody can locate")
-        has_target = self.target_ref is not None and self.target_ref.strip() != ""
-        if (self.target_mode is TargetModeV1.PREDICTION) != has_target:
+        has_column = self.target_ref is not None and self.target_ref.strip() != ""
+        has_rule = (self.target_definition_id is not None
+                    and self.target_definition_id.strip() != "")
+        if has_column and has_rule:
             raise ValueError(
-                f"target_mode={self.target_mode.value} and target_ref={self.target_ref!r} disagree: "
+                f"target_ref={self.target_ref!r} and "
+                f"target_definition_id={self.target_definition_id!r} are both set: an "
+                f"authorization names one kind of target, and two would authorize one generation "
+                f"to predict two different things")
+        if (self.target_mode is TargetModeV1.PREDICTION) != (has_column or has_rule):
+            raise ValueError(
+                f"target_mode={self.target_mode.value}, target_ref={self.target_ref!r} and "
+                f"target_definition_id={self.target_definition_id!r} disagree: "
                 f"an exploration build HAS no target — that is what the mode means — and a "
                 f"prediction without one would be authorized to predict something nobody named")
 
     def identity_payload(self) -> dict[str, Any]:
         """What this authorization IS. No actor, no timestamp — those are provenance."""
-        return {
+        payload = {
             "environment_id": self.environment_id,
             "logical_group_name": self.logical_group_name,
             "build_set_revision_id": self.build_set_revision_id,
             "target_mode": self.target_mode.value,
             "target_ref": self.target_ref,
         }
+        # CONDITIONAL, and that is the whole point. `verification_attempt` (1080) is keyed on the
+        # id this payload produces; emitting the key unconditionally would re-mint every
+        # authorization ever recorded and silently orphan its verifications. Two tests pin the
+        # pre-change hashes.
+        if self.target_definition_id is not None:
+            payload["target_definition_id"] = self.target_definition_id
+        return payload
 
     @property
     def revision_id(self) -> str:
@@ -91,12 +111,23 @@ def record_generation_authorization(
 
     conn.execute(
         "INSERT INTO generation_authorization (revision_id, environment_id, logical_group_name, "
-        "build_set_revision_id, target_mode, target_ref, authorized_by, authorized_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (revision_id) DO NOTHING",
+        "build_set_revision_id, target_mode, target_ref, target_definition_id, authorized_by, "
+        "authorized_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (revision_id) DO NOTHING",
         (authorization.revision_id, authorization.environment_id,
          authorization.logical_group_name, authorization.build_set_revision_id,
-         authorization.target_mode.value, authorization.target_ref, authorized_by.strip(),
-         authorized_at))
+         authorization.target_mode.value, authorization.target_ref,
+         authorization.target_definition_id, authorized_by.strip(), authorized_at))
+    if authorization.target_definition_id is not None:
+        # §9's first job — IMPACT. "This column is being retired: which labels break, and who is
+        # training on them?" `target_consumer` has existed since 1142 with nothing ever writing to
+        # it, so the question had no answer. Authorization is the moment a label acquires a
+        # consumer. Idempotent, because authorization itself is.
+        conn.execute(
+            "INSERT INTO target_consumer (definition_id, consumer_ref) VALUES (%s, %s) "
+            "ON CONFLICT (definition_id, consumer_ref) DO NOTHING",
+            (authorization.target_definition_id,
+             f"generation_authorization:{authorization.revision_id}"))
     return authorization.revision_id
 
 
@@ -129,13 +160,13 @@ def load_generation_authorization(
     """
     row = conn.execute(
         "SELECT environment_id, logical_group_name, build_set_revision_id, target_mode, "
-        "target_ref FROM generation_authorization WHERE revision_id = %s",
+        "target_ref, target_definition_id FROM generation_authorization WHERE revision_id = %s",
         (revision_id,)).fetchone()
     if row is None:
         return None
     authorization = GenerationAuthorizationV1(
         environment_id=row[0], logical_group_name=row[1], build_set_revision_id=row[2],
-        target_mode=TargetModeV1(row[3]), target_ref=row[4])
+        target_mode=TargetModeV1(row[3]), target_ref=row[4], target_definition_id=row[5])
     if authorization.revision_id != revision_id:
         raise ValueError(
             f"generation authorization {revision_id} does not reproduce its own id: it would "
