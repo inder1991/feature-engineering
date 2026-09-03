@@ -406,7 +406,7 @@ export function TargetLabelScreen() {
               return (
                 <div className={needs ? 'field field--needs-input' : 'field'} key={spec.key}>
                   <label htmlFor={id}>
-                    {spec.label} <code className="micro-label">{spec.key}</code>
+                    {spec.label} <code className="tgt-field-key">{spec.key}</code>
                   </label>
                   {spec.kind === 'select' ? (
                     <select
@@ -433,7 +433,7 @@ export function TargetLabelScreen() {
                   {needs && (
                     <p className="tgt-reason">{REASONS[draft.notes[spec.key]] ?? draft.notes[spec.key]}</p>
                   )}
-                  {!needs && spec.hint && <p className="micro-label">{spec.hint}</p>}
+                  {!needs && spec.hint && <p className="tgt-hint">{spec.hint}</p>}
                 </div>
               )
             })}

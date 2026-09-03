@@ -8385,3 +8385,23 @@ button.stat:hover {
   gap: 0.5rem;
   align-items: center;
 }
+
+/* Each field is a visual BLOCK. Without this the hint under one input sits immediately above the
+   next field's label, so "binary labels only" reads as belonging to Threshold when it belongs to
+   Operator — a form where the guidance attaches to the wrong field is worse than one with none. */
+.tgt-screen .field { margin: 0 0 1.15rem; }
+.tgt-screen .field > label { display: block; margin-bottom: 0.25rem; }
+
+/* The technical field name, inline beside the human label rather than shouting on its own line.
+   It is here because the same name appears in the stored rule, the SQL and the API, and a person
+   debugging with a data scientist needs to see it — but it is a footnote, not the heading. */
+.tgt-field-key {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.72rem;
+  opacity: 0.55;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.tgt-hint, .tgt-reason { margin: 0.25rem 0 0; }
+.tgt-hint { font-size: 0.78rem; line-height: 1.4; opacity: 0.7; }
