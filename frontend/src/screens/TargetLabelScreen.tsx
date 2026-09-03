@@ -109,6 +109,14 @@ const SHAPE_FIELDS: Record<string, FieldSpec[]> = {
 // rejects, with the person unable to see why.
 const STAMPED = ['entity', 'anchor_catalog', 'grain_ref', 'as_of_ref']
 
+// The conditions that decide WHICH EVENTS COUNT. Rendered separately because a filter is a nested
+// object, not a scalar — and rendered at all because a label with none counts every row in the
+// table. "Who will start transacting in FOREIGN CURRENCY" with no currency condition is a label
+// that looks right and answers a wider question, which is the failure this whole screen is for.
+interface EventFilter { column_ref: string; op: string; value: string }
+
+const FILTER_OPS = ['==', '!=', '>', '>=', '<', '<=']
+
 //: Long enough that typing a value is one request rather than one per character, short enough that
 //: the sentence still reads as live feedback on what was just typed.
 const DEBOUNCE_MS = 250
@@ -152,6 +160,7 @@ export function TargetLabelScreen() {
   const [existing, setExisting] = useState<ExistingTarget[]>([])
   const [proposalFailed, setProposalFailed] = useState(false)
   const [values, setValues] = useState<Record<string, string>>({})
+  const [filters, setFilters] = useState<EventFilter[]>([])
   const [comment, setComment] = useState('')
   const [description, setDescription] = useState('')
 
@@ -189,8 +198,14 @@ export function TargetLabelScreen() {
     listTargets(entity).then(setRegistered).catch(() => setRegistered([]))
   }, [entity])
 
-  const rule = useMemo(
-    () => (draft ? buildRule(draft.shape, values) : null), [draft, values])
+  const rule = useMemo(() => {
+    if (!draft) return null
+    const built = buildRule(draft.shape, values)
+    if (draft.shape === 'event_window') {
+      built.event_filters = filters.filter(f => f.column_ref.trim() && f.op)
+    }
+    return built
+  }, [draft, values, filters])
 
   // The sentence and the SQL are recomputed from the CURRENT form, not from what was proposed —
   // a person approving a statement about a rule they have since edited is approving nothing.
@@ -237,6 +252,13 @@ export function TargetLabelScreen() {
           if (!(spec.key in seeded)) seeded[spec.key] = spec.kind === 'bool' ? 'true' : ''
         }
         setValues(seeded)
+        const proposedFilters = result.draft.fields.event_filters
+        setFilters(Array.isArray(proposedFilters)
+          ? (proposedFilters as EventFilter[]).map(f => ({
+            column_ref: String(f.column_ref ?? ''), op: String(f.op ?? '=='),
+            value: String(f.value ?? ''),
+          }))
+          : [])
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'the proposal failed')
@@ -402,6 +424,60 @@ export function TargetLabelScreen() {
               )
             })}
           </section>
+
+          {draft.shape === 'event_window' && (
+            <section className="panel">
+              <h2>Which events count</h2>
+              {filters.length === 0 ? (
+                <p className="empty">
+                  No conditions, so this label counts every row in {String(values.event_table
+                    || 'the event table')}. If you meant a particular currency, channel or product,
+                  say so here — a label that counts everything looks right and answers a wider
+                  question.
+                </p>
+              ) : (
+                <p className="micro-label">
+                  All conditions must hold. They apply to the outcome window AND to the prior
+                  activity that decides who is a candidate.
+                </p>
+              )}
+              {filters.map((f, i) => (
+                <div className="field tgt-filter" key={i}>
+                  <input
+                    type="text" value={f.column_ref}
+                    aria-label={`condition ${i + 1} column`} placeholder="public.table.column"
+                    onChange={e => setFilters(list => list.map(
+                      (x, j) => (j === i ? { ...x, column_ref: e.target.value } : x)))}
+                  />
+                  <select
+                    value={f.op} aria-label={`condition ${i + 1} operator`}
+                    onChange={e => setFilters(list => list.map(
+                      (x, j) => (j === i ? { ...x, op: e.target.value } : x)))}
+                  >
+                    {FILTER_OPS.map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
+                  <input
+                    type="text" value={f.value} aria-label={`condition ${i + 1} value`}
+                    onChange={e => setFilters(list => list.map(
+                      (x, j) => (j === i ? { ...x, value: e.target.value } : x)))}
+                  />
+                  <button
+                    type="button" className="btn btn--ghost"
+                    aria-label={`remove condition ${i + 1}`}
+                    onClick={() => setFilters(list => list.filter((_, j) => j !== i))}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button" className="btn"
+                onClick={() => setFilters(list => [...list, { column_ref: '', op: '==', value: '' }])}
+              >
+                Add a condition
+              </button>
+            </section>
+          )}
 
           <section className="panel">
             <h2>What this means</h2>

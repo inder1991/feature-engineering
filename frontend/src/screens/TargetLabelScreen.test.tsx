@@ -175,3 +175,49 @@ it('collapses a burst of typing into ONE describe call, not one per keystroke', 
   // out of order, leaving a sentence describing a rule the person has already moved past.
   expect(describeTarget.mock.calls.length).toBeLessThan(4)
 })
+
+const EVENT_DRAFT: api.TargetDraft = {
+  shape: 'event_window',
+  fields: {
+    name: 'tgt_start_fx_90d', entity: 'customer', anchor_catalog: 'cib',
+    grain_ref: 'public.bo_cib_customer.cust_num',
+    as_of_ref: 'public.bo_cib_customer.business_dt',
+    window_days: 90, as_of_frequency: 'monthly', label_type: 'binary',
+    operator: '>=', threshold: 1,
+    event_catalog: 'ftr', event_table: 'txns', event_date_ref: 'public.txns.tran_date',
+    join_left: 'public.bo_cib_customer.cust_num', join_right: 'public.txns.cif_id',
+    aggregate: 'count', population_having: 'none',
+    event_filters: [{ column_ref: 'public.txns.tran_crncy', op: '!=', value: 'AED' }],
+  },
+  needs_input: ['population_lookback_days'],
+  notes: { population_lookback_days: 'not_stated' },
+}
+
+it('shows WHICH EVENTS COUNT, so a label that counts everything is visible', async () => {
+  proposeTarget.mockResolvedValue({ existing: [], draft: EVENT_DRAFT })
+  await proposed()
+  expect(screen.getByDisplayValue('public.txns.tran_crncy')).toBeInTheDocument()
+  expect(screen.getByDisplayValue('AED')).toBeInTheDocument()
+})
+
+it('says plainly when an event label counts EVERY row', async () => {
+  proposeTarget.mockResolvedValue({
+    existing: [],
+    draft: { ...EVENT_DRAFT, fields: { ...EVENT_DRAFT.fields, event_filters: [] } },
+  })
+  await proposed()
+  expect(screen.getByText(/counts every row/i)).toBeInTheDocument()
+})
+
+it('submits the edited filters with the rule', async () => {
+  proposeTarget.mockResolvedValue({ existing: [], draft: EVENT_DRAFT })
+  const user = await proposed()
+  await user.clear(screen.getByDisplayValue('AED'))
+  await user.type(screen.getByLabelText(/condition 1 value/i), 'USD')
+  await user.type(screen.getByLabelText(/lookback/i), '180')
+  await waitFor(() => expect(screen.getByRole('button', { name: /register/i })).toBeEnabled())
+  await user.click(screen.getByRole('button', { name: /register/i }))
+  await waitFor(() => expect(registerTarget).toHaveBeenCalled())
+  const filters = registerTarget.mock.calls[0][0].rule.event_filters as { value: string }[]
+  expect(filters[0].value).toBe('USD')
+})
