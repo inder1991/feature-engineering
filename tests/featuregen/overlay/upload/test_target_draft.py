@@ -100,6 +100,19 @@ def _catalog(db):
                 concepts={content_hash(r): c for r, c in rows})
 
 
+def _pairs(**kw) -> list:
+    """The wire form: {key, value} pairs, values as TEXT, a list field repeating its key."""
+    out = []
+    for key, value in kw.items():
+        for item in (value if isinstance(value, list) else [value]):
+            out.append({"key": key, "value": str(item)})
+    return out
+
+
+def _notes(**kw) -> list:
+    return [{"field": k, "reason": v} for k, v in kw.items()]
+
+
 def _client(output: dict) -> FakeLLM:
     return FakeLLM(script={TARGET_DRAFT_TASK: FakeResponse(output=output)})
 
@@ -115,11 +128,10 @@ def test_a_draft_comes_back_with_its_blanks_and_reasons(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
-                   "as_of_frequency": "monthly", "label_type": "binary"},
+        "fields": _pairs(name="tgt_npe_90d", column_ref=_FLAG, window_days=90,
+                         as_of_frequency="monthly", label_type="binary"),
         "needs_input": ["from_values", "to_values"],
-        "notes": [{"field": "from_values", "reason": "no_value_profile"},
-                  {"field": "to_values", "reason": "no_value_profile"}]}))
+        "notes": _notes(from_values="no_value_profile", to_values="no_value_profile")}))
     assert draft.shape == "state_change"
     assert "from_values" in draft.needs_input
     assert draft.fields["column_ref"] == _FLAG
@@ -132,10 +144,9 @@ def test_the_chosen_entitys_SPINE_is_stamped_on_never_guessed(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
-                   "as_of_frequency": "monthly", "label_type": "binary",
-                   "from_values": ["P"], "to_values": ["N"],
-                   "grain_ref": "public.customers.something_else"},
+        "fields": _pairs(name="tgt_npe_90d", column_ref=_FLAG, window_days=90,
+                         as_of_frequency="monthly", label_type="binary",
+                         from_values=["P"], to_values=["N"]),
         "needs_input": [], "notes": []}))
     assert draft.fields["grain_ref"] == _GRAIN
     assert draft.fields["as_of_ref"] == _ASOF
@@ -148,9 +159,9 @@ def test_a_ref_the_model_INVENTED_is_dropped_and_becomes_a_blank(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": "public.customers.invented",
-                   "window_days": 90, "as_of_frequency": "monthly", "label_type": "binary",
-                   "from_values": ["P"], "to_values": ["N"]},
+        "fields": _pairs(name="tgt_npe_90d", column_ref="public.customers.invented",
+                         window_days=90, as_of_frequency="monthly", label_type="binary",
+                         from_values=["P"], to_values=["N"]),
         "needs_input": [], "notes": []}))
     assert "column_ref" not in draft.fields
     assert "column_ref" in draft.needs_input
@@ -164,10 +175,9 @@ def test_an_unstated_horizon_comes_back_as_a_BLANK_not_a_default(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
-                   "label_type": "binary", "from_values": ["P"], "to_values": ["N"]},
-        "needs_input": ["as_of_frequency"],
-        "notes": [{"field": "as_of_frequency", "reason": "not_stated"}]}))
+        "fields": _pairs(name="tgt_npe_90d", column_ref=_FLAG, window_days=90,
+                         label_type="binary", from_values=["P"], to_values=["N"]),
+        "needs_input": ["as_of_frequency"], "notes": _notes(as_of_frequency="not_stated")}))
     assert "as_of_frequency" in draft.needs_input
     assert "as_of_frequency" not in draft.fields
 
@@ -181,9 +191,8 @@ def test_a_body_that_contradicts_itself_returns_nothing(db):
     """Filled AND needed is refused by the draft type; the proposer must not paper over it."""
     _catalog(db)
     assert _propose(db, _client({
-        "shape": "state_change", "fields": {"window_days": 90},
-        "needs_input": ["window_days"],
-        "notes": [{"field": "window_days", "reason": "not_stated"}]})) is None
+        "shape": "state_change", "fields": _pairs(window_days=90),
+        "needs_input": ["window_days"], "notes": _notes(window_days="not_stated")})) is None
 
 
 def test_a_draft_must_ACCOUNT_FOR_every_field_its_shape_needs():
@@ -243,18 +252,21 @@ def test_the_dispatched_schema_DECLARES_every_field_it_expects():
     Naming the fields in the prompt did not change it and could not have.
     """
     schema = _SCHEMAS[(TARGET_DRAFT_SCHEMA_ID, TARGET_DRAFT_SCHEMA_VERSION)]
-    declared = set(schema["properties"]["fields"].get("properties", {}))
+    declared = set(schema["properties"]["fields"]["items"]["properties"]["key"]["enum"])
+    stamped = {"entity", "anchor_catalog", "grain_ref", "as_of_ref"}
     for shape, needed in SHAPE_FIELDS.items():
-        missing = [f for f in needed if f not in declared]
+        missing = [f for f in needed if f not in declared and f not in stamped]
         assert not missing, f"{shape} needs {missing}, which the schema never mentions"
 
 
-def test_the_schema_still_ACCEPTS_the_stamped_fields_the_model_may_echo():
-    """The instruction tells it not to supply these, but a closed schema that REFUSES them would
-    turn a harmless echo into a failed call. They are overwritten server-side anyway."""
+def test_the_STAMPED_fields_are_absent_from_the_schema():
+    """An earlier version declared them "defensively", in case the model echoed one back. That was
+    wrong twice: structured output constrains GENERATION against this schema, so the model cannot
+    emit an undeclared key at all — and the provider caps schema complexity, which those four keys
+    pushed past. They are stamped server-side from the person's own choice regardless."""
     schema = _SCHEMAS[(TARGET_DRAFT_SCHEMA_ID, TARGET_DRAFT_SCHEMA_VERSION)]
-    declared = set(schema["properties"]["fields"].get("properties", {}))
-    assert {"entity", "anchor_catalog", "grain_ref", "as_of_ref"} <= declared
+    declared = set(schema["properties"]["fields"]["items"]["properties"]["key"]["enum"])
+    assert not ({"entity", "anchor_catalog", "grain_ref", "as_of_ref"} & declared)
 
 
 def test_the_schema_constrains_a_BLANKS_REASON_to_the_closed_set():
@@ -286,11 +298,10 @@ def test_the_wire_form_of_notes_is_normalised_back_to_a_MAPPING(db):
     _catalog(db)
     draft = _propose(db, _client({
         "shape": "state_change",
-        "fields": {"name": "tgt_npe_90d", "column_ref": _FLAG, "window_days": 90,
-                   "as_of_frequency": "monthly", "label_type": "binary"},
+        "fields": _pairs(name="tgt_npe_90d", column_ref=_FLAG, window_days=90,
+                         as_of_frequency="monthly", label_type="binary"),
         "needs_input": ["from_values", "to_values"],
-        "notes": [{"field": "from_values", "reason": "no_value_profile"},
-                  {"field": "to_values", "reason": "business_choice"}]}))
+        "notes": _notes(from_values="no_value_profile", to_values="business_choice")}))
     assert draft.notes == {"from_values": "no_value_profile", "to_values": "business_choice"}
 
 
@@ -305,3 +316,35 @@ def test_the_dict_form_of_notes_still_normalises():
     assert _notes_from([{"field": "a", "reason": "not_stated"}]) == {"a": "not_stated"}
     assert _notes_from(None) == {}
     assert _notes_from([{"reason": "not_stated"}]) == {}, "a pair with no field names nothing"
+
+
+def test_text_values_are_COERCED_back_to_the_types_the_contract_expects():
+    """Every value arrives as text — the wire form has no other option. A window that stayed the
+    string "90" would be refused by the contract for the wrong reason."""
+    from featuregen.overlay.upload.target_draft import _fields_from
+    fields = _fields_from([
+        {"key": "window_days", "value": "90"},
+        {"key": "threshold", "value": "1"},
+        {"key": "require_full_window", "value": "true"},
+        {"key": "name", "value": "tgt_npe_90d"}])
+    assert fields == {"window_days": 90, "threshold": 1, "require_full_window": True,
+                      "name": "tgt_npe_90d"}
+
+
+def test_a_LIST_field_is_built_by_repeating_its_key():
+    """The wire form has no arrays inside a pair, so a multi-value field repeats its key the way an
+    HTML form encodes one. A single occurrence must still produce a list, or a one-value rule would
+    be shaped differently from a two-value one."""
+    from featuregen.overlay.upload.target_draft import _fields_from
+    many = _fields_from([{"key": "to_values", "value": "Non-performing"},
+                         {"key": "to_values", "value": "Written off"}])
+    assert many["to_values"] == ["Non-performing", "Written off"]
+    one = _fields_from([{"key": "from_values", "value": "Performing"}])
+    assert one["from_values"] == ["Performing"]
+
+
+def test_a_value_that_will_not_COERCE_is_kept_rather_than_dropped():
+    """Showing `window_days: "ninety"` lets a person see and fix what the model said. Dropping it
+    would present an unexplained blank and lose the evidence that anything went wrong."""
+    from featuregen.overlay.upload.target_draft import _fields_from
+    assert _fields_from([{"key": "window_days", "value": "ninety"}]) == {"window_days": "ninety"}

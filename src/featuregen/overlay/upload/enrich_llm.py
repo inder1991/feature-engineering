@@ -1498,10 +1498,14 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # v2 — the version dispatched today. Every field a rule can carry is DECLARED, with its type
     # and, where the contract closes the set, its enum.
     #
-    # The four STAMPED keys are declared even though the instruction says not to send them:
-    # `project_for_anthropic` CLOSES `additionalProperties` on the wire schema, so an undeclared
-    # key the model echoes back is not a droppable ref — it is a failed call. Declaring them makes
-    # a harmless echo harmless. They are overwritten server-side regardless.
+    # THE STAMPED KEYS ARE DELIBERATELY ABSENT. An earlier draft declared entity / anchor_catalog
+    # / grain_ref / as_of_ref "defensively", in case the model echoed them back. That was wrong
+    # twice over: structured output CONSTRAINS generation against the wire schema, which closes
+    # `additionalProperties`, so the model cannot emit an undeclared key at all — and Anthropic
+    # caps a schema at 24 OPTIONAL parameters, which those four pushed to 26 and rejected the whole
+    # call with HTTP 400. Every field here is optional by necessity (a blank field is absent from
+    # `fields` and named in `needs_input` instead), so that ceiling is a real design constraint on
+    # this schema, not a detail.
     #
     # `notes` values are the CLOSED reason set, so a bad reason is repaired inside the bounded loop
     # instead of the whole draft being discarded after it returns.
@@ -1509,49 +1513,46 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "type": "object", "additionalProperties": False,
         "properties": {
             "shape": {"type": "string", "enum": ["state_change", "event_window"]},
+            # KEY/VALUE PAIRS, not an object of 22 optional properties — and this is a provider
+            # limit, not a preference. Anthropic compiles the schema into a generation grammar and
+            # refuses one with more than 24 optional parameters ("too many optional parameters"),
+            # then refuses this one at 22 as well ("Schema is too complex"). Probing the live API
+            # established both that the COUNT is what bites — 22 optional properties are rejected
+            # even when every one is a plain string — and where the ceiling sits: 12 optional
+            # properties are ACCEPTED, 16 are REJECTED. A rule carries 22, and every one must be
+            # optional by necessity (a blank field is ABSENT from `fields` and named in
+            # `needs_input` instead), so the object form was never viable here. This is the shape
+            # that fits, not a workaround for one that nearly did.
+            #
+            # `key` stays enum-constrained, so the model is still steered to the field names it may
+            # use; the types come back as text and are coerced server-side (`_fields_from`), where
+            # a value that will not coerce is kept verbatim and shown rather than silently dropped.
+            # A LIST field repeats its key, the way a form encodes a multi-value input.
+            #
+            # The four STAMPED keys (entity / anchor_catalog / grain_ref / as_of_ref) are
+            # deliberately absent: structured output constrains GENERATION against this schema, so
+            # the model cannot emit them, and the server overwrites them regardless.
             "fields": {
-                "type": "object", "additionalProperties": True,
-                "properties": {
-                    # Stamped server-side from the person's own choice; declared, never trusted.
-                    "entity": {"type": "string"},
-                    "anchor_catalog": {"type": "string"},
-                    "grain_ref": {"type": "string"},
-                    "as_of_ref": {"type": "string"},
-                    # Shared by both shapes.
-                    "name": {"type": "string"},
-                    "window_days": {"type": "integer"},
-                    "as_of_frequency": {
-                        "type": "string",
-                        "enum": ["daily", "weekly", "monthly", "quarterly", "single"]},
-                    "label_type": {"type": "string", "enum": ["binary", "count", "amount"]},
-                    "operator": {"type": "string",
-                                 "enum": ["==", "!=", ">=", "<=", ">", "<"]},
-                    "threshold": {"type": "number"},
-                    "require_full_window": {"type": "boolean"},
-                    # state_change.
-                    "column_ref": {"type": "string"},
-                    "from_values": {"type": "array", "items": {"type": "string"}},
-                    "to_values": {"type": "array", "items": {"type": "string"}},
-                    "population_filter": {"type": "string", "enum": ["from_values", "all"]},
-                    "exclude_null_at_as_of": {"type": "boolean"},
-                    "at_least_once": {"type": "boolean"},
-                    # event_window.
-                    "event_catalog": {"type": "string"},
-                    "event_table": {"type": "string"},
-                    "event_date_ref": {"type": "string"},
-                    "join_left": {"type": "string"},
-                    "join_right": {"type": "string"},
-                    "aggregate": {"type": "string", "enum": ["count", "sum"]},
-                    "measure_ref": {"type": "string"},
-                    "population_having": {"type": "string", "enum": ["any", "none"]},
-                    "population_lookback_days": {"type": "integer"}}},
+                "type": "array",
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "key": {"type": "string", "enum": [
+                            "name", "window_days", "as_of_frequency", "label_type", "operator",
+                            "threshold", "require_full_window",
+                            "column_ref", "from_values", "to_values", "population_filter",
+                            "exclude_null_at_as_of", "at_least_once",
+                            "event_catalog", "event_table", "event_date_ref", "join_left",
+                            "join_right", "aggregate", "measure_ref", "population_having",
+                            "population_lookback_days"]},
+                        "value": {"type": "string"}},
+                    "required": ["key", "value"]}},
             "needs_input": {"type": "array", "items": {"type": "string"}},
-            # An ARRAY of pairs, not a map. `notes` is conceptually field -> reason, but a map has
-            # arbitrary KEYS and Anthropic's subset requires closed objects — a dict-valued
-            # `additionalProperties` is rejected outright (HTTP 400, keyword=type), which one live
-            # call proved. Pairs express the same thing in the closed form, and buy something the
-            # map could not: the reason is enum-constrained ON THE WIRE, so a bad one is repaired
-            # inside the bounded loop instead of failing the draft after it returns.
+            # An ARRAY of pairs for the same reason, and one the map form could not have satisfied
+            # anyway: a map has arbitrary KEYS, and Anthropic rejects a dict-valued
+            # `additionalProperties` outright (HTTP 400). Pairs keep the reason enum-constrained ON
+            # THE WIRE, so a bad one is repaired inside the bounded loop instead of failing the
+            # draft after it returns.
             "notes": {
                 "type": "array",
                 "items": {

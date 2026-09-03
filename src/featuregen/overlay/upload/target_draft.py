@@ -114,9 +114,12 @@ _INSTRUCTION = (
     "`shape` is `state_change` (a column's value at the as-of date versus inside the window — use "
     "this when the outcome is a flag flipping) or `event_window` (rows in another table inside the "
     "window — use this when the outcome is something happening, or not happening).\n\n"
-    "EVERY field below must be ACCOUNTED FOR — either in `fields` or in `needs_input` with a "
-    "reason. A field you simply omit is neither, and the form then shows a blank nobody can "
-    "explain.\n\n"
+    "`fields` is a LIST OF {key, value} PAIRS, and every value is TEXT — write 90, not the number "
+    "90. A field taking several values (from_values, to_values) REPEATS its key, one pair per "
+    "value.\n\n"
+    "EVERY field below must be ACCOUNTED FOR — either as a pair in `fields`, or in `needs_input` "
+    "with a reason in `notes`. A field you simply omit is neither, and the form then shows a blank "
+    "nobody can explain. `notes` is also a list of pairs: {field, reason}.\n\n"
     "Both shapes need: name (prefixed `tgt_`), window_days, as_of_frequency, label_type "
     "(binary|count|amount), and for a binary label operator + threshold. `state_change` also "
     "needs column_ref, from_values, to_values. `event_window` also needs event_catalog, "
@@ -138,6 +141,57 @@ _INSTRUCTION = (
     "filter value produces one that is always 1. Both look like working models. Never invent a "
     "ref, and never both fill a field and list it in `needs_input`."
 )
+
+
+#: Fields whose value is a LIST. The wire form has no arrays inside a pair, so the model repeats
+#: the key — the way an HTML form encodes a multi-value input — and they are collected here.
+_LIST_FIELDS = ("from_values", "to_values")
+_INT_FIELDS = ("window_days", "population_lookback_days")
+_FLOAT_FIELDS = ("threshold",)
+_BOOL_FIELDS = ("require_full_window", "exclude_null_at_as_of", "at_least_once")
+
+
+def _coerce(key: str, value):
+    """Text back into the type the contract expects.
+
+    A value that will NOT coerce is kept verbatim rather than dropped. The draft is a form, not a
+    rule: showing `window_days: "ninety"` lets a person see and fix what the model said, whereas
+    dropping it would present an unexplained blank and quietly lose the evidence.
+    """
+    text = str(value).strip()
+    try:
+        if key in _INT_FIELDS:
+            return int(text)
+        if key in _FLOAT_FIELDS:
+            number = float(text)
+            return int(number) if number.is_integer() else number
+    except ValueError:
+        return text
+    if key in _BOOL_FIELDS:
+        lowered = text.lower()
+        return lowered == "true" if lowered in ("true", "false") else text
+    return text
+
+
+def _fields_from(raw) -> dict:
+    """The wire form is a LIST of {key, value} pairs; the draft holds a mapping.
+
+    Anthropic refuses a schema with this many OPTIONAL properties, so the fields cannot be declared
+    as an object at all — see the schema comment. The dict form is still accepted so a recorded v1
+    body remains readable data.
+    """
+    if isinstance(raw, dict):
+        return dict(raw)
+    fields: dict = {}
+    for entry in raw or ():
+        if not isinstance(entry, dict) or not entry.get("key"):
+            continue
+        key = str(entry["key"])
+        if key in _LIST_FIELDS:
+            fields.setdefault(key, []).append(str(entry.get("value", "")).strip())
+        else:
+            fields[key] = _coerce(key, entry.get("value"))
+    return fields
 
 
 def _notes_from(raw) -> dict:
@@ -187,7 +241,7 @@ def propose_target_draft(conn, client, *, hypothesis: str, entity: str, catalog_
         return None
 
     body = dict(call.output)
-    fields = dict(body.get("fields") or {})
+    fields = _fields_from(body.get("fields"))
     needs = list(body.get("needs_input") or ())
     notes = _notes_from(body.get("notes"))
 
