@@ -269,3 +269,30 @@ def test_authorizing_with_BOTH_kinds_of_target_is_a_422(make_client, db, monkeyp
         "target_definition_id": definition_id}, headers=AUTH)
     assert res.status_code == 422
     assert "one kind of target" in str(res.json()["detail"])
+
+
+def test_the_label_attached_to_an_intent_can_be_READ_back(make_client, db):
+    """A column nothing reads is the same defect as `target_consumer` had: written on registration,
+    invisible for ever afterwards. The intent is also the link back to the HYPOTHESIS that
+    motivated the label, which nothing else records."""
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    rule = _valid_rule(client)
+    client.post("/targets", json={"rule": rule, "description": "d"}, headers=AUTH)
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, "
+               "redacted_hypothesis) VALUES ('int-7','which customers go NPE','hypothesis','h')")
+    client.post(f"/targets/{rule['entity']}/tgt_npe_90d/attach",
+                json={"intent_id": "int-7"}, headers=AUTH)
+
+    body = client.get("/targets/for-intent/int-7", headers=AUTH).json()
+    assert body["name"] == "tgt_npe_90d"
+    assert body["hypothesis"] == "which customers go NPE"
+    assert "one row per" in body["reads_as"]
+
+
+def test_an_intent_with_no_rule_target_reads_back_as_NOTHING_not_an_error(make_client, db):
+    client = make_client(_draft_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, "
+               "redacted_hypothesis) VALUES ('int-6','h','hypothesis','h')")
+    assert client.get("/targets/for-intent/int-6", headers=AUTH).json() is None

@@ -262,3 +262,26 @@ def attach_to_intent(entity: str, name: str, body: AttachIn, conn: _Conn) -> dic
                  (row["definition_id"], body.intent_id))
     return {"intent_id": body.intent_id, "definition_id": row["definition_id"], "name": name,
             "reads_as": describe_target(target_from_canonical(row["rule"]))}
+
+
+@router.get("/targets/for-intent/{intent_id}", dependencies=[Depends(require_feature_generate)])
+def target_for_intent(intent_id: str, conn: _Conn) -> dict | None:
+    """The rule-based label attached to an intent, with the hypothesis that motivated it.
+
+    Without this `contract_intent.target_definition_id` would be WRITE-ONLY — set on attach and
+    invisible for ever after, which is exactly the defect `target_consumer` carried from 1142 until
+    1144. It is also the only place the link from a label back to its motivating hypothesis is
+    recorded, and "why does this label exist" is the first question anyone reviewing one asks.
+
+    `None` rather than a 404 when nothing is attached: an intent without a rule target is the
+    ordinary case, not a missing resource.
+    """
+    row = conn.execute(
+        "SELECT d.name, d.entity, d.rule, d.description, i.hypothesis "
+        "  FROM contract_intent i"
+        "  JOIN target_definition d ON d.definition_id = i.target_definition_id"
+        " WHERE i.intent_id = %s", (intent_id,)).fetchone()
+    if row is None:
+        return None
+    return {"name": row[0], "entity": row[1], "description": row[3], "hypothesis": row[4],
+            "reads_as": describe_target(target_from_canonical(row[2]))}

@@ -511,6 +511,24 @@ This must be stated in the ladder now rather than bolted on, because a label sit
 executing pipeline to report an outcome back; that is a later design, and it is the single most
 valuable extension.
 
+**UPDATE 2026-09-03 — the derivation logic is now emitted.** `target_sql.compile_target_sql`
+renders the rule as one runnable SELECT, deterministically and with no model call, exposed at
+`POST /targets/sql` (preview, while the form is still being edited) and
+`GET /targets/{entity}/{name}/sql` (a registered label). This does not move the ladder: the
+platform still never sees the labels produced, so `DATA-CHECKED` remains out of reach for exactly
+the reason above. What it changes is that the specification is no longer the only artifact — the
+logic a pipeline will run is now readable by the person approving it.
+
+The renderer is honest about the one thing the platform does not know. The registry records a
+CATALOG, never a physical database, and `object_ref` is only `public.{table}.{column}` (M3), so the
+SQL carries a source-binding header naming each catalog rather than emitting a confident
+three-part name that could silently read the wrong table.
+
+A second test suite EXECUTES the compiled SQL against a hand-computed cohort. Text assertions
+cannot see a query that parses and answers the wrong question — an off-by-one at the window edge, a
+population bound that keeps rows it should drop, a censoring rule that labels the unobservable as
+0 — and those are the defects that make a label look like a working model while being wrong.
+
 ---
 
 ## 11. Why the unknowns are asked rather than guessed
@@ -549,12 +567,25 @@ confirmation stays either way.
    `target_derives_from` answer "nothing depends on this column" about a column a label was
    defined by. Zero labels were registered at the time, so the shape changed with no data
    migration.
-2. **Who may change a definition** other people's models are trained against. Content-addressing
-   makes an edit a new row, but the *name* must resolve somewhere — needs an active-revision
-   pointer and a rule about moving it, mirroring `feature_active_revision`.
-3. **Does a label supersede `target_ref`** on `contract_intent`, or sit beside it? A column target
-   is the degenerate case of a rule; folding them is cleaner but touches the signed-reading path
-   and the confirm gate.
+2. **Who may change a definition** other people's models are trained against. **Shipped posture:
+   nobody.** `target_definition_name_per_entity` is unique and `register_target` raises
+   `TargetNameTaken`, so a registered definition is immutable and a revised label is a NEW name
+   with `adapted_from` recording what it came from. That is the conservative answer and it is
+   deliberate: an active-revision pointer would let the meaning of a name move under models already
+   trained against it, which is the very risk this question names. Revisit only with a rule about
+   who may move the pointer.
+3. ~~**Does a label supersede `target_ref`**~~ — **RESOLVED 2026-09-03, owner's decision: BESIDE.**
+   Migration 1144 adds `target_definition_id` to both `contract_intent` and
+   `generation_authorization`, with a CHECK admitting exactly one kind of target. The deciding
+   argument was that superseding is not cleanly possible: a bare column target fits neither rule
+   shape — `state_change` needs from/to values, `event_window` needs a second table — so folding
+   them would mean inventing a third passthrough shape purely to migrate existing rows, and moving
+   the signed-reading path and confirm gate with it.
+
+   `generation_authorization.revision_id` is content-addressed and `verification_attempt` is keyed
+   on it, so the new key enters `identity_payload` ONLY when a rule target is present. Two tests
+   pin the pre-change hashes; if either moves, every authorization ever recorded has been re-minted
+   and its verifications orphaned.
 4. **Population definition** beyond `population_filter` — entity-level exclusions (staff accounts,
    closed relationships) are real and currently unexpressible.
 
