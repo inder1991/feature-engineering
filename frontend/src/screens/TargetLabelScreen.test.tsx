@@ -15,7 +15,6 @@ vi.mock('../api', async importOriginal => {
     describeTarget: vi.fn(),
     previewTargetSql: vi.fn(),
     registerTarget: vi.fn(),
-    listTargets: vi.fn(),
   }
 })
 const listCatalogs = vi.mocked(api.listCatalogs)
@@ -24,7 +23,6 @@ const proposeTarget = vi.mocked(api.proposeTarget)
 const describeTarget = vi.mocked(api.describeTarget)
 const previewTargetSql = vi.mocked(api.previewTargetSql)
 const registerTarget = vi.mocked(api.registerTarget)
-const listTargets = vi.mocked(api.listTargets)
 
 const DRAFT: api.TargetDraft = {
   shape: 'state_change',
@@ -47,7 +45,6 @@ beforeEach(() => {
     { entity: 'customer', spine_table: 'bo_cib_customer',
       spine_ref: 'public.bo_cib_customer.cust_num' },
   ])
-  listTargets.mockResolvedValue([])
   proposeTarget.mockResolvedValue({ existing: [], draft: DRAFT })
   describeTarget.mockResolvedValue({ reads_as: 'tgt_npe_90d: one row per customer…',
     incomplete: null })
@@ -259,11 +256,9 @@ async function startProposing() {
 it('says what it is doing while the model is thinking', async () => {
   const { pending } = await startProposing()
   const status = await screen.findByRole('status')
-  expect(status).toHaveTextContent(/reading/i)
-  // Naming the catalog and its size is the difference between "something is happening" and
-  // "this is the work I asked for".
-  expect(status).toHaveTextContent(/cib/)
-  expect(status).toHaveTextContent(/9 columns/)
+  // It says it is working and how long that normally takes. How many columns the shortlist holds
+  // is the tool's business, not news.
+  expect(status).toHaveTextContent(/proposing a target/i)
   pending.resolve({ existing: [], draft: DRAFT })
 })
 

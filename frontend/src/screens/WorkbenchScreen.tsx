@@ -1558,6 +1558,11 @@ export function WorkbenchScreen() {
   // lines still draft. Distinct from the top notice, which carries deployment-level facts.
   const [draftErrors, setDraftErrors] = useState<string[]>([])
   const [generating, setGenerating] = useState(false)
+  // WHICH wait is running. "Generating" alone reads as stuck: both steps are model calls over the
+  // whole catalog and take tens of seconds, and one label for two different subjects says "still
+  // going" where it could say which half is running.
+  const [generatingStage, setGeneratingStage] = useState<'reading' | 'planning' | null>(null)
+  const [generatingFor, setGeneratingFor] = useState(0)
   const [drafting, setDrafting] = useState(false)
   const [confirmingBatch, setConfirmingBatch] = useState(false)
   const [batchBusy, setBatchBusy] = useState(false)
@@ -2027,7 +2032,7 @@ export function WorkbenchScreen() {
   // release the busy flags the discarded flights can no longer clear.
   function voidInFlightRounds() {
     generateSeq.current += 1
-    setGenerating(false)
+    setGenerating(false); setGeneratingStage(null)
     // A scope edit also drops the Gate #1 confirm step and any scoped disposition lens: the
     // recognised scope was for the previous scope context. (Both no-ops when the flags are off.)
     setRecognition(null)
@@ -2195,6 +2200,7 @@ export function WorkbenchScreen() {
     setNotice('')
     setScopeChanged(false)
     setGenerating(true)
+    setGeneratingStage('reading')
     // The confirm step shows only the proposed scope: clear any prior round's candidates + lens.
     setGenerated(null)
     setDispositions(null)
@@ -2246,7 +2252,7 @@ export function WorkbenchScreen() {
       setRecognition(null)
       fail(err)
     } finally {
-      if (seq === generateSeq.current) setGenerating(false)
+      if (seq === generateSeq.current) { setGenerating(false); setGeneratingStage(null) }
     }
   }
 
@@ -2333,6 +2339,7 @@ export function WorkbenchScreen() {
     const seq = ++generateSeq.current
     setNotice('')
     setGenerating(true)
+    setGeneratingStage('planning')
     try {
       const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
         catalogSource: source.trim() || undefined,
@@ -2365,7 +2372,7 @@ export function WorkbenchScreen() {
       if (seq !== generateSeq.current) return
       fail(err)
     } finally {
-      if (seq === generateSeq.current) setGenerating(false)
+      if (seq === generateSeq.current) { setGenerating(false); setGeneratingStage(null) }
     }
   }
 
@@ -2415,7 +2422,7 @@ export function WorkbenchScreen() {
       if (seq !== generateSeq.current) return
       fail(err)
     } finally {
-      if (seq === generateSeq.current) setGenerating(false)
+      if (seq === generateSeq.current) { setGenerating(false); setGeneratingStage(null) }
     }
   }
 
@@ -2492,7 +2499,7 @@ export function WorkbenchScreen() {
       }
       fail(err)
     } finally {
-      if (seq === generateSeq.current) setGenerating(false)
+      if (seq === generateSeq.current) { setGenerating(false); setGeneratingStage(null) }
     }
   }
 
@@ -2958,6 +2965,19 @@ export function WorkbenchScreen() {
       : lensNote
     : null
 
+  // A ticking count, because the useful question during a long wait is whether it is still going,
+  // and a static line cannot answer it.
+  useEffect(() => {
+    if (generatingStage === null) {
+      setGeneratingFor(0)
+      return
+    }
+    const started = Date.now()
+    const timer = setInterval(() => setGeneratingFor(Math.round((Date.now() - started) / 1000)),
+                              1000)
+    return () => clearInterval(timer)
+  }, [generatingStage])
+
   return (
     // Carry the current round's governing intent on the DOM so a later task can govern these
     // candidates into a signed contract; undefined until the first successful generate.
@@ -2994,6 +3014,20 @@ export function WorkbenchScreen() {
           sub="Nothing is saved or governed without your click, under your name."
         />
       </div>
+      {/* WHAT THE ENGINE IS DOING. "Generating" on a disabled button reads as stuck: both steps are
+          model calls over the whole catalog and take tens of seconds. Named per step, because
+          recognition and planning are different subjects, and counted, because the useful question
+          during a long wait is whether it is still going. Above the shells, so it is visible in
+          whichever phase the run is in. */}
+      {generatingStage !== null && (
+        <p className="wb-progress" role="status" aria-label="Engine progress">
+          {generatingStage === 'reading'
+            ? 'Reading your objective and confirming the scope.'
+            : 'Planning candidates over the catalog.'}
+          {' This usually takes 20–40 seconds'}
+          {generatingFor > 0 ? ` — ${generatingFor}s so far` : ''}.
+        </p>
+      )}
       {/* The blocking notice is a platform fact about the deployment, not a property of the intake
           form it used to live inside: it renders above whichever shell is showing. */}
       {notice && (

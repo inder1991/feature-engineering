@@ -15,13 +15,12 @@ import {
   describeTarget,
   listCatalogs,
   listTargetEntities,
-  listTargets,
   previewTargetSql,
   proposeTarget,
   registerTarget,
 } from '../api'
 import type {
-  ExistingTarget, RegisteredTarget, SelectableEntity, TargetDraft, VisibleCatalog,
+  ExistingTarget, SelectableEntity, TargetDraft, VisibleCatalog,
 } from '../api'
 
 // Why a field was left blank, in the words a person can act on. The API's reason codes are a
@@ -184,7 +183,6 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
   const [incomplete, setIncomplete] = useState<string | null>(null)
   const [sql, setSql] = useState<string | null>(null)
   const [showSql, setShowSql] = useState(false)
-  const [registered, setRegistered] = useState<RegisteredTarget[]>([])
   const [busy, setBusy] = useState(false)
   // SEPARATE from `busy`, which also covers registration. A progress line saying "reading the
   // catalog" while a registration is in flight would describe the wrong work.
@@ -218,11 +216,6 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
         setEntities([])
       })
   }, [source])
-
-  useEffect(() => {
-    if (!entity) return
-    listTargets(entity).then(setRegistered).catch(() => setRegistered([]))
-  }, [entity])
 
   const rule = useMemo(() => {
     if (!draft) return null
@@ -307,7 +300,6 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
     }
   }, [hypothesis, entity, source])
 
-  const columnCount = catalogs.find(c => c.source === source)?.columns ?? null
   const blanks = draft?.needs_input ?? []
   const unfilled = blanks.filter(key => !(values[key] ?? '').trim())
 
@@ -324,7 +316,6 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
         author_comment: comment,
       })
       setDone(result.name)
-      listTargets(entity).then(setRegistered).catch(() => undefined)
       // The run that opened this panel adopts the label immediately. Registering one inside a
       // generation run and then leaving the run without a target would be the same dead end this
       // whole path exists to close.
@@ -397,9 +388,10 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
               // its size is the difference between "something is happening" and "this is the work
               // I asked for" — one real call reads the whole shortlist.
               <p className="tgt-progress" role="status">
-                Reading {columnCount === null ? 'the' : columnCount} column
-                {columnCount === 1 ? '' : 's'} in {source} and proposing a rule. This usually takes
-                20–40 seconds{elapsed > 0 ? ` — ${elapsed}s so far` : ''}.
+                {/* No column count: how many columns the shortlist holds is the tool's business,
+                    not news. What a person needs is that it is working and still going. */}
+                Proposing a target. This usually takes 20–40 seconds
+                {elapsed > 0 ? ` — ${elapsed}s so far` : ''}.
               </p>
             )}
             {error && !proposing && <p className="error" role="alert">{error}</p>}
@@ -607,18 +599,6 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
         </>
       )}
 
-      {registered.length > 0 && (
-        <section className="panel">
-          <h2>Targets registered for {entity}</h2>
-          <ul className="rows">
-            {registered.map(t => (
-              <li key={t.definition_id} className="row">
-                <strong>{t.name}</strong> — {t.description} ({t.window_days} days, {t.label_type})
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
     </div>
   )
 }

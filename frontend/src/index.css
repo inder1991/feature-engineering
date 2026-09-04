@@ -8428,3 +8428,10 @@ button.stat:hover {
   padding-top: 0.75rem;
 }
 .tgt-screen--embedded h2 { font-size: 0.95rem; }
+
+.wb-progress {
+  margin: 0.75rem 0 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  opacity: 0.8;
+}
