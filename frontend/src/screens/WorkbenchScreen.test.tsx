@@ -3169,6 +3169,23 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     release(RECOGNITION)
   })
 
+  it('a second click on Show-all while one is in flight sends NOTHING', async () => {
+    // broadenScope had no re-entry guard: with the button enabled until React re-rendered, a
+    // double-click sent two considered-set requests, and the second — against a scope the first
+    // was already superseding — is a refusal waiting to happen.
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    let release!: (r: api.ConsideredSetResp) => void
+    await generateConfirmOn()
+    await userEvent.click(await screen.findByRole('button', { name: /change the scope/i }))
+    contractConsideredSet.mockReturnValue(new Promise(res => { release = res }))
+    const showAll = screen.getAllByRole('button', { name: /show all buildable recipes/i })[0]
+    await userEvent.click(showAll)
+    await userEvent.click(showAll)
+    expect(contractConsideredSet).toHaveBeenCalledTimes(1)
+    release(scoped())
+  })
+
   it('DISAGREEING with the scope has somewhere to go', async () => {
     // "If someone disagrees with the scope, what's the option here?" — the review question this
     // block answers. Expanding the settled scope must name every remedy: swap to an alternative

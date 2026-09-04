@@ -2396,13 +2396,23 @@ export function WorkbenchScreen() {
   // Broaden ("show all buildable recipes"): re-run UNSCOPED under a fresh run, superseding the prior
   // scope (lineage only). Available from the proposed-scope panel and from the disposition lens.
   async function broadenScope() {
-    if (feedbackLocked) return
+    if (feedbackLocked || generating) return
     const rec = recognition
     const transition = recognitionTransition
     const prior = generatedRef.current ?? []
     const seq = ++generateSeq.current
     setNotice('')
     setGenerating(true)
+    setGeneratingStage('planning')
+    // The LINEAGE this broaden can reference. The server refuses an unscoped broaden that names
+    // neither a recognition nor a prior confirmed scope — correctly, for lineage — and a live
+    // click produced exactly that refusal as a bare "Unprocessable Entity". When no reference
+    // exists at all, the EMERGENCY path is the documented answer: no confirmed_scope, no ids —
+    // the pre-1B full-grounding request the server keeps for precisely this case. Show-all is
+    // the escape hatch; an escape hatch that can refuse is not one.
+    const recognitionId = rec?.recognition_id ?? undefined
+    const supersedes = transition?.supersedesScopeId ?? lastScopeId ?? undefined
+    const hasLineage = recognitionId !== undefined || supersedes !== undefined
     try {
       const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
         catalogSource: source.trim() || undefined,
@@ -2410,10 +2420,10 @@ export function WorkbenchScreen() {
         // Prefer the committed intentId: from the disposition-lens broaden (~post-generation) `rec` is
         // already cleared, so falling back to `rec?.intent_id` alone would mint a FRESH intent and orphan
         // the run/scope lineage. `intentId` holds the confirmed round's intent (set by applyConsideredRound).
-        intentId: intentId ?? rec?.intent_id,
-        recognitionId: rec?.recognition_id,
+        intentId: hasLineage ? (intentId ?? rec?.intent_id) : undefined,
+        recognitionId,
         feedback: transition?.feedback,
-        confirmedScope: {
+        confirmedScope: !hasLineage ? undefined : {
           primary: null,
           secondary: [],
           expansion: 'exact',
@@ -2425,9 +2435,7 @@ export function WorkbenchScreen() {
           uoaEntity: uoaChoice?.entity ?? null,
           spineRef: uoaChoice?.spine_ref ?? null,
         },
-        supersedesScopeId: transition?.supersedesScopeId
-          ?? lastScopeId
-          ?? undefined,
+        supersedesScopeId: supersedes,
       })
       if (seq !== generateSeq.current) return
       applyConsideredRound(
