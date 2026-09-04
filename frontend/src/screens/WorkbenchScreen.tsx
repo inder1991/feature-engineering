@@ -3259,20 +3259,6 @@ export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
                   governed meaning. Cross-catalog generation returns in a later release.
                 </p>
               </div>
-              <div className="field" style={{ flex: '1 1 220px' }}>
-                <label htmlFor="wb-target">Target column</label>
-                <input
-                  id="wb-target"
-                  value={target}
-                  onChange={e => changeTarget(e.target.value)}
-                  placeholder="e.g. public.labels.churned"
-                  disabled={feedbackLocked}
-                />
-                <p className="hint" style={HELP_STYLE}>
-                  What you are predicting. Candidates are screened against it server-side, so leaky
-                  features never reach you.
-                </p>
-              </div>
             </div>
             <div className="paths">
               <button
@@ -3461,8 +3447,39 @@ export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
               it is a hint to the reader and a fallback when there is no model, never a decision.
               "You named it, already recorded" could therefore no longer be said of anything, and
               the branch that said it is gone: every pin falls through to the confirm gate below,
-              which asks out loud. The ticket still reports the match and the class. */}
-          {intake !== null && (
+              which asks out loud. The ticket still reports the match and the class.
+
+              THE MANUAL TARGET FIELD MOVED HERE. It used to sit in the intake form, beside the
+              catalog source, where it asserted that the thing being predicted is a COLUMN before
+              anything had read the objective — and a great many labels are not: "went
+              non-performing within 90 days" is a rule over history. Removing it outright would
+              have deleted the documented degrade path ("absent intake renders nothing: the manual
+              target field above carries the flow"), so it is not deleted, it is relocated to the
+              only case that needs it — an intake that did not land — where it can say WHY it is
+              asking. */}
+          {intake === null ? (
+            <div className="scope-target" data-role="intake-unavailable" style={{ marginTop: 16 }}>
+              <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
+              <p style={{ margin: '0 0 8px' }}>
+                Nothing read your objective for a target — the reading step did not land. Name the
+                column you are predicting, or build the target from a rule.
+              </p>
+              <div className="field">
+                <label htmlFor="wb-target">Target column</label>
+                <input
+                  id="wb-target"
+                  value={target}
+                  onChange={e => changeTarget(e.target.value)}
+                  placeholder="e.g. public.labels.churned"
+                  disabled={feedbackLocked}
+                />
+                <p className="hint" style={HELP_STYLE}>
+                  Candidates are screened against it server-side, so leaky features never reach you.
+                </p>
+              </div>
+              <BuildTargetAction navigate={navigate} hypothesis={hypothesis} source={source} />
+            </div>
+          ) : (
             <div className="scope-target" data-role="intake-target" style={{ marginTop: 16 }}>
               <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
               {intakeReading !== null ? (

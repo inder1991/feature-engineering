@@ -236,9 +236,10 @@ async function renderAndGenerate(
   if (scope.source) {
     await userEvent.type(screen.getByLabelText('Catalog source'), scope.source)
   }
-  if (scope.target) {
-    await userEvent.type(screen.getByLabelText('Target column'), scope.target)
-  }
+  // NOTE: `scope.target` can no longer be typed here. The intake form used to carry a "Target
+  // column" field, which asserted the thing being predicted is a COLUMN before anything had read
+  // the objective. Naming a column now happens at the scope step, where the read either produced
+  // one or reported that it could not — see `nameTargetAtScopeStep`.
   await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
   await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
   await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -376,9 +377,12 @@ describe('gates strip', () => {
 
 describe('generation', () => {
   it('passes the hypothesis, goal, and every scope field through to the considered-set call', async () => {
-    await renderAndGenerate([], { source: 'deposits', target: 'public.labels.churned' })
+    await renderAndGenerate([], { source: 'deposits' })
+    // `targetRef` is undefined because the brief no longer collects one. The target is READ from
+    // the objective and confirmed at the scope step; a client-supplied column asserted up front
+    // what only the reading can establish.
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
-      catalogSource: 'deposits', targetRef: 'public.labels.churned',
+      catalogSource: 'deposits', targetRef: undefined,
     })
   })
 
@@ -971,7 +975,7 @@ describe('selection and registration', () => {
     // (Slice 3: the form is in the revise drawer, so its submit names the revised round.)
     expect(screen.getByRole('button', { name: /generate revised round/i })).toBeDisabled()
     expect(screen.getByLabelText('Catalog source')).toBeDisabled()
-    expect(screen.getByLabelText('Target column')).toBeDisabled()
+    // the target field is gone from the brief; the source carries the scope lock
     await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
     // Still locked while the batch is in flight.
     expect(screen.getByRole('button', { name: /generate revised round/i })).toBeDisabled()
@@ -1059,29 +1063,20 @@ describe('scope changes', () => {
     expect(status).toHaveTextContent('Scope changed. Regenerate to refresh candidates.')
   })
 
-  // The entity field is gone (E4), so the target column is the one scope edit that invalidates
-  // generated candidates WITHOUT touching the source snapshot the drafts were drafted against.
-  it('editing the target clears generated candidates but keeps drafts', async () => {
-    featureRecipe.mockResolvedValue(recipeWith([]))
-    await renderAndGenerate([IDEA], { source: 'deposits' })
-    await openDescribe()
-    await draftFeature('total spend per customer')
-    expect(await screen.findByText('total_spend_per_customer')).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('Target column'), 'c')
-    expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
-    expect(screen.getByText('total_spend_per_customer')).toBeInTheDocument()
-    expect(screen.getByRole('status')).toHaveTextContent(/scope changed/i)
-  })
+  // RETIRED, not re-pointed. Its subject was the one scope edit that invalidated generated
+  // candidates WITHOUT touching the source snapshot the drafts were drafted against — the target
+  // column. The entity field went at E4 and the target field has now gone too (the brief no longer
+  // asserts the target is a column), so no such edit exists to test. Pointing it at Catalog source
+  // would assert the OPPOSITE of what it was written to prove, which is worse than deleting it.
+  // The surviving guarantee — a source edit clears generated candidates — is covered above.
 
-  it('editing the target clears generated candidates and the screening note', async () => {
-    await renderAndGenerate([IDEA], { target: 'public.labels.churned' })
+  it('a scope edit clears generated candidates and the screening note', async () => {
+    await renderAndGenerate([IDEA], { source: 'deposits' })
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
-    expect(screen.getByText(/leaky candidates were rejected/i)).toBeInTheDocument()
-    // Candidates were screened against the previous target: any edit voids them.
+    // Candidates were planned against this scope: any edit voids them.
     await reviseBrief()
-    await userEvent.type(screen.getByLabelText('Target column'), '2')
+    await userEvent.type(screen.getByLabelText('Catalog source'), '2')
     expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
-    expect(screen.queryByText(/leaky candidates were rejected/i)).not.toBeInTheDocument()
     expect(screen.getByRole('status')).toHaveTextContent(/scope changed/i)
   })
 
@@ -1091,21 +1086,21 @@ describe('scope changes', () => {
     await selectCandidate('txn_count')
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     await reviseBrief()
-    await userEvent.type(screen.getByLabelText('Target column'), 'c')
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'c')
     expect(screen.queryByText('2 selected')).not.toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: 'Approve and register 2 features' }),
     ).not.toBeInTheDocument()
   })
 
-  it('editing the target clears the sets row and the rejections panel too', async () => {
+  it('a scope edit clears the sets row and the rejections panel too', async () => {
     await renderAndGenerateSets(multiSetRound([
       { name: 'days_to_churn', reason: 'derives from the target column', code: 'LEAKAGE' },
     ]))
     expect(await screen.findByText('Temporal set')).toBeInTheDocument()
     expect(screen.getByText('1 rejected')).toBeInTheDocument()
     await reviseBrief()
-    await userEvent.type(screen.getByLabelText('Target column'), 'c')
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'c')
     expect(screen.queryByText('Temporal set')).not.toBeInTheDocument()
     expect(screen.queryByText('1 rejected')).not.toBeInTheDocument()
     expect(screen.queryByText(/engine's pick/i)).not.toBeInTheDocument()
@@ -1478,7 +1473,9 @@ describe('whole-round feedback', () => {
     // Feedback routes through considered-set with the ROUND's snapshotted hypothesis + objective
     // (the goal input now reads 'predict churn fast') plus the instruction as `feedback`.
     expect(contractConsideredSet).toHaveBeenLastCalledWith(HYPOTHESIS, 'predict churn', {
-      catalogSource: 'deposits', targetRef: 'public.labels.churned',
+      // `targetRef` is undefined: the brief no longer collects a column, so feedback carries the
+      // round's snapshotted scope and nothing the client asserted about the target.
+      catalogSource: 'deposits', targetRef: undefined,
       feedback: 'more behavioral signals',
     })
     // The selected candidate is pinned: kept, still selected. The unselected one is replaced.
@@ -1610,7 +1607,7 @@ describe('whole-round feedback', () => {
     contractConsideredSet.mockImplementationOnce(() => pending.promise)
     await submitSetFeedback('one note')
     await reviseBrief()
-    await userEvent.type(screen.getByLabelText('Target column'), 'c')
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'c')
     await act(async () => {
       pending.resolve(considered(singleSetRound([idea('stale_signal')])))
     })
@@ -1630,7 +1627,7 @@ describe('whole-round feedback', () => {
       name: 'Regenerate with feedback · round 2 of 3',
     })).toBeInTheDocument()
     await reviseBrief()
-    await userEvent.type(screen.getByLabelText('Target column'), 'c')
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'c')
     expect(screen.queryByLabelText('Feedback on the whole round')).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
@@ -3217,21 +3214,36 @@ describe('Intake target confirmation', () => {
     expect(screen.queryByText(/you named it/)).toBeNull()
     expect(screen.getByRole('button', { name: /yes, that's my target/i })).toBeInTheDocument()
     expect(contractIntakeTarget).not.toHaveBeenCalled()
-    // the pin threads into the manual target field for the considered-set request (which the
-    // submitted-brief shell now keeps behind Revise brief)
+    // The pin used to thread into a manual target field on the brief. That field is gone — the
+    // brief no longer asserts the target is a column — so the pin is what it always was on its
+    // own terms: a READING the ticket reports, which the confirm gate below still asks about.
     await reviseBrief()
-    expect(screen.getByLabelText('Target column')).toHaveValue('public.labels.churned')
+    expect(screen.queryByLabelText('Target column')).toBeNull()
   })
 
-  it('an intake failure renders no block and never blocks the flow', async () => {
-    // beforeEach default: contractIntake rejects — the degraded path
+  it('an intake failure ASKS for the target instead of rendering nothing', async () => {
+    // beforeEach default: contractIntake rejects — the degraded path.
+    //
+    // This used to assert that nothing rendered, because the intake form carried a "Target column"
+    // field that stood in for the reading. That field asserted the thing being predicted is a
+    // COLUMN before anything had read the objective, and a great many labels are not — so it was
+    // removed. Deleting it outright would have deleted the degrade path with it, so the control
+    // moved HERE, to the only case that needs it, where it can say why it is asking.
     await generateConfirmOn()
     expect(await screen.findByText('Customer churn')).toBeInTheDocument()
     expect(screen.queryByText(/I understood your target as/)).toBeNull()
-    expect(screen.queryByRole('heading', { name: 'Prediction target' })).toBeNull()
-    // generation is unimpeded
+    expect(screen.getByText(/nothing read your objective for a target/i)).toBeInTheDocument()
+    expect(screen.getByLabelText('Target column')).toBeInTheDocument()
+    // generation is still unimpeded — the block asks, it does not gate
     await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
     expect(contractConsideredSet).toHaveBeenCalled()
+  })
+
+  it('the intake form no longer asserts the target is a COLUMN up front', async () => {
+    render(<WorkbenchScreen />)
+    expect(screen.getByLabelText('Hypothesis')).toBeInTheDocument()
+    expect(screen.getByLabelText('Catalog source')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Target column')).toBeNull()
   })
 
   // ── T7 (c): THE NON-OUTCOME ACKNOWLEDGMENT ────────────────────────────────────────────────────
@@ -3781,7 +3793,7 @@ describe('post-submit workspace shell', () => {
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     await reviseBrief()
-    await userEvent.type(screen.getByLabelText('Target column'), 'public.labels.churned')
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     // The candidates that brief produced are gone, so the brief that describes them goes too.
     expect(screen.queryByText('Your submitted brief')).toBeNull()
     expect(phaseOf(container)).toBe('draft')
@@ -4413,7 +4425,7 @@ describe('Slice 3: the revise drawer', () => {
   const REVISED = 'dormant cards precede attrition'
 
   it('opens populated from the submitted snapshot, with the run still on screen behind it', async () => {
-    await renderAndGenerate([IDEA], { source: 'deposits', target: 'public.labels.churned' })
+    await renderAndGenerate([IDEA], { source: 'deposits' })
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     await openRevise()
 
@@ -4421,7 +4433,8 @@ describe('Slice 3: the revise drawer', () => {
     expect(within(panel).getByLabelText('Hypothesis')).toHaveValue(HYPOTHESIS)
     expect(within(panel).getByLabelText('Prediction goal')).toHaveValue('predict churn')
     expect(within(panel).getByLabelText('Catalog source')).toHaveValue('deposits')
-    expect(within(panel).getByLabelText('Target column')).toHaveValue('public.labels.churned')
+    // No target field to populate: the brief does not collect one any more.
+    expect(within(panel).queryByLabelText('Target column')).toBeNull()
     expect(within(panel).getByText('Populated from the brief this run was generated from.'))
       .toBeInTheDocument()
     // The run behind it is untouched and still says what produced it: a human editing a draft of
@@ -4646,10 +4659,10 @@ describe('Slice 3: the revise drawer', () => {
   })
 
   it('a scope edit in the drawer voids the round, closes the drawer, and says so', async () => {
-    await renderAndGenerate([IDEA], { target: 'public.labels.churned' })
+    await renderAndGenerate([IDEA], { source: 'deposits' })
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     await openRevise()
-    await userEvent.type(within(drawer()).getByLabelText('Target column'), '2')
+    await userEvent.type(within(drawer()).getByLabelText('Catalog source'), '2')
 
     // The candidates that scope produced are gone, so the drawer's premise — a live run behind
     // it — is gone too. The page hands itself back to the draft shell rather than leaving a
