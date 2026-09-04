@@ -59,6 +59,7 @@
 //   resolves after the edit is discarded, never applied against the new scope.
 import { Fragment, type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import {
+  attachTargetToIntent,
   ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
   type OptionActionsEntry,
   type IntakeReading, type IntakeResp, type NeedsSetupCandidate,
@@ -76,7 +77,7 @@ import {
   type FormulaDraftStatus,
 } from '../api'
 import { FormulaDraftAction } from './FormulaDraftAction'
-import type { Route } from '../nav'
+import { TargetLabelScreen } from './TargetLabelScreen'
 import { getSession } from '../session'
 
 // ---- Phase 1B feature flags -------------------------------------------------------------------
@@ -640,27 +641,16 @@ function Gate({ state, who, title, sub }: {
 // catalog DOES hold, and the nearest proxies. On the 2026-08-24 AML run every one of these facts
 // existed and none of them was rendered: the objective said "in the next 90 days", the ticket said
 // 0, and the screen showed neither number.
-function BuildTargetAction({ navigate, hypothesis, source, subtle }: {
-  navigate?: (route: Route, params?: Record<string, string>) => void
-  hypothesis: string
-  source: string
-  subtle?: boolean
-}) {
-  // The THIRD answer at the target decision, and the one the platform did not have. "Sign this
-  // target" and "pick a different one" both assume the outcome is already a column; a great many
-  // are not — "went non-performing within 90 days" is a rule over history. Without this, an
-  // objective whose label has to be CONSTRUCTED could only be answered with "just exploring",
-  // which is a different question.
+function BuildTargetAction({ onOpen, subtle }: { onOpen: () => void; subtle?: boolean }) {
+  // The THIRD answer at the target decision, and the one the platform did not have. "Yes, that's
+  // my target" and "change it" both assume the outcome is already a column; a great many are not —
+  // "went non-performing within 90 days" is a rule over history. Without this, an objective whose
+  // label has to be CONSTRUCTED could only be answered with "just exploring", a different question.
   //
-  // The hypothesis travels in the hash so it is stated once, here, and never retyped.
-  if (!navigate) return null
+  // It opens the form IN PLACE. Sending the person to another screen would make them state the
+  // same objective twice and leave the run they were configuring behind them.
   return (
-    <button
-      type="button" className={subtle ? 'btn btn--ghost' : 'btn'}
-      onClick={() => navigate('targets', {
-        hypothesis, catalog_source: source, from: 'workbench',
-      })}
-    >
+    <button type="button" className={subtle ? 'btn btn--ghost' : 'btn'} onClick={onOpen}>
       Build the target instead
     </button>
   )
@@ -1476,12 +1466,7 @@ function AuditDrawerBody({ record }: { record: OptionDecisionRecord }) {
 }
 
 
-interface WorkbenchProps {
-  /** Present when the shell can route; the target step uses it to hand off and take you back. */
-  navigate?: (route: Route, params?: Record<string, string>) => void
-}
-
-export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
+export function WorkbenchScreen() {
   const [goal, setGoal] = useState('')
   const [hypothesis, setHypothesis] = useState('')
   // The server-side intent that will later govern these candidates into a signed contract. Set
@@ -1499,6 +1484,10 @@ export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
   const [intakeCorrecting, setIntakeCorrecting] = useState(false)
   const [intakeCorrection, setIntakeCorrection] = useState('')
   const [intakeBusy, setIntakeBusy] = useState(false)
+  // The derived-target form, opened IN PLACE at the target decision.
+  const [buildingTarget, setBuildingTarget] = useState(false)
+  const [builtTarget, setBuiltTarget] = useState<{ name: string; readsAs: string } | null>(null)
+  const [buildError, setBuildError] = useState('')
   const [intakeError, setIntakeError] = useState('')
   // T7 (c): the confirm gate's refusal, held so the human can read the SERVER's own words and
   // then act on them. `detail` is rendered verbatim and never summarised; `decision`/`ref` are
@@ -3477,7 +3466,7 @@ export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
                   Candidates are screened against it server-side, so leaky features never reach you.
                 </p>
               </div>
-              <BuildTargetAction navigate={navigate} hypothesis={hypothesis} source={source} />
+              <BuildTargetAction onOpen={() => setBuildingTarget(true)} />
             </div>
           ) : (
             <div className="scope-target" data-role="intake-target" style={{ marginTop: 16 }}>
@@ -3580,9 +3569,7 @@ export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
                         the outcome is often not the label you want — the label is usually a rule
                         over a window, and this is where a person can say so. Subtle: the read
                         column stays the primary answer. */}
-                    <BuildTargetAction
-                      navigate={navigate} hypothesis={hypothesis} source={source} subtle
-                    />
+                    <BuildTargetAction onOpen={() => setBuildingTarget(true)} subtle />
                     <button
                       type="button" className="btn" disabled={intakeBusy}
                       onClick={() => setIntakeCorrecting(v => !v)}
@@ -3642,9 +3629,7 @@ export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
                       nearest proxies are what makes it one. Same block as the confirm branch. */}
                   <TargetTicketFacts intake={intake} />
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    <BuildTargetAction
-                      navigate={navigate} hypothesis={hypothesis} source={source}
-                    />
+                    <BuildTargetAction onOpen={() => setBuildingTarget(true)} />
                     <button
                       type="button" className="btn" disabled={intakeBusy}
                       onClick={() => answerIntake('exploring')}
@@ -3684,6 +3669,56 @@ export function WorkbenchScreen({ navigate }: WorkbenchProps = {}) {
                 <p className="hint" role="alert" style={{ margin: '8px 0 0' }}>{intakeError}</p>
               )}
             </div>
+          )}
+          {/* THE DERIVED-TARGET FORM, IN PLACE. One panel for all three entry points above, so
+              opening it never moves the person off the run they are configuring — the objective
+              they already stated is handed straight to it, and a registered label becomes THIS
+              intent's target rather than something they must go and attach afterwards. */}
+          {buildingTarget && (
+            <div className="scope-target" data-role="build-target" style={{ marginTop: 16 }}>
+              <h3 style={{ margin: '0 0 4px' }}>Build a prediction target</h3>
+              <p className="hint" style={{ margin: '0 0 8px' }}>
+                A training label is normally CONSTRUCTED, not stored. The tool proposes the rule:
+                filled where the catalog justifies it, blank where only you can know.
+              </p>
+              <TargetLabelScreen
+                embedded
+                initialHypothesis={hypothesis}
+                initialSource={source}
+                onCancel={() => setBuildingTarget(false)}
+                onRegistered={({ name, entity }) => {
+                  setBuildError('')
+                  if (intake === null) {
+                    // No intent to attach to (the read did not land). The label is registered and
+                    // reusable; saying so is better than implying this run adopted it.
+                    setBuiltTarget({ name, readsAs: '' })
+                    setBuildingTarget(false)
+                    return
+                  }
+                  attachTargetToIntent(entity, name, intake.intent_id)
+                    .then(r => {
+                      setBuiltTarget({ name: r.name, readsAs: r.reads_as })
+                      setBuildingTarget(false)
+                      invalidateGenerated()
+                    })
+                    .catch(e => setBuildError(
+                      e instanceof Error ? e.message : 'the target could not be attached'))
+                }}
+              />
+            </div>
+          )}
+          {builtTarget !== null && (
+            <div className="scope-target" data-role="built-target" style={{ marginTop: 16 }}>
+              <p role="status" style={{ margin: 0 }}>
+                This run predicts <code>{builtTarget.name}</code>.
+              </p>
+              {builtTarget.readsAs && (
+                <p className="hint" style={{ margin: '4px 0 0' }}>{builtTarget.readsAs}</p>
+              )}
+            </div>
+          )}
+          {buildError && (
+            <p className="hint" role="alert" style={{ margin: '8px 0 0' }}>{buildError}</p>
           )}
           {/* Phase-2B SOFT dimension: the prediction grain. Rendered whenever a recognition has
               landed — a dimension can be proposed WITHOUT a use-case — so it lives OUTSIDE the

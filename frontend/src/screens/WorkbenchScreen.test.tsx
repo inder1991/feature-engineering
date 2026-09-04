@@ -3123,7 +3123,6 @@ describe('Intake target confirmation', () => {
     // The dead end this closes. A label like "went non-performing within 90 days" is a rule over
     // history, not a column anyone ingested — so an objective whose outcome has to be CONSTRUCTED
     // could previously only be answered with "just exploring", which is a different question.
-    const navigate = vi.fn()
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
     contractRecognitions.mockResolvedValue(RECOGNITION)
     contractConsideredSet.mockResolvedValue(scoped())
@@ -3131,28 +3130,32 @@ describe('Intake target confirmation', () => {
       ...INTAKE, ticket: { ...TICKET, target_column: null }, target_detail: null,
     })
     contractIntakeTarget.mockResolvedValue({ ...READING, target_ref: null })
-    render(<WorkbenchScreen navigate={navigate} />)
+    render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
 
     await userEvent.click(
       await screen.findByRole('button', { name: /build the target instead/i }))
-    // The hypothesis TRAVELS: stating it twice is what made this a separate screen to begin with.
-    expect(navigate).toHaveBeenCalledWith('targets',
-      expect.objectContaining({ hypothesis: HYPOTHESIS, from: 'workbench' }))
+    // IN PLACE: the form opens here, on the run being configured. Sending the person to another
+    // screen would make them state the same objective twice and leave the run behind them.
+    expect(await screen.findByRole('heading', { name: /build a prediction target/i }))
+      .toBeInTheDocument()
+    expect(screen.getByLabelText(/what are you trying to predict/i)).toHaveValue(HYPOTHESIS)
+    // ...and the target decision it opened from is still on screen around it. (The brief itself
+    // is collapsed behind "Revise brief" at this phase, which is why it is not asserted here.)
+    expect(screen.getByText(/no target detected in your objective/i)).toBeInTheDocument()
   })
 
   it('offers to build one even when a column WAS read, without displacing it', async () => {
     // A column that merely records the outcome is often not the label you want. The read column
     // stays the primary answer; this is the escape hatch beside it.
-    const navigate = vi.fn()
     contractIntake.mockResolvedValue(INTAKE)
     contractIntakeTarget.mockResolvedValue(READING)
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
     contractRecognitions.mockResolvedValue(RECOGNITION)
     contractConsideredSet.mockResolvedValue(scoped())
-    render(<WorkbenchScreen navigate={navigate} />)
+    render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -3160,16 +3163,6 @@ describe('Intake target confirmation', () => {
     await screen.findByText(/I understood your target as/)
     expect(screen.getByRole('button', { name: /yes, that's my target/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /build the target instead/i })).toBeInTheDocument()
-  })
-
-  it('shows no build-a-target action when the shell cannot route', async () => {
-    // Every other WorkbenchScreen test renders without `navigate`. A control that cannot go
-    // anywhere is worse than an absent one.
-    contractIntake.mockResolvedValue(INTAKE)
-    contractIntakeTarget.mockResolvedValue(READING)
-    await generateConfirmOn()
-    await screen.findByText(/I understood your target as/)
-    expect(screen.queryByRole('button', { name: /build the target instead/i })).toBeNull()
   })
 
   it('exploring mode states the honest asymmetry on LLM-origin cards', async () => {

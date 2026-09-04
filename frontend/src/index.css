@@ -8412,3 +8412,19 @@ button.stat:hover {
   line-height: 1.45;
   opacity: 0.8;
 }
+
+/* The target form rendered INSIDE a run. Its sections are panels of their own when it is a page;
+   nested inside another panel they would read as a stack of unrelated cards, so the chrome comes
+   off and the spacing tightens. The content is identical — only its frame changes. */
+.tgt-screen--embedded { gap: 0.75rem; }
+.tgt-screen--embedded .panel {
+  border: 0;
+  padding: 0;
+  background: none;
+  box-shadow: none;
+}
+.tgt-screen--embedded .panel + .panel {
+  border-top: 1px solid var(--rule, rgba(127, 127, 127, 0.22));
+  padding-top: 0.75rem;
+}
+.tgt-screen--embedded h2 { font-size: 0.95rem; }

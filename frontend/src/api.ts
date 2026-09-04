@@ -5072,3 +5072,20 @@ export function listTargets(entity: string): Promise<RegisteredTarget[]> {
 export function registeredTargetSql(entity: string, name: string): Promise<TargetSql> {
   return request(`/targets/${encodeURIComponent(entity)}/${encodeURIComponent(name)}/sql`)
 }
+
+export interface TargetAttached {
+  intent_id: string
+  definition_id: string
+  name: string
+  reads_as: string
+}
+
+/** Make a registered label the prediction target of an intent. Server-side, like `target_ref`. */
+export function attachTargetToIntent(
+  entity: string, name: string, intentId: string,
+): Promise<TargetAttached> {
+  return post(
+    `/targets/${encodeURIComponent(entity)}/${encodeURIComponent(name)}/attach`,
+    { intent_id: intentId },
+  )
+}

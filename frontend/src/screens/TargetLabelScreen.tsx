@@ -154,12 +154,17 @@ interface Props {
   /** The objective stated in the workbench, carried across so it is typed ONCE. */
   initialHypothesis?: string
   initialSource?: string
-  /** Present when this was reached from a feature-generation run; the way back to it. */
-  onBack?: () => void
+  /** Rendered INSIDE a feature-generation run rather than as a page of its own. */
+  embedded?: boolean
+  /** Called once a label is registered, so the run that needed it can adopt it. */
+  onRegistered?: (result: { definitionId: string; name: string; entity: string }) => void
+  /** A way out of the panel without registering anything. */
+  onCancel?: () => void
 }
 
 export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
-                                    onBack }: Props = {}) {
+                                    embedded = false, onRegistered,
+                                    onCancel }: Props = {}) {
   const [catalogs, setCatalogs] = useState<VisibleCatalog[]>([])
   const [source, setSource] = useState(initialSource)
   const [entities, setEntities] = useState<SelectableEntity[] | null>(null)
@@ -320,15 +325,19 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
       })
       setDone(result.name)
       listTargets(entity).then(setRegistered).catch(() => undefined)
+      // The run that opened this panel adopts the label immediately. Registering one inside a
+      // generation run and then leaving the run without a target would be the same dead end this
+      // whole path exists to close.
+      onRegistered?.({ definitionId: result.definition_id, name: result.name, entity })
     } catch (e) {
       setError(e instanceof Error ? e.message : 'registration failed')
     } finally {
       setBusy(false)
     }
-  }, [draft, rule, description, comment, entity])
+  }, [draft, rule, description, comment, entity, onRegistered])
 
   return (
-    <div className="tgt-screen">
+    <div className={embedded ? 'tgt-screen tgt-screen--embedded' : 'tgt-screen'}>
       <section className="panel">
         <h2>What are you predicting?</h2>
         <div className="field">
@@ -587,15 +596,11 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
             >
               Register this target
             </button>
-            {done && (
-              <div className="tgt-done">
-                <p className="hint" role="status">Registered {done}.</p>
-                {onBack && (
-                  <button type="button" className="btn btn--primary" onClick={onBack}>
-                    Back to feature generation
-                  </button>
-                )}
-              </div>
+            {done && <p className="hint" role="status">Registered {done}.</p>}
+            {onCancel && !done && (
+              <button type="button" className="btn btn--ghost" onClick={onCancel}>
+                Cancel
+              </button>
             )}
             {error && <p className="error" role="alert">{error}</p>}
           </section>

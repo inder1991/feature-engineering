@@ -25,7 +25,6 @@ import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
 import { RunDetailScreen } from './screens/RunDetailScreen'
 import { RunsScreen } from './screens/RunsScreen'
 import { AnalysisWorkspaceScreen } from './screens/AnalysisWorkspaceScreen'
-import { TargetLabelScreen } from './screens/TargetLabelScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { SemanticsPendingScreen } from './screens/SemanticsPendingScreen'
 import { SuggestedFeaturesScreen } from './screens/SuggestedFeaturesScreen'
@@ -74,14 +73,6 @@ function NavIcon({ children }: { children: ReactElement | ReactElement[] }) {
 }
 
 const ICONS: Record<Route, ReactElement> = {
-  targets: (
-    <NavIcon>
-      {/* a bullseye — the thing being predicted */}
-      <circle cx="8" cy="8" r="6.25" />
-      <circle cx="8" cy="8" r="3" />
-      <circle cx="8" cy="8" r="0.75" />
-    </NavIcon>
-  ),
   'code-generation': (
     <NavIcon>
       {/* code brackets — the generation workspace */}
@@ -435,25 +426,9 @@ type PageHead = {
 }
 
 // The detail sheets, keyed by route: reached from an action elsewhere, never from the left rail.
-// Authoring a prediction target is a STEP INSIDE feature generation, not a destination beside it:
-// the label is what the features are FOR, and a separate rail item made you state the same
-// hypothesis twice. Reached from the workbench's target decision, the same way `asset` is reached
-// from a search hit — a route, deliberately absent from the rail.
-const TARGETS_PAGE = {
-  route: 'targets' as Route,
-  label: 'Prediction target',
-  eyebrow: 'CATALOG · GENERATE · TARGET',
-  title: 'Build a prediction target',
-  description:
-    'A training label is normally CONSTRUCTED, not stored — "went non-performing within 90 days" '
-    + 'is a rule over history, not a column anyone ingested. The tool proposes the rule: filled '
-    + 'where the catalog justifies it, blank where only you can know.',
-}
-
 const DETAIL_PAGES: Partial<Record<Route, PageHead>> = {
   asset: ASSET_PAGE,
   suggested: SUGGESTED_PAGE,
-  targets: TARGETS_PAGE,
 }
 
 export default function App() {
@@ -610,19 +585,7 @@ export default function App() {
           />
         )}
         {route === 'entity-map' && entityMapEnabled() && <EntityMapScreen navigate={navigate} />}
-        {route === 'workbench' && <WorkbenchScreen navigate={navigate} />}
-        {route === 'targets' && (
-          // The hypothesis rides the hash so it is stated ONCE, in the workbench, and carried
-          // here — retyping it was the friction that made this a separate tab in the first place.
-          <TargetLabelScreen
-            key={params.get('hypothesis') ?? ''}
-            initialHypothesis={params.get('hypothesis') ?? ''}
-            initialSource={params.get('catalog_source') ?? ''}
-            onBack={params.get('from') === 'workbench'
-              ? () => navigate('workbench')
-              : undefined}
-          />
-        )}
+        {route === 'workbench' && <WorkbenchScreen />}
         {route === 'analysis' && <AnalysisWorkspaceScreen />}
       </main>
     </div>

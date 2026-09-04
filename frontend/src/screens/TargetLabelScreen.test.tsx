@@ -304,24 +304,24 @@ it('starts from the objective the workbench already has, rather than asking agai
     .toHaveValue('which customers go non-performing')
 })
 
-it('hands you back to the run that needed the label', async () => {
-  const onBack = vi.fn()
-  const user = await proposed({ onBack })
+it('tells the run that needed the label once it is registered', async () => {
+  const onRegistered = vi.fn()
+  const user = await proposed({ onRegistered })
   await user.type(screen.getByLabelText(/starting values/i), 'Performing')
   await user.type(screen.getByLabelText(/outcome values/i), 'Non-performing')
   await waitFor(() => expect(screen.getByRole('button', { name: /register this/i })).toBeEnabled())
   await user.click(screen.getByRole('button', { name: /register this/i }))
   await waitFor(() => expect(registerTarget).toHaveBeenCalled())
-  await user.click(await screen.findByRole('button', { name: /back to feature generation/i }))
-  expect(onBack).toHaveBeenCalled()
+  expect(onRegistered).toHaveBeenCalledWith(
+    expect.objectContaining({ name: 'tgt_npe_90d', definitionId: 'def-1' }))
 })
 
-it('offers no way back when it was NOT reached from a run', async () => {
+it('registers cleanly when no run is listening', async () => {
   const user = await proposed()
   await user.type(screen.getByLabelText(/starting values/i), 'Performing')
   await user.type(screen.getByLabelText(/outcome values/i), 'Non-performing')
   await waitFor(() => expect(screen.getByRole('button', { name: /register this/i })).toBeEnabled())
   await user.click(screen.getByRole('button', { name: /register this/i }))
   await waitFor(() => expect(registerTarget).toHaveBeenCalled())
-  expect(screen.queryByRole('button', { name: /back to feature generation/i })).toBeNull()
+  expect(await screen.findByText(/registered tgt_npe_90d/i)).toBeInTheDocument()
 })
