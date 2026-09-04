@@ -8495,3 +8495,17 @@ button.stat:hover {
   animation: wb-spin 0.9s linear infinite;
 }
 @media (prefers-reduced-motion: reduce) { .btn-spinner { animation: none; } }
+
+/* ── Scope review: internal boundaries ─────────────────────────────────────────────────────── */
+/* The review that forced this: "no clear boundaries, no panels, no visibility on where we are".
+   Everything inside the scope panel ran together as one column of text. Each decision block is
+   now its own bounded card, so the eye can tell the recognition, the target decision, and the
+   build form apart — and the micro-label prompt above each button row says what is being asked. */
+.scope-target {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  padding: 14px 16px;
+  background: var(--surface-sunken, rgba(127, 127, 127, 0.04));
+}
+.scope-target > h3 { margin-top: 0 }
+.scope-target .hint { font-size: 12.5px; line-height: 1.5; }

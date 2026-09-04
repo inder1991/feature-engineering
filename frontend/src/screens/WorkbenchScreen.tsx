@@ -3616,8 +3616,7 @@ export function WorkbenchScreen() {
                       disabled={intakeBusy}
                     />
                     <p className="hint" style={HELP_STYLE}>
-                      How far ahead you are predicting. Leakage checks that compare a feature
-                      against the label over time need this; leave it blank if there is no horizon.
+                      How far ahead you are predicting — leakage checks need it.
                     </p>
                   </div>
                   {intake.ticket.contradiction !== null && (
@@ -3625,9 +3624,12 @@ export function WorkbenchScreen() {
                       Heads up: {intake.ticket.contradiction}.
                     </p>
                   )}
+                  <p className="micro-label" style={{ margin: '10px 0 2px' }}>
+                    Your decision — pick one
+                  </p>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                     <button
-                      type="button" className="btn" disabled={intakeBusy}
+                      type="button" className="btn btn--primary" disabled={intakeBusy}
                       onClick={() =>
                         answerIntake('confirmed', intake.ticket.target_column ?? undefined)}
                     >
@@ -3696,6 +3698,9 @@ export function WorkbenchScreen() {
                   {/* An abstention is an ANSWER, not a blank: the catalog's own outcome labels and
                       nearest proxies are what makes it one. Same block as the confirm branch. */}
                   <TargetTicketFacts intake={intake} />
+                  <p className="micro-label" style={{ margin: '10px 0 2px' }}>
+                    Your decision — pick one
+                  </p>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                     <BuildTargetAction onOpen={() => setBuildingTarget(true)} />
                     <button

@@ -387,7 +387,7 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
     <div className={embedded ? 'tgt-screen tgt-screen--embedded' : 'tgt-screen'}>
       <section className="panel">
         <h2>What are you predicting?</h2>
-        {embedded && initialSource ? (
+        {embedded ? (
           // The run already chose its catalog. A second dropdown here could DIVERGE from it —
           // a label anchored on ftr attached to a cib run — so the choice is shown, not re-asked.
           <p className="micro-label">Catalog: <code>{source}</code> — from this run.</p>
