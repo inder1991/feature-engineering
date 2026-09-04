@@ -3283,6 +3283,17 @@ export function WorkbenchScreen() {
                 </p>
               </div>
             </div>
+            {generatingStage !== null && (
+              // Duplicated from the top-of-page banner ON PURPOSE: this one sits beside the
+              // buttons, where the person who clicked is actually looking.
+              <p className="wb-progress" role="status" aria-label="Engine progress">
+                {generatingStage === 'reading'
+                  ? 'Reading your objective and confirming the scope.'
+                  : 'Planning candidates over the catalog.'}
+                {' This usually takes 20–40 seconds'}
+                {generatingFor > 0 ? ` — ${generatingFor}s so far` : ''}.
+              </p>
+            )}
             <div className="paths">
               <button
                 type="submit"
@@ -3299,9 +3310,12 @@ export function WorkbenchScreen() {
                       drawer starts a REVISED round over a run that already exists; calling that
                       "Generate candidate sets" hides the replacement from the click that causes
                       it. */}
-                  {generating
-                    ? 'Generating'
-                    : reviseDrawerOpen ? 'Generate revised round' : 'Generate candidate sets'}
+                  {generating ? (
+                    // The working state lives IN the button that was clicked: the progress
+                    // callout renders up by the gates strip, which can be scrolled out of view
+                    // from down here — a person watches the control under their cursor.
+                    <><span className="btn-spinner" aria-hidden="true" /> Generating…</>
+                  ) : reviseDrawerOpen ? 'Generate revised round' : 'Generate candidate sets'}
                 </span>
                 <span className="d">
                   Governed recipes and model intents planned over this catalog's confirmed meaning,
@@ -3884,7 +3898,9 @@ export function WorkbenchScreen() {
                 disabled={generating}
                 onClick={() => void confirmScope()}
               >
-                Confirm scope and generate
+                {generating
+                  ? <><span className="btn-spinner" aria-hidden="true" /> Generating…</>
+                  : 'Confirm scope and generate'}
               </button>
             )}
             <button

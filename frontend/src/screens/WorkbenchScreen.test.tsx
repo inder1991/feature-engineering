@@ -3119,6 +3119,26 @@ describe('Intake target confirmation', () => {
     expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
   })
 
+it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', async () => {
+    // The progress callout renders up by the gates strip — which can be scrolled out of view from
+    // the button at the bottom of the form. The person watches the control under their cursor,
+    // and "Generating" without motion or ellipsis there is what read as stuck.
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    let release!: (r: api.RecognitionResp) => void
+    contractRecognitions.mockReturnValue(new Promise(res => { release = res }))
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+
+    const busy = await screen.findByRole('button', { name: /generating…/i })
+    expect(busy).toBeDisabled()
+    // and the callout ALSO sits beside the form's buttons, not only at the page top
+    expect(screen.getAllByRole('status', { name: /engine progress/i }).length)
+      .toBeGreaterThanOrEqual(2)
+    release(RECOGNITION)
+  })
+
   it('says what the engine is DOING while it runs, not just that it is running', async () => {
     // "Generating" alone reads as stuck: the first step is a model call over the whole catalog and
     // takes tens of seconds, with nothing on screen to say so. A person testing it reloads.
@@ -3130,7 +3150,7 @@ describe('Intake target confirmation', () => {
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
 
-    const status = await screen.findByRole('status', { name: /engine progress/i })
+    const [status] = await screen.findAllByRole('status', { name: /engine progress/i })
     expect(status).toHaveTextContent(/reading your objective/i)
     expect(status).toHaveTextContent(/seconds/i)
     release(RECOGNITION)
@@ -3152,7 +3172,7 @@ describe('Intake target confirmation', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: /confirm scope and generate/i }))
 
-    const status = await screen.findByRole('status', { name: /engine progress/i })
+    const [status] = await screen.findAllByRole('status', { name: /engine progress/i })
     expect(status).toHaveTextContent(/planning candidates/i)
     release(considered(singleSetRound([IDEA])))
   })

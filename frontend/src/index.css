@@ -8479,3 +8479,19 @@ button.stat:hover {
 }
 
 .tgt-existing { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+
+/* The in-button working state — a person watches the control under their cursor, and the page
+   banner can be scrolled out of view from where the button sits. */
+.btn-spinner {
+  display: inline-block;
+  vertical-align: -2px;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  opacity: 0.85;
+  animation: wb-spin 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) { .btn-spinner { animation: none; } }
