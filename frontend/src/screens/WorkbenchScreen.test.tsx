@@ -3095,7 +3095,7 @@ describe('Intake target confirmation', () => {
     })
     await generateConfirmOn()
     await screen.findByText(/I understood your target as/)
-    await userEvent.click(screen.getByRole('button', { name: /change it/i }))
+    await userEvent.click(screen.getByRole('button', { name: /pick a different column/i }))
     await userEvent.type(screen.getByLabelText('Correct target'), 'public.labels.closed')
     await userEvent.click(screen.getByRole('button', { name: /sign this target/i }))
     expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'corrected',
@@ -3110,7 +3110,7 @@ describe('Intake target confirmation', () => {
     })
     await generateConfirmOn()
     await screen.findByText(/I understood your target as/)
-    await userEvent.click(screen.getByRole('button', { name: /change it/i }))
+    await userEvent.click(screen.getByRole('button', { name: /pick a different column/i }))
     // the ranked runner-up renders with its one-liner and signs in ONE click
     await userEvent.click(screen.getByRole('button',
       { name: /public\.labels\.closed — Whether the account was closed\./ }))
@@ -3137,6 +3137,24 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     expect(screen.getAllByRole('status', { name: /engine progress/i }).length)
       .toBeGreaterThanOrEqual(2)
     release(RECOGNITION)
+  })
+
+  it('an IN-FLIGHT target read says it is reading, never that nothing landed', async () => {
+    // `intake === null` used to mean both "still running" and "failed", so during the wait the
+    // screen asserted "nothing read your objective" — false, and it then swapped to the real
+    // reading. In flight and failed are different states with different sentences.
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractIntake.mockReturnValue(new Promise(() => {}))   // never lands
+    contractConsideredSet.mockResolvedValue(scoped())
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+
+    expect(await screen.findByText(/reading your objective for the prediction target/i))
+      .toBeInTheDocument()
+    expect(screen.queryByText(/nothing read your objective/i)).toBeNull()
   })
 
   it('says what the engine is DOING while it runs, not just that it is running', async () => {

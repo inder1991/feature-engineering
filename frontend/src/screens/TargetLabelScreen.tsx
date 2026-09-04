@@ -415,18 +415,27 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
           </p>
         ) : (
           <>
-            <div className="field">
-              <label htmlFor="tgt-entity">Entity</label>
-              <select
-                id="tgt-entity" value={entity} onChange={e => setEntity(e.target.value)}
-              >
-                {(entities ?? []).map(e => (
-                  <option key={e.entity} value={e.entity}>
-                    {e.entity} — one row per {e.entity} in {e.spine_table}
-                  </option>
-                ))}
-              </select>
-            </div>
+            {(entities ?? []).length === 1 ? (
+              // A dropdown with one option is a question with one answer — noise dressed as a
+              // decision. Most catalogs anchor exactly one entity; state it and move on.
+              <p className="micro-label">
+                One row per <strong>{entities![0].entity}</strong> in{' '}
+                <code>{entities![0].spine_table}</code>.
+              </p>
+            ) : (
+              <div className="field">
+                <label htmlFor="tgt-entity">Entity</label>
+                <select
+                  id="tgt-entity" value={entity} onChange={e => setEntity(e.target.value)}
+                >
+                  {(entities ?? []).map(e => (
+                    <option key={e.entity} value={e.entity}>
+                      {e.entity} — one row per {e.entity} in {e.spine_table}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             <div className="field">
               <label htmlFor="tgt-hypothesis">What are you trying to predict?</label>

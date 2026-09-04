@@ -642,6 +642,9 @@ function Gate({ state, who, title, sub }: {
 // existed and none of them was rendered: the objective said "in the next 90 days", the ticket said
 // 0, and the screen showed neither number.
 function BuildTargetAction({ onOpen, subtle }: { onOpen: () => void; subtle?: boolean }) {
+  // `subtle` only beside a signed column, where the read column is the primary answer. Where NO
+  // column was found this IS the primary answer, and a ghost control read as prose — a person
+  // told us it "is not looking a button".
   // The THIRD answer at the target decision, and the one the platform did not have. "Yes, that's
   // my target" and "change it" both assume the outcome is already a column; a great many are not —
   // "went non-performing within 90 days" is a rule over history. Without this, an objective whose
@@ -650,7 +653,7 @@ function BuildTargetAction({ onOpen, subtle }: { onOpen: () => void; subtle?: bo
   // It opens the form IN PLACE. Sending the person to another screen would make them state the
   // same objective twice and leave the run they were configuring behind them.
   return (
-    <button type="button" className={subtle ? 'btn btn--ghost' : 'btn'} onClick={onOpen}>
+    <button type="button" className={subtle ? 'btn' : 'btn btn--primary'} onClick={onOpen}>
       Build the target instead
     </button>
   )
@@ -1489,6 +1492,11 @@ export function WorkbenchScreen() {
   const [builtTarget, setBuiltTarget] = useState<{ name: string; readsAs: string } | null>(null)
   const [buildError, setBuildError] = useState('')
   const [intakeError, setIntakeError] = useState('')
+  // IN FLIGHT is not FAILED. `intake === null` used to mean both, so while the target read was
+  // still running the screen showed "nothing read your objective" — a false statement that then
+  // swapped to the real reading. The read is a model call and takes seconds to tens of seconds;
+  // saying so is the difference between waiting and concluding it is broken.
+  const [intakeInFlight, setIntakeInFlight] = useState(false)
   // T7 (c): the confirm gate's refusal, held so the human can read the SERVER's own words and
   // then act on them. `detail` is rendered verbatim and never summarised; `decision`/`ref` are
   // what the acknowledge control re-sends, so acknowledging cannot quietly retarget the answer.
@@ -2218,17 +2226,22 @@ export function WorkbenchScreen() {
     setIntakeAck(null)
     setIntakeAcknowledged('')
     const intakeSeq = seq
+    setIntakeInFlight(true)
     contractIntake(hypothesis.trim(),
                    { catalogSource: source.trim() || undefined, objective })
       .then(resp => {
         if (intakeSeq !== generateSeq.current) return
+        setIntakeInFlight(false)
         setIntake(resp)
         setWindowDraft(resp.ticket.target_window_days?.toString() ?? '')
         // A pinned name is already recorded server-side (user_typed, no click needed): thread it
         // into the manual field so the considered-set request carries what the server signed.
         if (resp.ticket.pinned && resp.ticket.target_column) setTarget(resp.ticket.target_column)
       })
-      .catch(() => { /* degrade to the manual target field */ })
+      .catch(() => {
+        // FAILED, distinctly from in-flight: the intake-unavailable block below asks instead.
+        if (intakeSeq === generateSeq.current) setIntakeInFlight(false)
+      })
     try {
       const rec = await contractRecognitions(hypothesis.trim(), objective)
       if (seq !== generateSeq.current) return
@@ -3494,7 +3507,14 @@ export function WorkbenchScreen() {
               target field above carries the flow"), so it is not deleted, it is relocated to the
               only case that needs it — an intake that did not land — where it can say WHY it is
               asking. */}
-          {intake === null ? (
+          {intakeInFlight && intake === null ? (
+            <div className="scope-target" data-role="intake-reading" style={{ marginTop: 16 }}>
+              <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
+              <p className="wb-progress" role="status" aria-label="Target reading progress">
+                Reading your objective for the prediction target — a few seconds more.
+              </p>
+            </div>
+          ) : intake === null ? (
             <div className="scope-target" data-role="intake-unavailable" style={{ marginTop: 16 }}>
               <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
               <p style={{ margin: '0 0 8px' }}>
@@ -3622,7 +3642,7 @@ export function WorkbenchScreen() {
                       type="button" className="btn" disabled={intakeBusy}
                       onClick={() => setIntakeCorrecting(v => !v)}
                     >
-                      Change it
+                      Pick a different column
                     </button>
                     <button
                       type="button" className="btn" disabled={intakeBusy}

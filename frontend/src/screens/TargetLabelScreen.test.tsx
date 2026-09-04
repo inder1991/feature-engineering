@@ -66,10 +66,23 @@ async function proposed(props: Parameters<typeof TargetLabelScreen>[0] = {}) {
   return user
 }
 
-it('offers entities the CATALOG can anchor a label on, not a free text box', async () => {
+it('a catalog anchoring ONE entity states it as a fact, not a one-option dropdown', async () => {
   render(<TargetLabelScreen />)
   await waitFor(() => expect(listTargetEntities).toHaveBeenCalledWith('cib'))
-  expect(screen.getByRole('combobox', { name: /entity/i })).toHaveValue('customer')
+  expect(screen.queryByRole('combobox', { name: /entity/i })).toBeNull()
+  expect(screen.getByText(/one row per/i)).toBeInTheDocument()
+})
+
+it('a catalog anchoring SEVERAL entities still offers the choice', async () => {
+  listTargetEntities.mockResolvedValue([
+    { entity: 'customer', spine_table: 'bo_cib_customer',
+      spine_ref: 'public.bo_cib_customer.cust_num' },
+    { entity: 'account', spine_table: 'bo_cib_account',
+      spine_ref: 'public.bo_cib_account.acct_num' },
+  ])
+  render(<TargetLabelScreen />)
+  const picker = await screen.findByRole('combobox', { name: /entity/i })
+  await waitFor(() => expect(picker).toHaveValue('customer'))
 })
 
 it('says a catalog cannot anchor a label rather than rendering an empty dropdown', async () => {
