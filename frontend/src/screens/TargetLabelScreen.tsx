@@ -50,6 +50,10 @@ interface FieldSpec {
   kind: Kind
   options?: string[]
   hint?: string
+  /** Render only when the current answers make the field MEANINGFUL. A field the contract will
+      refuse — a threshold on a count label, a measure under a count aggregate — must not be
+      offered: filling it produces a rejection for doing what the form invited. */
+  showIf?: (values: Record<string, string>) => boolean
 }
 
 const SHARED: FieldSpec[] = [
@@ -62,9 +66,19 @@ const SHARED: FieldSpec[] = [
       + 'dataset' },
   { key: 'label_type', label: 'Label type', kind: 'select',
     options: ['', 'binary', 'count', 'amount'] },
+]
+
+// Only an event_window BINARY label genuinely chooses these ("at least 3 trades", "sum over
+// 10000"). A state change is binary by contract and "happened at least once" is the question —
+// the >= 1 is supplied silently. Count and amount labels FORBID them, so offering the fields
+// there invites a refusal for doing what the form asked.
+const THRESHOLDING: FieldSpec[] = [
   { key: 'operator', label: 'Operator', kind: 'select',
-    options: ['', '>=', '>', '==', '!=', '<=', '<'], hint: 'binary labels only' },
-  { key: 'threshold', label: 'Threshold', kind: 'number', hint: 'binary labels only' },
+    options: ['', '>=', '>', '==', '!=', '<=', '<'],
+    showIf: v => v.label_type === 'binary' },
+  { key: 'threshold', label: 'Threshold', kind: 'number',
+    hint: 'the label is 1 when the count or sum clears this',
+    showIf: v => v.label_type === 'binary' },
 ]
 
 const CENSORING: FieldSpec = {
@@ -78,9 +92,11 @@ const SHAPE_FIELDS: Record<string, FieldSpec[]> = {
     ...SHARED,
     { key: 'column_ref', label: 'Flag column', kind: 'text' },
     { key: 'from_values', label: 'Starting values', kind: 'list',
-      hint: 'comma separated — rows in these states are the candidates' },
+      hint: 'comma separated, exactly as the column spells them — matching is case-sensitive, so '
+        + '"performing" will never match "Performing"' },
     { key: 'to_values', label: 'Outcome values', kind: 'list',
-      hint: 'comma separated — moving into one of these is the outcome' },
+      hint: 'comma separated, exactly as the column spells them — a misspelt value makes a label '
+        + 'that is silently always 0' },
     { key: 'population_filter', label: 'Population', kind: 'select',
       options: ['from_values', 'all'],
       hint: 'from_values excludes rows that ALREADY have the outcome' },
@@ -94,12 +110,19 @@ const SHAPE_FIELDS: Record<string, FieldSpec[]> = {
     { key: 'event_date_ref', label: 'Event date column', kind: 'text' },
     { key: 'join_left', label: 'Join key (anchor side)', kind: 'text' },
     { key: 'join_right', label: 'Join key (event side)', kind: 'text' },
-    { key: 'aggregate', label: 'Aggregate', kind: 'select', options: ['count', 'sum'] },
-    { key: 'measure_ref', label: 'Measure column', kind: 'text', hint: 'sum only' },
+    { key: 'aggregate', label: 'Counting events, or summing a value?', kind: 'select',
+      options: ['count', 'sum'],
+      // count and amount labels ARE the choice; only binary genuinely picks.
+      showIf: v => v.label_type === 'binary' },
+    { key: 'measure_ref', label: 'Measure column', kind: 'text',
+      hint: 'the column being summed',
+      showIf: v => v.aggregate === 'sum' || v.label_type === 'amount' },
+    ...THRESHOLDING,
     { key: 'population_having', label: 'Population', kind: 'select', options: ['any', 'none'],
       hint: 'none asks who will START — it excludes anyone already doing this' },
     { key: 'population_lookback_days', label: 'Lookback (days)', kind: 'number',
-      hint: 'how far back “already doing this” looks' },
+      hint: 'how far back “already doing this” looks',
+      showIf: v => v.population_having === 'none' },
     CENSORING,
   ],
 }
@@ -131,7 +154,20 @@ function asText(value: unknown): string {
 function buildRule(shape: string, values: Record<string, string>): Record<string, unknown> {
   const rule: Record<string, unknown> = { shape }
   for (const key of STAMPED) rule[key] = values[key] ?? ''
+  // A state change is binary by contract, and "did it happen at least once" is the question —
+  // the person is never asked for the >= 1 that is the only sane answer.
+  if (shape === 'state_change') {
+    rule.operator = '>='
+    rule.threshold = 1
+  }
+  // count and amount labels do not choose their aggregate — they are the choice.
+  if (shape === 'event_window' && values.label_type === 'count') rule.aggregate = 'count'
+  if (shape === 'event_window' && values.label_type === 'amount') rule.aggregate = 'sum'
   for (const spec of SHAPE_FIELDS[shape] ?? []) {
+    // A hidden field is ABSENT from the rule, not sent blank: the route's defaults are the
+    // contract's own, and null where an integer is expected reads as "incomplete" forever.
+    if (spec.showIf && !spec.showIf(values)) continue
+    if (spec.key in rule) continue
     const raw = values[spec.key] ?? ''
     if (spec.kind === 'list') {
       rule[spec.key] = raw.split(',').map(v => v.trim()).filter(Boolean)
@@ -157,12 +193,14 @@ interface Props {
   embedded?: boolean
   /** Called once a label is registered, so the run that needed it can adopt it. */
   onRegistered?: (result: { definitionId: string; name: string; entity: string }) => void
+  /** Called when the person picks an EXISTING label instead of building a twin. */
+  onAdopt?: (result: { name: string; entity: string }) => void
   /** A way out of the panel without registering anything. */
   onCancel?: () => void
 }
 
 export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
-                                    embedded = false, onRegistered,
+                                    embedded = false, onRegistered, onAdopt,
                                     onCancel }: Props = {}) {
   const [catalogs, setCatalogs] = useState<VisibleCatalog[]>([])
   const [source, setSource] = useState(initialSource)
@@ -172,6 +210,9 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
   const [hypothesis, setHypothesis] = useState(initialHypothesis)
 
   const [draft, setDraft] = useState<TargetDraft | null>(null)
+  // The person may overrule the model's shape. A draft proposing state_change when the outcome
+  // lives in another table was previously a dead end: nothing on the form could say so.
+  const [shapeOverride, setShapeOverride] = useState<string | null>(null)
   const [existing, setExisting] = useState<ExistingTarget[]>([])
   const [proposalFailed, setProposalFailed] = useState(false)
   const [values, setValues] = useState<Record<string, string>>({})
@@ -217,14 +258,15 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
       })
   }, [source])
 
+  const shape = shapeOverride ?? draft?.shape ?? ''
   const rule = useMemo(() => {
     if (!draft) return null
-    const built = buildRule(draft.shape, values)
-    if (draft.shape === 'event_window') {
+    const built = buildRule(shape, values)
+    if (shape === 'event_window') {
       built.event_filters = filters.filter(f => f.column_ref.trim() && f.op)
     }
     return built
-  }, [draft, values, filters])
+  }, [draft, shape, values, filters])
 
   // The sentence and the SQL are recomputed from the CURRENT form, not from what was proposed —
   // a person approving a statement about a rule they have since edited is approving nothing.
@@ -273,6 +315,7 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
       const result = await proposeTarget({ hypothesis, entity, catalog_source: source })
       setExisting(result.existing)
       setDraft(result.draft)
+      setShapeOverride(null)
       setProposalFailed(result.draft === null)
       if (result.draft) {
         const seeded: Record<string, string> = {}
@@ -300,7 +343,14 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
     }
   }, [hypothesis, entity, source])
 
-  const blanks = draft?.needs_input ?? []
+  // Blanks are judged against the CURRENT shape and the CURRENTLY MEANINGFUL fields: a blank the
+  // model flagged for the other shape, or one a later answer hid (a lookback under population
+  // 'any'), must not hold the register button hostage.
+  const currentSpecs = SHAPE_FIELDS[shape] ?? []
+  const visible = new Set(currentSpecs
+    .filter(spec => !spec.showIf || spec.showIf(values))
+    .map(spec => spec.key))
+  const blanks = (draft?.needs_input ?? []).filter(key => visible.has(key))
   const unfilled = blanks.filter(key => !(values[key] ?? '').trim())
 
   const submit = useCallback(async () => {
@@ -331,14 +381,20 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
     <div className={embedded ? 'tgt-screen tgt-screen--embedded' : 'tgt-screen'}>
       <section className="panel">
         <h2>What are you predicting?</h2>
-        <div className="field">
-          <label htmlFor="tgt-catalog">Catalog</label>
-          <select
-            id="tgt-catalog" value={source} onChange={e => setSource(e.target.value)}
-          >
-            {catalogs.map(c => <option key={c.source} value={c.source}>{c.source}</option>)}
-          </select>
-        </div>
+        {embedded && initialSource ? (
+          // The run already chose its catalog. A second dropdown here could DIVERGE from it —
+          // a label anchored on ftr attached to a cib run — so the choice is shown, not re-asked.
+          <p className="micro-label">Catalog: <code>{source}</code> — from this run.</p>
+        ) : (
+          <div className="field">
+            <label htmlFor="tgt-catalog">Catalog</label>
+            <select
+              id="tgt-catalog" value={source} onChange={e => setSource(e.target.value)}
+            >
+              {catalogs.map(c => <option key={c.source} value={c.source}>{c.source}</option>)}
+            </select>
+          </div>
+        )}
 
         {forbidden ? (
           <p className="empty">
@@ -407,9 +463,21 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
             a new label with the same meaning and a different window quietly does not.
           </p>
           <ul className="rows">
-            {existing.map(e => (
-              <li key={e.name} className="row">
-                <strong>{e.name}</strong> — {e.description} ({e.window_days} days)
+            {existing.map(hit => (
+              <li key={hit.name} className="row tgt-existing">
+                <span>
+                  <strong>{hit.name}</strong> — {hit.description} ({hit.window_days} days)
+                </span>
+                {onAdopt && (
+                  // The whole point of surfacing these: adopt the decision already made instead
+                  // of minting a twin with a slightly different window nobody can compare.
+                  <button
+                    type="button" className="btn"
+                    onClick={() => onAdopt({ name: hit.name, entity })}
+                  >
+                    Use this label
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -429,9 +497,24 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
         <>
           <section className="panel">
             <h2>The proposed target</h2>
-            <p className="micro-label">
-              Shape: {draft.shape}. Filled where the catalog justifies it, blank where it does not.
-            </p>
+            <div className="field">
+              <label htmlFor="tgt-shape">What kind of outcome is this?</label>
+              <select id="tgt-shape" value={shape}
+                onChange={e => setShapeOverride(e.target.value)}
+              >
+                <option value="state_change">
+                  A column changes state (a flag flips, a status moves)
+                </option>
+                <option value="event_window">
+                  Something happens in another table (transactions, events)
+                </option>
+              </select>
+              <p className="tgt-hint">
+                The tool proposed {draft.shape === 'state_change'
+                  ? 'a state change' : 'an event window'}; change it if the outcome lives
+                elsewhere. Filled where the catalog justifies it, blank where only you can know.
+              </p>
+            </div>
 
             <dl className="tgt-stamped">
               {STAMPED.map(key => (
@@ -442,7 +525,8 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
               ))}
             </dl>
 
-            {(SHAPE_FIELDS[draft.shape] ?? []).map(spec => {
+            {currentSpecs.map(spec => {
+              if (spec.showIf && !spec.showIf(values)) return null
               const needs = blanks.includes(spec.key)
               const id = `tgt-${spec.key}`
               return (
@@ -481,7 +565,7 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
             })}
           </section>
 
-          {draft.shape === 'event_window' && (
+          {shape === 'event_window' && (
             <section className="panel">
               <h2>Which events count</h2>
               {filters.length === 0 ? (
@@ -539,9 +623,14 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
             <h2>What this means</h2>
             {sentence ? <p className="tgt-sentence">{sentence}</p> : (
               <p className="empty">
-                {incomplete
-                  ? `Not a complete rule yet: ${incomplete}`
-                  : 'Fill the remaining fields to see what this label would mean.'}
+                {unfilled.length > 0
+                  // While required blanks remain, the contract's refusal is EXPECTED — showing
+                  // its raw text ("as_of_frequency 'None' not in ('daily', ...)") reads as an
+                  // error in the app rather than a form still being filled in.
+                  ? `Waiting on: ${unfilled.join(', ')}.`
+                  : incomplete
+                    ? `Not a valid rule yet: ${incomplete}`
+                    : 'Fill the remaining fields to see what this label would mean.'}
               </p>
             )}
 

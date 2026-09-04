@@ -209,12 +209,16 @@ def compile_target_sql(rule: TargetRuleV1) -> str:
 
 def _population(anchor: str, grain: str, as_of: str, extra_select: list[str],
                 joins: list[str], where: list[str]) -> str:
-    selected = [f"    SELECT a.{grain} AS entity_id", *extra_select,
+    """One row per (entity, as-of). DISTINCT because a duplicated snapshot row — a rerun ETL
+    batch, a dedup that never ran — would otherwise double-count inside the outcome aggregate and
+    double-weight the customer. And a NULL entity key is DROPPED: a label row about nobody cannot
+    be joined to features, so keeping it only poisons the training set downstream."""
+    selected = [f"    SELECT DISTINCT a.{grain} AS entity_id", *extra_select,
                 f"           a.{as_of} AS as_of_date"]
     lines = [",\n".join(selected), f"    FROM {anchor} a",
              "    JOIN as_of_dates s ON a." + as_of + " = s.as_of_date", *joins]
-    if where:
-        lines.append("    WHERE " + "\n      AND ".join(where))
+    lines.append("    WHERE a." + grain + " IS NOT NULL"
+                 + ("\n      AND " + "\n      AND ".join(where) if where else ""))
     return "population AS (\n" + "\n".join(lines) + "\n)"
 
 

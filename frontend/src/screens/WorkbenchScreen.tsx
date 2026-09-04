@@ -3720,6 +3720,24 @@ export function WorkbenchScreen() {
                 initialHypothesis={hypothesis}
                 initialSource={source}
                 onCancel={() => setBuildingTarget(false)}
+                onAdopt={({ name, entity }) => {
+                  // An existing label adopted for THIS run: same attach as a fresh registration,
+                  // no new row minted.
+                  setBuildError('')
+                  if (intake === null) {
+                    setBuiltTarget({ name, readsAs: '' })
+                    setBuildingTarget(false)
+                    return
+                  }
+                  attachTargetToIntent(entity, name, intake.intent_id)
+                    .then(r => {
+                      setBuiltTarget({ name: r.name, readsAs: r.reads_as })
+                      setBuildingTarget(false)
+                      invalidateGenerated()
+                    })
+                    .catch(e => setBuildError(
+                      e instanceof Error ? e.message : 'the target could not be attached'))
+                }}
                 onRegistered={({ name, entity }) => {
                   setBuildError('')
                   if (intake === null) {

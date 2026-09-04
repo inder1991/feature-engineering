@@ -287,3 +287,28 @@ def test_a_stored_rule_that_is_INVALID_is_refused_on_the_way_back_in():
 def test_a_rehydrated_rule_compiles_to_the_SAME_sql():
     assert compile_target_sql(target_from_canonical(canonical_target(_state()))) == \
         compile_target_sql(_state())
+
+
+# ══ label_type and aggregate must cohere ═════════════════════════════════════════════════════════
+
+def test_a_COUNT_label_cannot_ride_a_SUM_aggregate():
+    """"The count of transactions" reported from SUM(amount) is a number wearing the wrong name.
+    Only a binary label genuinely chooses its aggregate — count and amount ARE the choice."""
+    with pytest.raises(Exception, match="count label"):
+        _event(aggregate="sum",
+               measure_ref="public.comp_financial_tran_repos_dly.tran_amt",
+               header=_header(name="tgt_x_90d", label_type="count",
+                              operator=None, threshold=None))
+
+
+def test_an_AMOUNT_label_cannot_ride_a_COUNT_aggregate():
+    with pytest.raises(Exception, match="amount label"):
+        _event(aggregate="count",
+               header=_header(name="tgt_x_90d", label_type="amount",
+                              operator=None, threshold=None))
+
+
+def test_a_BINARY_label_may_choose_either_aggregate():
+    compile_target_sql(_event())                      # count
+    compile_target_sql(_event(
+        aggregate="sum", measure_ref="public.comp_financial_tran_repos_dly.tran_amt"))

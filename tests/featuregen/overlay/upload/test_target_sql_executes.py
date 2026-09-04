@@ -259,3 +259,27 @@ def test_the_two_at_least_once_modes_treat_an_UNOBSERVED_window_differently(db):
     ended = _run(db, _state(at_least_once=False))
     assert ever[("C7", "2024-01-31")] == 0
     assert ("C7", "2024-01-31") not in ended
+
+
+def test_DUPLICATE_spine_rows_at_one_as_of_yield_ONE_label_row(db):
+    """A snapshot table with two rows for the same (entity, as-of) — a rerun ETL batch, a dedup
+    that never ran — would otherwise produce two identical label rows, silently DOUBLE-WEIGHTING
+    that customer in training. One entity, one as-of date, one label row: that is the grain."""
+    rows = [("C2", d, "Performing") for d in _SNAPSHOTS]
+    rows += [("C8", d, "Performing") for d in _SNAPSHOTS]
+    rows.append(("C8", "2024-01-31", "Performing"))         # the duplicate
+    _anchor(db, rows)
+    labels = db.execute(compile_target_sql(_state())).fetchall()
+    c8_jan = [r for r in labels if r[0] == "C8" and str(r[1]) == "2024-01-31"]
+    assert len(c8_jan) == 1, "a duplicated snapshot row must not double-weight the customer"
+
+
+def test_a_NULL_entity_key_at_the_as_of_date_is_dropped(db):
+    """A label row about nobody. NULL grain keys happen — a staging join that missed, a purge that
+    nulled the key — and an anonymous label row cannot be joined to features, so keeping it only
+    poisons the training set downstream."""
+    rows = [("C2", d, "Performing") for d in _SNAPSHOTS]
+    rows.append((None, "2024-01-31", "Performing"))
+    _anchor(db, rows)
+    labels = db.execute(compile_target_sql(_state())).fetchall()
+    assert all(r[0] is not None for r in labels)

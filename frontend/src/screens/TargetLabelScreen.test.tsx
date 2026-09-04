@@ -320,3 +320,91 @@ it('registers cleanly when no run is listening', async () => {
   await waitFor(() => expect(registerTarget).toHaveBeenCalled())
   expect(await screen.findByText(/registered tgt_npe_90d/i)).toBeInTheDocument()
 })
+
+// ══ the review: ask only what only the person can know ═══════════════════════════════════════════
+
+it('never asks for an operator or threshold on a STATE CHANGE', async () => {
+  // A state changed or it did not — the contract itself forces binary, and ">= 1" is the only
+  // sane answer. Asking for it is boilerplate; the rule carries it silently.
+  const user = await proposed()
+  expect(screen.queryByLabelText(/^operator/i)).toBeNull()
+  expect(screen.queryByLabelText(/^threshold/i)).toBeNull()
+  await user.type(screen.getByLabelText(/starting values/i), 'Performing')
+  await user.type(screen.getByLabelText(/outcome values/i), 'Non-performing')
+  await waitFor(() => expect(screen.getByRole('button', { name: /register this/i })).toBeEnabled())
+  await user.click(screen.getByRole('button', { name: /register this/i }))
+  await waitFor(() => expect(registerTarget).toHaveBeenCalled())
+  const body = registerTarget.mock.calls[0][0]
+  expect(body.rule.operator).toBe('>=')
+  expect(body.rule.threshold).toBe(1)
+})
+
+it('hides fields the CONTRACT would refuse, instead of offering them', async () => {
+  // A count label forbids a threshold; a count aggregate forbids a measure; population "any"
+  // has no lookback. A form that offers a field and then rejects you for filling it is asking
+  // the person to already know the contract.
+  proposeTarget.mockResolvedValue({ existing: [], draft: EVENT_DRAFT })
+  const user = await proposed()
+  expect(screen.getByLabelText(/^operator/i)).toBeInTheDocument()  // binary: genuinely chooses
+  expect(screen.queryByLabelText(/measure column/i)).toBeNull()     // aggregate is count
+  await user.selectOptions(screen.getByLabelText(/label type/i), 'count')
+  expect(screen.queryByLabelText(/^operator/i)).toBeNull()
+  await user.selectOptions(screen.getByLabelText(/^population population_having/i), 'any')
+  expect(screen.queryByLabelText(/lookback/i)).toBeNull()
+})
+
+it('a blank hidden by a later answer stops holding Register hostage', async () => {
+  // The model flagged the lookback as needed while population was "none". Flipping population to
+  // "any" makes the lookback meaningless — the register button must notice.
+  proposeTarget.mockResolvedValue({
+    existing: [],
+    draft: { ...EVENT_DRAFT,
+      needs_input: ['population_lookback_days'],
+      notes: { population_lookback_days: 'not_stated' } },
+  })
+  const user = await proposed()
+  expect(screen.getByRole('button', { name: /register this/i })).toBeDisabled()
+  await user.selectOptions(screen.getByLabelText(/^population population_having/i), 'any')
+  await waitFor(() => expect(screen.getByRole('button', { name: /register this/i })).toBeEnabled())
+})
+
+it('the SHAPE can be overruled when the model guessed wrong', async () => {
+  // A draft proposing state_change when the outcome lives in another table was a dead end:
+  // nothing on the form could say so.
+  const user = await proposed()
+  expect(screen.getByLabelText(/flag column/i)).toBeInTheDocument()
+  await user.selectOptions(screen.getByLabelText(/what kind of outcome/i), 'event_window')
+  expect(screen.queryByLabelText(/flag column/i)).toBeNull()
+  expect(screen.getByLabelText(/event table/i)).toBeInTheDocument()
+})
+
+it('says WHICH fields it is waiting on, never a raw contract error', async () => {
+  // "as_of_frequency 'None' not in ('daily', ...)" is engineer-speak for a form still being
+  // filled in — an expected state, not an app error.
+  describeTarget.mockResolvedValue({
+    reads_as: null,
+    incomplete: "as_of_frequency 'None' not in ('daily', 'weekly', 'monthly')",
+  })
+  await proposed()
+  expect(await screen.findByText(/waiting on: from_values, to_values/i)).toBeInTheDocument()
+  expect(screen.queryByText(/not in \('daily'/i)).toBeNull()
+})
+
+it('an EXISTING label can be adopted instead of minting a twin', async () => {
+  const onAdopt = vi.fn()
+  proposeTarget.mockResolvedValue({
+    existing: [{ name: 'tgt_npe_60d', description: 'credit deterioration', window_days: 60,
+      match_terms: ['non-performing'] }],
+    draft: DRAFT,
+  })
+  const user = await proposed({ onAdopt })
+  await user.click(screen.getByRole('button', { name: /use this label/i }))
+  expect(onAdopt).toHaveBeenCalledWith({ name: 'tgt_npe_60d', entity: 'customer' })
+})
+
+it('the embedded form shows the RUN’s catalog as a fact, not a second decision', async () => {
+  render(<TargetLabelScreen embedded initialSource="cib" initialHypothesis="h" />)
+  await waitFor(() => expect(listTargetEntities).toHaveBeenCalledWith('cib'))
+  expect(screen.queryByLabelText(/^catalog$/i)).toBeNull()
+  expect(screen.getByText(/from this run/i)).toBeInTheDocument()
+})

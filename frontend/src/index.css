@@ -8477,3 +8477,5 @@ button.stat:hover {
 @media (prefers-reduced-motion: reduce) {
   .wb-progress::before { animation: none; }
 }
+
+.tgt-existing { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }

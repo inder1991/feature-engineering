@@ -226,6 +226,19 @@ class EventWindowRuleV1:
         else:
             _require(self.measure_ref is None,
                      "a count aggregate FORBIDS measure_ref — it counts rows, not values")
+        # count and amount labels do not CHOOSE an aggregate — they are the choice. "The count of
+        # transactions" reported from SUM(amount) is a number wearing the wrong name, and both
+        # directions of that mismatch were expressible until a review asked what an 'amount' label
+        # counting rows would even mean. Only a binary label genuinely picks (>= N events, or
+        # sum >= T).
+        if self.header.label_type == "count":
+            _require(self.aggregate == "count",
+                     "a count label REQUIRES the count aggregate — it reports how many, and a sum "
+                     "wearing that name would be read as a row count")
+        if self.header.label_type == "amount":
+            _require(self.aggregate == "sum",
+                     "an amount label REQUIRES the sum aggregate — it reports how much, and a row "
+                     "count wearing that name would be read as money")
         _require(self.population_having in EVENT_POPULATIONS,
                  f"population_having {self.population_having!r} not in {EVENT_POPULATIONS}")
         if self.population_having == "none":

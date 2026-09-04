@@ -597,3 +597,14 @@ confirmation stays either way.
 - `DATA-CHECKED` and above (needs §10's feedback path).
 - Labels spanning three or more tables.
 - Multi-class and survival-style targets.
+- **An indeterminate zone** (2026-09-04 review). Credit practice often EXCLUDES the middle from
+  training — 30–89 DPD is neither "performing" (0) nor "defaulted" (1), and labelling it 0 teaches
+  the model that near-misses are safe. The contract cannot express "these states are neither":
+  a state inside the window that is in neither `from_values` nor `to_values` silently counts as 0.
+  The shape it needs is an `exclude_values` set on `state_change` that DROPS the row, mirroring
+  `exclude_null_at_as_of`. Deferred because it widens the wire schema and the form; the honest
+  workaround today is a narrower `to_values`.
+- **Attrition inside the window** (same review). A customer whose snapshots STOP mid-window (a
+  closed account) is labelled 0 by "ever" — honest, the observed count is zero — and dropped by
+  "at end" — there is no end state to read. Both behaviours are pinned by executing tests; neither
+  is a per-rule choice yet.
