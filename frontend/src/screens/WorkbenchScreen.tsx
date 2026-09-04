@@ -3475,8 +3475,8 @@ export function WorkbenchScreen() {
           {/* The target confirm block (intake build): the model's DRAFT reading of the prediction
               target, awaiting the human's signature. The extracted target drives the leakage veto,
               so it must not take effect as an unreviewed model pick. Absent intake (older backend,
-              no LLM) renders nothing: the manual target field above carries the flow exactly as
-              before.
+              no LLM), the intake-unavailable block below asks for the target instead — the manual
+              field moved there when the brief stopped asserting the target is a column.
 
               ▲ T7 (c), NB-2: the shows-doesn't-gate PIN path is now OUTCOME-FAMILY ONLY. The
               server writes NOTHING for a typed name, in any class — a bare word match cannot tell
@@ -3523,8 +3523,8 @@ export function WorkbenchScreen() {
                 intakeReading.target_provenance === 'exploring' ? (
                   <p role="status" style={{ margin: 0 }}>
                     <span className="badge">Exploring</span>{' '}
-                    No target declared. Generation runs, but leakage checks are off — declare a
-                    target any time in the target field above.
+                    No target declared. Generation runs, but leakage checks are off — revise the
+                    brief and pick or build a target to turn them on.
                   </p>
                 ) : (
                   <div style={{ display: 'grid', gap: 8 }}>
@@ -3670,8 +3670,8 @@ export function WorkbenchScreen() {
               ) : (
                 <div style={{ display: 'grid', gap: 8 }}>
                   <p style={{ margin: 0 }}>
-                    No target detected in your objective. Type one into the target field above,
-                    build the target from a rule, or explore without one.
+                    No target detected in your objective. Build the target from a rule, pick a
+                    column below, or explore without one.
                   </p>
                   {/* An abstention is an ANSWER, not a blank: the catalog's own outcome labels and
                       nearest proxies are what makes it one. Same block as the confirm branch. */}
