@@ -3169,6 +3169,24 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     release(RECOGNITION)
   })
 
+  it('DISAGREEING with the scope has somewhere to go', async () => {
+    // "If someone disagrees with the scope, what's the option here?" — the review question this
+    // block answers. Expanding the settled scope must name every remedy: swap to an alternative
+    // (when one exists), generate over everything, or rewrite the brief.
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    await generateConfirmOn()
+    await userEvent.click(await screen.findByRole('button', { name: /change the scope/i }))
+    const block = screen.getByText(/don't agree with this scope\?/i).closest('div')!
+    expect(within(block).getByRole('button', { name: /show all buildable recipes/i }))
+      .toBeInTheDocument()
+    expect(within(block).getByRole('button', { name: /rewrite the brief/i }))
+      .toBeInTheDocument()
+    // and the rewrite path actually opens the brief for editing
+    await userEvent.click(within(block).getByRole('button', { name: /rewrite the brief/i }))
+    expect(await screen.findByLabelText('Hypothesis')).toBeInTheDocument()
+  })
+
   it('an IN-FLIGHT target read says it is reading, never that nothing landed', async () => {
     // `intake === null` used to mean both "still running" and "failed", so during the wait the
     // screen asserted "nothing read your objective" — false, and it then swapped to the real

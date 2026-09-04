@@ -3510,6 +3510,41 @@ export function WorkbenchScreen() {
               </label>
             </>
           )}
+          {/* THE DISAGREEMENT PATHS, named as such. "Change the scope" used to open a view
+              where — with no alternatives returned — there was nothing to switch to, and the real
+              remedies sat elsewhere unlabelled. Disagreeing must have somewhere to go. */}
+          {recognition.candidates.length > 0 && (
+          <div className="scope-disagree" data-role="scope-disagree" style={{ marginTop: 14 }}>
+            <p className="micro-label" style={{ margin: '0 0 2px' }}>
+              Don't agree with this scope?
+            </p>
+            <div className="choice-list">
+              {secondaryCandidates.length > 0 && (
+                <p className="hint" style={{ margin: 0 }}>
+                  Right idea, wrong pick — use <strong>Make primary</strong> on an alternative
+                  above.
+                </p>
+              )}
+              <div className="choice-row">
+                <button
+                  type="button" className="btn" disabled={generating}
+                  onClick={() => void broadenScope()}
+                >
+                  Show all buildable recipes
+                </button>
+                <span className="hint">skip scope filtering and generate over everything</span>
+              </div>
+              <div className="choice-row">
+                <button type="button" className="btn" onClick={() => setReviseOpen(true)}>
+                  Rewrite the brief
+                </button>
+                <span className="hint">
+                  say what you're building in different words — recognition runs again
+                </span>
+              </div>
+            </div>
+          </div>
+          )}
           {primaryCandidate !== null && (
             <div style={{ marginTop: 10 }}>
               <button type="button" className="btn" onClick={() => setScopeReopened(false)}>
