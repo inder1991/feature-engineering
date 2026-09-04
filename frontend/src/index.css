@@ -8407,10 +8407,26 @@ button.stat:hover {
 .tgt-hint { font-size: 0.78rem; line-height: 1.4; opacity: 0.7; }
 
 .tgt-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
   margin: 0.6rem 0 0;
+  padding: 0.65rem 0.9rem;
+  border: 1px solid var(--rule, rgba(127, 127, 127, 0.25));
+  border-radius: 8px;
   font-size: 0.82rem;
   line-height: 1.45;
-  opacity: 0.8;
+  background: var(--surface-sunken, rgba(127, 127, 127, 0.06));
+}
+.tgt-progress::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--rule, rgba(127, 127, 127, 0.35));
+  border-top-color: var(--accent, #4a7dff);
+  animation: wb-spin 0.9s linear infinite;
 }
 
 /* The target form rendered INSIDE a run. Its sections are panels of their own when it is a page;
@@ -8430,8 +8446,34 @@ button.stat:hover {
 .tgt-screen--embedded h2 { font-size: 0.95rem; }
 
 .wb-progress {
-  margin: 0.75rem 0 0;
+  /* A CALLOUT with motion, not a grey sentence. The report that forced this: "looks like it is
+     stuck" — while the line was already on screen. Text alone does not read as work happening;
+     something has to move. */
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: 0.9rem 0 0;
+  padding: 0.65rem 0.9rem;
+  border: 1px solid var(--rule, rgba(127, 127, 127, 0.25));
+  border-radius: 8px;
   font-size: 0.85rem;
   line-height: 1.45;
-  opacity: 0.8;
+  background: var(--surface-sunken, rgba(127, 127, 127, 0.06));
+}
+
+.wb-progress::before {
+  content: '';
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--rule, rgba(127, 127, 127, 0.35));
+  border-top-color: var(--accent, #4a7dff);
+  animation: wb-spin 0.9s linear infinite;
+}
+
+@keyframes wb-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-progress::before { animation: none; }
 }
