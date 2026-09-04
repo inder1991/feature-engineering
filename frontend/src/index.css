@@ -8509,3 +8509,23 @@ button.stat:hover {
 }
 .scope-target > h3 { margin-top: 0 }
 .scope-target .hint { font-size: 12.5px; line-height: 1.5; }
+
+.step-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 8px;
+  border-radius: 50%;
+  font-size: 12px;
+  font-weight: 600;
+  vertical-align: -3px;
+  background: var(--accent, #4a7dff);
+  color: #fff;
+}
+
+.choice-list { display: grid; gap: 8px; }
+.choice-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.choice-row .btn { flex: 0 0 auto; min-width: 220px; justify-content: center; }
+.choice-row .hint { margin: 0; }

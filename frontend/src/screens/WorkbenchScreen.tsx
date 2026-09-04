@@ -3381,7 +3381,11 @@ export function WorkbenchScreen() {
           panel must not vanish under the click that started it. */}
       {phase === 'scope_review' && recognition !== null && (
         <div className="panel" id="wb-scope-panel">
-          <h2>Confirm the scope</h2>
+          <h2><span className="step-chip" aria-hidden="true">1</span>Confirm the scope</h2>
+          <p className="hint" style={{ marginTop: 4 }}>
+            If the recognition below is right there is nothing to click here — you confirm with
+            the button at the bottom of this panel.
+          </p>
           <p className="hint" style={{ marginTop: 4 }}>
             We recognised what you're building. Confirm it, adjust it, or show every buildable
             recipe. Nothing generates until you confirm.
@@ -3538,7 +3542,9 @@ export function WorkbenchScreen() {
             </div>
           ) : (
             <div className="scope-target" data-role="intake-target" style={{ marginTop: 16 }}>
-              <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
+              <h3 style={{ margin: '0 0 8px' }}>
+                <span className="step-chip" aria-hidden="true">2</span>Prediction target
+              </h3>
               {intakeReading !== null ? (
                 intakeReading.target_provenance === 'exploring' ? (
                   <p role="status" style={{ margin: 0 }}>
@@ -3624,34 +3630,49 @@ export function WorkbenchScreen() {
                       Heads up: {intake.ticket.contradiction}.
                     </p>
                   )}
+                  {/* A CHOICE LIST, not a row of equal grey buttons. Four options with nothing
+                      saying which is default or when each applies is where a person freezes —
+                      "customer will have no idea on where to click". Each row is the button plus
+                      the one line that says when to choose it. */}
                   <p className="micro-label" style={{ margin: '10px 0 2px' }}>
                     Your decision — pick one
                   </p>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    <button
-                      type="button" className="btn btn--primary" disabled={intakeBusy}
-                      onClick={() =>
-                        answerIntake('confirmed', intake.ticket.target_column ?? undefined)}
-                    >
-                      Yes, that's my target
-                    </button>
-                    {/* Offered even when a column WAS read, because a column that merely records
-                        the outcome is often not the label you want — the label is usually a rule
-                        over a window, and this is where a person can say so. Subtle: the read
-                        column stays the primary answer. */}
-                    <BuildTargetAction onOpen={() => setBuildingTarget(true)} subtle />
-                    <button
-                      type="button" className="btn" disabled={intakeBusy}
-                      onClick={() => setIntakeCorrecting(v => !v)}
-                    >
-                      Pick a different column
-                    </button>
-                    <button
-                      type="button" className="btn" disabled={intakeBusy}
-                      onClick={() => answerIntake('exploring')}
-                    >
-                      No target — just exploring
-                    </button>
+                  <div className="choice-list">
+                    <div className="choice-row">
+                      <button
+                        type="button" className="btn btn--primary" disabled={intakeBusy}
+                        onClick={() =>
+                          answerIntake('confirmed', intake.ticket.target_column ?? undefined)}
+                      >
+                        Yes, that's my target
+                      </button>
+                      <span className="hint">the suggested column above is what you're predicting</span>
+                    </div>
+                    <div className="choice-row">
+                      <BuildTargetAction onOpen={() => setBuildingTarget(true)} subtle />
+                      <span className="hint">
+                        the outcome isn't a stored column — it's a rule, like “goes non-performing
+                        within 90 days”
+                      </span>
+                    </div>
+                    <div className="choice-row">
+                      <button
+                        type="button" className="btn" disabled={intakeBusy}
+                        onClick={() => setIntakeCorrecting(v => !v)}
+                      >
+                        Pick a different column
+                      </button>
+                      <span className="hint">right idea, wrong column</span>
+                    </div>
+                    <div className="choice-row">
+                      <button
+                        type="button" className="btn" disabled={intakeBusy}
+                        onClick={() => answerIntake('exploring')}
+                      >
+                        No target — just exploring
+                      </button>
+                      <span className="hint">browse features without a prediction; leakage checks turn off</span>
+                    </div>
                   </div>
                   {intakeCorrecting && (
                     <div style={{ display: 'grid', gap: 8 }}>
@@ -3701,14 +3722,22 @@ export function WorkbenchScreen() {
                   <p className="micro-label" style={{ margin: '10px 0 2px' }}>
                     Your decision — pick one
                   </p>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                    <BuildTargetAction onOpen={() => setBuildingTarget(true)} />
-                    <button
-                      type="button" className="btn" disabled={intakeBusy}
-                      onClick={() => answerIntake('exploring')}
-                    >
-                      No target — just exploring
-                    </button>
+                  <div className="choice-list">
+                    <div className="choice-row">
+                      <BuildTargetAction onOpen={() => setBuildingTarget(true)} />
+                      <span className="hint">
+                        define the outcome as a rule — like “goes non-performing within 90 days”
+                      </span>
+                    </div>
+                    <div className="choice-row">
+                      <button
+                        type="button" className="btn" disabled={intakeBusy}
+                        onClick={() => answerIntake('exploring')}
+                      >
+                        No target — just exploring
+                      </button>
+                      <span className="hint">browse features without a prediction; leakage checks turn off</span>
+                    </div>
                   </div>
                 </div>
               )}
