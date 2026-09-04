@@ -323,7 +323,13 @@ export function TargetLabelScreen({ initialHypothesis = '', initialSource = '',
           seeded[key] = asText(value)
         }
         for (const spec of SHAPE_FIELDS[result.draft.shape] ?? []) {
-          if (!(spec.key in seeded)) seeded[spec.key] = spec.kind === 'bool' ? 'true' : ''
+          if (spec.key in seeded) continue
+          // A select with no blank option DISPLAYS its first choice whichever value the state
+          // holds — seeding '' there makes the screen show an answer the rule does not contain,
+          // and the register button stay disabled for a field that looks filled. Seed what the
+          // person actually sees.
+          const first = spec.kind === 'select' ? (spec.options?.[0] ?? '') : ''
+          seeded[spec.key] = spec.kind === 'bool' ? 'true' : first
         }
         setValues(seeded)
         const proposedFilters = result.draft.fields.event_filters

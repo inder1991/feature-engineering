@@ -408,3 +408,19 @@ it('the embedded form shows the RUN’s catalog as a fact, not a second decision
   expect(screen.queryByLabelText(/^catalog$/i)).toBeNull()
   expect(screen.getByText(/from this run/i)).toBeInTheDocument()
 })
+
+it('a select with no blank option never SHOWS a value the rule lacks', async () => {
+  // population_filter's options are from_values/all — no blank. Seeding '' made the screen
+  // display "from_values" while the state held nothing: a field that looks answered, a register
+  // button that stays disabled, and no way to see why. Found live, not by a test.
+  proposeTarget.mockResolvedValue({
+    existing: [],
+    draft: { ...DRAFT, needs_input: [...DRAFT.needs_input, 'population_filter'],
+      notes: { ...DRAFT.notes, population_filter: 'population_choice' } },
+  })
+  const user = await proposed()
+  await user.type(screen.getByLabelText(/starting values/i), 'Performing')
+  await user.type(screen.getByLabelText(/outcome values/i), 'Non-performing')
+  // population_filter was seeded to what the select DISPLAYS, so it does not block.
+  await waitFor(() => expect(screen.getByRole('button', { name: /register this/i })).toBeEnabled())
+})
