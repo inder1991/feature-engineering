@@ -2455,6 +2455,9 @@ describe('Gate #1 scope confirmation', () => {
   })
 
   it('flag ON: the entity is proposed and confirmable; a proposed CONTEXT is neither', async () => {
+    // The entity control is now gated on RANKING — its only consumer — the
+    // same argument that removed the modelling-context control.
+    vi.stubEnv('VITE_INTENT_RANKING', '1')
     // The entity half is unchanged — proposed, editable, threaded through on confirm.
     //
     // The context half is the honesty proof. This recognition proposes `ifrs9`. The control that
@@ -2481,6 +2484,9 @@ describe('Gate #1 scope confirmation', () => {
   })
 
   it('flag ON: clearing the entity sends a null target entity', async () => {
+    // The entity control is now gated on RANKING — its only consumer — the
+    // same argument that removed the modelling-context control.
+    vi.stubEnv('VITE_INTENT_RANKING', '1')
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
     contractRecognitions.mockResolvedValue(RECOGNITION)
     contractConsideredSet.mockResolvedValue(scopedConsidered())
@@ -2494,6 +2500,9 @@ describe('Gate #1 scope confirmation', () => {
   })
 
   it('flag ON: a recognizer dimension warning renders a non-fatal hint', async () => {
+    // The entity control is now gated on RANKING — its only consumer — the
+    // same argument that removed the modelling-context control.
+    vi.stubEnv('VITE_INTENT_RANKING', '1')
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
     contractRecognitions.mockResolvedValue({ ...RECOGNITION, warnings: ['UNKNOWN_TARGET_ENTITY'] })
     contractConsideredSet.mockResolvedValue(scopedConsidered())

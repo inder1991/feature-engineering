@@ -3855,6 +3855,13 @@ export function WorkbenchScreen() {
               recorded on `intent_recognition_attempt`; what is gone is any claim a human reviewed
               it. Restoring the control is the way to restore the confirmed rows — not re-seeding
               behind a screen nobody can see. */}
+          {/* GATED ON RANKING, the same argument that removed the modelling-context control:
+              this dimension's only consumer is the ranker, and with FEATUREGEN_INTENT_RANKING
+              unset the field was collected from people and read by nothing that changes what they
+              see. In this deployment it rendered as an empty box, a Clear button and a warning —
+              pure noise at the exact point the person is trying to decide. Where ranking is ON it
+              still renders and still works. */}
+          {rankingEnabled() && (
           <div className="scope-dimensions" style={{ marginTop: 16 }}>
             <h3 style={{ margin: '0 0 8px' }}>Target entity (optional)</h3>
             <div className="field" style={{ maxWidth: 320 }}>
@@ -3880,6 +3887,7 @@ export function WorkbenchScreen() {
               </p>
             )}
           </div>
+          )}
           {/* B10 — the unit-of-analysis confirmation: yes/no on the DERIVED proposal, or one of
               the catalog's realistic spine-backed entities (a closed list, never free text).
               Optional: skipping it never gates the confirm button. */}
