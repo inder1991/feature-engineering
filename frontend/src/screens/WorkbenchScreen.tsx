@@ -1497,6 +1497,9 @@ export function WorkbenchScreen() {
   // swapped to the real reading. The read is a model call and takes seconds to tens of seconds;
   // saying so is the difference between waiting and concluding it is broken.
   const [intakeInFlight, setIntakeInFlight] = useState(false)
+  // Step 1 collapses to a settled summary once a PRIMARY exists — the person's one open decision
+  // is then the target. `scopeReopened` lets them expand it again to adjust.
+  const [scopeReopened, setScopeReopened] = useState(false)
   // T7 (c): the confirm gate's refusal, held so the human can read the SERVER's own words and
   // then act on them. `detail` is rendered verbatim and never summarised; `decision`/`ref` are
   // what the acknowledge control re-sends, so acknowledging cannot quietly retarget the answer.
@@ -2227,6 +2230,7 @@ export function WorkbenchScreen() {
     setIntakeAcknowledged('')
     const intakeSeq = seq
     setIntakeInFlight(true)
+    setScopeReopened(false)
     contractIntake(hypothesis.trim(),
                    { catalogSource: source.trim() || undefined, objective })
       .then(resp => {
@@ -3382,21 +3386,18 @@ export function WorkbenchScreen() {
       {phase === 'scope_review' && recognition !== null && (
         <div className="panel" id="wb-scope-panel">
           <h2><span className="step-chip" aria-hidden="true">1</span>Confirm the scope</h2>
-          <p className="hint" style={{ marginTop: 4 }}>
-            If the recognition below is right there is nothing to click here — you confirm with
-            the button at the bottom of this panel.
-          </p>
-          <p className="hint" style={{ marginTop: 4 }}>
-            We recognised what you're building. Confirm it, adjust it, or show every buildable
-            recipe. Nothing generates until you confirm.
-          </p>
+          {/* SEQUENCED, not simultaneous. With a settled primary, step 1 is a one-line summary
+              and the target is the page's only open decision — scope-then-target in narrative
+              order without a forced click on the confident path. Only while the scope is
+              genuinely UNSETTLED (candidates exist, none primary) does step 2 defer. */}
+          {/* What happened to the recognition — repaired, partially recovered, discarded
+              proposals. TRUST statements, deliberately OUTSIDE the collapse: a settled summary
+              must not hide that the answer it summarises was patched together. */}
           {recognition.status === 'ambiguous' && primaryCandidate !== null && (
             <p className="hint" role="status">
               The objective read as ambiguous — check the primary before confirming.
             </p>
           )}
-          {/* What you are looking at, and what it cost. Five outcomes, five sentences — see
-              scopeNotice/qualityNotice. */}
           {scopeNotice(recognition, primaryCandidate !== null) !== null && (
             <p role="status">{scopeNotice(recognition, primaryCandidate !== null)}</p>
           )}
@@ -3405,6 +3406,26 @@ export function WorkbenchScreen() {
               {qualityNotice(recognition)}
             </p>
           )}
+          {primaryCandidate !== null && !scopeReopened ? (
+            <div className="scope-settled" data-role="scope-settled">
+              <p style={{ margin: 0 }}>
+                Scope: <strong>{primaryCandidate.display_name}</strong>{' '}
+                <span className="badge">{primaryCandidate.confidence} confidence</span>
+              </p>
+              <button type="button" className="btn" onClick={() => setScopeReopened(true)}>
+                Change the scope
+              </button>
+            </div>
+          ) : (
+          <>
+          <p className="hint" style={{ marginTop: 4 }}>
+            If the recognition below is right there is nothing to click here — you confirm with
+            the button at the bottom of this panel.
+          </p>
+          <p className="hint" style={{ marginTop: 4 }}>
+            We recognised what you're building. Confirm it, adjust it, or show every buildable
+            recipe. Nothing generates until you confirm.
+          </p>
           {/* The proposals render whenever the recognizer made any — NOT only when one of them is
               the primary. A partial recovery whose primary was the discarded candidate, and an
               ambiguous answer that designated none, both have real alternatives to choose from;
@@ -3489,6 +3510,15 @@ export function WorkbenchScreen() {
               </label>
             </>
           )}
+          {primaryCandidate !== null && (
+            <div style={{ marginTop: 10 }}>
+              <button type="button" className="btn" onClick={() => setScopeReopened(false)}>
+                Done — collapse the scope
+              </button>
+            </div>
+          )}
+          </>
+          )}
           {/* The target confirm block (intake build): the model's DRAFT reading of the prediction
               target, awaiting the human's signature. The extracted target drives the leakage veto,
               so it must not take effect as an unreviewed model pick. Absent intake (older backend,
@@ -3511,7 +3541,20 @@ export function WorkbenchScreen() {
               target field above carries the flow"), so it is not deleted, it is relocated to the
               only case that needs it — an intake that did not land — where it can say WHY it is
               asking. */}
-          {intakeInFlight && intake === null ? (
+          {recognition.candidates.length > 0 && primaryCandidate === null ? (
+            // THE ONE REAL SEQUENCING DEPENDENCY. While the person is mid-decision on the scope,
+            // a second open decision beside it is what "no idea where to click" was made of. No
+            // primary yet -> the target defers, and appears the moment one is picked.
+            <div className="scope-target scope-target--deferred" data-role="target-deferred"
+                 style={{ marginTop: 16 }}>
+              <h3 style={{ margin: 0 }}>
+                <span className="step-chip" aria-hidden="true">2</span>Prediction target
+              </h3>
+              <p className="hint" style={{ margin: '6px 0 0' }}>
+                Settle the scope above first — this step opens as soon as a primary is picked.
+              </p>
+            </div>
+          ) : intakeInFlight && intake === null ? (
             <div className="scope-target" data-role="intake-reading" style={{ marginTop: 16 }}>
               <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
               <p className="wb-progress" role="status" aria-label="Target reading progress">

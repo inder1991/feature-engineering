@@ -8529,3 +8529,12 @@ button.stat:hover {
 .choice-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .choice-row .btn { flex: 0 0 auto; min-width: 220px; justify-content: center; }
 .choice-row .hint { margin: 0; }
+
+.scope-settled {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.scope-target--deferred { opacity: 0.65; }

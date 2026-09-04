@@ -2308,6 +2308,8 @@ describe('Gate #1 scope confirmation', () => {
     expect(contractConsideredSet).not.toHaveBeenCalled()
     // The proposed primary + one evidence span render.
     expect(await screen.findByText('Customer churn')).toBeInTheDocument()
+    // the evidence lives behind the settled summary now — expand to inspect it
+    await userEvent.click(screen.getByRole('button', { name: /change the scope/i }))
     expect(screen.getByText(/about to leave/)).toBeInTheDocument()
     // Confirm → considered-set with a confirmedScope carrying the recognised primary + secondary.
     await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
@@ -2326,6 +2328,8 @@ describe('Gate #1 scope confirmation', () => {
     contractRecognitions.mockResolvedValue(RECOGNITION)
     contractConsideredSet.mockResolvedValue(scopedConsidered())
     await generateFlagOn()
+    // secondaries live behind the settled summary — expand to edit them
+    await userEvent.click(await screen.findByRole('button', { name: /change the scope/i }))
     await userEvent.click(await screen.findByRole('button', { name: 'Remove Engagement decline' }))
     await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
@@ -2703,6 +2707,23 @@ describe('Gate #1 recognition quality', () => {
     // And choosing one is a click, which is what "choose or broaden" has to mean.
     await userEvent.click(screen.getAllByRole('button', { name: 'Make primary' })[0])
     expect(screen.getByRole('button', { name: /confirm scope and generate/i })).toBeInTheDocument()
+  })
+
+  it('the TARGET DEFERS while the scope is unsettled, and opens when one is picked', async () => {
+    // The one real sequencing dependency: while the person is mid-decision on the scope, a second
+    // open decision beside it is what "no idea where to click" was made of. With a settled
+    // primary, step 1 is a one-line summary instead and the target is the only open decision —
+    // scope-then-target without a forced click on the confident path.
+    await render_(recognition({
+      status: 'ambiguous',
+      candidates: [candidate('engagement', 'Engagement decline', 'secondary'),
+                   candidate('deposit', 'Deposit attrition', 'secondary')],
+      recognition_quality: quality({ disposition: 'clean' }),
+    }))
+    expect(screen.getByText(/settle the scope above first/i)).toBeInTheDocument()
+    expect(screen.queryByText(/your decision — pick one/i)).toBeNull()
+    await userEvent.click(screen.getAllByRole('button', { name: 'Make primary' })[0])
+    expect(screen.queryByText(/settle the scope above first/i)).toBeNull()
   })
 
   it('a partial recovery that lost its primary reports BOTH facts', async () => {
