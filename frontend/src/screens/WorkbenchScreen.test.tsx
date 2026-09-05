@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import { waitFor, act, fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -11,6 +11,7 @@ vi.mock('../api', async importOriginal => {
     recommendFeatures: vi.fn(),
     contractConsideredSet: vi.fn(),
     contractRecognitions: vi.fn(),
+    targetForIntent: vi.fn(),
     contractIntake: vi.fn(),
     contractIntakeTarget: vi.fn(),
     contractDraft: vi.fn(),
@@ -27,6 +28,7 @@ vi.mock('../api', async importOriginal => {
 const recommendFeatures = vi.mocked(api.recommendFeatures)
 const contractConsideredSet = vi.mocked(api.contractConsideredSet)
 const contractRecognitions = vi.mocked(api.contractRecognitions)
+const targetForIntent = vi.mocked(api.targetForIntent)
 const contractIntake = vi.mocked(api.contractIntake)
 const contractIntakeTarget = vi.mocked(api.contractIntakeTarget)
 const contractDraft = vi.mocked(api.contractDraft)
@@ -39,6 +41,7 @@ const registerFeature = vi.mocked(api.registerFeature)
 const featureFreshness = vi.mocked(api.featureFreshness)
 
 beforeEach(() => {
+  targetForIntent.mockResolvedValue(null)
   recommendFeatures.mockReset()
   contractConsideredSet.mockReset()
   contractRecognitions.mockReset()
@@ -3167,6 +3170,61 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     expect(screen.getAllByRole('status', { name: /engine progress/i }).length)
       .toBeGreaterThanOrEqual(2)
     release(RECOGNITION)
+  })
+
+
+  it('a REWRITTEN brief clears the previous run\'s target banner', async () => {
+    // The builder belongs to the round. Left alone, changing the hypothesis kept a stale
+    // "this run predicts tgt_x" — a false claim about the new run.
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    targetForIntent.mockResolvedValueOnce(
+      { intent_id: 'int_1', definition_id: 'd1', name: 'tgt_npe_90d', reads_as: 'one row per…' })
+    await generateConfirmOn()
+    expect(await screen.findByText(/this run predicts/i)).toBeInTheDocument()
+    // rewrite: same flow, but the server now reports NO attached label for the new intent
+    targetForIntent.mockResolvedValue(null)
+    await userEvent.click(screen.getByRole('button', { name: /revise brief/i }))
+    await userEvent.type(screen.getByLabelText('Hypothesis'), ' now about something else')
+    await userEvent.click(screen.getByRole('button', { name: /generate revised round/i }))
+    await screen.findByText(/I understood your target as/)
+    expect(screen.queryByText(/this run predicts/i)).toBeNull()
+  })
+
+  it('an intent that ALREADY carries a label shows it — server truth, not client memory', async () => {
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    targetForIntent.mockResolvedValue(
+      { intent_id: 'int_1', definition_id: 'd1', name: 'tgt_npe_90d', reads_as: 'one row per…' })
+    await generateConfirmOn()
+    expect(await screen.findByText(/this run predicts/i)).toBeInTheDocument()
+    expect(screen.getByText('tgt_npe_90d')).toBeInTheDocument()
+  })
+
+  it('Confirm REFUSES to destroy a target build in progress', async () => {
+    contractIntake.mockResolvedValue({
+      ...INTAKE, ticket: { ...TICKET, target_column: null }, target_detail: null,
+    })
+    contractIntakeTarget.mockResolvedValue({ ...READING, target_ref: null })
+    await generateConfirmOn()
+    await userEvent.click(
+      await screen.findByRole('button', { name: /build the target instead/i }))
+    await screen.findByRole('heading', { name: /build a prediction target/i })
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    // nothing generated, and the reason is stated — the person's propose outranks our button
+    expect(contractConsideredSet).not.toHaveBeenCalled()
+    expect(screen.getByText(/finish or cancel the target builder first/i)).toBeInTheDocument()
+  })
+
+  it('says leakage checks are OFF while no target decision exists', async () => {
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    expect(screen.getByText(/no target decision yet/i)).toBeInTheDocument()
+    // deciding removes the nudge
+    await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+    await waitFor(() => expect(screen.queryByText(/no target decision yet/i)).toBeNull())
   })
 
   it('a second click on Show-all while one is in flight sends NOTHING', async () => {

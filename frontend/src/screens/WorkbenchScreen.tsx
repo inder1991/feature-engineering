@@ -60,6 +60,7 @@
 import { Fragment, type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import {
   attachTargetToIntent,
+  targetForIntent,
   ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
   type OptionActionsEntry,
   type IntakeReading, type IntakeResp, type NeedsSetupCandidate,
@@ -2228,6 +2229,12 @@ export function WorkbenchScreen() {
     setIntakeError('')
     setIntakeAck(null)
     setIntakeAcknowledged('')
+    // The target builder belongs to the ROUND. Left alone, a rewritten brief kept a stale
+    // "this run predicts tgt_x" banner (a false claim about the new run) and reopened a
+    // half-filled build panel over a different objective.
+    setBuildingTarget(false)
+    setBuiltTarget(null)
+    setBuildError('')
     const intakeSeq = seq
     setIntakeInFlight(true)
     setScopeReopened(false)
@@ -2237,6 +2244,15 @@ export function WorkbenchScreen() {
         if (intakeSeq !== generateSeq.current) return
         setIntakeInFlight(false)
         setIntake(resp)
+        // The banner is SERVER truth, not client memory: an intent reused across sessions (same
+        // hypothesis is content-addressed) may already carry an attached label, and a fresh
+        // browser must show it. null clears honestly.
+        targetForIntent(resp.intent_id)
+          .then(attached => {
+            if (intakeSeq !== generateSeq.current) return
+            setBuiltTarget(attached ? { name: attached.name, readsAs: attached.reads_as } : null)
+          })
+          .catch(() => undefined)
         setWindowDraft(resp.ticket.target_window_days?.toString() ?? '')
         // A pinned name is already recorded server-side (user_typed, no click needed): thread it
         // into the manual field so the considered-set request carries what the server signed.
@@ -2350,7 +2366,13 @@ export function WorkbenchScreen() {
   // in-scope subset. Reuses the round's snapshotted hypothesis/objective (set at recognise time).
   async function confirmScope() {
     const rec = recognition
-    if (!rec || feedbackLocked) return
+    if (!rec || feedbackLocked || generating) return
+    if (buildingTarget) {
+      // Generating unmounts the scope panel and the build form inside it — a propose the person
+      // is mid-way through would be destroyed without a word. Their work outranks our button.
+      setNotice('Finish or cancel the target builder first — generating now would discard it.')
+      return
+    }
     const transition = recognitionTransition
     const prior = generatedRef.current ?? []
     const seq = ++generateSeq.current
@@ -2397,6 +2419,10 @@ export function WorkbenchScreen() {
   // scope (lineage only). Available from the proposed-scope panel and from the disposition lens.
   async function broadenScope() {
     if (feedbackLocked || generating) return
+    if (buildingTarget) {
+      setNotice('Finish or cancel the target builder first — generating now would discard it.')
+      return
+    }
     const rec = recognition
     const transition = recognitionTransition
     const prior = generatedRef.current ?? []
@@ -4060,6 +4086,12 @@ export function WorkbenchScreen() {
               Show all buildable recipes
             </button>
           </div>
+          {intake !== null && intakeReading === null && builtTarget === null && (
+            <p className="hint" role="status" data-role="no-target-nudge" style={{ margin: '8px 0 0' }}>
+              No target decision yet — you can still generate, but leakage checks will be off
+              until one is made.
+            </p>
+          )}
         </div>
       )}
 

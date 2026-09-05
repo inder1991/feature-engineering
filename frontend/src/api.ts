@@ -5089,3 +5089,9 @@ export function attachTargetToIntent(
     { intent_id: intentId },
   )
 }
+
+/** The rule-based label attached to an intent, or null — the SERVER's answer, so the "this run
+    predicts X" banner reflects recorded truth rather than client memory. */
+export function targetForIntent(intentId: string): Promise<TargetAttached | null> {
+  return request(`/targets/for-intent/${encodeURIComponent(intentId)}`)
+}
