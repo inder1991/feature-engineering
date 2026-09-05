@@ -2238,32 +2238,44 @@ export function WorkbenchScreen() {
     const intakeSeq = seq
     setIntakeInFlight(true)
     setScopeReopened(false)
-    contractIntake(hypothesis.trim(),
-                   { catalogSource: source.trim() || undefined, objective })
-      .then(resp => {
-        if (intakeSeq !== generateSeq.current) return
-        setIntakeInFlight(false)
-        setIntake(resp)
+    // SEQUENCED after recognitions, deliberately. Fired in parallel, both routes get-or-create
+    // the intent by hypothesis and BOTH inserted — two intents 59 microseconds apart in the live
+    // database, splitting one run's lineage across two ids (a label attached to intake's intent,
+    // a run governed by recognition's). Recognition creating the intent first makes intake FIND
+    // it; the second call starts when the first returns, which costs its latency and buys one
+    // intent per run.
+    const intakeAfterRecognition = (recognitionDone: Promise<unknown>) =>
+      recognitionDone
+        .catch(() => undefined)   // intake proceeds even when recognition failed — degrade, never block
+        .then(() => contractIntake(hypothesis.trim(),
+                                   { catalogSource: source.trim() || undefined, objective }))
+        .then(resp => {
+          if (intakeSeq !== generateSeq.current) return
+          setIntakeInFlight(false)
+          setIntake(resp)
         // The banner is SERVER truth, not client memory: an intent reused across sessions (same
         // hypothesis is content-addressed) may already carry an attached label, and a fresh
         // browser must show it. null clears honestly.
-        targetForIntent(resp.intent_id)
-          .then(attached => {
-            if (intakeSeq !== generateSeq.current) return
-            setBuiltTarget(attached ? { name: attached.name, readsAs: attached.reads_as } : null)
-          })
-          .catch(() => undefined)
-        setWindowDraft(resp.ticket.target_window_days?.toString() ?? '')
-        // A pinned name is already recorded server-side (user_typed, no click needed): thread it
-        // into the manual field so the considered-set request carries what the server signed.
-        if (resp.ticket.pinned && resp.ticket.target_column) setTarget(resp.ticket.target_column)
-      })
-      .catch(() => {
-        // FAILED, distinctly from in-flight: the intake-unavailable block below asks instead.
-        if (intakeSeq === generateSeq.current) setIntakeInFlight(false)
-      })
+          targetForIntent(resp.intent_id)
+            .then(attached => {
+              if (intakeSeq !== generateSeq.current) return
+              setBuiltTarget(attached ? { name: attached.name, readsAs: attached.reads_as } : null)
+            })
+            .catch(() => undefined)
+          setWindowDraft(resp.ticket.target_window_days?.toString() ?? '')
+          // A pinned name is already recorded server-side (user_typed, no click needed): thread
+          // it into the manual field so the considered-set request carries what the server
+          // signed.
+          if (resp.ticket.pinned && resp.ticket.target_column) setTarget(resp.ticket.target_column)
+        })
+        .catch(() => {
+          // FAILED, distinctly from in-flight: the intake-unavailable block below asks instead.
+          if (intakeSeq === generateSeq.current) setIntakeInFlight(false)
+        })
     try {
-      const rec = await contractRecognitions(hypothesis.trim(), objective)
+      const recognitionCall = contractRecognitions(hypothesis.trim(), objective)
+      void intakeAfterRecognition(recognitionCall)
+      const rec = await recognitionCall
       if (seq !== generateSeq.current) return
       setRoundHypothesis(hypothesis.trim())
       setRoundObjective(objective)

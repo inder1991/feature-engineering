@@ -10,7 +10,13 @@ from typing import Annotated
 
 import psycopg
 from fastapi import Depends, FastAPI
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import PlainTextResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 from featuregen.api.deps import get_conn, get_identity
@@ -214,6 +220,30 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app = FastAPI(title="FeatureGen API", lifespan=_lifespan)
     app.state.llm_client = llm_client
+
+    @app.exception_handler(RequestValidationError)
+    async def _log_422_shape(request, exc: RequestValidationError):
+        # OBSERVABILITY, not behaviour: the response is byte-identical to FastAPI's default. A
+        # live click surfaced as a bare "Unprocessable Entity" three times and the access log
+        # records only the status line, so the cause could not be named after the fact. Now every
+        # schema-level 422 logs WHERE and WHAT failed.
+        logger.warning("422 validation on %s: %s", request.url.path,
+                       "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}"
+                                 for e in exc.errors()[:5]))
+        # DELEGATE, never re-build: pydantic's error `ctx` can carry raw exception objects, and
+        # FastAPI's own handler runs them through jsonable_encoder. A hand-rolled JSONResponse
+        # crashed on exactly that — fourteen tests' worth of value_error refusals.
+        return await request_validation_exception_handler(request, exc)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _log_4xx_detail(request, exc: StarletteHTTPException):
+        # Same purpose for HANDLER-raised refusals: the sentence a route wrote is the diagnosis,
+        # and it was reaching only the client. Response unchanged (http_exception_handler is
+        # FastAPI's own default).
+        if 400 <= exc.status_code < 500 and exc.status_code not in (401, 403, 404):
+            logger.warning("%s refusal on %s: %s", exc.status_code, request.url.path,
+                           str(exc.detail)[:300])
+        return await http_exception_handler(request, exc)
 
     @app.exception_handler(Exception)
     def _raw_fault_run_id_header(request, exc: Exception) -> PlainTextResponse:

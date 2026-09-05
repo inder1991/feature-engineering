@@ -3262,6 +3262,28 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     expect(await screen.findByLabelText('Hypothesis')).toBeInTheDocument()
   })
 
+  it('intake WAITS for recognitions, so one run cannot mint two intents', async () => {
+    // Fired in parallel, both routes get-or-create the intent by hypothesis and both inserted —
+    // two intents 59 microseconds apart in the live database, splitting one run's lineage. The
+    // recognition creates the intent; the intake, sequenced after it, finds it.
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    let releaseRec!: (r: api.RecognitionResp) => void
+    contractRecognitions.mockReturnValue(new Promise(res => { releaseRec = res }))
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    contractConsideredSet.mockResolvedValue(scoped())
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+
+    // recognition still pending -> intake must not have fired
+    expect(contractIntake).not.toHaveBeenCalled()
+    releaseRec(RECOGNITION)
+    await screen.findByText(/I understood your target as/)
+    expect(contractIntake).toHaveBeenCalledTimes(1)
+  })
+
   it('an IN-FLIGHT target read says it is reading, never that nothing landed', async () => {
     // `intake === null` used to mean both "still running" and "failed", so during the wait the
     // screen asserted "nothing read your objective" — false, and it then swapped to the real
