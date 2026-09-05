@@ -3960,7 +3960,11 @@ export function WorkbenchScreen() {
                     .then(r => {
                       setBuiltTarget({ name: r.name, readsAs: r.reads_as })
                       setBuildingTarget(false)
-                      invalidateGenerated()
+                      // Invalidate ONLY when a round exists: those candidates were screened
+                      // against a different target. At scope review nothing is generated yet —
+                      // and invalidateGenerated clears the RECOGNITION too, which live-tested as
+                      // "register a label, watch the whole scope review vanish".
+                      if ((generatedRef.current?.length ?? 0) > 0) invalidateGenerated()
                     })
                     .catch(e => setBuildError(
                       e instanceof Error ? e.message : 'the target could not be attached'))
@@ -3978,7 +3982,11 @@ export function WorkbenchScreen() {
                     .then(r => {
                       setBuiltTarget({ name: r.name, readsAs: r.reads_as })
                       setBuildingTarget(false)
-                      invalidateGenerated()
+                      // Invalidate ONLY when a round exists: those candidates were screened
+                      // against a different target. At scope review nothing is generated yet —
+                      // and invalidateGenerated clears the RECOGNITION too, which live-tested as
+                      // "register a label, watch the whole scope review vanish".
+                      if ((generatedRef.current?.length ?? 0) > 0) invalidateGenerated()
                     })
                     .catch(e => setBuildError(
                       e instanceof Error ? e.message : 'the target could not be attached'))

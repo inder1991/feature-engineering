@@ -12,6 +12,8 @@ vi.mock('../api', async importOriginal => {
     contractConsideredSet: vi.fn(),
     contractRecognitions: vi.fn(),
     targetForIntent: vi.fn(),
+    attachTargetToIntent: vi.fn(),
+    proposeTarget: vi.fn(),
     listTargetEntities: vi.fn(),
     contractIntake: vi.fn(),
     contractIntakeTarget: vi.fn(),
@@ -31,6 +33,8 @@ const contractConsideredSet = vi.mocked(api.contractConsideredSet)
 const contractRecognitions = vi.mocked(api.contractRecognitions)
 const targetForIntent = vi.mocked(api.targetForIntent)
 const listTargetEntities = vi.mocked(api.listTargetEntities)
+const attachTargetToIntent = vi.mocked(api.attachTargetToIntent)
+const proposeTarget = vi.mocked(api.proposeTarget)
 const contractIntake = vi.mocked(api.contractIntake)
 const contractIntakeTarget = vi.mocked(api.contractIntakeTarget)
 const contractDraft = vi.mocked(api.contractDraft)
@@ -3231,6 +3235,36 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     await generateConfirmOn()
     expect(await screen.findByText(/this run predicts/i)).toBeInTheDocument()
     expect(screen.getByText('tgt_npe_90d')).toBeInTheDocument()
+  })
+
+  it('registering a label from scope review KEEPS the scope review', async () => {
+    // Found by the end-to-end pass, not the unit tests: the attach handler called
+    // invalidateGenerated unconditionally, and that helper clears the RECOGNITION — so
+    // registering a label made the entire scope review vanish back to the draft shell.
+    // Invalidation is for rounds; at scope review there is nothing to invalidate.
+    contractIntake.mockResolvedValue({
+      ...INTAKE, ticket: { ...TICKET, target_column: null }, target_detail: null,
+    })
+    contractIntakeTarget.mockResolvedValue({ ...READING, target_ref: null })
+    attachTargetToIntent.mockResolvedValue(
+      { intent_id: 'int_1', definition_id: 'd9', name: 'tgt_e2e_60d', reads_as: 'one row per…' })
+    await generateConfirmOn()
+    await userEvent.click(
+      await screen.findByRole('button', { name: /build the target instead/i }))
+    await screen.findByRole('heading', { name: /build a prediction target/i })
+    // shortcut the form: adopt-an-existing exercises the same attach path
+    proposeTarget.mockResolvedValue({
+      existing: [{ name: 'tgt_e2e_60d', description: 'd', window_days: 60, match_terms: ['x'] }],
+      draft: null,
+    })
+    await userEvent.click(screen.getByRole('button', { name: /propose a target/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /use this label/i }))
+
+    expect(await screen.findByText(/this run predicts/i)).toBeInTheDocument()
+    // the scope review SURVIVES — step 1 summary still on screen, CTA still offered
+    expect(screen.getByText('Customer churn')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /confirm scope and generate/i }))
+      .toBeInTheDocument()
   })
 
   it('Confirm REFUSES to destroy a target build in progress', async () => {
