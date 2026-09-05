@@ -12,6 +12,7 @@ vi.mock('../api', async importOriginal => {
     contractConsideredSet: vi.fn(),
     contractRecognitions: vi.fn(),
     targetForIntent: vi.fn(),
+    listTargetEntities: vi.fn(),
     contractIntake: vi.fn(),
     contractIntakeTarget: vi.fn(),
     contractDraft: vi.fn(),
@@ -29,6 +30,7 @@ const recommendFeatures = vi.mocked(api.recommendFeatures)
 const contractConsideredSet = vi.mocked(api.contractConsideredSet)
 const contractRecognitions = vi.mocked(api.contractRecognitions)
 const targetForIntent = vi.mocked(api.targetForIntent)
+const listTargetEntities = vi.mocked(api.listTargetEntities)
 const contractIntake = vi.mocked(api.contractIntake)
 const contractIntakeTarget = vi.mocked(api.contractIntakeTarget)
 const contractDraft = vi.mocked(api.contractDraft)
@@ -42,6 +44,12 @@ const featureFreshness = vi.mocked(api.featureFreshness)
 
 beforeEach(() => {
   targetForIntent.mockResolvedValue(null)
+  // The embedded target panel loads the catalog's anchorable entities; with a real catalog now
+  // always present on the brief, an unmocked fetch would reject and the panel would honestly
+  // report "no keyed spine table" instead of rendering its form.
+  listTargetEntities.mockResolvedValue([
+    { entity: 'customer', spine_table: 'accounts', spine_ref: 'public.accounts.id' },
+  ])
   recommendFeatures.mockReset()
   contractConsideredSet.mockReset()
   contractRecognitions.mockReset()
@@ -236,9 +244,9 @@ async function renderAndGenerate(
 ) {
   contractConsideredSet.mockResolvedValue(considered(singleSetRound(ideas, rejections)))
   render(<WorkbenchScreen />)
-  if (scope.source) {
-    await userEvent.type(screen.getByLabelText('Catalog source'), scope.source)
-  }
+  // A catalog is REQUIRED now — the copy always said so, and the server always refused without
+  // one (SEMANTIC_REQUIRES_CATALOG_SOURCE); only these tests could generate catalog-free.
+  await userEvent.type(screen.getByLabelText('Catalog source'), scope.source ?? 'deposits')
   // NOTE: `scope.target` can no longer be typed here. The intake form used to carry a "Target
   // column" field, which asserted the thing being predicted is a COLUMN before anything had read
   // the objective. Naming a column now happens at the scope step, where the read either produced
@@ -251,6 +259,7 @@ async function renderAndGenerate(
 async function renderAndGenerateRaw() {
   // The caller has already queued its own contractConsideredSet mock (e.g. with v2 sections).
   render(<WorkbenchScreen />)
+  await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
   await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
   await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
   await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -259,6 +268,7 @@ async function renderAndGenerateRaw() {
 async function renderAndGenerateSets(round: api.FeatureSetsResult) {
   contractConsideredSet.mockResolvedValue(considered(round))
   render(<WorkbenchScreen />)
+  await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
   await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
   await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
   await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -323,6 +333,7 @@ describe('gates strip', () => {
     // Goal alone is not the whole brief: the gate stays active until the hypothesis is given too
     // (else it would falsely promise the next step while Generate silently no-ops — bug_004).
     expect(gateState('State the goal')).toBe('active')
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     expect(gateState('State the goal')).toBe('done')
     expect(gateState('Plan over the catalog')).toBe('active')
@@ -389,11 +400,17 @@ describe('generation', () => {
     })
   })
 
-  it('leaves blank scope fields undefined in the considered-set call', async () => {
-    await renderAndGenerate([])
-    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
-      catalogSource: undefined, targetRef: undefined,
-    })
+  it('a blank catalog is refused AT THE BRIEF, not thirty seconds later by the server', async () => {
+    // The copy said "Required." from the start; nothing enforced it, and a catalog-free run
+    // sailed through recognition and scope review to die on the server's
+    // SEMANTIC_REQUIRES_CATALOG_SOURCE — the owner hit exactly that, three times, as a bare 422.
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(contractConsideredSet).not.toHaveBeenCalled()
+    expect(contractRecognitions).not.toHaveBeenCalled()
+    expect(screen.getByText(/name a catalog source/i)).toBeInTheDocument()
   })
 
   // E4 cutover: entity-only generation is refused typed by the route
@@ -412,6 +429,7 @@ describe('generation', () => {
     contractConsideredSet.mockResolvedValue(considered(singleSetRound([])))
     render(<WorkbenchScreen />)
     expect(screen.queryByText(/no grounded candidates/i)).not.toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -425,6 +443,7 @@ describe('generation', () => {
       .mockImplementationOnce(() => first.promise)
       .mockImplementationOnce(() => second.promise)
     const { container } = render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -457,6 +476,7 @@ describe('generation', () => {
     const detail = 'cross-catalog planning is interlocked: no activation ceremony for source ftr'
     contractConsideredSet.mockRejectedValue(new api.ApiError(503, detail))
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -666,6 +686,7 @@ describe('multiple sets', () => {
       ],
     }))
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -721,6 +742,7 @@ describe('the needs-setup lane', () => {
       ...considered(singleSetRound([])), contract_version: 2, needs_setup: entries,
     })
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -2268,6 +2290,7 @@ describe('Gate #1 scope confirmation', () => {
 
   async function generateFlagOn() {
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -2284,7 +2307,7 @@ describe('Gate #1 scope confirmation', () => {
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     expect(contractConsideredSet).toHaveBeenCalledTimes(1)
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
-      catalogSource: undefined, targetRef: undefined,
+      catalogSource: 'deposits', targetRef: undefined,
     })
     expect(contractRecognitions).not.toHaveBeenCalled()
     // No confirm step and no lens render when the flags are off.
@@ -2354,6 +2377,7 @@ describe('Gate #1 scope confirmation', () => {
 
   async function generateFlagOnWithSource() {
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.type(screen.getByLabelText('Catalog source'), 'bank')
@@ -2625,6 +2649,7 @@ describe('Gate #1 recognition quality', () => {
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
     contractRecognitions.mockResolvedValue(rec)
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -2820,6 +2845,7 @@ describe('Phase 2A ranking', () => {
 
   async function generateRanked() {
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -2964,6 +2990,7 @@ describe('Intake target confirmation', () => {
     contractRecognitions.mockResolvedValue(RECOGNITION)
     contractConsideredSet.mockResolvedValue(scoped())
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -2976,7 +3003,7 @@ describe('Intake target confirmation', () => {
     // the mandatory read ran alongside recognition, on the SAME hypothesis — AND the prediction
     // goal, which is where the horizon is written and which never used to reach this read.
     expect(contractIntake).toHaveBeenCalledWith(
-      HYPOTHESIS, { catalogSource: undefined, objective: 'predict churn' })
+      HYPOTHESIS, { catalogSource: 'deposits', objective: 'predict churn' })
     // the draft reading renders with the summary one-liner and the window
     expect(await screen.findByText(/I understood your target as/)).toBeInTheDocument()
     expect(screen.getByText('Whether the customer churned in the window.')).toBeInTheDocument()
@@ -2993,7 +3020,7 @@ describe('Intake target confirmation', () => {
     expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'confirmed', {
       targetRef: 'public.labels.churned', targetWindowDays: 90,
       targetType: 'binary_classification', businessDomain: ['retail_churn'],
-      catalogSource: undefined, targetNotOutcomeAcknowledged: false,
+      catalogSource: 'deposits', targetNotOutcomeAcknowledged: false,
     })
     expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
     // the signed target threads into the considered-set request
@@ -3160,6 +3187,7 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     let release!: (r: api.RecognitionResp) => void
     contractRecognitions.mockReturnValue(new Promise(res => { release = res }))
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -3273,6 +3301,7 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     contractIntakeTarget.mockResolvedValue(READING)
     contractConsideredSet.mockResolvedValue(scoped())
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -3293,6 +3322,7 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     contractIntake.mockReturnValue(new Promise(() => {}))   // never lands
     contractConsideredSet.mockResolvedValue(scoped())
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -3309,6 +3339,7 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     let release!: (r: api.RecognitionResp) => void
     contractRecognitions.mockReturnValue(new Promise(res => { release = res }))
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -3329,6 +3360,7 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     let release!: (r: api.ConsideredSetResp) => void
     contractConsideredSet.mockReturnValue(new Promise(res => { release = res }))
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -3358,6 +3390,7 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     })
     contractIntakeTarget.mockResolvedValue({ ...READING, target_ref: null })
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -3383,6 +3416,7 @@ it('the CLICKED BUTTON shows the working state, not only a banner elsewhere', as
     contractRecognitions.mockResolvedValue(RECOGNITION)
     contractConsideredSet.mockResolvedValue(scoped())
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -3965,6 +3999,7 @@ describe('post-submit workspace shell', () => {
   it('a landed round replaces the intake form with the compact submitted brief', async () => {
     const { container } = render(<WorkbenchScreen />)
     contractConsideredSet.mockResolvedValue(considered(singleSetRound([IDEA])))
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -4008,6 +4043,7 @@ describe('post-submit workspace shell', () => {
   it('a scope edit voids the round and returns the screen to its draft shell', async () => {
     const { container } = render(<WorkbenchScreen />)
     contractConsideredSet.mockResolvedValue(considered(singleSetRound([IDEA])))
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -4071,6 +4107,7 @@ describe('post-submit workspace shell', () => {
     const pending = deferred<api.ConsideredSetResp>()
     contractConsideredSet.mockImplementationOnce(() => pending.promise)
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -4093,6 +4130,7 @@ describe('post-submit workspace shell', () => {
   it('empty: reports the absence and the zero it measured, inventing nothing', async () => {
     contractConsideredSet.mockResolvedValue(considered(singleSetRound([])))
     const { container } = render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -4100,7 +4138,7 @@ describe('post-submit workspace shell', () => {
     expect(phaseOf(container)).toBe('empty')
     // The submitted brief still says what was asked; unset scope reads "not set", never a guess.
     expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
-    expect(screen.getByText('catalog · not set')).toBeInTheDocument()
+    expect(screen.getByText('catalog · deposits')).toBeInTheDocument()
     expect(screen.getByText('target · not set')).toBeInTheDocument()
     // The engine-output card states the measured zero, and no composition is drawn over nothing.
     expect(screen.getByText('0 candidates')).toBeInTheDocument()
@@ -4112,6 +4150,7 @@ describe('post-submit workspace shell', () => {
     const detail = 'catalog ftr has no activated cross-catalog interlock'
     contractConsideredSet.mockRejectedValue(new api.ApiError(503, detail))
     const { container } = render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -4134,6 +4173,7 @@ describe('post-submit workspace shell', () => {
       }],
     }))
     const { container } = render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -4782,7 +4822,7 @@ describe('Slice 3: the revise drawer', () => {
     expect(screen.getByText(REVISED)).toBeInTheDocument()
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(contractConsideredSet).toHaveBeenLastCalledWith(REVISED, 'predict churn', {
-      catalogSource: undefined, targetRef: undefined,
+      catalogSource: 'deposits', targetRef: undefined,
     })
   })
 

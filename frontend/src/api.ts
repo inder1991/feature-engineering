@@ -77,6 +77,10 @@ async function requestWithResponse<T>(
         // place of the one thing the route said to help.
         payload = body.detail as Record<string, unknown>
         if (typeof payload.detail === 'string') detail = payload.detail
+        // The OTHER structured shape: {code, message}. The considered-set refusals use it, and
+        // without this line every one of them rendered as the bare status word — three separate
+        // "Unprocessable Entity" reports before the sentence underneath was ever seen.
+        else if (typeof payload.message === 'string') detail = payload.message
         if (typeof payload.code === 'string') errorCode = payload.code
       } else if (Array.isArray(body.detail) && body.detail.length > 0) {
         // FastAPI 422 validation shape: detail is [{loc, msg, type}, ...]

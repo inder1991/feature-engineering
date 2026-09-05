@@ -2435,6 +2435,14 @@ export function WorkbenchScreen() {
       setNotice('Finish or cancel the target builder first — generating now would discard it.')
       return
     }
+    if (!source.trim()) {
+      setNotice('Name a catalog source in the brief — generation plans over one catalog.')
+      return
+    }
+    if (!source.trim()) {
+      setNotice('Name a catalog source in the brief — generation plans over one catalog.')
+      return
+    }
     const rec = recognition
     const transition = recognitionTransition
     const prior = generatedRef.current ?? []
@@ -2511,6 +2519,13 @@ export function WorkbenchScreen() {
     // Both the hypothesis and the objective are required: the considered-set intake governs
     // against a stated hypothesis. Same early-return style as the objective check.
     if (!hypothesis.trim() || !objective) return
+    if (!source.trim()) {
+      // The copy has said "Required" all along; nothing enforced it. Without a catalog the run
+      // sails through recognition and scope review and dies 30 seconds later on the server's
+      // SEMANTIC_REQUIRES_CATALOG_SOURCE — a dead end where a sentence at the start was owed.
+      setNotice('Name a catalog source — generation plans over one catalog.')
+      return
+    }
     // A register batch is confirming or in flight: a new round would replace the rows the
     // human is approving, letting their registrations complete out of view.
     if (feedbackLocked) return
