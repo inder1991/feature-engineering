@@ -1501,6 +1501,10 @@ export function WorkbenchScreen() {
   // Step 1 collapses to a settled summary once a PRIMARY exists — the person's one open decision
   // is then the target. `scopeReopened` lets them expand it again to adjust.
   const [scopeReopened, setScopeReopened] = useState(false)
+  // "Show all buildable recipes" chosen as the SCOPE — the run plans over every recipe instead of
+  // the recognised use-case's. A choice, not a generate action: the owner's review caught show-all
+  // jumping straight to generation past the target step the flow had just been sequenced around.
+  const [scopeBroadenChosen, setScopeBroadenChosen] = useState(false)
   // T7 (c): the confirm gate's refusal, held so the human can read the SERVER's own words and
   // then act on them. `detail` is rendered verbatim and never summarised; `decision`/`ref` are
   // what the acknowledge control re-sends, so acknowledging cannot quietly retarget the answer.
@@ -2238,6 +2242,7 @@ export function WorkbenchScreen() {
     const intakeSeq = seq
     setIntakeInFlight(true)
     setScopeReopened(false)
+    setScopeBroadenChosen(false)
     // SEQUENCED after recognitions, deliberately. Fired in parallel, both routes get-or-create
     // the intent by hypothesis and BOTH inserted — two intents 59 microseconds apart in the live
     // database, splitting one run's lineage across two ids (a label attached to intake's intent,
@@ -3467,7 +3472,20 @@ export function WorkbenchScreen() {
               {qualityNotice(recognition)}
             </p>
           )}
-          {primaryCandidate !== null && !scopeReopened ? (
+          {scopeBroadenChosen && !scopeReopened ? (
+            <div className="scope-settled" data-role="scope-settled">
+              <p style={{ margin: 0 }}>
+                Scope: <strong>everything buildable</strong>{' '}
+                <span className="badge">no use-case filter</span>
+              </p>
+              <button
+                type="button" className="btn"
+                onClick={() => { setScopeBroadenChosen(false); setScopeReopened(true) }}
+              >
+                Change the scope
+              </button>
+            </div>
+          ) : primaryCandidate !== null && !scopeReopened ? (
             <div className="scope-settled" data-role="scope-settled">
               <p style={{ margin: 0 }}>
                 Scope: <strong>{primaryCandidate.display_name}</strong>{' '}
@@ -3589,11 +3607,13 @@ export function WorkbenchScreen() {
               <div className="choice-row">
                 <button
                   type="button" className="btn" disabled={generating}
-                  onClick={() => void broadenScope()}
+                  onClick={() => { setScopeBroadenChosen(true); setScopeReopened(false) }}
                 >
                   Show all buildable recipes
                 </button>
-                <span className="hint">skip scope filtering and generate over everything</span>
+                <span className="hint">
+                  drop the use-case filter — you still decide the target next, then generate
+                </span>
               </div>
               <div className="choice-row">
                 <button type="button" className="btn" onClick={() => setReviseOpen(true)}>
@@ -4092,26 +4112,34 @@ export function WorkbenchScreen() {
             </div>
           )}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 16 }}>
-            {primaryCandidate !== null && (
+            {(primaryCandidate !== null || scopeBroadenChosen) && (
               <button
                 type="button"
                 className="btn btn--primary"
                 disabled={generating}
-                onClick={() => void confirmScope()}
+                onClick={() => void (scopeBroadenChosen ? broadenScope() : confirmScope())}
               >
                 {generating
                   ? <><span className="btn-spinner" aria-hidden="true" /> Generating…</>
-                  : 'Confirm scope and generate'}
+                  : scopeBroadenChosen ? 'Generate over everything' : 'Confirm scope and generate'}
               </button>
             )}
-            <button
-              type="button"
-              className="btn"
-              disabled={generating}
-              onClick={() => void broadenScope()}
-            >
-              Show all buildable recipes
-            </button>
+            {!scopeBroadenChosen && (
+              <button
+                type="button"
+                className="btn"
+                disabled={generating}
+                onClick={() => recognition.candidates.length > 0
+                  // With a recognised scope on screen this is a CHOICE — the target step still
+                  // follows, and the primary CTA generates. Direct generation survives only where
+                  // nothing was recognised: there show-all is the sole forward path, and the
+                  // absence copy promises exactly that.
+                  ? (setScopeBroadenChosen(true), setScopeReopened(false))
+                  : void broadenScope()}
+              >
+                Show all buildable recipes
+              </button>
+            )}
           </div>
           {intake !== null && intakeReading === null && builtTarget === null && (
             <p className="hint" role="status" data-role="no-target-nudge" style={{ margin: '8px 0 0' }}>
